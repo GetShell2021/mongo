@@ -44,12 +44,152 @@ structs:
     CreateCommandReply:
         description: 'Reply from the {create: ...} command'
         strict: true
+        is_command_reply: true
         fields:
             note:
                 description: 'Warnings or other additional information'
                 type: string
                 optional: true
-                unstable: false
+                stability: stable
+    
+    CreateCollectionRequest:
+        description: "Base request to create a collection"
+        strict: true 
+        fields:
+            capped:
+                description: "Specify true to create a capped collection. If you specify true, you
+                              must also set a maximum size in the 'size' field."
+                type: safeBool
+                default: false
+                # The capped parameter should actually be unstable, and in practice it is, because
+                # it is required to also set the 'size' field, which is properly marked as unstable.
+                stability: stable
+            autoIndexId:
+                description: "Specify false to disable the automatic creation of an index on the
+                              _id field."
+                type: safeBool
+                optional: true
+                stability: unstable
+            idIndex:
+                description: "Specify the default _id index specification."
+                type: object
+                optional: true
+                stability: stable
+            size:
+                description: "Specify a maximum size in bytes for the capped collection."
+                type: safeInt64
+                optional: true
+                validator:
+                    gte: 1
+                    lte: 1125899906842624  # 1 PB
+                stability: unstable
+            max:
+                description: "The maximum number of documents allowed in the capped collection. The
+                              'size' limit takes precedence over this limit."
+                type: safeInt64
+                optional: true
+                validator:
+                    lt: 2147483648  # 2^31
+                stability: unstable
+            storageEngine:
+                description: "Specify a configuration to the storage engine on a per-collection
+                              basis when creating a collection."
+                type: object
+                optional: true
+                stability: unstable
+            validator:
+                description: "Specify validation rules or expressions for the collection."
+                type: object
+                optional: true
+                stability: stable
+            validationLevel:
+                description: "Determines how strictly to apply the validation rules to existing
+                              documents during an update.
+                              Can be one of following values: 'off', 'strict' or 'moderate'."
+                type: ValidationLevel
+                optional: true
+                stability: stable
+            validationAction:
+                description: "Determines whether to error on invalid documents or just warn about
+                              the violations but allow invalid documents to be inserted.
+                              Can be either 'warn' or 'error'."
+                type: ValidationAction
+                optional: true
+                stability: stable
+            indexOptionDefaults:
+                description: "Allows users to specify a default configuration for indexes when
+                              creating a collection."
+                type: IndexOptionDefaults
+                optional: true
+                stability: unstable
+            viewOn:
+                description: "The name of the source collection or view from which to create the
+                              view."
+                type: string
+                optional: true
+                stability: stable
+                validator:
+                    callback: create_command_validation::validateViewOnNotEmpty
+            pipeline:
+                description: "An array that consists of the aggregation pipeline. Creates the view
+                              by applying the specified pipeline to the 'viewOn' collection or
+                              view."
+                type: array<object>
+                optional: true
+                stability: stable
+            collation:
+                description: "Specifies the default collation for the collection or the view."
+                type: Collation
+                optional: true
+                stability: stable
+            changeStreamPreAndPostImages:
+                description: "The options for point-in-time pre- and post-images in change streams opened on this collection."
+                type: ChangeStreamPreAndPostImagesOptions
+                optional: true
+                stability: unstable
+            timeseries:
+                description: "The options to create the time-series collection with."
+                type: TimeseriesOptions
+                optional: true
+                stability: stable
+            clusteredIndex:
+                description: "Specifies whether this collection should have a clusteredIndex.
+                    Boolean is accepted as the legacy clustered index format for specific internal
+                    collections - and implies clustering by _id. Otherwise, clusters according to
+                    the ClusteredIndexSpec."
+                type:
+                    variant: [safeBool, ClusteredIndexSpec]
+                optional: true
+                stability: stable
+            recordIdsReplicated:
+                description: "Specifies whether this collection should utilize the same recordId for a given document
+                              across all nodes in a replica set."
+                type: safeBool
+                optional: true
+                stability: unstable
+            expireAfterSeconds:
+                description: "The number of seconds after which old data should be deleted."
+                type: safeInt64
+                optional: true
+                stability: stable
+            encryptedFields:
+                description: "Specifies the fields that are encrypted by client-side FLE."
+                type: EncryptedFieldConfig
+                optional: true
+                stability: stable
+            temp:
+                description: "Internal field that can be used in the $out aggregation code."
+                type: safeBool
+                optional: true
+                # The temp field is an internal field and not documented publicly, but we need to set
+                # the 'stability' to 'stable' because it can be used in the $out aggregation stage.
+                # This is due to the limitation of the API strict checking infrastructure.
+                stability: stable
+            flags:
+                description: "DEPRECATED"
+                type: safeInt64
+                optional: true
+                stability: unstable     
 
 commands:
     create:
@@ -80,135 +220,7 @@ commands:
                     action_type: [remove, update, collStats, indexStats, planCacheRead]
         reply_type: CreateCommandReply
         strict: true
-        fields:
-            capped:
-                description: "Specify true to create a capped collection. If you specify true, you
-                              must also set a maximum size in the 'size' field."
-                type: safeBool
-                default: false
-                # The capped parameter should actually be unstable, and in practice it is, because
-                # it is required to also set the 'size' field, which is properly marked as unstable.
-                unstable: false
-            autoIndexId:
-                description: "Specify false to disable the automatic creation of an index on the
-                              _id field."
-                type: safeBool
-                optional: true
-                unstable: true
-            idIndex:
-                description: "Specify the default _id index specification."
-                type: object
-                optional: true
-                unstable: false
-            size:
-                description: "Specify a maximum size in bytes for the capped collection."
-                type: safeInt64
-                optional: true
-                validator:
-                    gte: 1
-                    lte: 1125899906842624  # 1 PB
-                unstable: true
-            max:
-                description: "The maximum number of documents allowed in the capped collection. The
-                              'size' limit takes precedence over this limit."
-                type: safeInt64
-                optional: true
-                validator:
-                    lt: 2147483648  # 2^31
-                unstable: true
-            storageEngine:
-                description: "Specify a configuration to the storage engine on a per-collection
-                              basis when creating a collection."
-                type: object
-                optional: true
-                unstable: true
-            validator:
-                description: "Specify validation rules or expressions for the collection."
-                type: object
-                optional: true
-                unstable: false
-            validationLevel:
-                description: "Determines how strictly to apply the validation rules to existing
-                              documents during an update.
-                              Can be one of following values: 'off', 'strict' or 'moderate'."
-                type: ValidationLevel
-                optional: true
-                unstable: false
-            validationAction:
-                description: "Determines whether to error on invalid documents or just warn about
-                              the violations but allow invalid documents to be inserted.
-                              Can be either 'warn' or 'error'."
-                type: ValidationAction
-                optional: true
-                unstable: false
-            indexOptionDefaults:
-                description: "Allows users to specify a default configuration for indexes when
-                              creating a collection."
-                type: IndexOptionDefaults
-                optional: true
-                unstable: true
-            viewOn:
-                description: "The name of the source collection or view from which to create the
-                              view."
-                type: string
-                optional: true
-                unstable: false
-                validator:
-                    callback: create_command_validation::validateViewOnNotEmpty
-            pipeline:
-                description: "An array that consists of the aggregation pipeline. Creates the view
-                              by applying the specified pipeline to the 'viewOn' collection or
-                              view."
-                type: array<object>
-                optional: true
-                unstable: false
-            collation:
-                description: "Specifies the default collation for the collection or the view."
-                type: Collation
-                optional: true
-                unstable: false
-            recordPreImages:
-                description: "Sets whether updates/deletes should store the pre-image of the
-                              document in the oplog"
-                type: safeBool
-                optional: true
-                unstable: true
-            changeStreamPreAndPostImages:
-                description: "The options for point-in-time pre- and post-images in change streams opened on this collection."
-                type: ChangeStreamPreAndPostImagesOptions
-                optional: true
-                unstable: true
-            timeseries:
-                description: "The options to create the time-series collection with."
-                type: TimeseriesOptions
-                optional: true
-                unstable: false
-            clusteredIndex:
-                description: "Specifies whether this collection should have a clusteredIndex.
-                    Boolean is accepted as the legacy clustered index format for specific internal
-                    collections - and implies clustering by _id. Otherwise, clusters according to
-                    the ClusteredIndexSpec."
-                type:
-                    variant: [safeBool, ClusteredIndexSpec]
-                optional: true
-                unstable: false
-            expireAfterSeconds:
-                description: "The number of seconds after which old data should be deleted."
-                type: safeInt64
-                optional: true
-                unstable: false
-            encryptedFields:
-                description: "Specifies the fields that are encrypted by client-side FLE."
-                type: EncryptedFieldConfig
-                optional: true
-                unstable: false
-            temp:
-                description: "DEPRECATED"
-                type: safeBool
-                optional: true
-                unstable: true
-            flags:
-                description: "DEPRECATED"
-                type: safeInt64
-                optional: true
-                unstable: true
+        inline_chained_structs: true
+        chained_structs:
+            CreateCollectionRequest: CreateCollectionRequest
+

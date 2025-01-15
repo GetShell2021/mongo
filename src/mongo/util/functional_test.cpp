@@ -29,7 +29,12 @@
 
 #include "mongo/util/functional.h"
 
-#include "mongo/unittest/unittest.h"
+#include <string>
+
+#include "mongo/base/static_assert.h"
+#include "mongo/base/string_data.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 /**
  * Note that tests in this file are deliberately outside the mongodb namespace to ensure that
@@ -104,7 +109,9 @@ TEST(UniqueFunctionTest, construct_simple_unique_function_from_lambda) {
     // Implicit construction
     {
         RunDetection<0> runDetection;
-        mongo::unique_function<void()> uf = [] { RunDetection<0>::itRan = true; };
+        mongo::unique_function<void()> uf = [] {
+            RunDetection<0>::itRan = true;
+        };
 
         uf();
 
@@ -114,7 +121,9 @@ TEST(UniqueFunctionTest, construct_simple_unique_function_from_lambda) {
     // Explicit construction
     {
         RunDetection<0> runDetection;
-        mongo::unique_function<void()> uf{[] { RunDetection<0>::itRan = true; }};
+        mongo::unique_function<void()> uf{[] {
+            RunDetection<0>::itRan = true;
+        }};
 
         uf();
 
@@ -236,7 +245,9 @@ TEST(UniqueFunctionTest, assign_simple_unique_function_from_lambda) {
     // Implicit construction
     RunDetection<0> runDetection;
     mongo::unique_function<void()> uf;
-    uf = [] { RunDetection<0>::itRan = true; };
+    uf = [] {
+        RunDetection<0>::itRan = true;
+    };
 
     uf();
 
@@ -254,9 +265,13 @@ TEST(UniqueFunctionTest, reassign_simple_unique_function_from_lambda) {
     RunDetection<0> runDetection0;
     RunDetection<1> runDetection1;
 
-    mongo::unique_function<void()> uf = [] { RunDetection<0>::itRan = true; };
+    mongo::unique_function<void()> uf = [] {
+        RunDetection<0>::itRan = true;
+    };
 
-    uf = [] { RunDetection<1>::itRan = true; };
+    uf = [] {
+        RunDetection<1>::itRan = true;
+    };
 
     uf();
 
@@ -267,8 +282,11 @@ TEST(UniqueFunctionTest, reassign_simple_unique_function_from_lambda) {
 TEST(FunctionRefTest, reassign_simple_function_ref_from_decayed_lambda) {
     // Implicit construction
     RunDetection<0> runDetection;
-    mongo::function_ref<void()> fr = +[] {};
-    fr = +[] { RunDetection<0>::itRan = true; };
+    mongo::function_ref<void()> fr = +[] {
+    };
+    fr = +[] {
+        RunDetection<0>::itRan = true;
+    };
 
     fr();
 
@@ -293,7 +311,8 @@ TEST(FunctionRefTest, reassign_simple_function_ref_from_function_ref) {
 TEST(UniqueFunctionTest, accepts_a_functor_that_is_move_only) {
     struct Checker {};
 
-    mongo::unique_function<void()> uf = [checkerPtr = std::make_unique<Checker>()] {};
+    mongo::unique_function<void()> uf = [checkerPtr = std::make_unique<Checker>()] {
+    };
 
     mongo::unique_function<void()> uf2 = std::move(uf);
 
@@ -363,7 +382,8 @@ TEST(UniqueFunctionTest, comparison_checks) {
     ASSERT_FALSE(uf != nullptr);
     ASSERT_FALSE(nullptr != uf);
 
-    uf = [] {};
+    uf = [] {
+    };
 
     ASSERT_FALSE(uf == nullptr);
     ASSERT_FALSE(nullptr == uf);
@@ -381,8 +401,12 @@ TEST(UniqueFunctionTest, comparison_checks) {
 TEST(UniqueFunctionTest, simple_instantiations) {
     mongo::unique_function<void()> a;
 
-    mongo::unique_function<void()> x = []() -> int { return 42; };
-    x = []() -> int { return 42; };
+    mongo::unique_function<void()> x = []() -> int {
+        return 42;
+    };
+    x = []() -> int {
+        return 42;
+    };
 }
 
 TEST(FunctionRefTest, simple_instantiations) {
@@ -776,7 +800,8 @@ bool accept(T arg, U) {
 }
 
 TEST(UniqueFunctionTest, functionDominanceExample) {
-    mongo::unique_function<void()> uf = [] {};
+    mongo::unique_function<void()> uf = [] {
+    };
 
     ASSERT_TRUE(accept(std::move(uf), nullptr));
 }

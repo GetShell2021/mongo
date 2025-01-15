@@ -34,6 +34,10 @@ from wiredtiger import stat
 #    Check that statistics are started or stopped when intended
 class test_stat06(wttest.WiredTigerTestCase):
 
+    # Turn off statistics by default for this test.
+    def conn_config(self):
+        return 'statistics=(none)'
+
     def test_stats_on(self):
         self.close_conn()
         self.conn = self.wiredtiger_open(None, "statistics=(fast)")
@@ -56,6 +60,3 @@ class test_stat06(wttest.WiredTigerTestCase):
             msg = '/database statistics configuration/'
             self.assertRaisesWithMessage(wiredtiger.WiredTigerError, lambda:
                 self.session.open_cursor('statistics:', None, None), msg)
-
-if __name__ == '__main__':
-    wttest.run()

@@ -29,25 +29,47 @@
 
 #pragma once
 
+#include <boost/intrusive_ptr.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <functional>
 #include <list>
+#include <memory>
+#include <set>
 #include <vector>
 
-#include <boost/intrusive_ptr.hpp>
-
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/pipeline/sharded_agg_helpers_targeting_policy.h"
-#include "mongo/db/query/cursor_response_gen.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/client_cursor/cursor_response_gen.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/query/async_results_merger_params_gen.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 class BSONObj;
@@ -70,7 +92,16 @@ using PipelineValidatorCallback = std::function<void(const Pipeline&)>;
 
 struct MakePipelineOptions {
     bool optimize = true;
+
+    // It is assumed that the pipeline has already been optimized when we create the
+    // MakePipelineOptions. If this is not the case, the caller is responsible for setting
+    // alreadyOptimized to false.
+    bool alreadyOptimized = true;
     bool attachCursorSource = true;
+
+    // When set to true, ensures that default collection collator will be attached to the pipeline.
+    // Needs 'attachCursorSource' set to true, in order to be applied.
+    bool useCollectionDefaultCollator = false;
     ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed;
     PipelineValidatorCallback validator = nullptr;
     boost::optional<BSONObj> readConcern;
@@ -126,6 +157,15 @@ public:
         PipelineValidatorCallback validator = nullptr);
 
     /**
+     * Parses sub-pipelines from a $facet aggregation. Like parse(), but skips top-level
+     * validators.
+     */
+    static std::unique_ptr<Pipeline, PipelineDeleter> parseFacetPipeline(
+        const std::vector<BSONObj>& rawPipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        PipelineValidatorCallback validator = nullptr);
+
+    /**
      * Like parse, but takes a BSONElement instead of a vector of objects. 'arrElem' must be an
      * array of objects.
      */
@@ -154,12 +194,25 @@ public:
      * - The boolean opts.optimize determines whether the pipeline will be optimized.
      * - If opts.attachCursorSource is false, the pipeline will be returned without attempting to
      * add an initial cursor source.
-     *
-     * This function throws if parsing the pipeline failed.
      */
     static std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        MakePipelineOptions opts = MakePipelineOptions{});
+
+    /**
+     * Creates a Pipeline from an AggregateCommandRequest. This preserves any aggregation options
+     * set on the aggRequest. The state of the returned pipeline will depend upon the supplied
+     * MakePipelineOptions:
+     * - The boolean opts.optimize determines whether the pipeline will be optimized.
+     *
+     * This function requires opts.attachCursorSource to be true.
+     * This function throws if parsing the pipeline set on aggRequest failed.
+     */
+    static std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
+        AggregateCommandRequest& aggRequest,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
         MakePipelineOptions opts = MakePipelineOptions{});
 
     /**
@@ -171,11 +224,19 @@ public:
     static Pipeline::SourceContainer::iterator optimizeEndOfPipeline(
         Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container);
 
+    static std::unique_ptr<Pipeline, PipelineDeleter> viewPipelineHelperForSearch(
+        const boost::intrusive_ptr<ExpressionContext>& subPipelineExpCtx,
+        ResolvedNamespace resolvedNs,
+        std::vector<BSONObj> currentPipeline,
+        MakePipelineOptions opts,
+        NamespaceString originalNs);
+
     static std::unique_ptr<Pipeline, PipelineDeleter> makePipelineFromViewDefinition(
         const boost::intrusive_ptr<ExpressionContext>& subPipelineExpCtx,
-        ExpressionContext::ResolvedNamespace resolvedNs,
+        ResolvedNamespace resolvedNs,
         std::vector<BSONObj> currentPipeline,
-        MakePipelineOptions opts);
+        MakePipelineOptions opts,
+        NamespaceString originalNs = NamespaceString());
 
     /**
      * Callers can optionally specify 'newExpCtx' to construct the deep clone with it. This will be
@@ -199,6 +260,12 @@ public:
      * to 'opCtx'.
      */
     void reattachToOperationContext(OperationContext* opCtx);
+
+    /**
+     * Recursively validate the operation contexts associated with this pipeline. Return true if
+     * all document sources and subpipelines point to the given operation context.
+     */
+    bool validateOperationContext(const OperationContext* opCtx) const;
 
     /**
      * Releases any resources held by this pipeline such as PlanExecutors or in-memory structures.
@@ -238,14 +305,38 @@ public:
     BSONObj getInitialQuery() const;
 
     /**
-     * Returns 'true' if the pipeline must merge on the primary shard.
+     * Convenience wrapper that parameterizes a pipeline's match stage, if present.
      */
-    bool needsPrimaryShardMerger() const;
+    void parameterize();
 
     /**
-     * Returns 'true' if the pipeline must merge on mongoS.
+     * Clear any parameterization in the pipeline.
      */
-    bool needsMongosMerger() const;
+    void unparameterize();
+
+    /**
+     * Returns 'true' if a pipeline's structure is eligible for parameterization. It must have a
+     * $match first stage.
+     */
+    bool canParameterize();
+
+    /**
+     * Returns 'true' if a pipeline is parameterized.
+     */
+    bool isParameterized() {
+        return _isParameterized;
+    }
+
+    /**
+     * Returns a specific ShardId that should be merger for this pipeline or boost::none if it is
+     * not needed.
+     */
+    boost::optional<ShardId> needsSpecificShardMerger() const;
+
+    /**
+     * Returns 'true' if the pipeline must merge on router.
+     */
+    bool needsRouterMerger() const;
 
     /**
      * Returns 'true' if any stage in the pipeline must run on a shard.
@@ -253,16 +344,22 @@ public:
     bool needsShard() const;
 
     /**
-     * Returns true if the pipeline can run on mongoS, but is not obliged to; that is, it can run
-     * either on mongoS or on a shard.
+     * Returns 'true' if any stage in the pipeline requires being run on all hosts within targeted
+     * shards.
      */
-    bool canRunOnMongos() const;
+    bool needsAllShardHosts() const;
 
     /**
-     * Returns true if this pipeline must only run on mongoS. Can be called on unsplit or merge
+     * Returns Status::OK() if the pipeline can run on router, but is not obliged to; that is, it
+     * can run either on mongoS or on a shard.
+     */
+    Status canRunOnRouter() const;
+
+    /**
+     * Returns true if this pipeline must only run on router. Can be called on unsplit or merge
      * pipelines, but not on the shards part of a split pipeline.
      */
-    bool requiredToRunOnMongos() const;
+    bool requiredToRunOnRouter() const;
 
     /**
      * Modifies the pipeline, optimizing it by combining and swapping stages.
@@ -270,7 +367,13 @@ public:
     void optimizePipeline();
 
     /**
-     * Modifies the container, optimizing it by combining and swapping stages.
+     * Modifies the container, optimizes each stage individually.
+     */
+    static void optimizeEachStage(SourceContainer* container);
+
+    /**
+     * Modifies the container, optimizing it by combining, swapping, dropping and/or inserting
+     * stages.
      */
     static void optimizeContainer(SourceContainer* container);
 
@@ -285,11 +388,12 @@ public:
      * Helpers to serialize a pipeline.
      */
     std::vector<Value> serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const;
+        boost::optional<const SerializationOptions&> opts = boost::none) const;
     std::vector<BSONObj> serializeToBson(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const;
+        boost::optional<const SerializationOptions&> opts = boost::none) const;
     static std::vector<Value> serializeContainer(
-        const SourceContainer& container, boost::optional<ExplainOptions::Verbosity> = boost::none);
+        const SourceContainer& container,
+        boost::optional<const SerializationOptions&> opts = boost::none);
 
     // The initial source is special since it varies between mongos and mongod.
     void addInitialSource(boost::intrusive_ptr<DocumentSource> source);
@@ -305,7 +409,8 @@ public:
      * Write the pipeline's operators to a std::vector<Value>, providing the level of detail
      * specified by 'verbosity'.
      */
-    std::vector<Value> writeExplainOps(ExplainOptions::Verbosity verbosity) const;
+    std::vector<Value> writeExplainOps(
+        const SerializationOptions& opts = SerializationOptions{}) const;
 
     /**
      * Returns the dependencies needed by this pipeline. 'unavailableMetadata' should reflect what
@@ -314,6 +419,12 @@ public:
      * reference unavailable metadata.
      */
     DepsTracker getDependencies(boost::optional<QueryMetadataBitSet> unavailableMetadata) const;
+
+    /**
+     * Populate 'refs' with the variables referred to by this pipeline, including user and system
+     * variables but excluding $$ROOT. Note that field path references are not considered variables.
+     */
+    void addVariableRefs(std::set<Variables::Id>* refs) const;
 
     /**
      * Returns the dependencies needed by the SourceContainer. 'unavailableMetadata' should reflect
@@ -377,6 +488,12 @@ public:
         StringData targetStageName, std::function<bool(const DocumentSource* const)> predicate);
 
     /**
+     * Appends another pipeline to the existing pipeline.
+     * NOTE: The other pipeline will be destroyed.
+     */
+    void appendPipeline(std::unique_ptr<Pipeline, PipelineDeleter> otherPipeline);
+
+    /**
      * Performs common validation for top-level or facet pipelines. Throws if the pipeline is
      * invalid.
      *
@@ -426,6 +543,7 @@ private:
         const std::vector<T>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         PipelineValidatorCallback validator,
+        bool isFacetPipeline,
         std::function<BSONObj(T)> getElemFunc);
 
     /**
@@ -436,16 +554,17 @@ private:
     void stitch();
 
     /**
-     * Returns Status::OK if the pipeline can run on mongoS, or an error with a message explaining
-     * why it cannot.
+     * Asserts whether operation contexts associated with this pipeline are consistent across
+     * sources.
      */
-    Status _pipelineCanRunOnMongoS() const;
+    void checkValidOperationContext() const;
 
     SourceContainer _sources;
 
     SplitState _splitState = SplitState::kUnsplit;
     boost::intrusive_ptr<ExpressionContext> pCtx;
     bool _disposed = false;
+    bool _isParameterized = false;
 };
 
 /**
@@ -488,15 +607,5 @@ private:
     bool _dismissed = false;
 };
 
-/**
- * A 'ServiceContext' decorator that by default does nothing but can be set to generate a
- * complimentary, metadata pipeline to the one passed in.
- */
-extern ServiceContext::Decoration<std::unique_ptr<Pipeline, PipelineDeleter> (*)(
-    OperationContext* opCtx,
-    boost::intrusive_ptr<ExpressionContext> expCtx,
-    const AggregateCommandRequest& request,
-    Pipeline* origPipeline,
-    boost::optional<UUID> uuid)>
-    generateMetadataPipelineFunc;
+using PipelinePtr = std::unique_ptr<Pipeline, PipelineDeleter>;
 }  // namespace mongo

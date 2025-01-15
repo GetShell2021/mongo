@@ -29,12 +29,22 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
-enum class JoinType { Inner, Left, Right };
+enum class JoinType : uint8_t { Inner, Left, Right };
 
 /**
  * Implements a traditional nested loop join. For each advance from the 'outer' child, re-opens the
@@ -90,6 +100,14 @@ public:
     std::vector<DebugPrinter::Block> debugPrint() const final;
     size_t estimateCompileTimeSize() const final;
 
+protected:
+    bool shouldOptimizeSaveState(size_t idx) const final {
+        // LoopJoinStage::getNext() only guarantees that the inner child's getNext() was called.
+        // Thus, it is safe to propagate disableSlotAccess to the inner child, but not to the outer
+        // child.
+        return idx == 1;
+    }
+
 private:
     PlanState getNextOuterSide() {
         _isReadingLeftSide = true;
@@ -114,8 +132,6 @@ private:
     // meaning that if they are coming from the 'outer', they must be projected by the 'outer'.
     const std::unique_ptr<EExpression> _predicate;
 
-    const JoinType _joinType;
-
     vm::ByteCode _bytecode;
     std::unique_ptr<vm::CodeFragment> _predicateCode;
 
@@ -127,11 +143,12 @@ private:
     // '_outerProjects' as a set (for faster checking of accessors, provided by the 'outer' child).
     value::SlotSet _outerRefs;
 
-    PlanState _innerState{PlanState::IS_EOF};
-    bool _innerReturned{false};
+    LoopJoinStats _specificStats;
+
+    const JoinType _joinType;
+
     bool _reOpenInner{false};
     bool _outerGetNext{false};
-    LoopJoinStats _specificStats;
 
     // Tracks whether or not we're reading from the left child or the right child.
     // This is necessary for yielding.

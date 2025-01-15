@@ -27,17 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <fmt/format.h>
+// IWYU pragma: no_include "ext/type_traits.h"
 #include <array>
 #include <cmath>
-#include <fmt/format.h>
 #include <limits>
+#include <ostream>
 
+#include "mongo/base/data_range.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -281,6 +285,25 @@ TEST(BSONElement, SafeNumberDoubleNegativeBound) {
               (double)BSONElement::kSmallestSafeLongLongAsDouble);
     ASSERT_EQ(obj["negativeInfinity"].safeNumberDouble(),
               (double)BSONElement::kSmallestSafeLongLongAsDouble);
+}
+
+TEST(BSONElement, IsNaN) {
+    ASSERT(BSON("" << std::numeric_limits<double>::quiet_NaN()).firstElement().isNaN());
+    ASSERT(BSON("" << -std::numeric_limits<double>::quiet_NaN()).firstElement().isNaN());
+    ASSERT(BSON("" << Decimal128::kPositiveNaN).firstElement().isNaN());
+    ASSERT(BSON("" << Decimal128::kNegativeNaN).firstElement().isNaN());
+
+    ASSERT_FALSE(BSON("" << std::numeric_limits<double>::infinity()).firstElement().isNaN());
+    ASSERT_FALSE(BSON("" << -std::numeric_limits<double>::infinity()).firstElement().isNaN());
+    ASSERT_FALSE(BSON("" << Decimal128::kPositiveInfinity).firstElement().isNaN());
+    ASSERT_FALSE(BSON("" << Decimal128::kNegativeInfinity).firstElement().isNaN());
+    ASSERT_FALSE(BSON("" << Decimal128{"9223372036854775808.5"}).firstElement().isNaN());
+    ASSERT_FALSE(BSON("" << Decimal128{"-9223372036854775809.99"}).firstElement().isNaN());
+    ASSERT_FALSE(BSON("" << 12345LL).firstElement().isNaN());
+    ASSERT_FALSE(BSON(""
+                      << "foo")
+                     .firstElement()
+                     .isNaN());
 }
 
 TEST(BSONElementIntegerParseTest, ParseIntegerElementToNonNegativeLongRejectsNegative) {

@@ -3,16 +3,12 @@
  * on collection Y. Exercises the fix for SERVER-64780.
  * @tags: [
  *     uses_change_streams,
- *     requires_fcv_50
+ *     requires_fcv_50,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");  // For assertDropAndRecreateCollection.
-load("jstests/libs/chunk_manipulation_util.js");   // For pauseMigrateAtStep, waitForMigrateStep and
-                                                   // unpauseMigrateAtStep.
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({
     shards: 2,
@@ -27,6 +23,10 @@ const reshardCollName = "coll_reshard";
 const otherCollName = "coll_other";
 
 const mongosDB = st.s.getDB(dbName);
+
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
+
 const mongosReshardColl = mongosDB[reshardCollName];
 
 const mongosOtherColl = mongosDB[otherCollName];
@@ -40,7 +40,6 @@ const shardOtherCollCsCursor =
 // Drop, recreate, and shard the 'coll_reshard' collection.
 assertDropAndRecreateCollection(mongosDB, reshardCollName);
 
-st.ensurePrimaryShard(dbName, st.rs0.name);
 st.shardColl(mongosReshardColl, {a: 1}, {a: 50});
 
 for (let i = 0; i < 100; ++i) {
@@ -48,8 +47,8 @@ for (let i = 0; i < 100; ++i) {
 }
 
 // Reshard the 'coll_reshard' collection on {b: 1}.
-assert.commandWorked(
-    mongosDB.adminCommand({reshardCollection: mongosReshardColl.getFullName(), key: {b: 1}}));
+assert.commandWorked(mongosDB.adminCommand(
+    {reshardCollection: mongosReshardColl.getFullName(), key: {b: 1}, numInitialChunks: 1}));
 
 // Confirm that the change stream we opened on 'coll_other' only sees the sentinel 'insert' but does
 // not see the earlier 'reshardBegin' or 'reshardDoneCatchUp' events on the 'coll_reshard'
@@ -60,4 +59,3 @@ assert.soon(() => shardOtherCollCsCursor.hasNext());
 assert.eq(shardOtherCollCsCursor.next().operationType, "insert");
 
 st.stop();
-})();

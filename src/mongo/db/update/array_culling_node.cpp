@@ -27,10 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
 
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/update/array_culling_node.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -64,7 +68,7 @@ void ArrayCullingNode::validateUpdate(mutablebson::ConstElement updatedElement,
                                       ModifyResult modifyResult,
                                       const bool validateForStorage,
                                       bool* containsDotsAndDollarsField) const {
-    invariant(modifyResult == ModifyResult::kNormalUpdate);
+    invariant(modifyResult.type == ModifyResult::kNormalUpdate);
 
     // Removing elements from an array cannot increase BSON depth or modify a DBRef, so we can
     // override validateUpdate to not validate storage constraints but we still want to know if
@@ -75,6 +79,7 @@ void ArrayCullingNode::validateUpdate(mutablebson::ConstElement updatedElement,
                                      recursionLevel,
                                      false, /* allowTopLevelDollarPrefixedFields */
                                      false, /* should validate for storage */
+                                     false, /* isEmbeddedInIdField */
                                      containsDotsAndDollarsField);
 }
 

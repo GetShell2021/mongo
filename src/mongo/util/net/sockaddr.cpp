@@ -40,7 +40,7 @@
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
-#include <errno.h>
+#include <cerrno>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -142,7 +142,7 @@ void SockAddr::initUnixDomainSocket(StringData path, int port) {
     uassert(
         13079, "path to unix socket too long", path.size() < sizeof(as<sockaddr_un>().sun_path));
     as<sockaddr_un>().sun_family = AF_UNIX;
-    path.copyTo(as<sockaddr_un>().sun_path, /* includeEndingNull =*/true);
+    str::copyAsCString(as<sockaddr_un>().sun_path, path);
     addressSize = sizeof(sockaddr_un);
     _isValid = true;
 }
@@ -199,7 +199,6 @@ std::vector<SockAddr> SockAddr::createAll(StringData target, int port, sa_family
         return std::vector<SockAddr>(ret.begin(), ret.end());
     } catch (const DBException& ex) {
         LOGV2(23176,
-              "getaddrinfo(\"{host}\") failed: {error}",
               "getaddrinfo invocation failed",
               "host"_attr = target,
               "error"_attr = ex.toStatus());
@@ -294,6 +293,16 @@ unsigned SockAddr::getPort() const {
     }
 }
 
+void SockAddr::setPort(int port) {
+    if (auto type = getType(); type == AF_INET) {
+        as<sockaddr_in>().sin_port = htons(port);
+    } else if (type == AF_INET6) {
+        as<sockaddr_in6>().sin6_port = htons(port);
+    } else {
+        massert(SOCK_FAMILY_UNKNOWN_ERROR, "unsupported address family", false);
+    }
+}
+
 std::string SockAddr::getAddr() const {
     switch (getType()) {
         case AF_INET:
@@ -323,6 +332,8 @@ constexpr auto kIPField = "ip"_sd;
 constexpr auto kPortField = "port"_sd;
 constexpr auto kUnixField = "unix"_sd;
 constexpr auto kAnonymous = "anonymous"_sd;
+
+constexpr auto kOCSFInterfaceNameField = "interface_name"_sd;
 }  // namespace
 
 void SockAddr::serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const {

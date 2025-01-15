@@ -1,9 +1,13 @@
 // Check that the output from printShardingStatus() (aka sh.status())
 // contains important information that it should, like the major section
 // headings and the names of sharded collections and their shard keys.
+// @tags: [
+//   # TODO (SERVER-97257): Re-enable this test.
+//   # Test doesn't start enough mongods to have num_mongos routers
+//   embedded_router_incompatible,
+// ]
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const MONGOS_COUNT = 2;
 
@@ -99,7 +103,14 @@ var config = mongos.getDB("config");
 var configCopy = standalone.getDB("configCopy");
 config.getCollectionInfos().forEach(function(c) {
     // It's illegal to copy the system collections.
-    if (["system.indexBuilds", "system.preimages", "system.change_collection"].includes(c.name)) {
+    if ([
+            "system.indexBuilds",
+            "system.preimages",
+            "system.change_collection",
+            "cache.chunks.config.system.sessions",
+            "system.sessions",
+            "system.sharding_ddl_coordinators",
+        ].includes(c.name)) {
         return;
     }
 
@@ -133,7 +144,7 @@ var output = grabStatusOutput(configCopy, false);
 assertPresentInOutput(output, "most recently active mongoses:", "section header");
 assertPresentInOutput(output, tojson(version) + " : 1\n", "recent mongos version");
 
-var output = grabStatusOutput(configCopy, true);
+output = grabStatusOutput(configCopy, true);
 assertPresentInOutput(output, "most recently active mongoses:", "section header");
 assertPresentInOutput(output, '"_id" : ' + tojson(s1Host), "recent mongos hostname");
 assertNotPresentInOutput(output, '"_id" : ' + tojson(s2Host), "old mongos hostname");
@@ -141,11 +152,11 @@ assertNotPresentInOutput(output, '"_id" : ' + tojson(s2Host), "old mongos hostna
 // Older mongoses
 configCopy.mongos.remove({_id: s1Host});
 
-var output = grabStatusOutput(configCopy, false);
+output = grabStatusOutput(configCopy, false);
 assertPresentInOutput(output, "most recently active mongoses:", "section header");
 assertPresentInOutput(output, tojson(version) + " : 1\n", "recent mongos version");
 
-var output = grabStatusOutput(configCopy, true);
+output = grabStatusOutput(configCopy, true);
 assertPresentInOutput(output, "most recently active mongoses:", "section header");
 assertNotPresentInOutput(output, '"_id" : ' + tojson(s1Host), "removed mongos hostname");
 assertPresentInOutput(output, '"_id" : ' + tojson(s2Host), "recent mongos hostname");
@@ -153,10 +164,10 @@ assertPresentInOutput(output, '"_id" : ' + tojson(s2Host), "recent mongos hostna
 // No mongoses at all
 configCopy.mongos.remove({});
 
-var output = grabStatusOutput(configCopy, false);
+output = grabStatusOutput(configCopy, false);
 assertPresentInOutput(output, "most recently active mongoses:\n        none", "no mongoses");
 
-var output = grabStatusOutput(configCopy, true);
+output = grabStatusOutput(configCopy, true);
 assertPresentInOutput(
     output, "most recently active mongoses:\n        none", "no mongoses (verbose)");
 
@@ -265,4 +276,3 @@ assert(mongos.getDB("test").dropDatabase());
 MongoRunner.stopMongod(standalone);
 
 st.stop();
-})();

@@ -29,14 +29,11 @@
 
 #pragma once
 
-#include <bitset>
 #include <boost/intrusive_ptr.hpp>
-#include <third_party/murmurhash3/MurmurHash3.h>
 
 #include "mongo/base/static_assert.h"
 #include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/stdx/variant.h"
 #include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
@@ -296,8 +293,8 @@ public:
         return _sd.size();
     }
 
-    inline void copyTo(char* dest, bool includeEndingNull) const {
-        return _sd.copyTo(dest, includeEndingNull);
+    inline size_t copy(char* dest, size_t len) const {
+        return _sd.copy(dest, len);
     }
 
     constexpr const char* rawData() const noexcept {
@@ -329,10 +326,8 @@ struct FieldNameHasher {
     using is_transparent = void;
 
     std::size_t operator()(StringData sd) const {
-        // TODO consider FNV-1a once we have a better benchmark corpus
-        unsigned out;
-        MurmurHash3_x86_32(sd.rawData(), sd.size(), 0, &out);
-        return out;
+        // Use the default absl string hasher.
+        return absl::Hash<absl::string_view>{}(absl::string_view(sd.rawData(), sd.size()));
     }
 
     std::size_t operator()(const std::string& s) const {
@@ -359,11 +354,11 @@ public:
 
     /**
      * Construct a storage from the BSON. The BSON is lazily processed as fields are requested from
-     * the document. If we know that the BSON does not contain any metadata fields we can set the
-     * 'stripMetadata' flag to false that will speed up the field iteration.
+     * the document. If we know that the BSON contains metadata fields we can set the
+     * 'bsonHasMetadata' flag to true.
      */
     DocumentStorage(const BSONObj& bson,
-                    bool stripMetadata,
+                    bool bsonHasMetadata,
                     bool modified,
                     uint32_t numBytesFromBSONInCache)
         : _cache(nullptr),
@@ -373,17 +368,22 @@ public:
           _hashTabMask(0),
           _bson(bson),
           _numBytesFromBSONInCache(numBytesFromBSONInCache),
-          _stripMetadata(stripMetadata),
+          _bsonHasMetadata(bsonHasMetadata),
           _modified(modified) {}
 
-    ~DocumentStorage();
+    ~DocumentStorage() override;
 
-    void reset(const BSONObj& bson, bool stripMetadata);
+    void reset(const BSONObj& bson, bool bsonHasMetadata);
 
     /**
-     * Populates the cache by recursively walking the underlying BSON.
+     * Returns a cache-only copy of the document with no backing bson.
      */
-    void fillCache() const;
+    Document shred() const;
+
+    /**
+     * Loads the whole document into cache.
+     */
+    void loadIntoCache() const;
 
     static const DocumentStorage& emptyDoc() {
         return kEmptyDoc;
@@ -416,7 +416,7 @@ public:
 
     // Document uses these
     const ValueElement& getField(Position pos) const {
-        verify(pos.found());
+        MONGO_verify(pos.found());
         return *(_firstElement->plusBytes(pos.index));
     }
 
@@ -437,7 +437,7 @@ public:
     // MutableDocument uses these
     ValueElement& getField(Position pos) {
         _modified = true;
-        verify(pos.found());
+        MONGO_verify(pos.found());
         return *(_firstElement->plusBytes(pos.index));
     }
 
@@ -450,23 +450,26 @@ public:
     }
 
     /**
-     * Given a field name either return a Value if the field resides in the cache, or a BSONElement
-     * if the field resides in the backing BSON.
+     * Retrieves the given field from the cache. Returns a boost::none if the field does not exist.
      */
-    stdx::variant<BSONElement, Value> getFieldNonCaching(StringData name) const {
+    boost::optional<Value> getFieldCacheOnly(StringData name) const {
         Position pos = findField(name, LookupPolicy::kCacheOnly);
         if (pos.found()) {
-            return {getField(pos).val};
+            return getField(pos).val;
         }
+        return boost::none;
+    }
 
+    /**
+     * Retrieves the given field from the backing BSON. Returns an EOO if the field does not exist.
+     */
+    BSONElement getFieldBsonOnly(StringData name) const {
         for (auto&& bsonElement : _bson) {
             if (name == bsonElement.fieldNameStringData()) {
-                return {bsonElement};
+                return bsonElement;
             }
         }
-
-        // Field not found. Return EOO Value.
-        return {Value()};
+        return BSONElement();
     }
 
     /// Adds a new field with missing Value at the end of the document
@@ -551,7 +554,7 @@ public:
      * WorkingSetMember.
      */
     const DocumentMetadataFields& metadata() const {
-        if (_stripMetadata) {
+        if (_bsonHasMetadata) {
             loadLazyMetadata();
         }
         return _metadataFields;
@@ -589,8 +592,8 @@ public:
         return _firstElement ? _firstElement->plusBytes(_usedBytes) : nullptr;
     }
 
-    auto stripMetadata() const {
-        return _stripMetadata;
+    auto bsonHasMetadata() const {
+        return _bsonHasMetadata;
     }
 
     Position constructInCache(const BSONElement& elem);
@@ -599,11 +602,48 @@ public:
         return _modified;
     }
 
+    auto isMetadataModified() const {
+        return _metadataFields.isModified();
+    }
+
     auto bsonObj() const {
         return _bson;
     }
 
+    size_t currentApproximateSize() const {
+        size_t size = sizeof(DocumentStorage) + allocatedBytes() + getMetadataApproximateSize() +
+            bsonObjSize();
+
+        for (auto it = iteratorCacheOnly(); !it.atEnd(); it.advance()) {
+            size += it->val.getApproximateSize() - sizeof(Value);
+        }
+
+        return size;
+    }
+
+    size_t snapshottedApproximateSize() const {
+        if (_snapshottedSize == 0) {
+            const_cast<DocumentStorage*>(this)->_snapshottedSize = currentApproximateSize();
+        }
+
+        return _snapshottedSize;
+    }
+
+    void resetSnapshottedApproximateSize() {
+        _snapshottedSize = 0;
+    }
+
 private:
+    enum class ConstructorTag { InitApproximateSize = 0 };
+    DocumentStorage(ConstructorTag tag) : DocumentStorage() {
+        switch (tag) {
+            case ConstructorTag::InitApproximateSize:
+                snapshottedApproximateSize();
+                return;
+        }
+        MONGO_UNREACHABLE;
+    }
+
     /// Returns the position of the named field in the cache or Position()
     template <typename T>
     Position findFieldInCache(T name) const;
@@ -685,21 +725,22 @@ private:
     // whole backing BSON, but only the portion of backing BSON that's not already in the cache.
     uint32_t _numBytesFromBSONInCache = 0;
 
-    // If '_stripMetadata' is true, tracks whether or not the metadata has been lazy-loaded from the
-    // backing '_bson' object. If so, then no attempt will be made to load the metadata again, even
-    // if the metadata has been released by a call to 'releaseMetadata()'.
+    // Tracks whether or not the metadata has been lazy-loaded from the backing '_bson' object. If
+    // so, then no attempt will be made to load the metadata again, even if the metadata has been
+    // released by a call to 'releaseMetadata()'.
     mutable bool _haveLazyLoadedMetadata = false;
 
     mutable DocumentMetadataFields _metadataFields;
 
-    // The storage constructed from a BSON value may contain metadata. When we process the BSON we
-    // have to move the metadata to the MetadataFields object. If we know that the BSON does not
-    // have any metadata we can set _stripMetadata to false that will speed up the iteration.
-    bool _stripMetadata{false};
+    // True if this storage was constructed from BSON with metadata. Serializing this object using
+    // the 'toBson()' method will omit (strip) the metadata fields.
+    bool _bsonHasMetadata{false};
 
     // This flag is set to true anytime the storage returns a mutable field. It is used to optimize
     // a conversion to BSON; i.e. if there are not any modifications we can directly return _bson.
     bool _modified{false};
+
+    size_t _snapshottedSize{0};
 
     // Defined in document.cpp
     static const DocumentStorage kEmptyDoc;

@@ -29,9 +29,11 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
-
 #include <boost/filesystem.hpp>
+#include <boost/filesystem/path.hpp>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "mongo/db/service_context.h"
 

@@ -29,19 +29,19 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "mongo/base/string_data.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/database_name.h"
-#include "mongo/s/database_version.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 
 namespace mongo {
-
-class Database;
-class OperationContext;
 
 /**
  * Registry of opened databases.
@@ -58,8 +58,9 @@ public:
     virtual ~DatabaseHolder() = default;
 
     /**
-     * Retrieves an already opened database or returns nullptr. Must be called with the database
-     * locked in at least IS-mode.
+     * Retrieves an already opened database or returns nullptr.
+     *
+     * The caller must hold the database lock in MODE_IS.
      */
     virtual Database* getDb(OperationContext* opCtx, const DatabaseName& dbName) const = 0;
 
@@ -71,7 +72,9 @@ public:
 
     /**
      * Retrieves a database reference if it is already opened, or opens it if it hasn't been
-     * opened/created yet. Must be called with the database locked in X-mode.
+     * opened/created yet.
+     *
+     * The caller must hold the database lock in MODE_IX.
      *
      * @param justCreated Returns whether the database was newly created (true) or it already
      *          existed (false). Can be NULL if this information is not necessary.
@@ -85,29 +88,32 @@ public:
      * doesn't notify the replication subsystem or do any other consistency checks, so it should
      * not be used directly from user commands.
      *
-     * Must be called with the specified database locked in X mode. The caller must ensure no index
-     * builds are in progress on the database.
+     * The caller must hold the database lock in MODE_X and ensure no index builds are in progress
+     * on the database.
      */
     virtual void dropDb(OperationContext* opCtx, Database* db) = 0;
 
     /**
-     * Closes the specified database. Must be called with the database locked in X-mode.
-     * No background jobs must be in progress on the database when this function is called.
+     * Closes the specified database.
+     *
+     * The caller must hold the database lock in MODE_X. No background jobs must be in progress on
+     * the database when this function is called.
      */
     virtual void close(OperationContext* opCtx, const DatabaseName& dbName) = 0;
 
     /**
-     * Closes all opened databases. Must be called with the global lock acquired in X-mode.
-     * Will uassert if any background jobs are running when this function is called.
+     * Closes all opened databases.
      *
-     * The caller must hold the global X lock and ensure there are no index builds in progress.
+     * The caller must hold the global lock in MODE_X and ensure no index builds are in progress on
+     * the databases. Will uassert if any background jobs are running when this function is called.
      */
     virtual void closeAll(OperationContext* opCtx) = 0;
 
     /**
-     * Returns the set of existing database names that differ only in casing.
+     * Returns the name of the database with conflicting casing if one exists.
      */
-    virtual std::set<DatabaseName> getNamesWithConflictingCasing(const DatabaseName& dbName) = 0;
+    virtual boost::optional<DatabaseName> getNameWithConflictingCasing(
+        const DatabaseName& dbName) = 0;
 
     /**
      * Returns all the database names (including those which are empty).

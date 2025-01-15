@@ -1,0 +1,126 @@
+load("@hedron_compile_commands//:refresh_compile_commands.bzl", "refresh_compile_commands")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("//bazel/install_rules:install_rules.bzl", "mongo_install")
+load("//bazel/toolchains:mongo_toolchain.bzl", "setup_mongo_toolchain_aliases")
+
+package(
+    default_visibility = ["//visibility:public"],
+)
+
+exports_files([
+    "pyproject.toml",
+    "poetry.lock",
+    "symbols.orderfile",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+alias(
+    name = "format",
+    actual = "//bazel/format",
+)
+
+alias(
+    name = "codeowners",
+    actual = "//buildscripts:codeowners",
+)
+
+setup_mongo_toolchain_aliases()
+
+# This rule makes it possible to set the clang-tidy configuration setting:
+genrule(
+    name = "clang_tidy_config",
+    srcs = [
+        ".clang-tidy.in",
+    ],
+    outs = [".clang-tidy"],
+
+    # Note: we use sed to substitute the known good value `build/compiledb/mongo`; testing
+    # has confirmed that this is the correct value.
+    # We also use it to append a line to opt-in to warnings as errors.
+    cmd = """
+    cp $(location .clang-tidy.in) $@ && \
+    sed -i 's|@MONGO_BUILD_DIR@|$(RULEDIR)/src/mongo|g ; s|@MONGO_BRACKET_BUILD_DIR@|$(RULEDIR)/src/mongo|g ; $$aWarningsAsErrors: "*"' $@
+    """,
+    visibility = ["//visibility:public"],
+)
+
+refresh_compile_commands(
+    name = "compiledb",
+    exclude_external_sources = True,
+    exclude_headers = "all",  # not using "all" adds headers as sources to compile_commands.json which is never what we want
+    tags = ["compiledb"],
+    targets = {
+        "//src/...": "",
+    },
+)
+
+mongo_install(
+    name = "wiredtiger",
+    srcs = [
+        "//src/third_party/wiredtiger:wt",
+    ],
+)
+
+mongo_install(
+    name = "mongod",
+    srcs = [
+        "//src/mongo/db:mongod",
+    ],
+)
+
+mongo_install(
+    name = "mongos",
+    srcs = [
+        "//src/mongo/s:mongos",
+    ],
+)
+
+mongo_install(
+    name = "mongo",
+    srcs = [
+        "//src/mongo/shell:mongo",
+    ],
+)
+
+mongo_install(
+    name = "core",
+    srcs = [],
+    deps = [
+        "mongod",
+        "mongos",
+    ],
+)
+
+mongo_install(
+    name = "devcore",
+    srcs = [],
+    deps = [
+        "mongo",
+        "mongod",
+        "mongos",
+    ],
+)
+
+mongo_install(
+    name = "dist-test",
+    srcs = [
+        "//src/mongo/db:mongod",
+        "//src/mongo/db:mongotrafficreader",
+        "//src/mongo/db/query/optimizer:optimizer_gdb_test_program",
+        "//src/mongo/db/query/query_tester:mongotest",
+        "//src/mongo/db/query/search/mongotmock",
+        "//src/mongo/db/storage/key_string:ksdecode",
+        "//src/mongo/s:mongos",
+        "//src/mongo/shell:mongo",
+        "//src/mongo/tools/mongobridge_tool:mongobridge",
+        "//src/mongo/util:pretty_printer_test_program",
+        "//src/third_party/wiredtiger:wt",
+    ] + select({
+        "@platforms//os:windows": ["@windows_sasl//:bins"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "//src/mongo/db/modules/enterprise:dist-test",
+    ],
+)

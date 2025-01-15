@@ -29,12 +29,23 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <utility>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/window_function/partition_iterator.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
 #include "mongo/db/pipeline/window_function/window_function_exec.h"
 #include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/memory_usage_tracker.h"
 
 namespace mongo {
 
@@ -57,7 +68,7 @@ public:
                                  boost::intrusive_ptr<Expression> time,
                                  WindowBounds bounds,
                                  boost::optional<TimeUnit> unit,
-                                 MemoryUsageTracker::PerFunctionMemoryTracker* memTracker)
+                                 MemoryUsageTracker::Impl* memTracker)
         : WindowFunctionExec(PartitionAccessor(iter, PartitionAccessor::Policy::kEndpoints),
                              memTracker),
           _position(std::move(position)),
@@ -67,12 +78,14 @@ public:
               if (!unit)
                   return boost::none;
 
-              auto status = timeUnitTypicalMilliseconds(*unit);
-              tassert(status);
-              return status.getValue();
+              auto milliseconds = timeUnitTypicalMilliseconds(*unit);
+              tassert(7823403,
+                      "TimeUnit must be less than or equal to a 'week' ",
+                      milliseconds <= timeUnitTypicalMilliseconds(TimeUnit::week));
+              return milliseconds;
           }()) {}
 
-    Value getNext() final;
+    Value getNext(boost::optional<Document> current = boost::none) final;
     void reset() final {}
 
 private:

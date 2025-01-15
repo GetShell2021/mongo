@@ -1,41 +1,28 @@
 // Basic tests for cluster authentication using x509.
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var common_options = {
     keyFile: "jstests/libs/key1",
-    sslMode: "requireSSL",
-    sslPEMKeyFile: "jstests/libs/server.pem",
-    sslCAFile: "jstests/libs/ca.pem",
-    sslAllowInvalidHostnames: ""
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: "jstests/libs/server.pem",
+    tlsCAFile: "jstests/libs/ca.pem",
+    tlsAllowInvalidHostnames: ""
 };
 
 function runInitialSyncTest() {
-    load("jstests/replsets/rslib.js");
-
-    // The mongo shell cannot authenticate as the internal __system user in tests that use x509 for
-    // cluster authentication. Choosing the default value for wcMajorityJournalDefault in
-    // ReplSetTest cannot be done automatically without the shell performing such authentication, so
-    // in this test we must make the choice explicitly, based on the global test options.
-    var wcMajorityJournalDefault;
-    if (jsTestOptions().noJournal || jsTestOptions().storageEngine == "inMemory") {
-        wcMajorityJournalDefault = false;
-    } else {
-        wcMajorityJournalDefault = true;
-    }
     print("1. Bring up set");
     var replTest = new ReplSetTest({
         name: "jstests_initsync1_x509",
         nodes: {node0: x509_options1, node1: x509_options2},
         waitForKeys: false
     });
-    var conns = replTest.startSet();
-
+    replTest.startSet();
     replTest.initiate();
 
     var primary = replTest.getPrimary();
     var foo = primary.getDB("foo");
     var admin = primary.getDB("admin");
-
-    var secondary1 = replTest.getSecondary();
 
     print("2. Create a root user.");
     admin.createUser({user: "root", pwd: "pass", roles: ["root"]});
@@ -57,7 +44,7 @@ function runInitialSyncTest() {
     print("5. Insert some stuff");
     primary = replTest.getPrimary();
     bulk = foo.bar.initializeUnorderedBulkOp();
-    for (var i = 0; i < 100; i++) {
+    for (let i = 0; i < 100; i++) {
         bulk.insert({date: new Date(), x: i, str: "all the talk on the market"});
     }
     assert.commandWorked(bulk.execute());
@@ -71,14 +58,14 @@ function runInitialSyncTest() {
 
 // Standard case, clusterAuthMode: x509
 var x509_options1 = Object.merge(
-    common_options, {sslClusterFile: "jstests/libs/cluster_cert.pem", clusterAuthMode: "x509"});
+    common_options, {tlsClusterFile: "jstests/libs/cluster_cert.pem", clusterAuthMode: "x509"});
 var x509_options2 = x509_options1;
 runInitialSyncTest();
 
 // Mixed clusterAuthMode: sendX509 and sendKeyFile and try adding --auth
 x509_options1 = Object.merge(
     common_options,
-    {sslClusterFile: "jstests/libs/cluster_cert.pem", clusterAuthMode: "sendX509", auth: ""});
+    {tlsClusterFile: "jstests/libs/cluster_cert.pem", clusterAuthMode: "sendX509", auth: ""});
 x509_options2 = Object.merge(common_options, {clusterAuthMode: "sendKeyFile"});
 runInitialSyncTest();
 
@@ -90,21 +77,21 @@ runInitialSyncTest();
 // verify that replset initiate fails if using a self-signed cert
 x509_options1 = Object.merge(common_options, {clusterAuthMode: "x509"});
 x509_options2 = Object.merge(common_options,
-                             {sslClusterFile: "jstests/libs/smoke.pem", clusterAuthMode: "x509"});
+                             {tlsClusterFile: "jstests/libs/smoke.pem", clusterAuthMode: "x509"});
 var replTest = new ReplSetTest({nodes: {node0: x509_options1, node1: x509_options2}});
 
 // We don't want to invoke the hang analyzer because we
 // expect this test to fail by timing out
 MongoRunner.runHangAnalyzer.disable();
 
-var conns = replTest.startSet();
+replTest.startSet();
 assert.throws(function() {
     replTest.initiate();
 });
 
 // stopSet will also fail because we cannot authenticate to stop it properly.
 // Ignore the error around unterminated processes.
-TestData.failIfUnterminatedProcesses = false;
+TestData.ignoreUnterminatedProcesses = true;
 
 assert.throws(function() {
     replTest.stopSet();

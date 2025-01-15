@@ -29,8 +29,13 @@
 
 #pragma once
 
+#include <cstdint>
+
+#include <boost/optional/optional.hpp>
+
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_oplog_applier_progress_gen.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
@@ -60,11 +65,11 @@ public:
 
 private:
     ReshardingMetrics* _metrics;
-    int64_t _insertsApplied{0};
-    int64_t _updatesApplied{0};
-    int64_t _deletesApplied{0};
-    int64_t _oplogEntriesApplied{0};
-    int64_t _writesToStashCollections{0};
+    AtomicWord<int64_t> _insertsApplied{0};
+    AtomicWord<int64_t> _updatesApplied{0};
+    AtomicWord<int64_t> _deletesApplied{0};
+    AtomicWord<int64_t> _oplogEntriesApplied{0};
+    AtomicWord<int64_t> _writesToStashCollections{0};
 };
 
 }  // namespace mongo

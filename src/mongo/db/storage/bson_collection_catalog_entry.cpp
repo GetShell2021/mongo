@@ -29,11 +29,25 @@
 
 #include "mongo/db/storage/bson_collection_catalog_entry.h"
 
+#include <boost/container/flat_set.hpp>
+#include <boost/container/vector.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <algorithm>
-#include <numeric>
+#include <cstddef>
+#include <mutex>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -46,6 +60,9 @@ const size_t kMaxKeyPatternPathLength = 2048;
 
 const std::string kTimeseriesBucketsMayHaveMixedSchemaDataFieldName =
     "timeseriesBucketsMayHaveMixedSchemaData";
+
+const std::string kTimeseriesBucketingParametersHaveChanged =
+    "timeseriesBucketingParametersHaveChanged";
 
 /**
  * Encodes 'multikeyPaths' as binary data and appends it to 'bob'.
@@ -86,7 +103,7 @@ void appendMultikeyPathsAsBytes(BSONObj keyPattern,
  */
 void parseMultikeyPathsFromBytes(BSONObj multikeyPathsObj, MultikeyPaths* multikeyPaths) {
     invariant(multikeyPaths);
-    for (auto elem : multikeyPathsObj) {
+    for (const auto& elem : multikeyPathsObj) {
         MultikeyComponents multikeyComponents;
         int len;
         const char* data = elem.binData(len);
@@ -216,7 +233,7 @@ bool BSONCollectionCatalogEntry::MetaData::eraseIndex(StringData name) {
 
 BSONObj BSONCollectionCatalogEntry::MetaData::toBSON(bool hasExclusiveAccess) const {
     BSONObjBuilder b;
-    b.append("ns", ns);
+    b.append("ns", NamespaceStringUtil::serializeForCatalog(nss));
     b.append("options", options.toBSON());
     {
         BSONArrayBuilder arr(b.subarrayStart("indexes"));
@@ -244,9 +261,6 @@ BSONObj BSONCollectionCatalogEntry::MetaData::toBSON(bool hasExclusiveAccess) co
                 }
             }
 
-            sub.append("head", 0ll);  // For backward compatibility with 4.0
-            sub.append("backgroundSecondary", indexes[i].isBackgroundSecondaryBuild);
-
             if (indexes[i].buildUUID) {
                 indexes[i].buildUUID->appendToBuilder(&sub, "buildUUID");
             }
@@ -260,11 +274,17 @@ BSONObj BSONCollectionCatalogEntry::MetaData::toBSON(bool hasExclusiveAccess) co
                  *timeseriesBucketsMayHaveMixedSchemaData);
     }
 
+    if (timeseriesBucketingParametersHaveChanged) {
+        b.append(kTimeseriesBucketingParametersHaveChanged,
+                 *timeseriesBucketingParametersHaveChanged);
+    }
+
     return b.obj();
 }
 
 void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
-    ns = obj.getStringField("ns").toString();
+    nss = NamespaceStringUtil::parseFromStringExpectTenantIdInMultitenancyMode(
+        obj.getStringField("ns").toString());
 
     if (obj["options"].isABSONObj()) {
         options = uassertStatusOK(
@@ -285,10 +305,6 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
                 parseMultikeyPathsFromBytes(multikeyPathsElem.Obj(), &imd.multikeyPaths);
             }
 
-            auto bgSecondary = BSONElement(idx["backgroundSecondary"]);
-            // Opt-in to rebuilding behavior for old-format index catalog objects.
-            imd.isBackgroundSecondaryBuild = bgSecondary.eoo() || bgSecondary.trueValue();
-
             if (idx["buildUUID"]) {
                 imd.buildUUID = fassert(31353, UUID::parse(idx["buildUUID"]));
             }
@@ -307,6 +323,11 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
     BSONElement timeseriesMixedSchemaElem = obj[kTimeseriesBucketsMayHaveMixedSchemaDataFieldName];
     if (!timeseriesMixedSchemaElem.eoo() && timeseriesMixedSchemaElem.isBoolean()) {
         timeseriesBucketsMayHaveMixedSchemaData = timeseriesMixedSchemaElem.Bool();
+    }
+
+    BSONElement tsBucketingParametersChangedElem = obj[kTimeseriesBucketingParametersHaveChanged];
+    if (!tsBucketingParametersChangedElem.eoo() && tsBucketingParametersChangedElem.isBoolean()) {
+        timeseriesBucketingParametersHaveChanged = tsBucketingParametersChangedElem.Bool();
     }
 }
 }  // namespace mongo

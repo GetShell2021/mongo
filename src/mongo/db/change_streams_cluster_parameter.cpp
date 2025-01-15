@@ -27,35 +27,33 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/change_streams_cluster_parameter.h"
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/db/change_stream_serverless_helpers.h"
 #include "mongo/db/change_streams_cluster_parameter_gen.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
+
 namespace mongo {
 
 Status validateChangeStreamsClusterParameter(
-    const ChangeStreamsClusterParameterStorage& clusterParameter) {
-    LOGV2_DEBUG(6594801,
-                1,
-                "Validating change streams cluster parameter",
-                "enabled"_attr = clusterParameter.getEnabled(),
-                "expireAfterSeconds"_attr = clusterParameter.getExpireAfterSeconds());
-    if (clusterParameter.getEnabled()) {
-        if (clusterParameter.getExpireAfterSeconds() <= 0) {
-            return Status(ErrorCodes::BadValue,
-                          "Expected a positive integer for 'expireAfterSeconds' field if 'enabled' "
-                          "field is true");
-        }
-    } else {
-        if (clusterParameter.getExpireAfterSeconds() != 0) {
-            return Status(
-                ErrorCodes::BadValue,
-                "Expected a zero value for 'expireAfterSeconds' if 'enabled' field is false");
-        }
+    const ChangeStreamsClusterParameterStorage& clusterParameter,
+    const boost::optional<TenantId>& tenantId) {
+    if (clusterParameter.getExpireAfterSeconds() <= 0) {
+        return Status(ErrorCodes::BadValue,
+                      "Expected a positive integer for 'expireAfterSeconds' field");
     }
+
     return Status::OK();
 }
 

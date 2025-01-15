@@ -1,16 +1,17 @@
 """Service for determining task timeouts."""
-from datetime import datetime
+
 from typing import Any, Dict, NamedTuple, Optional
 
 import inject
 import structlog
-from buildscripts.task_generation.resmoke_proxy import ResmokeProxyService
+
+from buildscripts.resmoke_proxy.resmoke_proxy import ResmokeProxyService
 from buildscripts.timeouts.timeout import TimeoutEstimate
-from buildscripts.util.teststats import HistoricTaskData
-from evergreen import EvergreenApi
+from buildscripts.util.teststats import HistoricTaskData, normalize_test_name
 
 LOGGER = structlog.get_logger(__name__)
 CLEAN_EVERY_N_HOOK = "CleanEveryN"
+REQUIRED_STATS_THRESHOLD = 0.8
 
 
 class TimeoutParams(NamedTuple):
@@ -31,29 +32,17 @@ class TimeoutParams(NamedTuple):
     is_asan: bool
 
 
-class TimeoutSettings(NamedTuple):
-    """Settings for determining timeouts."""
-
-    start_date: datetime
-    end_date: datetime
-
-
 class TimeoutService:
     """A service for determining task timeouts."""
 
     @inject.autoparams()
-    def __init__(self, evg_api: EvergreenApi, resmoke_proxy: ResmokeProxyService,
-                 timeout_settings: TimeoutSettings) -> None:
+    def __init__(self, resmoke_proxy: ResmokeProxyService) -> None:
         """
         Initialize the service.
 
-        :param evg_api: Evergreen API client.
         :param resmoke_proxy: Proxy to query resmoke.
-        :param timeout_settings: Settings for how timeouts are calculated.
         """
-        self.evg_api = evg_api
         self.resmoke_proxy = resmoke_proxy
-        self.timeout_settings = timeout_settings
 
     def get_timeout_estimate(self, timeout_params: TimeoutParams) -> TimeoutEstimate:
         """
@@ -64,21 +53,22 @@ class TimeoutService:
         """
         historic_stats = self.lookup_historic_stats(timeout_params)
         if not historic_stats:
+            LOGGER.warning("Missing historic runtime information, using default timeout")
             return TimeoutEstimate.no_timeouts()
 
-        test_set = set(self.resmoke_proxy.list_tests(timeout_params.suite_name))
+        test_set = {
+            normalize_test_name(test)
+            for test in self.resmoke_proxy.list_tests(timeout_params.suite_name)
+        }
         test_runtimes = [
             stat for stat in historic_stats.get_tests_runtimes() if stat.test_name in test_set
         ]
         test_runtime_set = {test.test_name for test in test_runtimes}
+        num_tests_missing_historic_data = 0
         for test in test_set:
             if test not in test_runtime_set:
-                # If we don't have historic runtime information for all the tests, we cannot
-                # reliable determine a timeout, so fallback to a default timeout.
-                LOGGER.warning(
-                    "Could not find historic runtime information for test, using default timeout",
-                    test=test)
-                return TimeoutEstimate.no_timeouts()
+                LOGGER.warning("Could not find historic runtime information for test", test=test)
+                num_tests_missing_historic_data += 1
 
         total_runtime = 0.0
         max_runtime = 0.0
@@ -88,20 +78,41 @@ class TimeoutService:
                 total_runtime += runtime.runtime
                 max_runtime = max(max_runtime, runtime.runtime)
             else:
-                LOGGER.warning("Found a test with 0 runtime, using default timeouts",
-                               test=runtime.test_name)
-                # We found a test with a runtime of 0, which indicates that it does not have a
-                # proper runtime history, so fall back to a default timeout.
-                return TimeoutEstimate.no_timeouts()
+                LOGGER.warning("Found a test with 0 runtime", test=runtime.test_name)
+                num_tests_missing_historic_data += 1
+
+        total_num_tests = len(test_set)
+        if not self._have_enough_historic_stats(total_num_tests, num_tests_missing_historic_data):
+            LOGGER.warning(
+                "Not enough historic runtime information, using default timeout",
+                total_num_tests=total_num_tests,
+                num_tests_missing_historic_data=num_tests_missing_historic_data,
+                required_stats_threshold=REQUIRED_STATS_THRESHOLD,
+            )
+            return TimeoutEstimate.no_timeouts()
 
         hook_overhead = self.get_task_hook_overhead(
-            timeout_params.suite_name, timeout_params.is_asan, len(test_set), historic_stats)
+            timeout_params.suite_name, timeout_params.is_asan, total_num_tests, historic_stats
+        )
         total_runtime += hook_overhead
+
+        if num_tests_missing_historic_data > 0:
+            total_runtime += num_tests_missing_historic_data * max_runtime
+            LOGGER.warning(
+                "At least one test misses historic runtime information, using default idle timeout",
+                num_tests_missing_historic_data=num_tests_missing_historic_data,
+            )
+            return TimeoutEstimate.only_task_timeout(expected_task_runtime=total_runtime)
 
         return TimeoutEstimate(max_test_runtime=max_runtime, expected_task_runtime=total_runtime)
 
-    def get_task_hook_overhead(self, suite_name: str, is_asan: bool, test_count: int,
-                               historic_stats: Optional[HistoricTaskData]) -> float:
+    def get_task_hook_overhead(
+        self,
+        suite_name: str,
+        is_asan: bool,
+        test_count: int,
+        historic_stats: Optional[HistoricTaskData],
+    ) -> float:
         """
         Add how much overhead task-level hooks each suite should account for.
 
@@ -122,8 +133,12 @@ class TimeoutService:
 
         clean_every_n_cadence = self._get_clean_every_n_cadence(suite_name, is_asan)
         avg_clean_every_n_runtime = historic_stats.get_avg_hook_runtime(CLEAN_EVERY_N_HOOK)
-        LOGGER.debug("task hook overhead", cadence=clean_every_n_cadence,
-                     runtime=avg_clean_every_n_runtime, is_asan=is_asan)
+        LOGGER.debug(
+            "task hook overhead",
+            cadence=clean_every_n_cadence,
+            runtime=avg_clean_every_n_runtime,
+            is_asan=is_asan,
+        )
         if avg_clean_every_n_runtime != 0:
             n_expected_runs = test_count / clean_every_n_cadence
             return n_expected_runs * avg_clean_every_n_runtime
@@ -137,20 +152,42 @@ class TimeoutService:
         :return: Historic test results if they exist.
         """
         try:
-            evg_stats = HistoricTaskData.from_evg(
-                self.evg_api, timeout_params.evg_project, self.timeout_settings.start_date,
-                self.timeout_settings.end_date, timeout_params.task_name,
-                timeout_params.build_variant)
+            LOGGER.info(
+                "Getting historic runtime information",
+                evg_project=timeout_params.evg_project,
+                build_variant=timeout_params.build_variant,
+                task_name=timeout_params.task_name,
+            )
+            evg_stats = HistoricTaskData.from_s3(
+                timeout_params.evg_project, timeout_params.task_name, timeout_params.build_variant
+            )
             if not evg_stats:
                 LOGGER.warning("No historic runtime information available")
                 return None
+            LOGGER.info(
+                "Found historic runtime information", evg_stats=evg_stats.historic_test_results
+            )
             return evg_stats
-        except Exception:  # pylint: disable=broad-except
+        except Exception as err:  # pylint: disable=broad-except
             # If we have any trouble getting the historic runtime information, log the issue, but
             # don't fall back to default timeouts instead of failing.
-            LOGGER.warning("Error querying history runtime information from evergreen",
-                           exc_info=True)
+            LOGGER.warning("Error querying history runtime information from evergreen: %s", err)
             return None
+
+    @staticmethod
+    def _have_enough_historic_stats(num_tests: int, num_tests_missing_data: int) -> bool:
+        """
+        Check whether the required number of stats threshold is met.
+
+        :param num_tests: Number of tests to run.
+        :param num_tests_missing_data: Number of test that misses historic runtime data.
+        :return: Whether the required number of stats threshold is met.
+        """
+        if num_tests < 0:
+            raise ValueError("Number of tests cannot be less than 0")
+        if num_tests == 0:
+            return True
+        return (num_tests - num_tests_missing_data) / num_tests > REQUIRED_STATS_THRESHOLD
 
     def _get_clean_every_n_cadence(self, suite_name: str, is_asan: bool) -> int:
         """
@@ -179,8 +216,9 @@ class TimeoutService:
         :param hook_name: Name of hook to query.
         :return: Configuration for hook, if it exists.
         """
-        hooks_config = self.resmoke_proxy.read_suite_config(suite_name).get("executor",
-                                                                            {}).get("hooks")
+        hooks_config = (
+            self.resmoke_proxy.read_suite_config(suite_name).get("executor", {}).get("hooks")
+        )
         if hooks_config:
             for hook in hooks_config:
                 if hook.get("class") == hook_name:

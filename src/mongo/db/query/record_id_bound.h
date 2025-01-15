@@ -30,6 +30,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <compare>
 #include <fmt/format.h>
 #include <ostream>
 
@@ -37,7 +38,6 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/record_id_helpers.h"
-#include "mongo/db/storage/key_string.h"
 
 namespace mongo {
 
@@ -49,12 +49,12 @@ public:
     RecordIdBound() = default;
 
     explicit RecordIdBound(RecordId&& recordId, boost::optional<BSONObj> bson = boost::none)
-        : _recordId(recordId), _bson(bson) {}
+        : _recordId(std::move(recordId)), _bson(bson) {}
 
     explicit RecordIdBound(const RecordId& recordId, boost::optional<BSONObj> bson = boost::none)
         : _recordId(recordId), _bson(bson) {}
 
-    RecordId recordId() const {
+    const RecordId& recordId() const {
         return _recordId;
     }
 
@@ -80,6 +80,15 @@ public:
     int compare(const RecordIdBound& rhs) const {
         return _recordId.compare(rhs._recordId);
     }
+
+    std::strong_ordering operator<=>(const RecordIdBound& rhs) const {
+        return compare(rhs) <=> 0;
+    }
+
+    bool operator==(const RecordIdBound& rhs) const {
+        return std::is_eq(*this <=> rhs);
+    }
+    bool operator!=(const RecordIdBound& rhs) const = default;
 
 private:
     RecordId _recordId;

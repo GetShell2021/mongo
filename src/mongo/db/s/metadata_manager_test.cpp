@@ -27,35 +27,44 @@
  *    it in the license file.
  */
 
-#include <boost/optional.hpp>
+#include <string>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/catalog_raii.h"
-#include "mongo/db/client.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/s/metadata_manager.h"
-#include "mongo/db/s/range_deletion_task_gen.h"
+#include "mongo/db/s/range_arithmetic.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/vector_clock.h"
-#include "mongo/executor/task_executor.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
-using unittest::assertGet;
 
-const NamespaceString kNss("TestDB", "TestColl");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("TestDB", "TestColl");
 const std::string kPattern = "key";
 const KeyPattern kShardKeyPattern(BSON(kPattern << 1));
 const std::string kThisShard{"thisShard"};
@@ -65,9 +74,15 @@ class MetadataManagerTest : public ShardServerTestFixture {
 protected:
     void setUp() override {
         ShardServerTestFixture::setUp();
-        _manager = std::make_shared<MetadataManager>(
-            getServiceContext(), kNss, executor(), makeEmptyMetadata());
+        _manager =
+            std::make_shared<MetadataManager>(getServiceContext(), kNss, makeEmptyMetadata());
         orphanCleanupDelaySecs.store(1);
+    }
+
+    void tearDown() override {
+        // Restore original `orphanCleanupDelaySecs` value for next unit tests
+        orphanCleanupDelaySecs.store(_defaultOrphanCleanupDelaySecs);
+        ShardServerTestFixture::tearDown();
     }
 
     /**
@@ -83,13 +98,14 @@ protected:
             kNss,
             uuid,
             shardKeyPattern,
+            false, /* unsplittable */
             nullptr,
             false,
             epoch,
             Timestamp(1, 1),
             boost::none /* timeseriesFields */,
-            boost::none,
-            boost::none /* chunkSizeBytes */,
+            boost::none /* reshardingFields */,
+
             true,
             {ChunkType{uuid, range, ChunkVersion({epoch, Timestamp(1, 1)}, {1, 0}), kOtherShard}});
 
@@ -142,8 +158,12 @@ protected:
                                  chunkVersion,
                                  kOtherShard);
 
-        auto rt = cm->getRoutingTableHistory_ForTest().makeUpdated(
-            boost::none /* timeseriesFields */, boost::none, boost::none, true, splitChunks);
+        auto rt =
+            cm->getRoutingTableHistory_forTest().makeUpdated(boost::none /* timeseriesFields */,
+                                                             boost::none /* reshardingFields */,
+                                                             true,
+                                                             false, /* unsplittable */
+                                                             splitChunks);
 
         return CollectionMetadata(ChunkManager(cm->dbPrimary(),
                                                cm->dbVersion(),
@@ -167,11 +187,11 @@ protected:
         auto chunkVersion = cm->getVersion();
         chunkVersion.incMajor();
 
-        auto rt = cm->getRoutingTableHistory_ForTest().makeUpdated(
+        auto rt = cm->getRoutingTableHistory_forTest().makeUpdated(
             boost::none /* timeseriesFields */,
-            boost::none,
-            boost::none,
+            boost::none /* reshardingFields */,
             true,
+            false, /* unsplittable */
             {ChunkType(metadata.getUUID(), ChunkRange(minKey, maxKey), chunkVersion, kOtherShard)});
 
         return CollectionMetadata(ChunkManager(cm->dbPrimary(),
@@ -182,108 +202,17 @@ protected:
     }
 
     std::shared_ptr<MetadataManager> _manager;
+
+private:
+    const int _defaultOrphanCleanupDelaySecs = orphanCleanupDelaySecs.load();
 };
-
-// The 'pending' field must not be set in order for a range deletion task to succeed, but the
-// ShardServerOpObserver will submit the task for deletion upon seeing an insert without the
-// 'pending' field. The tests call removeDocumentsFromRange directly, so we want to avoid having
-// the op observer also submit the task. The ShardServerOpObserver will ignore replacement
-//  updates on the range deletions namespace though, so we can get around the issue by inserting
-// the task with the 'pending' field set, and then remove the field using a replacement update
-// after.
-RangeDeletionTask insertRangeDeletionTask(OperationContext* opCtx,
-                                          const NamespaceString& nss,
-                                          const UUID& uuid,
-                                          const ChunkRange& range,
-                                          int64_t numOrphans) {
-    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-    auto migrationId = UUID::gen();
-    RangeDeletionTask t(migrationId, nss, uuid, ShardId("donor"), range, CleanWhenEnum::kDelayed);
-    t.setPending(true);
-    t.setNumOrphanDocs(numOrphans);
-    const auto currentTime = VectorClock::get(opCtx)->getTime();
-    t.setTimestamp(currentTime.clusterTime().asTimestamp());
-    store.add(opCtx, t);
-
-    auto query = BSON(RangeDeletionTask::kIdFieldName << migrationId);
-    t.setPending(boost::none);
-    auto update = t.toBSON();
-    store.update(opCtx, query, update);
-
-    return t;
-}
-
-TEST_F(MetadataManagerTest, TrackOrphanedDataCleanupBlocksOnScheduledRangeDeletions) {
-    ChunkRange cr1(BSON("key" << 0), BSON("key" << 10));
-    const auto task =
-        insertRangeDeletionTask(operationContext(), kNss, _manager->getCollectionUuid(), cr1, 0);
-
-    // Enable fail point to suspendRangeDeletion.
-    globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::alwaysOn);
-
-    auto notifn1 = _manager->cleanUpRange(cr1, task.getId(), false /*delayBeforeDeleting*/);
-    ASSERT_FALSE(notifn1.isReady());
-    ASSERT_EQ(_manager->numberOfRangesToClean(), 1UL);
-
-    auto optNotifn = _manager->trackOrphanedDataCleanup(cr1);
-    ASSERT_FALSE(notifn1.isReady());
-    ASSERT_FALSE(optNotifn->isReady());
-
-    globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::off);
-}
-
-TEST_F(MetadataManagerTest, CleanupNotificationsAreSignaledWhenMetadataManagerIsDestroyed) {
-    const ChunkRange rangeToClean(BSON("key" << 20), BSON("key" << 30));
-    const auto task = insertRangeDeletionTask(
-        operationContext(), kNss, _manager->getCollectionUuid(), rangeToClean, 0);
-
-
-    _manager->setFilteringMetadata(cloneMetadataPlusChunk(
-        _manager->getActiveMetadata(boost::none)->get(), {BSON("key" << 0), BSON("key" << 20)}));
-
-    _manager->setFilteringMetadata(
-        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), rangeToClean));
-
-    // Optional so that it can be reset.
-    boost::optional<ScopedCollectionDescription> cursorOnMovedMetadata{
-        _manager->getActiveMetadata(boost::none)};
-
-    _manager->setFilteringMetadata(
-        cloneMetadataMinusChunk(_manager->getActiveMetadata(boost::none)->get(), rangeToClean));
-
-    auto notif = _manager->cleanUpRange(rangeToClean, task.getId(), false /*delayBeforeDeleting*/);
-    ASSERT(!notif.isReady());
-
-    auto optNotif = _manager->trackOrphanedDataCleanup(rangeToClean);
-    ASSERT(optNotif);
-    ASSERT(!optNotif->isReady());
-
-    // Reset the original shared_ptr. The cursorOnMovedMetadata will still contain its own copy of
-    // the shared_ptr though, so the destructor of ~MetadataManager won't yet be called.
-    _manager.reset();
-    ASSERT(!notif.isReady());
-    ASSERT(!optNotif->isReady());
-
-    // Destroys the ScopedCollectionDescription object and causes the destructor of MetadataManager
-    // to run, which should trigger all deletion notifications.
-    cursorOnMovedMetadata.reset();
-
-    // Advance time to simulate orphanCleanupDelaySecs passing.
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(network());
-        network()->advanceTime(network()->now() + Seconds{5});
-    }
-
-    notif.wait();
-    optNotif->wait();
-}
 
 TEST_F(MetadataManagerTest, RefreshAfterSuccessfulMigrationSinglePending) {
     ChunkRange cr1(BSON("key" << 0), BSON("key" << 10));
 
     _manager->setFilteringMetadata(
-        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), cr1));
-    ASSERT_EQ(_manager->getActiveMetadata(boost::none)->get().getChunks().size(), 1UL);
+        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none, false)->get(), cr1));
+    ASSERT_EQ(_manager->getActiveMetadata(boost::none, false)->get().getChunks().size(), 1UL);
 }
 
 TEST_F(MetadataManagerTest, RefreshAfterSuccessfulMigrationMultiplePending) {
@@ -292,15 +221,14 @@ TEST_F(MetadataManagerTest, RefreshAfterSuccessfulMigrationMultiplePending) {
 
     {
         _manager->setFilteringMetadata(
-            cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), cr1));
-        ASSERT_EQ(_manager->numberOfRangesToClean(), 0UL);
-        ASSERT_EQ(_manager->getActiveMetadata(boost::none)->get().getChunks().size(), 1UL);
+            cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none, false)->get(), cr1));
+        ASSERT_EQ(_manager->getActiveMetadata(boost::none, false)->get().getChunks().size(), 1UL);
     }
 
     {
         _manager->setFilteringMetadata(
-            cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), cr2));
-        ASSERT_EQ(_manager->getActiveMetadata(boost::none)->get().getChunks().size(), 2UL);
+            cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none, false)->get(), cr2));
+        ASSERT_EQ(_manager->getActiveMetadata(boost::none, false)->get().getChunks().size(), 2UL);
     }
 }
 
@@ -308,9 +236,10 @@ TEST_F(MetadataManagerTest, RefreshAfterNotYetCompletedMigrationMultiplePending)
     ChunkRange cr1(BSON("key" << 0), BSON("key" << 10));
     ChunkRange cr2(BSON("key" << 30), BSON("key" << 40));
 
-    _manager->setFilteringMetadata(cloneMetadataPlusChunk(
-        _manager->getActiveMetadata(boost::none)->get(), {BSON("key" << 50), BSON("key" << 60)}));
-    ASSERT_EQ(_manager->getActiveMetadata(boost::none)->get().getChunks().size(), 1UL);
+    _manager->setFilteringMetadata(
+        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none, false)->get(),
+                               {BSON("key" << 50), BSON("key" << 60)}));
+    ASSERT_EQ(_manager->getActiveMetadata(boost::none, false)->get().getChunks().size(), 1UL);
 }
 
 TEST_F(MetadataManagerTest, BeginReceiveWithOverlappingRange) {
@@ -318,42 +247,47 @@ TEST_F(MetadataManagerTest, BeginReceiveWithOverlappingRange) {
     ChunkRange cr2(BSON("key" << 30), BSON("key" << 40));
 
     _manager->setFilteringMetadata(
-        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), cr1));
+        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none, false)->get(), cr1));
     _manager->setFilteringMetadata(
-        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), cr2));
+        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none, false)->get(), cr2));
 
     ChunkRange crOverlap(BSON("key" << 5), BSON("key" << 35));
 }
 
-// Tests membership functions for _rangesToClean
-TEST_F(MetadataManagerTest, RangesToCleanMembership) {
-    ChunkRange cr(BSON("key" << 0), BSON("key" << 10));
-    const auto task =
-        insertRangeDeletionTask(operationContext(), kNss, _manager->getCollectionUuid(), cr, 0);
+TEST_F(MetadataManagerTest, GetActiveMetadataDoesNotAlwaysPreserveRange) {
+    ChunkRange cr1(BSON("key" << 0), BSON("key" << 10));
+    ChunkRange cr2(BSON("key" << 30), BSON("key" << 40));
+    ChunkRange cr3(BSON("key" << 50), BSON("key" << 60));
 
-    ASSERT_EQ(0UL, _manager->numberOfRangesToClean());
+    auto metadataWithTimestamp = _manager->getActiveMetadata(LogicalTime(Timestamp(1, 1)), false);
 
-    // Enable fail point to suspendRangeDeletion.
-    globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::alwaysOn);
+    _manager->setFilteringMetadata(cloneMetadataPlusChunk(metadataWithTimestamp->get(), cr1));
+    ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 0);
 
-    auto notifn = _manager->cleanUpRange(cr, task.getId(), false /*delayBeforeDeleting*/);
-    ASSERT(!notifn.isReady());
-    ASSERT_EQ(1UL, _manager->numberOfRangesToClean());
+    auto metadataWithoutTimestampNoPreservation = _manager->getActiveMetadata(boost::none, false);
 
-    globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::off);
+    _manager->setFilteringMetadata(
+        cloneMetadataPlusChunk(metadataWithoutTimestampNoPreservation->get(), cr2));
+    ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 0);
+
+    auto metadataWithoutTimestampPreserveRange =
+        _manager->getActiveMetadata(boost::none, true /* preserveRange */);
+
+    _manager->setFilteringMetadata(
+        cloneMetadataPlusChunk(metadataWithoutTimestampPreserveRange->get(), cr3));
+    ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 1);
 }
 
 TEST_F(MetadataManagerTest, ClearUnneededChunkManagerObjectsLastSnapshotInList) {
     ChunkRange cr1(BSON("key" << 0), BSON("key" << 10));
     ChunkRange cr2(BSON("key" << 30), BSON("key" << 40));
 
-    auto scm1 = _manager->getActiveMetadata(boost::none);
+    auto scm1 = _manager->getActiveMetadata(boost::none, true);
     {
         _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm1->get(), cr1));
         ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 1UL);
-        ASSERT_EQ(_manager->numberOfRangesToClean(), 0UL);
 
-        auto scm2 = _manager->getActiveMetadata(boost::none);
+        auto scm2 = _manager->getActiveMetadata(boost::none, true);
         ASSERT_EQ(scm2->get().getChunks().size(), 1UL);
         _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm2->get(), cr2));
         ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 2UL);
@@ -365,7 +299,7 @@ TEST_F(MetadataManagerTest, ClearUnneededChunkManagerObjectsLastSnapshotInList) 
     ASSERT_EQ(_manager->numberOfEmptyMetadataSnapshots(), 1);
     ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 2UL);
 
-    auto scm = _manager->getActiveMetadata(boost::none);
+    auto scm = _manager->getActiveMetadata(boost::none, false);
     ASSERT_EQ(scm->get().getChunks().size(), 2UL);
 }
 
@@ -375,17 +309,16 @@ TEST_F(MetadataManagerTest, ClearUnneededChunkManagerObjectSnapshotInMiddleOfLis
     ChunkRange cr3(BSON("key" << 50), BSON("key" << 80));
     ChunkRange cr4(BSON("key" << 90), BSON("key" << 100));
 
-    auto scm = _manager->getActiveMetadata(boost::none);
+    auto scm = _manager->getActiveMetadata(boost::none, true);
     _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm->get(), cr1));
     ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 1UL);
-    ASSERT_EQ(_manager->numberOfRangesToClean(), 0UL);
 
-    auto scm2 = _manager->getActiveMetadata(boost::none);
+    auto scm2 = _manager->getActiveMetadata(boost::none, true);
     ASSERT_EQ(scm2->get().getChunks().size(), 1UL);
     _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm2->get(), cr2));
 
     {
-        auto scm3 = _manager->getActiveMetadata(boost::none);
+        auto scm3 = _manager->getActiveMetadata(boost::none, true);
         ASSERT_EQ(scm3->get().getChunks().size(), 2UL);
         _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm3->get(), cr3));
         ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 3UL);
@@ -401,7 +334,7 @@ TEST_F(MetadataManagerTest, ClearUnneededChunkManagerObjectSnapshotInMiddleOfLis
          *      CollectionMetadataTracker{ metadata: xxx, orphans: [], usageCounter: 1}
          * ]
          */
-        scm2 = _manager->getActiveMetadata(boost::none);
+        scm2 = _manager->getActiveMetadata(boost::none, true);
         ASSERT_EQ(scm2->get().getChunks().size(), 3UL);
         _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm2->get(), cr4));
         ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 4UL);

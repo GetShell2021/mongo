@@ -12,7 +12,7 @@ enterprise_path="src/mongo/db/modules/enterprise"
 diff_file_name="with_base_upstream.diff"
 
 # get the list of feature flags from the patched version
-$python buildscripts/idl/gen_all_feature_flag_list.py --import-dir src --import-dir "$enterprise_path"/src
+$python buildscripts/idl/gen_all_feature_flag_list.py
 mv all_feature_flags.txt patch_all_feature_flags.txt
 
 # get the list of feature flags from the base commit
@@ -21,15 +21,7 @@ if [ -s "$diff_file_name" ]; then
   git apply -R "$diff_file_name"
 fi
 
-# This script has to be run on an Evergreen variant or local repo with the enterprise module.
-pushd "$enterprise_path"
-git --no-pager diff "$(git merge-base origin/${branch_name} HEAD)" --output="$diff_file_name" --binary
-if [ -s "$diff_file_name" ]; then
-  git apply -R "$diff_file_name"
-fi
-popd
-
-$python buildscripts/idl/gen_all_feature_flag_list.py --import-dir src --import-dir "$enterprise_path"/src
+$python buildscripts/idl/gen_all_feature_flag_list.py
 mv all_feature_flags.txt base_all_feature_flags.txt
 
 # print out the list of tests that previously had feature flag tag, that was

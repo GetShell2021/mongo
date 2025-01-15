@@ -28,9 +28,26 @@
  */
 
 #include "mongo/db/catalog/collection_catalog_helper.h"
+
+#include <boost/optional.hpp>
+#include <functional>
+#include <memory>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/views/view.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -42,7 +59,8 @@ Status checkIfNamespaceExists(OperationContext* opCtx, const NamespaceString& ns
     auto catalog = CollectionCatalog::get(opCtx);
     if (catalog->lookupCollectionByNamespace(opCtx, nss)) {
         return Status(ErrorCodes::NamespaceExists,
-                      str::stream() << "Collection " << nss.ns() << " already exists.");
+                      str::stream()
+                          << "Collection " << nss.toStringForErrorMsg() << " already exists.");
     }
 
     auto view = catalog->lookupView(opCtx, nss);
@@ -51,11 +69,12 @@ Status checkIfNamespaceExists(OperationContext* opCtx, const NamespaceString& ns
 
     if (view->timeseries()) {
         return Status(ErrorCodes::NamespaceExists,
-                      str::stream() << "A timeseries collection already exists. NS: " << nss);
+                      str::stream() << "A timeseries collection already exists. NS: "
+                                    << nss.toStringForErrorMsg());
     }
 
     return Status(ErrorCodes::NamespaceExists,
-                  str::stream() << "A view already exists. NS: " << nss);
+                  str::stream() << "A view already exists. NS: " << nss.toStringForErrorMsg());
 }
 
 
@@ -66,11 +85,10 @@ void forEachCollectionFromDb(OperationContext* opCtx,
                              CollectionCatalog::CollectionInfoFn predicate) {
 
     auto catalogForIteration = CollectionCatalog::get(opCtx);
-    for (auto collectionIt = catalogForIteration->begin(opCtx, dbName);
-         collectionIt != catalogForIteration->end(opCtx);) {
-        auto uuid = collectionIt.uuid().get();
+    size_t collectionCount = 0;
+    for (auto&& coll : catalogForIteration->range(dbName)) {
+        auto uuid = coll->uuid();
         if (predicate && !catalogForIteration->checkIfCollectionSatisfiable(uuid, predicate)) {
-            ++collectionIt;
             continue;
         }
 
@@ -81,12 +99,12 @@ void forEachCollectionFromDb(OperationContext* opCtx,
         while (auto nss = catalog->lookupNSSByUUID(opCtx, uuid)) {
             // Get a fresh snapshot for each locked collection to see any catalog changes.
             clk.emplace(opCtx, *nss, collLockMode);
-            opCtx->recoveryUnit()->abandonSnapshot();
+            shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
             catalog = CollectionCatalog::get(opCtx);
 
             if (catalog->lookupNSSByUUID(opCtx, uuid) == nss) {
                 // Success: locked the namespace and the UUID still maps to it.
-                collection = catalog->lookupCollectionByUUID(opCtx, uuid);
+                collection = CollectionPtr(catalog->lookupCollectionByUUID(opCtx, uuid));
                 invariant(collection);
                 break;
             }
@@ -94,19 +112,45 @@ void forEachCollectionFromDb(OperationContext* opCtx,
             clk.reset();
         }
 
-        // Increment iterator before calling callback. This allows for collection deletion inside
-        // this callback even if we are in batched inplace mode.
-        ++collectionIt;
-
         // The NamespaceString couldn't be resolved from the uuid, so the collection was dropped.
         if (!collection)
             continue;
 
-        if (!callback(collection))
+        if (!callback(collection.get()))
             break;
 
+        // This was a rough heuristic that was found that 400 collections would take 100
+        // milliseconds with calling checkForInterrupt() (with freeStorage: 1).
+        // We made the checkForInterrupt() occur after 200 collections to be conservative.
+        if (!(collectionCount % 200)) {
+            opCtx->checkForInterrupt();
+        }
         hangBeforeGettingNextCollection.pauseWhileSet();
+        collectionCount += 1;
     }
+}
+
+boost::optional<bool> getConfigDebugDump(const NamespaceString& nss) {
+    static const std::array kConfigDumpCollections = {
+        "chunks"_sd,
+        "collections"_sd,
+        "databases"_sd,
+        "settings"_sd,
+        "shards"_sd,
+        "tags"_sd,
+        "version"_sd,
+    };
+
+    if (!nss.isConfigDB()) {
+        return boost::none;
+    }
+
+    if (MONGO_unlikely(!mongo::feature_flags::gConfigDebugDumpSupported.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()))) {
+        return boost::none;
+    }
+
+    return std::ranges::find(kConfigDumpCollections, nss.coll()) != kConfigDumpCollections.cend();
 }
 
 }  // namespace catalog

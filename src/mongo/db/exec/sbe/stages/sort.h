@@ -29,11 +29,25 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/sorter/sorter_stats.h"
 
 namespace mongo {
 template <typename Key, typename Value>
 class SortIteratorInterface;
+
 template <typename Key, typename Value>
 class Sorter;
 }  // namespace mongo
@@ -67,13 +81,14 @@ public:
               value::SlotVector obs,
               std::vector<value::SortDirection> dirs,
               value::SlotVector vals,
-              size_t limit,
+              std::unique_ptr<EExpression> limit,
               size_t memoryLimit,
               bool allowDiskUse,
+              PlanYieldPolicy* yieldPolicy,
               PlanNodeId planNodeId,
               bool participateInTrialRunTracking = true);
 
-    ~SortStage();
+    ~SortStage() override;
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -88,35 +103,72 @@ public:
     std::vector<DebugPrinter::Block> debugPrint() const final;
     size_t estimateCompileTimeSize() const final;
 
-protected:
-    void doDetachFromTrialRunTracker() override;
-    TrialRunTrackerAttachResultMask doAttachToTrialRunTracker(
-        TrialRunTracker* tracker, TrialRunTrackerAttachResultMask childrenAttachResult) override;
+private:
+    class SortIface {
+    public:
+        virtual ~SortIface() {}
+        virtual void prepare(CompileCtx& ctx) = 0;
+        virtual value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) = 0;
+        virtual void open(bool reOpen) = 0;
+        virtual PlanState getNext() = 0;
+        virtual void close() = 0;
+    };
+
+    template <typename KeyRow, typename ValueRow>
+    class SortImpl : public SortIface {
+    public:
+        SortImpl(SortStage& stage);
+        ~SortImpl() override;
+
+        void prepare(CompileCtx& ctx) final;
+        value::SlotAccessor* getAccessor(CompileCtx& ctx, value::SlotId slot) final;
+        void open(bool reOpen) final;
+        PlanState getNext() final;
+        void close() final;
+
+    private:
+        int64_t runLimitCode();
+        void makeSorter();
+
+        using SorterIterator = SortIteratorInterface<KeyRow, ValueRow>;
+        using SorterData = std::pair<KeyRow, ValueRow>;
+
+        SortStage& _stage;
+
+        std::vector<value::SlotAccessor*> _inKeyAccessors;
+        std::vector<value::SlotAccessor*> _inValueAccessors;
+
+        value::SlotMap<std::unique_ptr<value::SlotAccessor>> _outAccessors;
+
+        std::unique_ptr<SorterIterator> _mergeIt;
+        SorterData _mergeData;
+        SorterData* _mergeDataIt{&_mergeData};
+        std::unique_ptr<Sorter<KeyRow, ValueRow>> _sorter;
+
+        std::unique_ptr<vm::CodeFragment> _limitCode;
+    };
 
 private:
-    void makeSorter();
+    template <typename KeyType, typename ValueType>
+    std::unique_ptr<SortIface> makeStageImplInternal();
+    template <typename KeyType>
+    std::unique_ptr<SortIface> makeStageImplInternal(size_t valueSize);
+    std::unique_ptr<SortIface> makeStageImplInternal(size_t keySize, size_t valueSize);
 
-    using SorterIterator = SortIteratorInterface<value::MaterializedRow, value::MaterializedRow>;
-    using SorterData = std::pair<value::MaterializedRow, value::MaterializedRow>;
+    std::unique_ptr<SortIface> makeStageImpl();
 
+private:
     const value::SlotVector _obs;
     const std::vector<value::SortDirection> _dirs;
     const value::SlotVector _vals;
     const bool _allowDiskUse;
+
+    std::unique_ptr<SorterFileStats> _sorterFileStats;
+
+    std::unique_ptr<SortIface> _stageImpl;
+
+    std::unique_ptr<EExpression> _limitExpr;
+
     SortStats _specificStats;
-
-    std::vector<value::SlotAccessor*> _inKeyAccessors;
-    std::vector<value::SlotAccessor*> _inValueAccessors;
-
-    value::SlotMap<std::unique_ptr<value::SlotAccessor>> _outAccessors;
-
-    std::unique_ptr<SorterIterator> _mergeIt;
-    SorterData _mergeData;
-    SorterData* _mergeDataIt{&_mergeData};
-    std::unique_ptr<Sorter<value::MaterializedRow, value::MaterializedRow>> _sorter;
-
-    // If provided, used during a trial run to accumulate certain execution stats. Once the trial
-    // run is complete, this pointer is reset to nullptr.
-    TrialRunTracker* _tracker{nullptr};
 };
 }  // namespace mongo::sbe

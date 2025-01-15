@@ -30,46 +30,45 @@
 #include "mongo/db/cluster_transaction_api.h"
 
 #include <fmt/format.h>
+#include <string>
 
-#include "mongo/executor/task_executor.h"
-#include "mongo/rpc/factory.h"
-#include "mongo/rpc/op_msg_rpc_impls.h"
-#include "mongo/rpc/reply_interface.h"
-#include "mongo/stdx/future.h"
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/cluster_command_translations.h"
+#include "mongo/s/service_entry_point_router_role.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo::txn_api::details {
 
-namespace {
+ClusterSEPTransactionClientBehaviors::ClusterSEPTransactionClientBehaviors(
+    OperationContext* opCtx) {
+    _service = opCtx->getService();
+    _isRouterEnabled = opCtx->getServiceContext()->getService(ClusterRole::RouterServer);
 
-StringMap<std::string> clusterCommandTranslations = {
-    {"abortTransaction", "clusterAbortTransaction"},
-    {"aggregate", "clusterAggregate"},
-    {"commitTransaction", "clusterCommitTransaction"},
-    {"delete", "clusterDelete"},
-    {"find", "clusterFind"},
-    {"getMore", "clusterGetMore"},
-    {"insert", "clusterInsert"},
-    {"update", "clusterUpdate"}};
-
-BSONObj replaceCommandNameWithClusterCommandName(BSONObj cmdObj) {
-    auto cmdName = cmdObj.firstElement().fieldNameStringData();
-    auto newNameIt = clusterCommandTranslations.find(cmdName);
-    uassert(6349501,
-            "Cannot use unsupported command {} with cluster transaction API"_format(cmdName),
-            newNameIt != clusterCommandTranslations.end());
-
-    return cmdObj.replaceFieldNames(BSON(newNameIt->second << 1));
+    if (_isRouterEnabled) {
+        invariant(_service->role().hasExclusively(ClusterRole::RouterServer));
+    }
 }
 
-}  // namespace
-
 BSONObj ClusterSEPTransactionClientBehaviors::maybeModifyCommand(BSONObj cmdObj) const {
-    return replaceCommandNameWithClusterCommandName(cmdObj);
+    if (!_isRouterEnabled) {
+        return cluster::cmd::translations::replaceCommandNameWithClusterCommandName(cmdObj);
+    }
+    return cmdObj;
 }
 
 Future<DbResponse> ClusterSEPTransactionClientBehaviors::handleRequest(
     OperationContext* opCtx, const Message& request) const {
-    return ServiceEntryPointMongos::handleRequestImpl(opCtx, request);
+    if (!_isRouterEnabled) {
+        return ServiceEntryPointRouterRole::handleRequestImpl(opCtx, request);
+    }
+    return _service->getServiceEntryPoint()->handleRequest(opCtx, request);
 }
 
 }  // namespace mongo::txn_api::details

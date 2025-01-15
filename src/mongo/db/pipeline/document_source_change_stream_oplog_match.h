@@ -29,29 +29,51 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <utility>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/tailable_mode_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 /**
  * A custom subclass of DocumentSourceMatch which is used to generate a $match stage to be applied
  * on the oplog. The stage requires itself to be the first stage in the pipeline.
  */
-class DocumentSourceChangeStreamOplogMatch final : public DocumentSourceMatch {
+class DocumentSourceChangeStreamOplogMatch final : public DocumentSourceInternalChangeStreamMatch {
 public:
     static constexpr StringData kStageName = "$_internalChangeStreamOplogMatch"_sd;
 
     DocumentSourceChangeStreamOplogMatch(Timestamp clusterTime,
-                                         const boost::intrusive_ptr<ExpressionContext>& expCtx);
+                                         const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         std::unique_ptr<MatchExpression> opLogMatchFilter,
+                                         std::vector<BSONObj> backingBsonObjs);
 
     DocumentSourceChangeStreamOplogMatch(const DocumentSourceChangeStreamOplogMatch& other,
                                          const boost::intrusive_ptr<ExpressionContext>& newExpCtx)
-        : DocumentSourceMatch(other, newExpCtx) {
+        : DocumentSourceInternalChangeStreamMatch(other, newExpCtx) {
         _clusterTime = other._clusterTime;
         _optimizedEndOfPipeline = other._optimizedEndOfPipeline;
     }
 
     boost::intrusive_ptr<DocumentSource> clone(
-        const boost::intrusive_ptr<ExpressionContext>& newExpCtx = nullptr) const final {
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const final {
         return new DocumentSourceChangeStreamOplogMatch(*this, newExpCtx);
     }
 
@@ -74,7 +96,7 @@ public:
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value doSerialize(const SerializationOptions& opts) const final;
 
 protected:
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
@@ -88,14 +110,18 @@ private:
      */
     DocumentSourceChangeStreamOplogMatch(BSONObj filter,
                                          const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : DocumentSourceMatch(std::move(filter), expCtx), _optimizedEndOfPipeline(true) {
-        expCtx->tailableMode = TailableModeEnum::kTailableAndAwaitData;
+        : DocumentSourceInternalChangeStreamMatch(filter, expCtx), _optimizedEndOfPipeline(true) {
+        expCtx->setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     }
 
     // Needed for re-creating the filter during optimization. Note that we do not serialize these
     // fields. The filter in a serialized DocumentSourceOplogMatch is considered final, so there is
     // no need to re-create it.
     boost::optional<Timestamp> _clusterTime;
+
+    // Stores the BSONObj used in building the OplogMatch MatchExpression. The BSONObj need to be
+    // kept for the query runtime.
+    std::vector<BSONObj> _backingBsonObjs;
 
     // Used to avoid infinte optimization loops. Note that we do not serialize this field, because
     // we assume that DocumentSourceOplogMatch is always serialized after optimization.

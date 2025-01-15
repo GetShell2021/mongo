@@ -29,6 +29,8 @@ DEFAULT_DBTEST_EXECUTABLE = os.path.join(os.curdir, "dbtest")
 DEFAULT_MONGO_EXECUTABLE = "mongo"
 DEFAULT_MONGOD_EXECUTABLE = "mongod"
 DEFAULT_MONGOS_EXECUTABLE = "mongos"
+DEFAULT_MONGOT_EXECUTABLE = "mongot-localdev/mongot"
+DEFAULT_MONGOTEST_EXECUTABLE = "mongotest"
 
 DEFAULT_BENCHMARK_REPETITIONS = 3
 DEFAULT_BENCHMARK_MIN_TIME = datetime.timedelta(seconds=5)
@@ -50,21 +52,29 @@ DEFAULT_GENNY_EXECUTABLE = os.path.normpath("genny/build/src/driver/genny")
 
 # Names below correspond to how they are specified via the command line or in the options YAML file.
 DEFAULTS = {
+    "auto_kill": "on",
     "always_use_log_files": False,
     "archive_limit_mb": 5000,
     "archive_limit_tests": 10,
     "base_port": 20000,
     "backup_on_restart_dir": None,
-    "buildlogger_url": "https://logkeeper.mongodb.org",
+    "embedded_router": None,
+    "config_shard": None,
     "continue_on_failure": False,
     "dbpath_prefix": None,
     "dbtest_executable": None,
     "dry_run": None,
     "exclude_with_any_tags": None,
-    "flow_control": None,
-    "flow_control_tickets": None,
-    "fuzz_mongod_configs": False,
+    "force_excluded_tests": False,
+    "skip_excluded_tests": False,
+    "skip_tests_covered_by_more_complex_suites": False,
+    "skip_symbolization": False,
+    "fuzz_mongod_configs": None,
+    "fuzz_runtime_params": None,
+    "fuzz_runtime_stress": "off",
+    "fuzz_mongos_configs": None,
     "config_fuzz_seed": None,
+    "disable_encryption_fuzzing": False,
     "genny_executable": None,
     "include_with_any_tags": None,
     "include_with_all_tags": None,
@@ -76,11 +86,14 @@ DEFAULTS = {
     "mongod_set_parameters": [],
     "mongos_executable": None,
     "mongos_set_parameters": [],
+    "mongot-localdev/mongot_executable": None,
+    "mongot_set_parameters": [],
     "mongocryptd_set_parameters": [],
     "mrlog": None,
     "no_journal": False,
     "num_clients_per_fixture": 1,
-    "perf_report_file": None,
+    "use_tenant_client": False,
+    "origin_suite": None,
     "cedar_report_file": None,
     "repeat_suites": 1,
     "repeat_tests": 1,
@@ -88,11 +101,12 @@ DEFAULTS = {
     "repeat_tests_min": None,
     "repeat_tests_secs": None,
     "replay_file": None,
-    "report_failure_status": "fail",
     "report_file": None,
     "run_all_feature_flag_tests": False,
-    "run_all_feature_flags_no_tests": False,
+    "run_no_feature_flag_tests": False,
     "additional_feature_flags": None,
+    "additional_feature_flags_file": None,
+    "disable_feature_flags": None,
     "seed": int(time.time() * 256),  # Taken from random.py code in Python 2.7.
     "service_executor": None,
     "shell_conn_string": None,
@@ -100,12 +114,15 @@ DEFAULTS = {
     "shuffle": None,
     "stagger_jobs": None,
     "majority_read_concern": "on",
+    "enable_enterprise_tests": "on",
+    "enable_evergreen_api_test_selection": False,
+    "shell_seed": None,
     "storage_engine": "wiredTiger",
     "storage_engine_cache_size_gb": None,
+    "mozjs_js_gc_zeal": None,
     "suite_files": "with_server",
     "tag_files": [],
     "test_files": [],
-    "transport_layer": None,
     "user_friendly_output": None,
     "mixed_bin_versions": None,
     "old_bin_version": None,
@@ -113,10 +130,15 @@ DEFAULTS = {
     "num_replset_nodes": None,
     "num_shards": None,
     "export_mongod_config": "off",
-
+    "tls_mode": None,
+    "tls_ca_file": None,
+    "shell_grpc": False,
+    "shell_tls_enabled": False,
+    "shell_tls_certificate_key_file": None,
+    "mongos_tls_certificate_key_file": None,
+    "mongod_tls_certificate_key_file": None,
     # Internal testing options.
     "internal_params": [],
-
     # Evergreen options.
     "evergreen_url": "evergreen.mongodb.com",
     "build_id": None,
@@ -131,43 +153,56 @@ DEFAULTS = {
     "task_doc": None,
     "variant_name": None,
     "version_id": None,
-
+    "work_dir": None,
+    "evg_project_config_path": "etc/evergreen.yml",
+    "requester": None,
     # WiredTiger options.
     "wt_coll_config": None,
     "wt_engine_config": None,
     "wt_index_config": None,
-
     # Benchmark options.
     "benchmark_filter": None,
     "benchmark_list_tests": None,
     "benchmark_min_time_secs": None,
     "benchmark_repetitions": None,
-
     # Config Dir
     "config_dir": "buildscripts/resmokeconfig",
-
-    # UndoDB options
-    "undo_recorder_path": None,
-
+    # Directory with jstests
+    "jstests_dir": "jstests",
     # Generate multiversion exclude tags options
     "exclude_tags_file_path": "generated_resmoke_config/multiversion_exclude_tags.yml",
-
     # Limit the number of tests to execute
     "max_test_queue_size": None,
+    # Sanity check
+    "sanity_check": False,
+    # otel info
+    "otel_trace_id": None,
+    "otel_parent_id": None,
+    "otel_collector_dir": None,
+    # The images to build for an External System Under Test
+    "docker_compose_build_images": None,
+    # Where the `--dockerComposeBuildImages` is happening.
+    "docker_compose_build_env": "local",
+    # Tag to use for images built & used for an External System Under Test
+    "docker_compose_tag": "development",
+    # Whether or not this resmoke suite is running against an External System Under Test
+    "external_sut": False,
 }
 
-_SuiteOptions = collections.namedtuple("_SuiteOptions", [
-    "description",
-    "fail_fast",
-    "include_tags",
-    "num_jobs",
-    "num_repeat_suites",
-    "num_repeat_tests",
-    "num_repeat_tests_max",
-    "num_repeat_tests_min",
-    "time_repeat_tests_secs",
-    "report_failure_status",
-])
+_SuiteOptions = collections.namedtuple(
+    "_SuiteOptions",
+    [
+        "description",
+        "fail_fast",
+        "include_tags",
+        "num_jobs",
+        "num_repeat_suites",
+        "num_repeat_tests",
+        "num_repeat_tests_max",
+        "num_repeat_tests_min",
+        "time_repeat_tests_secs",
+    ],
+)
 
 
 class SuiteOptions(_SuiteOptions):
@@ -223,18 +258,22 @@ class SuiteOptions(_SuiteOptions):
         include_tags = None
         parent = dict(
             list(
-                zip(SuiteOptions._fields, [
-                    description,
-                    FAIL_FAST,
-                    include_tags,
-                    JOBS,
-                    REPEAT_SUITES,
-                    REPEAT_TESTS,
-                    REPEAT_TESTS_MAX,
-                    REPEAT_TESTS_MIN,
-                    REPEAT_TESTS_SECS,
-                    REPORT_FAILURE_STATUS,
-                ])))
+                zip(
+                    SuiteOptions._fields,
+                    [
+                        description,
+                        FAIL_FAST,
+                        include_tags,
+                        JOBS,
+                        REPEAT_SUITES,
+                        REPEAT_TESTS,
+                        REPEAT_TESTS_MAX,
+                        REPEAT_TESTS_MIN,
+                        REPEAT_TESTS_SECS,
+                    ],
+                )
+            )
+        )
 
         options = self._asdict()
         for field in SuiteOptions._fields:
@@ -245,7 +284,8 @@ class SuiteOptions(_SuiteOptions):
 
 
 SuiteOptions.ALL_INHERITED = SuiteOptions(  # type: ignore
-    **dict(list(zip(SuiteOptions._fields, itertools.repeat(SuiteOptions.INHERIT)))))
+    **dict(list(zip(SuiteOptions._fields, itertools.repeat(SuiteOptions.INHERIT))))
+)
 
 
 class MultiversionOptions(object):
@@ -265,6 +305,9 @@ class MultiversionOptions(object):
 # Variables that are set by the user at the command line or with --options.
 ##
 
+# Allow resmoke permission to automatically kill existing rogue mongo processes.
+AUTO_KILL = "on"
+
 # Log to files located in the db path and don't clean dbpaths after tests.
 ALWAYS_USE_LOG_FILES = False
 
@@ -281,9 +324,6 @@ BACKUP_ON_RESTART_DIR = None
 # mongo shell.
 BASE_PORT = None
 
-# The root url of the buildlogger server.
-BUILDLOGGER_URL = None
-
 # Root directory for where resmoke.py puts directories containing data files of mongod's it starts,
 # as well as those started by individual tests.
 DBPATH_PREFIX = None
@@ -294,6 +334,18 @@ DBTEST_EXECUTABLE = None
 # If set to "tests", then resmoke.py will output the tests that would be run by each suite (without
 # actually running them).
 DRY_RUN = None
+
+# If set, specifies which node is the config shard. Can also be set to 'any'.
+CONFIG_SHARD = None
+
+# If set, use mongod's embedded router functionality for all sharding tests instead of mongos.
+EMBEDDED_ROUTER = None
+
+# if set, enables enterprise jstest to automatically be included
+ENABLE_ENTERPRISE_TESTS = None
+
+# if set, enables test selection using the Evergreen API
+ENABLE_EVERGREEN_API_TEST_SELECTION = None
 
 # URL to connect to the Evergreen service.
 EVERGREEN_URL = None
@@ -337,8 +389,30 @@ EVERGREEN_VARIANT_NAME = None
 # the commit hash.
 EVERGREEN_VERSION_ID = None
 
+# The Evergreen task's working directory.
+EVERGREEN_WORK_DIR = None
+
+# Path to evergreen project configuration yaml file
+EVERGREEN_PROJECT_CONFIG_PATH = None
+
+# What triggered the task: patch, github_pr, github_tag, commit, trigger, commit_queue, or ad_hoc
+EVERGREEN_REQUESTER = None
+
 # If set, then any jstests that have any of the specified tags will be excluded from the suite(s).
 EXCLUDE_WITH_ANY_TAGS = None
+
+# Allow test files passed as positional args to run even if they are excluded on the suite config.
+FORCE_EXCLUDED_TESTS = None
+
+# Allow a suite to continue its execution if the list of test files passed as positional args
+# contains any excluded test. This flag gets ignored when FORCE_EXCLUDED_TESTS is also set.
+SKIP_EXCLUDED_TESTS = None
+
+# Only run tests on the given suite that will not be run on a more complex suite.
+SKIP_TESTS_COVERED_BY_MORE_COMPLEX_SUITES = None
+
+# Skip symbolizing stacktraces generated during tests.
+SKIP_SYMBOLIZATION = None
 
 # A tag which is implicited excluded. This is useful for temporarily disabling a test.
 EXCLUDED_TAG = "__TEMPORARILY_DISABLED__"
@@ -346,8 +420,23 @@ EXCLUDED_TAG = "__TEMPORARILY_DISABLED__"
 # If true, then a test failure or error will cause resmoke.py to exit and not run any more tests.
 FAIL_FAST = None
 
-FUZZ_MONGOD_CONFIGS = False
+# Defines how to fuzz mongod parameters on startup
+FUZZ_MONGOD_CONFIGS = None
+
+# Defines how to fuzz mongod/mongos parameters at test run-time
+FUZZ_RUNTIME_PARAMS = None
+
+# Defines how to stress the system at run-time
+FUZZ_RUNTIME_STRESS = None
+
+# Defines how to fuzz mongos parameters on startup
+FUZZ_MONGOS_CONFIGS = None
+
+# This seeds the random number generator used to fuzz mongod and mongos parameters
 CONFIG_FUZZ_SEED = None
+
+# Disables the fuzzing that sometimes enables the encrypted storage engine.
+DISABLE_ENCRYPTION_FUZZING = None
 
 # Executable file for genny, passed in as a command line arg.
 GENNY_EXECUTABLE = None
@@ -375,8 +464,14 @@ INSTALL_DIR = None
 # Whether to run tests for feature flags.
 RUN_ALL_FEATURE_FLAG_TESTS = None
 
-# Whether to run the server with feature flags. Defaults to true if `RUN_ALL_FEATURE_FLAG_TESTS` is true.
-RUN_ALL_FEATURE_FLAGS = None
+# Whether to run the tests with enabled feature flags
+RUN_NO_FEATURE_FLAG_TESTS = None
+
+# the path to a file containing feature flags
+ADDITIONAL_FEATURE_FLAGS_FILE = None
+
+# List of feature flags to disable
+DISABLE_FEATURE_FLAGS = None
 
 # List of enabled feature flags.
 ENABLED_FEATURE_FLAGS = []
@@ -390,11 +485,23 @@ MONGOD_EXECUTABLE = None
 # The --setParameter options passed to mongod.
 MONGOD_SET_PARAMETERS = []
 
+# Extra configurations for mongod (i.e. ones that aren't setParameters). Unlike other configuration
+# options, these "extra" configs are only used to invoke resmoke's standalone mongod instance. Extra
+# configs are a dictionary of {flag: bool, ...} which will become command-line args to mongod of the
+# form "--flag" if true, and nothing if false.
+MONGOD_EXTRA_CONFIG = {}
+
 # The path to the mongos executable used by resmoke.py.
 MONGOS_EXECUTABLE = None
 
 # The --setParameter options passed to mongos.
 MONGOS_SET_PARAMETERS = []
+
+# The path to the mongot executable used by resmoke.py.
+MONGOT_EXECUTABLE = None
+
+# The --setParameter options passed to mongot.
+MONGOT_SET_PARAMETERS = []
 
 # The --setParameter options passed to mongocryptd.
 MONGOCRYPTD_SET_PARAMETERS = []
@@ -406,8 +513,11 @@ NO_JOURNAL = None
 # If set, then each fixture runs tests with the specified number of clients.
 NUM_CLIENTS_PER_FIXTURE = None
 
-# Report file for the Evergreen performance plugin.
-PERF_REPORT_FILE = None
+# If set, each client will be constructed with a generated tenant id.
+USE_TENANT_CLIENT = False
+
+# Indicates the name of the test suite prior to the suite being split up by uite generation
+ORIGIN_SUITE = None
 
 # Report file for Cedar.
 CEDAR_REPORT_FILE = None
@@ -433,9 +543,6 @@ REPEAT_TESTS_MIN = None
 # If set, then each test is repeated the specified time (seconds) inside the suites.
 REPEAT_TESTS_SECS = None
 
-# Controls if the test failure status should be reported as failed or be silently ignored.
-REPORT_FAILURE_STATUS = None
-
 # If set, then resmoke.py will write out a report file with the status of each test that ran.
 REPORT_FILE = None
 
@@ -445,6 +552,9 @@ SERVICE_EXECUTOR = None
 # If set, resmoke will override the default fixture and connect to the fixture specified by this
 # connection string instead.
 SHELL_CONN_STRING = None
+
+# If set, resmoke will override the random seed for jstests.
+SHELL_SEED = None
 
 # If true, then the order the tests run in is randomized. Otherwise the tests will run in
 # alphabetical (case-insensitive) order.
@@ -462,6 +572,25 @@ MIXED_BIN_VERSIONS = None
 # Specifies the binary version of last-lts or last-continous when multiversion enabled
 MULTIVERSION_BIN_VERSION = None
 
+# Specifies whether to use gRPC when connecting via the shell by default.
+SHELL_GRPC = None
+
+# Specifies what tlsMode the server(s) should be started with.
+TLS_MODE = None
+
+# Specifies the CA file that all servers and shell instances should use.
+TLS_CA_FILE = None
+
+# Shell TLS options.
+SHELL_TLS_ENABLED = None
+SHELL_TLS_CERTIFICATE_KEY_FILE = None
+
+# Specifies the TLS certicicate that all mongods in the cluster should use.
+MONGOD_TLS_CERTIFICATE_KEY_FILE = None
+
+# Specifies the TLS certicicate that all mongoses in the cluster should use.
+MONGOS_TLS_CERTIFICATE_KEY_FILE = None
+
 # Specifies the number of replica set members in a ReplicaSetFixture.
 NUM_REPLSET_NODES = None
 
@@ -476,13 +605,6 @@ EXPORT_MONGOD_CONFIG = None
 
 # If true, run ReplicaSetFixture with linear chaining.
 LINEAR_CHAIN = None
-
-# If set to "on", it enables flow control. If set to "off", it disables flow control. If left as
-# None, the server's default will determine whether flow control is enabled.
-FLOW_CONTROL = None
-
-# If set, it ensures Flow Control only ever assigns this number of tickets in one second.
-FLOW_CONTROL_TICKETS = None
 
 # If set, then all mongod's started by resmoke.py and by the mongo shell will use the specified
 # storage engine.
@@ -501,8 +623,10 @@ TAG_FILES = None
 # The test files to execute.
 TEST_FILES = None
 
-# If set, then mongod/mongos's started by resmoke.py will use the specified transport layer.
-TRANSPORT_LAYER = None
+# Metrics for open telemetry
+OTEL_TRACE_ID = None
+OTEL_PARENT_ID = None
+OTEL_COLLECTOR_DIR = None
 
 # If set, then all mongod's started by resmoke.py and by the mongo shell will use the specified
 # WiredTiger collection configuration settings.
@@ -521,9 +645,6 @@ BENCHMARK_FILTER = None
 BENCHMARK_LIST_TESTS = None
 BENCHMARK_MIN_TIME = None
 BENCHMARK_REPETITIONS = None
-
-# UndoDB options
-UNDO_RECORDER_PATH = None
 
 # # Generate multiversion exclude tags options
 EXCLUDE_TAGS_FILE_PATH = None
@@ -556,16 +677,40 @@ DEFAULT_BENCHMARK_TEST_LIST = "build/benchmarks.txt"
 DEFAULT_UNIT_TEST_LIST = "build/unittests.txt"
 DEFAULT_INTEGRATION_TEST_LIST = "build/integration_tests.txt"
 DEFAULT_LIBFUZZER_TEST_LIST = "build/libfuzzer_tests.txt"
-
+DEFAULT_PRETTY_PRINTER_TEST_LIST = "build/pretty_printer_tests.txt"
+SPLIT_UNITTESTS_LISTS = [
+    f"build/{test_group}_quarter_unittests.txt"
+    for test_group in ["first", "second", "third", "fourth"]
+]
+BENCHMARK_SUITE_TEST_LISTS = [
+    "build/repl_bm.txt",
+    "build/query_bm.txt",
+    "build/bsoncolumn_bm.txt",
+    "build/first_half_bm.txt",
+    "build/second_half_bm.txt",
+    "build/storage_bm.txt",
+    "build/sharding_bm.txt",
+    "build/sep_bm.txt",
+]
 # External files or executables, used as suite selectors, that are created during the build and
 # therefore might not be available when creating a test membership map.
-EXTERNAL_SUITE_SELECTORS = (DEFAULT_BENCHMARK_TEST_LIST, DEFAULT_UNIT_TEST_LIST,
-                            DEFAULT_INTEGRATION_TEST_LIST, DEFAULT_DBTEST_EXECUTABLE,
-                            DEFAULT_LIBFUZZER_TEST_LIST)
+EXTERNAL_SUITE_SELECTORS = (
+    DEFAULT_BENCHMARK_TEST_LIST,
+    DEFAULT_UNIT_TEST_LIST,
+    DEFAULT_INTEGRATION_TEST_LIST,
+    DEFAULT_DBTEST_EXECUTABLE,
+    DEFAULT_LIBFUZZER_TEST_LIST,
+    DEFAULT_PRETTY_PRINTER_TEST_LIST,
+    *SPLIT_UNITTESTS_LISTS,
+    *BENCHMARK_SUITE_TEST_LISTS,
+)
 
 # Where to look for logging and suite configuration files
 CONFIG_DIR = None
 LOGGER_DIR = None
+
+# Where to look for jstests existence
+JSTESTS_DIR = None
 
 # Generated logging config for the current invocation.
 LOGGING_CONFIG: dict = {}
@@ -580,8 +725,40 @@ USE_LEGACY_MULTIVERSION = True
 # Expansions file location
 # in CI, the expansions file is located in the ${workdir}, one dir up
 # from src, the checkout directory
-EXPANSIONS_FILE = "../expansions.yml" if 'CI' in os.environ else None
+EXPANSIONS_FILE = "../expansions.yml" if "CI" in os.environ else "expansions.yml"
 
 # Symbolizer secrets
 SYMBOLIZER_CLIENT_SECRET = None
 SYMBOLIZER_CLIENT_ID = None
+
+# Sanity check
+SANITY_CHECK = False
+
+# The images to build for an External System Under Test
+DOCKER_COMPOSE_BUILD_IMAGES = None
+
+# Where the `--dockerComposeBuildImages` is happening.
+DOCKER_COMPOSE_BUILD_ENV = "local"
+
+# Tag to use for images built & used for an External System Under Test
+DOCKER_COMPOSE_TAG = "development"
+
+# Whether or not this resmoke suite is running against an External System Under Test
+EXTERNAL_SUT = False
+
+# This will be set to True when:
+# (1) We are building images for an External SUT
+# (2) Running against an External SUT
+NOOP_MONGO_D_S_PROCESSES = False
+
+# If resmoke is running from within a `workload` container,
+# we may need to do additional setup to run the suite successfully.
+REQUIRES_WORKLOAD_CONTAINER_SETUP = False
+
+# Config fuzzer encryption options, this is only set when the fuzzer is run
+CONFIG_FUZZER_ENCRYPTION_OPTS = None
+
+# If resmoke is running on a build variant that specifies a mongo_mozjs_opts,
+# we need a way to provide the JS_GC_ZEAL setting provided as part of the mongo_mozjs_opts
+# exclusively to mongod/mongos.
+MOZJS_JS_GC_ZEAL = None

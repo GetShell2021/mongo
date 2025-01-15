@@ -8,8 +8,9 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
 
 // TODO SERVER-50144 Remove this and allow orphan checking.
 // This test calls removeShard which can leave docs in config.rangeDeletions in state "pending",
@@ -41,38 +42,17 @@ function convertShardToRS() {
         delete node.fullOptions.shardsvr;
     });
 
-    shardServer.restart(shardServer.nodes, {skipValidation: true});
+    shardServer.nodes.forEach(node => shardServer.restart(node, {skipValidation: true}));
     jsTest.log("Coversion shard -> RS took: " + (new Date() - start));
 }
 
 function convertRSToShard() {
     let start = new Date();
     jsTestLog("Converting replicaSet server to shardServer.");
-    shardServer.restart(shardServer.nodes, {shardsvr: "", skipValidation: true});
+    shardServer.nodes.forEach(node =>
+                                  shardServer.restart(node, {shardsvr: "", skipValidation: true}));
+
     jsTest.log("Coversion RS -> Shard took: " + (new Date() - start));
-}
-
-function removeShardAndWait() {
-    let start = new Date();
-    jsTestLog("Removing the shard from the cluster should succeed.");
-    const removeShardCmd = {removeShard: shardServer.getURL()};
-    const res = st.s.adminCommand(removeShardCmd);
-
-    assert.commandWorked(res);
-    assert(res.state === "started");
-
-    assert.soon(function() {
-        let res = st.s.adminCommand(removeShardCmd);
-        if (res.state === "completed") {
-            return true;
-        } else {
-            jsTestLog("Still waiting for shard removal to complete:");
-            printjson(res);
-            return false;
-        }
-    });
-
-    jsTestLog("Shard removal completed. took: " + (new Date() - start));
 }
 
 function testAddShard(cwwcOnShard, cwwcOnCluster, shouldSucceed, fixCWWCOnShard) {
@@ -123,7 +103,10 @@ function testAddShard(cwwcOnShard, cwwcOnCluster, shouldSucceed, fixCWWCOnShard)
     assert.commandWorked(admin.runCommand({addshard: shardServer.getURL()}));
 
     // Cleanup.
-    removeShardAndWait();
+    let start = new Date();
+    jsTestLog("Removing the shard from the cluster should succeed.");
+    removeShard(st, shardServer.getURL());
+    jsTestLog("Shard removal completed. took: " + (new Date() - start));
     convertShardToRS();
 }
 
@@ -164,4 +147,3 @@ for (var i = 0; i < cwwc.length; i++) {
 
 st.stop();
 shardServer.stopSet({skipValidation: true});
-})();

@@ -3,8 +3,7 @@
  * comment for more detailed explanations on the possible options. You can run this test to see how
  * it works. Feel free to add to the guide.
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 /**
  * Default Configuration
@@ -146,4 +145,3 @@
     });
     st.stop();
 }
-})();

@@ -29,11 +29,35 @@
 
 #include "mongo/s/collection_uuid_mismatch.h"
 
-#include "mongo/db/bson/dotted_path_support.h"
+#include <memory>
+#include <mutex>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/catalog/collection_uuid_mismatch_info.h"
+#include "mongo/db/client.h"
 #include "mongo/db/list_collections_gen.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 Status populateCollectionUUIDMismatch(OperationContext* opCtx,
@@ -49,27 +73,32 @@ Status populateCollectionUUIDMismatch(OperationContext* opCtx,
 
     // The listCollections command cannot be run in multi-document transactions, so run it using an
     // alternative client.
-    auto client = opCtx->getServiceContext()->makeClient("populateCollectionUUIDMismatch");
+    //
+    // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+    auto client = opCtx->getService()->makeClient("populateCollectionUUIDMismatch",
+                                                  Client::noSession(),
+                                                  ClientOperationKillableByStepdown{false});
     auto alternativeOpCtx = client->makeOperationContext();
     opCtx = alternativeOpCtx.get();
     AlternativeClientRegion acr{client};
 
-    auto swDbInfo = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, info->db());
+    auto swDbInfo = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, info->dbName());
     if (!swDbInfo.isOK()) {
         return swDbInfo.getStatus();
     }
 
     ListCollections listCollections;
-    listCollections.setDbName(info->db());
+    // Empty tenant id is acceptable here as command's tenant id will not be serialized to BSON.
+    listCollections.setDbName(info->dbName());
     listCollections.setFilter(BSON("info.uuid" << info->collectionUUID()));
 
-    auto response =
-        executeCommandAgainstDatabasePrimary(opCtx,
-                                             info->db(),
-                                             swDbInfo.getValue(),
-                                             listCollections.toBSON({}),
-                                             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                             Shard::RetryPolicy::kIdempotent);
+    auto response = executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
+        opCtx,
+        info->dbName(),
+        swDbInfo.getValue(),
+        listCollections.toBSON(),
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        Shard::RetryPolicy::kIdempotent);
     if (!response.swResponse.isOK()) {
         return response.swResponse.getStatus();
     }
@@ -81,7 +110,7 @@ Status populateCollectionUUIDMismatch(OperationContext* opCtx,
 
     if (auto actualCollectionElem = dotted_path_support::extractElementAtPath(
             response.swResponse.getValue().data, "cursor.firstBatch.0.name")) {
-        return {CollectionUUIDMismatchInfo{info->db(),
+        return {CollectionUUIDMismatchInfo{info->dbName(),
                                            info->collectionUUID(),
                                            info->expectedCollection(),
                                            actualCollectionElem.str()},

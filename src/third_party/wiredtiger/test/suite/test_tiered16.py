@@ -40,12 +40,12 @@ class test_tiered16(TieredConfigMixin, wttest.WiredTigerTestCase):
     def check_cache(self, cache_dir, expect1):
         got = sorted(list(os.listdir(cache_dir)))
         expect = sorted(expect1)
-        self.assertEquals(got, expect)
+        self.assertEqual(got, expect)
 
     def check_bucket(self, expect1):
         got = sorted(list(os.listdir(self.bucket)))
         expect = sorted(expect1)
-        self.assertEquals(got, expect)
+        self.assertEqual(got, expect)
 
     def test_remove_shared(self):
         uri_a = "table:tiereda"
@@ -54,6 +54,8 @@ class test_tiered16(TieredConfigMixin, wttest.WiredTigerTestCase):
         base_b = "tieredb-000000000"
         obj1file_b = base_b + "1.wtobj"
         obj2file_b = base_b + "2.wtobj"
+
+        uri_c = "table:tieredc"
 
         self.session.create(uri_a, "key_format=S,value_format=S")
         self.session.create(uri_b, "key_format=S,value_format=S")
@@ -78,15 +80,19 @@ class test_tiered16(TieredConfigMixin, wttest.WiredTigerTestCase):
             c["a"] = "a"
             c["b"] = "b"
             c.close()
-            self.session.checkpoint()
-            self.session.flush_tier(None)
+            c2 = self.session.open_cursor(uri_b)
+            c2["a"] = "a"
+            c2["b"] = "b"
+            c2.close()
+            # Use force to make sure the new objects are created.
+            self.session.checkpoint('flush_tier=(enabled,force=true)')
 
             c2 = self.session.open_cursor(uri_b)
             c2["c"] = "c"
             c2["d"] = "d"
             c2.close()
-            self.session.checkpoint()
-            self.session.flush_tier(None)
+            # Use force to make sure the new objects are created.
+            self.session.checkpoint('flush_tier=(enabled,force=true)')
 
             self.session.drop(uri_a, "remove_files=true,remove_shared=true")
 
@@ -102,5 +108,20 @@ class test_tiered16(TieredConfigMixin, wttest.WiredTigerTestCase):
             self.check_cache(cache_dir, [])
             self.check_bucket([])
 
-if __name__ == '__main__':
-    wttest.run
+        # For any scenario, we should be able to do drops after reopens.
+        self.session.create(uri_c, 'key_format=S,value_format=S')
+
+        # Insert a record
+        cursor = self.session.open_cursor(uri_c, None)
+        cursor["a"] = "a"
+        cursor.close()
+
+        self.session.checkpoint('flush_tier=(enabled,force=true)')
+        self.reopen_conn()
+        #self.conn.reconfigure('verbose=(tiered:5)')
+
+        cursor = self.session.open_cursor(uri_c, None)
+        cursor["a"] = "b"
+        cursor.close()
+
+        self.dropUntilSuccess(self.session, uri_c)

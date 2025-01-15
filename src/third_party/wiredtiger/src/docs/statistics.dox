@@ -79,15 +79,6 @@ logged:
 
 @snippet ex_all.c Statistics clear configuration
 
-The following example opens a statistics cursor on an open join cursor:
-
-@snippet ex_schema.c Statistics cursor join cursor
-
-The statistics gathered will be organized by reference cursors participating
-in the join (see WT_SESSION::join); the uri of each reference cursor appears
-as a prefix in the description field returned as a value by the statistics
-cursor.
-
 The following example opens a statistics cursor on an open WiredTiger session:
 
 @snippet ex_all.c Statistics cursor session
@@ -95,6 +86,11 @@ The following example opens a statistics cursor on an open WiredTiger session:
 A reset call on this cursor would reset the session statistics values to zero,
 with or without the statistics configuration \c clear being specified to the
 WT_SESSION::open_cursor method.
+
+The following example shows that the application can indicate columns
+that will not be needed:
+
+@snippet ex_all.c Statistics cursor ignore column
 
 @section statistics_log Statistics logging
 

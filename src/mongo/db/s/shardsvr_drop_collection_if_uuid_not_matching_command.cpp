@@ -27,13 +27,26 @@
  *    it in the license file.
  */
 
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/request_types/drop_collection_if_uuid_not_matching_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -41,8 +54,8 @@
 namespace mongo {
 namespace {
 
-class ShardsvrDropCollectionIfUUIDNotMatchingCommand final
-    : public TypedCommand<ShardsvrDropCollectionIfUUIDNotMatchingCommand> {
+class ShardsvrDropCollectionIfUUIDNotMatchingWithWriteConcernCommand final
+    : public TypedCommand<ShardsvrDropCollectionIfUUIDNotMatchingWithWriteConcernCommand> {
 public:
     bool skipApiVersionCheck() const override {
         /* Internal command (server to server) */
@@ -57,18 +70,22 @@ public:
         return "Internal command aimed to remove stale entries from the local collection catalog.";
     }
 
-    using Request = ShardsvrDropCollectionIfUUIDNotMatchingRequest;
+    using Request = ShardsvrDropCollectionIfUUIDNotMatchingWithWriteConcernRequest;
 
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
+
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
+
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             uassertStatusOK(dropCollectionIfUUIDNotMatching(
-                opCtx, ns(), request().getExpectedCollectionUUID()));
+                opCtx, ns(), request().getExpectedCollectionUUID(), true /* fromMigrate */));
         }
 
     private:
@@ -77,18 +94,19 @@ public:
         }
 
         bool supportsWriteConcern() const override {
-            return false;
+            return true;
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::dropCollection));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::dropCollection));
         }
     };
-} shardSvrDropCollectionIfUUIDNotMatching;
-
+};
+MONGO_REGISTER_COMMAND(ShardsvrDropCollectionIfUUIDNotMatchingWithWriteConcernCommand).forShard();
 }  // namespace
 }  // namespace mongo

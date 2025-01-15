@@ -6,6 +6,8 @@
  * See the file LICENSE for redistribution information.
  */
 
+#pragma once
+
 /*
  * Define the maximum number of tiers for convenience. We expect at most two initially. This can
  * change if more are needed. It is easier to have the array statically allocated initially than
@@ -25,28 +27,22 @@
 #define WT_TIERED_NAME_ONLY 0x04u
 #define WT_TIERED_NAME_PREFIX 0x08u
 #define WT_TIERED_NAME_SHARED 0x10u
-/* AUTOMATIC FLAG VALUE GENERATION STOP 32 */
-
-/* Flush tier flags */
-/* AUTOMATIC FLAG VALUE GENERATION START 0 */
-#define WT_FLUSH_TIER_FORCE 0x1u
-#define WT_FLUSH_TIER_OFF 0x2u
-#define WT_FLUSH_TIER_ON 0x4u
+#define WT_TIERED_NAME_SKIP_PREFIX 0x20u
 /* AUTOMATIC FLAG VALUE GENERATION STOP 32 */
 
 /*
  * The flush state is a simple counter we manipulate atomically.
  */
-#define WT_FLUSH_STATE_DONE(state) ((state) == 0)
+#define WT_FLUSH_STATE_DONE(state) (__wt_atomic_loadv32(&(state)) == 0)
 
 /*
  * Different types of work units for tiered trees.
  */
 /* AUTOMATIC FLAG VALUE GENERATION START 0 */
-#define WT_TIERED_WORK_DROP_LOCAL 0x1u   /* Drop object from local storage. */
-#define WT_TIERED_WORK_DROP_SHARED 0x2u  /* Drop object from tier. */
-#define WT_TIERED_WORK_FLUSH 0x4u        /* Flush object to tier. */
-#define WT_TIERED_WORK_FLUSH_FINISH 0x8u /* Perform flush finish on object. */
+#define WT_TIERED_WORK_FLUSH 0x1u         /* Flush object to tier. */
+#define WT_TIERED_WORK_FLUSH_FINISH 0x2u  /* Perform flush finish on object. */
+#define WT_TIERED_WORK_REMOVE_LOCAL 0x4u  /* Remove object from local storage. */
+#define WT_TIERED_WORK_REMOVE_SHARED 0x8u /* Remove object from tier. */
 /* AUTOMATIC FLAG VALUE GENERATION STOP 32 */
 
 /*

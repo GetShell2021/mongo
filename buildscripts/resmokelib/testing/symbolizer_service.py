@@ -1,4 +1,5 @@
 """Symbolize stacktraces inside test logs."""
+
 from __future__ import annotations
 
 import os
@@ -7,10 +8,10 @@ import sys
 import time
 from datetime import timedelta
 from threading import Lock
-
-from typing import List, Optional, NamedTuple
+from typing import List, NamedTuple, Optional, Set
 
 from buildscripts.resmokelib import config as _config
+from buildscripts.resmokelib.flags import HANG_ANALYZER_CALLED
 from buildscripts.resmokelib.testing.testcases.interface import TestCase
 
 # This lock prevents different resmoke jobs from symbolizing stacktraces concurrently,
@@ -19,6 +20,7 @@ _lock = Lock()
 
 STACKTRACE_FILE_EXTENSION = ".stacktrace"
 SYMBOLIZE_RETRY_TIMEOUT_SECS = timedelta(minutes=4).total_seconds()
+PROCESSED_FILES_LIST_FILE_PATH = "symbolizer-processed-files.txt"  # noqa
 
 
 class ResmokeSymbolizerConfig(NamedTuple):
@@ -33,6 +35,7 @@ class ResmokeSymbolizerConfig(NamedTuple):
     evg_task_id: Optional[str]
     client_id: Optional[str]
     client_secret: Optional[str]
+    skip_symbolization: bool
 
     @classmethod
     def from_resmoke_config(cls) -> ResmokeSymbolizerConfig:
@@ -45,6 +48,7 @@ class ResmokeSymbolizerConfig(NamedTuple):
             evg_task_id=_config.EVERGREEN_TASK_ID,
             client_id=_config.SYMBOLIZER_CLIENT_ID,
             client_secret=_config.SYMBOLIZER_CLIENT_SECRET,
+            skip_symbolization=_config.SKIP_SYMBOLIZATION,
         )
 
     @staticmethod
@@ -54,25 +58,44 @@ class ResmokeSymbolizerConfig(NamedTuple):
 
         :return: True if on Windows
         """
-        return sys.platform == "win32" or sys.platform == "cygwin"
+        return sys.platform in ("win32", "cygwin")
+
+    @staticmethod
+    def is_macos() -> bool:
+        """
+        Whether we are on MacOS.
+
+        :return: True if on MacOS.
+        """
+        return sys.platform == "darwin"
 
 
 class ResmokeSymbolizer:
     """Symbolize stacktraces inside test logs."""
 
-    def __init__(self, config: Optional[ResmokeSymbolizerConfig] = None,
-                 symbolizer_service: Optional[SymbolizerService] = None,
-                 file_service: Optional[FileService] = None):
+    def __init__(
+        self,
+        config: Optional[ResmokeSymbolizerConfig] = None,
+        symbolizer_service: Optional[SymbolizerService] = None,
+        file_service: Optional[FileService] = None,
+    ):
         """Initialize instance."""
 
-        self.config = config if config is not None else ResmokeSymbolizerConfig.from_resmoke_config(
+        self.config = (
+            config if config is not None else ResmokeSymbolizerConfig.from_resmoke_config()
         )
-        self.symbolizer_service = symbolizer_service if symbolizer_service is not None else SymbolizerService(
+        self.symbolizer_service = (
+            symbolizer_service if symbolizer_service is not None else SymbolizerService()
         )
-        self.file_service = file_service if file_service is not None else FileService()
+        self.file_service = (
+            file_service
+            if file_service is not None
+            else FileService(PROCESSED_FILES_LIST_FILE_PATH)
+        )
 
-    def symbolize_test_logs(self, test: TestCase,
-                            symbolize_retry_timeout: float = SYMBOLIZE_RETRY_TIMEOUT_SECS) -> None:
+    def symbolize_test_logs(
+        self, test: TestCase, symbolize_retry_timeout: float = SYMBOLIZE_RETRY_TIMEOUT_SECS
+    ) -> None:
         """
         Perform all necessary actions to symbolize and write output to test logs.
 
@@ -86,31 +109,40 @@ class ResmokeSymbolizer:
         if dbpath is None:
             return
 
-        test.logger.info("Looking for stacktrace files in '%s'", dbpath)
-        files = self.collect_stacktrace_files(dbpath)
-        if not files:
-            test.logger.info("No failure logs/stacktrace files found, skipping symbolization")
-            return
-
         with _lock:
-            test.logger.info("Found stacktrace files. \nBEGIN Symbolization")
-            test.logger.info("Stacktrace files: %s", files)
+            test.logger.info("Looking for stacktrace files in '%s'", dbpath)
+            files = self.collect_stacktrace_files(dbpath)
+            if not files:
+                test.logger.info("No failure logs/stacktrace files found, skipping symbolization")
+                return
+
+            test.logger.info("Found stacktrace files: %s", files)
+            # To avoid performing the same actions on these files again, we mark them as processed
+            self.file_service.add_to_processed_files(files)
+            self.file_service.write_processed_files(PROCESSED_FILES_LIST_FILE_PATH)
+
+            if test.return_code == 0:
+                test.logger.info("Test succeeded, skipping symbolization")
+                return
+
+            test.logger.info("Symbolization process started.")
+            test.logger.info("\nBEGIN Symbolization")
 
             start_time = time.perf_counter()
             for file_path in files:
                 test.logger.info("Working on: %s", file_path)
-                symbolizer_script_timeout = int(symbolize_retry_timeout -
-                                                (time.perf_counter() - start_time))
+                symbolizer_script_timeout = int(
+                    symbolize_retry_timeout - (time.perf_counter() - start_time)
+                )
                 symbolized_out = self.symbolizer_service.run_symbolizer_script(
-                    file_path, symbolizer_script_timeout)
+                    file_path, symbolizer_script_timeout
+                )
                 test.logger.info(symbolized_out)
                 if time.perf_counter() - start_time > symbolize_retry_timeout:
                     break
 
-            # To avoid performing the same actions on these files again, we remove them
-            self.file_service.remove_all(files)
-
-            test.logger.info("\nEND Symbolization \nSymbolization process completed. ")
+            test.logger.info("\nEND Symbolization")
+            test.logger.info("Symbolization process completed.")
 
     def should_symbolize(self, test: TestCase) -> bool:
         """
@@ -119,17 +151,32 @@ class ResmokeSymbolizer:
         :param test: resmoke test case
         :return: whether we should symbolize
         """
+        if self.config.skip_symbolization:
+            test.logger.info("Configured to skip symbolization, skipping symbolization")
+            return False
+
         if self.config.evg_task_id is None:
             test.logger.info("Not running in Evergreen, skipping symbolization")
             return False
 
         if self.config.client_id is None or self.config.client_secret is None:
-            test.logger.info("Symbolizer client secret and/or client ID are absent,"
-                             " skipping symbolization")
+            test.logger.info(
+                "Symbolizer client secret and/or client ID are absent," " skipping symbolization"
+            )
             return False
 
         if self.config.is_windows():
             test.logger.info("Running on Windows, skipping symbolization")
+            return False
+
+        if self.config.is_macos():
+            test.logger.info("Running on MacOS, skipping symbolization")
+            return False
+
+        if HANG_ANALYZER_CALLED.is_set():
+            test.logger.info(
+                "Hang analyzer has been called, skipping symbolization to meet timeout constraints."
+            )
             return False
 
         return True
@@ -162,14 +209,60 @@ class ResmokeSymbolizer:
 
         files = self.file_service.find_all_children_recursively(dir_path)
         files = self.file_service.filter_by_extension(files, STACKTRACE_FILE_EXTENSION)
-        self.file_service.remove_empty(files)
+        files = self.file_service.filter_out_empty_files(files)
         files = self.file_service.filter_out_non_files(files)
+        files = self.file_service.filter_out_already_processed_files(files)
 
         return files
 
 
 class FileService:
     """A service for working with files."""
+
+    def __init__(self, processed_files_list_path: str = PROCESSED_FILES_LIST_FILE_PATH):
+        """Initialize FileService instance."""
+        self._processed_files = self.load_processed_files(processed_files_list_path)
+
+    @staticmethod
+    def load_processed_files(file_path: str) -> Set[str]:
+        """
+        Load processed files info from a file.
+
+        :param: path to a file where we store processed files info.
+        """
+        if os.path.exists(file_path):
+            with open(file_path, "r") as file:
+                return {line for line in set(file.readlines()) if line}
+        return set()
+
+    def add_to_processed_files(self, files: List[str]) -> None:
+        """
+        Bulk add to collection of processed files.
+
+        :param files: files to add to processed files collection
+        :return: None
+        """
+        for file in files:
+            self._processed_files.add(file)
+
+    def write_processed_files(self, file_path: str) -> None:
+        """
+        Write processed files info to a file.
+
+        :param file_path: path to a file where we store processed files info
+        :return: None
+        """
+        with open(file_path, "w") as file:
+            file.write("\n".join(self._processed_files))
+
+    def is_processed(self, file: str) -> bool:
+        """
+        Check if file is already processed or not.
+
+        :param file: file path
+        :return: whether the file is already processed or not
+        """
+        return file in self._processed_files
 
     @staticmethod
     def find_all_children_recursively(dir_path: str) -> List[str]:
@@ -205,25 +298,31 @@ class FileService:
         """
         return [f for f in files if os.path.isfile(f)]
 
-    @staticmethod
-    def remove_empty(files: List[str]) -> None:
+    def filter_out_already_processed_files(self, files: List[str]):
         """
-        Delete files that are empty.
+        Filter out already processed files.
+
+        :param files: list of file paths
+        :return: non-processed files
+        """
+        return [f for f in files if not self.is_processed(f)]
+
+    @staticmethod
+    def filter_out_empty_files(files: List[str]) -> List[str]:
+        """
+        Filter our files that are empty.
 
         :param files: list of paths
+        :return: Non-empty files
         """
-        for file in [f for f in files if os.stat(f).st_size == 0]:
-            os.remove(file)
-
-    @staticmethod
-    def remove_all(files: List[str]) -> None:
-        """
-        Delete all files.
-
-        :param files: list of paths
-        """
+        filtered_files = []
         for file in files:
-            os.remove(file)
+            try:
+                if not os.stat(file).st_size == 0:
+                    filtered_files.append(file)
+            except FileNotFoundError:
+                pass
+        return filtered_files
 
     @staticmethod
     def check_path_exists(path: str) -> bool:
@@ -250,8 +349,8 @@ class SymbolizerService:
         """
 
         symbolizer_args = [
-            "python",
-            "buildscripts/mongosymb.py",
+            "db-contrib-tool",
+            "symbolize",
             "--client-secret",
             _config.SYMBOLIZER_CLIENT_SECRET,
             "--client-id",
@@ -261,9 +360,13 @@ class SymbolizerService:
         ]
 
         with open(full_file_path) as file_obj:
-            symbolizer_process = subprocess.Popen(args=symbolizer_args, close_fds=True,
-                                                  stdin=file_obj, stdout=subprocess.PIPE,
-                                                  stderr=subprocess.STDOUT)
+            symbolizer_process = subprocess.Popen(
+                args=symbolizer_args,
+                close_fds=True,
+                stdin=file_obj,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
 
         try:
             output, _ = symbolizer_process.communicate(timeout=retry_timeout_secs)

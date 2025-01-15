@@ -28,16 +28,26 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/catalog/drop_database.h"
-#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/s/database_sharding_state.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -69,14 +79,14 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
             const auto& dbName = request().getDbName();
 
             try {
-                uassertStatusOK(dropDatabase(opCtx, dbName.toString()));
+                uassertStatusOK(dropDatabase(opCtx, dbName));
             } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
                 LOGV2_DEBUG(5281101,
                             1,
@@ -88,7 +98,7 @@ public:
 
     private:
         NamespaceString ns() const override {
-            return {request().getDbName(), ""};
+            return NamespaceString(request().getDbName());
         }
 
         bool supportsWriteConcern() const override {
@@ -99,11 +109,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-} sharsvrdDropCollectionParticipantCommand;
+};
+MONGO_REGISTER_COMMAND(ShardsvrDropDatabaseParticipantCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

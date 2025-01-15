@@ -29,19 +29,19 @@
 
 #pragma once
 
-#include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
 
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/storage/key_format.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/test_harness_helper.h"
 
 namespace mongo {
-
-class RecordStore;
-class RecoveryUnit;
 
 class RecordStoreHarnessHelper : public HarnessHelper {
 public:
@@ -60,6 +60,20 @@ public:
     virtual std::unique_ptr<RecordStore> newOplogRecordStore() = 0;
 
     virtual KVEngine* getEngine() = 0;
+
+    /**
+     * Advances the stable timestamp of the engine.
+     */
+    void advanceStableTimestamp(Timestamp newTimestamp) {
+        auto engine = getEngine();
+        // Disable the callback for oldest active transaction as it blocks the timestamps from
+        // advancing.
+        engine->setOldestActiveTransactionTimestampCallback(
+            StorageEngine::OldestActiveTransactionTimestampCallback{});
+        engine->setInitialDataTimestamp(newTimestamp);
+        engine->setStableTimestamp(newTimestamp, true);
+        engine->checkpoint();
+    }
 };
 
 void registerRecordStoreHarnessHelperFactory(

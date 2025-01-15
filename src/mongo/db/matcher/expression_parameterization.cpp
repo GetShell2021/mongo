@@ -31,10 +31,17 @@
 
 #include <cmath>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+
 namespace mongo {
 void MatchExpressionParameterizationVisitor::visitBitTestExpression(BitTestMatchExpression* expr) {
-    expr->setBitPositionsParamId(_context->nextInputParamId(expr));
-    expr->setBitMaskParamId(_context->nextInputParamId(expr));
+    if (_context->availableParamIds(2)) {
+        expr->setBitPositionsParamId(_context->nextInputParamId(expr));
+        expr->setBitMaskParamId(_context->nextInputParamId(expr));
+    }
 }
 
 void MatchExpressionParameterizationVisitor::visit(BitsAllClearMatchExpression* expr) {
@@ -74,13 +81,17 @@ void MatchExpressionParameterizationVisitor::visit(LTMatchExpression* expr) {
 }
 
 void MatchExpressionParameterizationVisitor::visit(ModMatchExpression* expr) {
-    expr->setDivisorInputParamId(_context->nextInputParamId(expr));
-    expr->setRemainderInputParamId(_context->nextInputParamId(expr));
+    if (_context->availableParamIds(2)) {
+        expr->setDivisorInputParamId(_context->nextInputParamId(expr));
+        expr->setRemainderInputParamId(_context->nextInputParamId(expr));
+    }
 }
 
 void MatchExpressionParameterizationVisitor::visit(RegexMatchExpression* expr) {
-    expr->setSourceRegexInputParamId(_context->nextInputParamId(expr));
-    expr->setCompiledRegexInputParamId(_context->nextInputParamId(expr));
+    if (_context->availableParamIds(2)) {
+        expr->setSourceRegexInputParamId(_context->nextInputParamId(expr));
+        expr->setCompiledRegexInputParamId(_context->nextInputParamId(expr));
+    }
 }
 
 void MatchExpressionParameterizationVisitor::visit(SizeMatchExpression* expr) {
@@ -102,32 +113,61 @@ void MatchExpressionParameterizationVisitor::visitComparisonMatchExpression(
         case BSONType::DBRef:
         case BSONType::MaxKey:
         case BSONType::Undefined:
-            // ignore such values
+        case BSONType::Object:
+        case BSONType::Bool:
             break;
 
         case BSONType::String:
-        case BSONType::Object:
+            if (!expr->getData().str().empty()) {
+                expr->setInputParamId(_context->nextReusableInputParamId(expr));
+            }
+            break;
         case BSONType::BinData:
         case BSONType::jstOID:
-        case BSONType::Bool:
         case BSONType::RegEx:
-        case BSONType::Date:
         case BSONType::Code:
         case BSONType::Symbol:
         case BSONType::CodeWScope:
-        case BSONType::NumberInt:
-        case BSONType::bsonTimestamp:
-        case BSONType::NumberLong:
-            expr->setInputParamId(_context->nextInputParamId(expr));
+            expr->setInputParamId(_context->nextReusableInputParamId(expr));
             break;
-        case BSONType::NumberDouble:
-            if (!std::isnan(expr->getData().numberDouble())) {
-                expr->setInputParamId(_context->nextInputParamId(expr));
+        case BSONType::bsonTimestamp:
+            if (expr->getData().timestamp() != Timestamp::max() &&
+                expr->getData().timestamp() != Timestamp::min()) {
+                expr->setInputParamId(_context->nextReusableInputParamId(expr));
             }
             break;
+        case BSONType::Date:
+            if (expr->getData().Date() != Date_t::max() &&
+                expr->getData().Date() != Date_t::min()) {
+                expr->setInputParamId(_context->nextReusableInputParamId(expr));
+            }
+            break;
+        case BSONType::NumberInt:
+            if (expr->getData().numberInt() != std::numeric_limits<int>::max() &&
+                expr->getData().numberInt() != std::numeric_limits<int>::min()) {
+                expr->setInputParamId(_context->nextReusableInputParamId(expr));
+            }
+            break;
+        case BSONType::NumberLong:
+            if (expr->getData().numberLong() != std::numeric_limits<long long>::max() &&
+                expr->getData().numberLong() != std::numeric_limits<long long>::min()) {
+                expr->setInputParamId(_context->nextReusableInputParamId(expr));
+            }
+            break;
+        case BSONType::NumberDouble: {
+            auto doubleVal = expr->getData().numberDouble();
+            if (!std::isnan(doubleVal) && doubleVal != std::numeric_limits<double>::max() &&
+                doubleVal != std::numeric_limits<double>::min() &&
+                doubleVal != std::numeric_limits<double>::infinity() &&
+                doubleVal != -std::numeric_limits<double>::infinity()) {
+                expr->setInputParamId(_context->nextReusableInputParamId(expr));
+            }
+            break;
+        }
         case BSONType::NumberDecimal:
-            if (!expr->getData().numberDecimal().isNaN()) {
-                expr->setInputParamId(_context->nextInputParamId(expr));
+            if (!expr->getData().numberDecimal().isNaN() &&
+                !expr->getData().numberDecimal().isInfinite()) {
+                expr->setInputParamId(_context->nextReusableInputParamId(expr));
             }
             break;
     }
@@ -139,21 +179,21 @@ void MatchExpressionParameterizationVisitor::visit(InMatchExpression* expr) {
         return;
     }
 
-    for (auto&& equality : expr->getEqualities()) {
-        switch (equality.type()) {
-            case BSONType::jstNULL:
-            case BSONType::Array:
-                // We don't set inputParamId if a InMatchExpression contains one of the values
-                // above.
-                return;
-            case BSONType::Undefined:
-                tasserted(6142000, "Unexpected type in $in expression");
-            default:
-                break;
-        };
+    // We don't set inputParamId if there's just one element because it could end up with a single
+    // interval index bound that may be eligible for fast COUNT_SCAN plan. However, a
+    // multiple-element $in query has more than one (point) intervals for the index bounds, which is
+    // ineligible for COUNT_SCAN. This is to make sure that $in queries with multiple elements will
+    // not share the same query shape with any other single-element $in query.
+    if (expr->equalitiesHasSingleElement()) {
+        return;
     }
 
-    expr->setInputParamId(_context->nextInputParamId(expr));
+    if (expr->hasNull() || expr->hasArray() || expr->hasObject()) {
+        // We don't set inputParamId if an InMatchExpression contains null, arrays, or objects.
+        return;
+    }
+
+    expr->setInputParamId(_context->nextReusableInputParamId(expr));
 }
 
 void MatchExpressionParameterizationVisitor::visit(TypeMatchExpression* expr) {

@@ -8,11 +8,9 @@
  * @tags: [requires_fcv_53]
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 var collName = "test.coll";
 var counter = 0;
@@ -32,7 +30,7 @@ var rst = new ReplSetTest({
     useBridge: true
 });
 var nodes = rst.startSet({setParameter: {allowMultipleArbiters: true}});
-rst.initiate();
+rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 // The default WC is majority and stopServerReplication could prevent satisfying any majority
 // writes.
@@ -142,4 +140,3 @@ rst.awaitSecondaryNodes();
 rst.checkReplicatedDataHashes();
 rst.checkOplogs();
 rst.stopSet();
-}());

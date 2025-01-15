@@ -4,15 +4,15 @@
  * accepted. However, hello requests return a ShutdownInProgress error, so that clients can
  * begin re-routing operations.
  * @tags: [
- *   live_record_incompatible,
+ *   # This test requires shutting down mongos alone.
+ *   # TODO (SERVER-88401): adapt this test for embedded router or create a new one supporting it.
+ *   embedded_router_incompatible,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/parallel_shell_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: [{nodes: 1}], mongos: 1});
 const mongos = st.s;
@@ -124,15 +124,10 @@ let pauseWhileKillingOperationsFailPoint =
 quiesceModeFailPoint.off();
 
 // This throws because the configureFailPoint command is killed by the shutdown.
-try {
-    pauseWhileKillingOperationsFailPoint.wait();
-} catch (e) {
-    if (e.code === ErrorCodes.InterruptedAtShutdown) {
-        jsTestLog(
-            "Ignoring InterruptedAtShutdown error because configureFailPoint is killed by shutdown");
-    } else {
-        throw e;
-    }
+if (!pauseWhileKillingOperationsFailPoint.wait(
+        {expectedErrorCodes: [ErrorCodes.InterruptedAtShutdown]})) {
+    jsTestLog(
+        "Ignoring InterruptedAtShutdown error because `waitForFailPoint` is killed by shutdown");
 }
 
 jsTestLog("Operations fail with a shutdown error and append the topologyVersion.");
@@ -143,4 +138,3 @@ checkTopologyVersion(assert.commandFailedWithCode(mongosDB.runCommand({find: col
 st.restartMongos(0);
 
 st.stop();
-})();

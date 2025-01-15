@@ -36,6 +36,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/mutex.h"
 
@@ -54,9 +55,9 @@ public:
     LocalOplogInfo& operator=(const LocalOplogInfo&) = delete;
     LocalOplogInfo() = default;
 
-    const CollectionPtr& getCollection() const;
-    void setCollection(const CollectionPtr& oplog);
-    void resetCollection();
+    RecordStore* getRecordStore() const;
+    void setRecordStore(RecordStore* rs);
+    void resetRecordStore();
 
     /**
      * Sets the global Timestamp to be 'newTime'.
@@ -70,17 +71,14 @@ public:
     std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count);
 
 private:
-    // Name of the oplog collection.
-    NamespaceString _oplogName;
-
-    // The "oplog" pointer is always valid (or null) because an operation must take the global
-    // exclusive lock to set the pointer to null when the Collection instance is destroyed. See
-    // "oplogCheckCloseDatabase".
-    CollectionPtr _oplog;
+    // The "oplog" record store pointer is always valid (or null) because an operation must take
+    // the global exclusive lock to set the pointer to null when the RecordStore instance is
+    // destroyed. See "oplogCheckCloseDatabase".
+    RecordStore* _rs = nullptr;
 
     // Synchronizes the section where a new Timestamp is generated and when it is registered in the
     // storage engine.
-    mutable Mutex _newOpMutex = MONGO_MAKE_LATCH("LocaloplogInfo::_newOpMutex");
+    mutable stdx::mutex _newOpMutex;
 };
 
 }  // namespace mongo

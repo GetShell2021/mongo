@@ -1,5 +1,7 @@
 // Test changing the --sslMode and --clusterAuthMode parameters using setParameter
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var SERVER_CERT = "jstests/libs/server.pem";
 var CA_CERT = "jstests/libs/ca.pem";
 
@@ -67,7 +69,7 @@ function testTransportTransitionCluster(scheme, oldMode, newMode) {
     rst.awaitReplication();
 
     print(`=== Switching ${scheme} from ${oldMode} to ${newMode[scheme]} for all nodes in cluster`);
-    for (n of rst.nodes) {
+    for (let n of rst.nodes) {
         let adminDB = n.getDB("admin");
         assert.commandWorked(adminDB.runCommand({"setParameter": 1, [scheme]: newMode[scheme]}));
     }

@@ -30,9 +30,11 @@
 #pragma once
 
 #include <boost/filesystem.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
 #include <string>
 
-#include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/util/uuid.h"
@@ -53,13 +55,9 @@ namespace mongo {
  */
 class BackupBlock final {
 public:
-    using IdentToNamespaceAndUUIDMap =
-        stdx::unordered_map<std::string, std::pair<NamespaceString, UUID>>;
-
-    explicit BackupBlock(OperationContext* opCtx,
+    explicit BackupBlock(boost::optional<NamespaceString> nss,
+                         boost::optional<UUID> uuid,
                          std::string filePath,
-                         const IdentToNamespaceAndUUIDMap& identToNamespaceAndUUIDMap,
-                         boost::optional<Timestamp> checkpointTimestamp,
                          std::uint64_t offset = 0,
                          std::uint64_t length = 0,
                          std::uint64_t fileSize = 0);
@@ -67,11 +65,11 @@ public:
     ~BackupBlock() = default;
 
     std::string filePath() const {
-        return _filePath;
+        return _filePath.string();
     }
 
-    std::string ns() const {
-        return _nss.toString();
+    boost::optional<NamespaceString> ns() const {
+        return _nss;
     }
 
     std::uint64_t offset() const {
@@ -96,27 +94,12 @@ public:
     bool isRequired() const;
 
 private:
-    /**
-     * Sets '_nss' and '_uuid' that is representative of the ident at the checkpoint timestamp for:
-     * - collections
-     * - indexes, to the NSS/UUID of their respective collection
-     *
-     * The 'checkpointTimestamp' will be boost::none if the backup is being taken on a standalone
-     * node.
-     * A null opCtx is ignored. A null opCtx is exercised by FCBIS unit tests.
-     */
-    void _initialize(OperationContext* opCtx,
-                     const IdentToNamespaceAndUUIDMap& identToNamespaceAndUUIDMap,
-                     boost::optional<Timestamp> checkpointTimestamp);
-    void _setNamespaceString(const NamespaceString& nss);
-
-    const std::string _filePath;
+    const boost::filesystem::path _filePath;
     const std::uint64_t _offset;
     const std::uint64_t _length;
     const std::uint64_t _fileSize;
 
-    std::string _filenameStem;
-    NamespaceString _nss;
+    boost::optional<NamespaceString> _nss;
     boost::optional<UUID> _uuid;
 };
 }  // namespace mongo

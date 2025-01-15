@@ -27,13 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
 
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/logical_session_id_helpers.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/document_source_list_local_sessions.h"
 #include "mongo/db/pipeline/document_source_list_sessions_gen.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -64,7 +81,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceListLocalSessions::createFrom
         ErrorCodes::InvalidNamespace,
         str::stream() << kStageName
                       << " must be run against the database with {aggregate: 1}, not a collection",
-        pExpCtx->ns.isCollectionlessAggregateNS());
+        pExpCtx->getNamespaceString().isCollectionlessAggregateNS());
 
     return new DocumentSourceListLocalSessions(pExpCtx, listSessionsParseSpec(kStageName, spec));
 }
@@ -72,13 +89,13 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceListLocalSessions::createFrom
 DocumentSourceListLocalSessions::DocumentSourceListLocalSessions(
     const boost::intrusive_ptr<ExpressionContext>& pExpCtx, const ListSessionsSpec& spec)
     : DocumentSource(kStageName, pExpCtx), _spec(spec) {
-    const auto& opCtx = pExpCtx->opCtx;
+    const auto& opCtx = pExpCtx->getOperationContext();
     _cache = LogicalSessionCache::get(opCtx);
     if (_spec.getAllUsers()) {
         invariant(!_spec.getUsers() || _spec.getUsers()->empty());
         _ids = _cache->listIds();
     } else {
-        _ids = _cache->listIds(listSessionsUsersToDigests(_spec.getUsers().get()));
+        _ids = _cache->listIds(listSessionsUsersToDigests(_spec.getUsers().value()));
     }
 }
 
@@ -87,7 +104,7 @@ ListSessionsUser getUserNameForLoggedInUser(const OperationContext* opCtx) {
     auto* client = opCtx->getClient();
 
     ListSessionsUser user;
-    if (AuthorizationManager::get(client->getServiceContext())->isAuthEnabled()) {
+    if (AuthorizationManager::get(client->getService())->isAuthEnabled()) {
         const auto& userName = AuthorizationSession::get(client)->getAuthenticatedUserName();
         uassert(ErrorCodes::Unauthorized, "There is no user authenticated", userName);
         user.setUser(userName->getUser());
@@ -112,7 +129,8 @@ std::vector<mongo::SHA256Block> mongo::listSessionsUsersToDigests(
     return ret;
 }
 
-mongo::PrivilegeVector mongo::listSessionsRequiredPrivileges(const ListSessionsSpec& spec) {
+mongo::PrivilegeVector mongo::listSessionsRequiredPrivileges(
+    const ListSessionsSpec& spec, const boost::optional<TenantId>& tenantId) {
     const auto needsPrivs = ([spec]() {
         if (spec.getAllUsers()) {
             return true;
@@ -122,13 +140,13 @@ mongo::PrivilegeVector mongo::listSessionsRequiredPrivileges(const ListSessionsS
 
         const auto& myName =
             getUserNameForLoggedInUser(Client::getCurrent()->getOperationContext());
-        const auto& users = spec.getUsers().get();
+        const auto& users = spec.getUsers().value();
         return !std::all_of(
             users.cbegin(), users.cend(), [myName](const auto& name) { return myName == name; });
     })();
 
     if (needsPrivs) {
-        return {Privilege(ResourcePattern::forClusterResource(), ActionType::listSessions)};
+        return {Privilege(ResourcePattern::forClusterResource(tenantId), ActionType::listSessions)};
     } else {
         return PrivilegeVector();
     }
@@ -141,7 +159,7 @@ mongo::ListSessionsSpec mongo::listSessionsParseSpec(StringData stageName,
                           << typeName(spec.type()),
             spec.type() == BSONType::Object);
 
-    IDLParserErrorContext ctx(stageName);
+    IDLParserContext ctx(stageName);
     auto ret = ListSessionsSpec::parse(ctx, spec.Obj());
 
     uassert(ErrorCodes::UnsupportedFormat,
@@ -154,7 +172,7 @@ mongo::ListSessionsSpec mongo::listSessionsParseSpec(StringData stageName,
         31106,
         str::stream() << "The " << DocumentSourceListLocalSessions::kStageName
                       << " stage is not allowed in this context :: missing an AuthorizationManager",
-        AuthorizationManager::get(Client::getCurrent()->getServiceContext()));
+        AuthorizationManager::get(Client::getCurrent()->getService()));
     uassert(
         31111,
         str::stream() << "The " << DocumentSourceListLocalSessions::kStageName

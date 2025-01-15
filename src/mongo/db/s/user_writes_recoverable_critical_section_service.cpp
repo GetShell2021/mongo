@@ -28,37 +28,48 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <utility>
 
-#include "mongo/db/s/user_writes_recoverable_critical_section_service.h"
-
-#include "mongo/db/db_raii.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/global_user_write_block_state.h"
 #include "mongo/db/s/user_writes_critical_section_document_gen.h"
+#include "mongo/db/s/user_writes_recoverable_critical_section_service.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/rpc/unique_message.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 
 namespace mongo {
-
-namespace user_writes_recoverable_critical_section_util {
-
-bool inRecoveryMode(OperationContext* opCtx) {
-    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    if (!replCoord->isReplEnabled()) {
-        return false;
-    }
-
-    const auto memberState = replCoord->getMemberState();
-    return memberState.startup2() || memberState.rollback();
-}
-
-}  // namespace user_writes_recoverable_critical_section_util
 
 namespace {
 MONGO_FAIL_POINT_DEFINE(skipRecoverUserWriteCriticalSections);
@@ -70,7 +81,8 @@ BSONObj findRecoverableCriticalSectionDoc(OperationContext* opCtx, const Namespa
     DBDirectClient dbClient(opCtx);
 
     const auto queryNss =
-        BSON(UserWriteBlockingCriticalSectionDocument::kNssFieldName << nss.toString());
+        BSON(UserWriteBlockingCriticalSectionDocument::kNssFieldName
+             << NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
     FindCommandRequest findRequest{NamespaceString::kUserWritesCriticalSectionsNamespace};
     findRequest.setFilter(queryNss);
     return dbClient.findOne(std::move(findRequest));
@@ -83,7 +95,8 @@ void setBlockUserWritesDocumentField(OperationContext* opCtx,
         NamespaceString::kUserWritesCriticalSectionsNamespace);
     store.update(
         opCtx,
-        BSON(UserWriteBlockingCriticalSectionDocument::kNssFieldName << nss.toString()),
+        BSON(UserWriteBlockingCriticalSectionDocument::kNssFieldName
+             << NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault())),
         BSON("$set" << BSON(UserWriteBlockingCriticalSectionDocument::kBlockUserWritesFieldName
                             << blockUserWrites)),
         ShardingCatalogClient::kLocalWriteConcern);
@@ -96,12 +109,12 @@ void acquireRecoverableCriticalSection(OperationContext* opCtx,
     LOGV2_DEBUG(6351900,
                 3,
                 "Acquiring user writes recoverable critical section",
-                "namespace"_attr = nss,
+                logAttrs(nss),
                 "blockShardedDDL"_attr = blockShardedDDL,
                 "blockUserWrites"_attr = blockUserWrites);
 
     invariant(nss == UserWritesRecoverableCriticalSectionService::kGlobalUserWritesNamespace);
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
 
     {
         // If we intend to start blocking user writes, take the GlobalLock in MODE_X in order to
@@ -111,7 +124,7 @@ void acquireRecoverableCriticalSection(OperationContext* opCtx,
         const auto bsonObj = findRecoverableCriticalSectionDoc(opCtx, nss);
         if (!bsonObj.isEmpty()) {
             const auto collCSDoc = UserWriteBlockingCriticalSectionDocument::parse(
-                IDLParserErrorContext("AcquireUserWritesCS"), bsonObj);
+                IDLParserContext("AcquireUserWritesCS"), bsonObj);
 
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << "Cannot acquire user writes critical section with different "
@@ -130,7 +143,10 @@ void acquireRecoverableCriticalSection(OperationContext* opCtx,
             LOGV2_DEBUG(6351914,
                         3,
                         "The user writes recoverable critical section was already acquired",
-                        "namespace"_attr = nss);
+                        logAttrs(nss));
+
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+
             return;
         }
 
@@ -148,14 +164,14 @@ void acquireRecoverableCriticalSection(OperationContext* opCtx,
     LOGV2_DEBUG(6351901,
                 2,
                 "Acquired user writes recoverable critical section",
-                "namespace"_attr = nss,
+                logAttrs(nss),
                 "blockShardedDDL"_attr = blockShardedDDL,
                 "blockUserWrites"_attr = blockUserWrites);
 }
 }  // namespace
 
 const NamespaceString UserWritesRecoverableCriticalSectionService::kGlobalUserWritesNamespace =
-    NamespaceString();
+    NamespaceString::kEmpty;
 
 UserWritesRecoverableCriticalSectionService* UserWritesRecoverableCriticalSectionService::get(
     ServiceContext* serviceContext) {
@@ -172,13 +188,14 @@ const ReplicaSetAwareServiceRegistry::Registerer<UserWritesRecoverableCriticalSe
         "UserWritesRecoverableCriticalSectionService");
 
 bool UserWritesRecoverableCriticalSectionService::shouldRegisterReplicaSetAwareService() const {
-    return serverGlobalParams.clusterRole != ClusterRole::ConfigServer;
+    return serverGlobalParams.clusterRole.has(ClusterRole::None) ||
+        serverGlobalParams.clusterRole.has(ClusterRole::ShardServer);
 }
 
 void UserWritesRecoverableCriticalSectionService::
     acquireRecoverableCriticalSectionBlockingUserWrites(OperationContext* opCtx,
                                                         const NamespaceString& nss) {
-    invariant(serverGlobalParams.clusterRole == ClusterRole::None,
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::None),
               "Acquiring the user writes recoverable critical section directly to start blocking "
               "writes is only allowed on non-sharded cluster.");
 
@@ -189,7 +206,7 @@ void UserWritesRecoverableCriticalSectionService::
 void UserWritesRecoverableCriticalSectionService::
     acquireRecoverableCriticalSectionBlockNewShardedDDL(OperationContext* opCtx,
                                                         const NamespaceString& nss) {
-    invariant(serverGlobalParams.clusterRole != ClusterRole::None,
+    invariant(!serverGlobalParams.clusterRole.has(ClusterRole::None),
               "Acquiring the user writes recoverable critical section blocking only sharded DDL is "
               "only allowed on sharded clusters");
 
@@ -201,17 +218,17 @@ void UserWritesRecoverableCriticalSectionService::
 void UserWritesRecoverableCriticalSectionService::
     promoteRecoverableCriticalSectionToBlockUserWrites(OperationContext* opCtx,
                                                        const NamespaceString& nss) {
-    invariant(serverGlobalParams.clusterRole != ClusterRole::None,
+    invariant(!serverGlobalParams.clusterRole.has(ClusterRole::None),
               "Promoting the user writes recoverable critical section to also block user writes is "
               "only allowed on sharded clusters");
 
     LOGV2_DEBUG(6351902,
                 3,
                 "Promoting user writes recoverable critical section to also block reads",
-                "namespace"_attr = nss);
+                logAttrs(nss));
 
     invariant(nss == UserWritesRecoverableCriticalSectionService::kGlobalUserWritesNamespace);
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
 
     {
         // Take the GlobalLock in MODE_X in order to ensure that any ongoing writes have completed
@@ -225,7 +242,7 @@ void UserWritesRecoverableCriticalSectionService::
                 !bsonObj.isEmpty());
 
         const auto collCSDoc = UserWriteBlockingCriticalSectionDocument::parse(
-            IDLParserErrorContext("PromoteUserWritesCS"), bsonObj);
+            IDLParserContext("PromoteUserWritesCS"), bsonObj);
 
         uassert(ErrorCodes::IllegalOperation,
                 "Cannot promote user writes critical section to block user writes if sharded DDL "
@@ -239,7 +256,10 @@ void UserWritesRecoverableCriticalSectionService::
                         "The user writes recoverable critical section was already promoted to also "
                         "block user "
                         "writes, do nothing",
-                        "namespace"_attr = nss);
+                        logAttrs(nss));
+
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+
             return;
         }
 
@@ -251,23 +271,23 @@ void UserWritesRecoverableCriticalSectionService::
     LOGV2_DEBUG(6351904,
                 2,
                 "Promoted user writes recoverable critical section to also block user writes",
-                "namespace"_attr = nss);
+                logAttrs(nss));
 }
 
 void UserWritesRecoverableCriticalSectionService::
     demoteRecoverableCriticalSectionToNoLongerBlockUserWrites(OperationContext* opCtx,
                                                               const NamespaceString& nss) {
-    invariant(serverGlobalParams.clusterRole != ClusterRole::None,
+    invariant(!serverGlobalParams.clusterRole.has(ClusterRole::None),
               "Demoting the user writes recoverable critical section to also block user writes is "
               "only allowed on sharded clusters");
 
     LOGV2_DEBUG(6351905,
                 3,
                 "Demoting user writes recoverable critical section to no longer block user writes",
-                "namespace"_attr = nss);
+                logAttrs(nss));
 
     invariant(nss == UserWritesRecoverableCriticalSectionService::kGlobalUserWritesNamespace);
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
 
     {
         Lock::GlobalLock globalLock(opCtx, MODE_IX);
@@ -279,12 +299,15 @@ void UserWritesRecoverableCriticalSectionService::
                 6351906,
                 3,
                 "The user writes recoverable critical section was not currently taken, do nothing",
-                "namespace"_attr = nss);
+                logAttrs(nss));
+
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+
             return;
         }
 
         const auto collCSDoc = UserWriteBlockingCriticalSectionDocument::parse(
-            IDLParserErrorContext("DemoteUserWritesCS"), bsonObj);
+            IDLParserContext("DemoteUserWritesCS"), bsonObj);
 
         // If we are not currently blocking user writes, then we are done.
         if (!collCSDoc.getBlockUserWrites()) {
@@ -292,7 +315,10 @@ void UserWritesRecoverableCriticalSectionService::
                         3,
                         "The user writes recoverable critical section was already not blocking "
                         "user writes, do nothing",
-                        "namespace"_attr = nss);
+                        logAttrs(nss));
+
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+
             return;
         }
 
@@ -304,17 +330,16 @@ void UserWritesRecoverableCriticalSectionService::
     LOGV2_DEBUG(6351908,
                 2,
                 "Demoted user writes recoverable critical section to no longer block user writes",
-                "namespace"_attr = nss);
+                logAttrs(nss));
 }
 
 
 void UserWritesRecoverableCriticalSectionService::releaseRecoverableCriticalSection(
     OperationContext* opCtx, const NamespaceString& nss) {
-    LOGV2_DEBUG(
-        6351909, 3, "Releasing user writes recoverable critical section", "namespace"_attr = nss);
+    LOGV2_DEBUG(6351909, 3, "Releasing user writes recoverable critical section", logAttrs(nss));
 
     invariant(nss == UserWritesRecoverableCriticalSectionService::kGlobalUserWritesNamespace);
-    invariant(!opCtx->lockState()->isLocked());
+    invariant(!shard_role_details::getLocker(opCtx)->isLocked());
 
     {
         Lock::GlobalLock globalLock(opCtx, MODE_IX);
@@ -327,12 +352,15 @@ void UserWritesRecoverableCriticalSectionService::releaseRecoverableCriticalSect
                 6351910,
                 3,
                 "The user writes recoverable critical section was already released, do nothing",
-                "namespace"_attr = nss);
+                logAttrs(nss));
+
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+
             return;
         }
 
         const auto collCSDoc = UserWriteBlockingCriticalSectionDocument::parse(
-            IDLParserErrorContext("ReleaseUserWritesCS"), bsonObj);
+            IDLParserContext("ReleaseUserWritesCS"), bsonObj);
 
         // Release the critical section by deleting the critical section document. The OpObserver
         // will release the in-memory CS when reacting to the delete event.
@@ -343,22 +371,22 @@ void UserWritesRecoverableCriticalSectionService::releaseRecoverableCriticalSect
 
             deleteOp.setDeletes({[&] {
                 write_ops::DeleteOpEntry entry;
-                entry.setQ(BSON(UserWriteBlockingCriticalSectionDocument::kNssFieldName
-                                << nss.toString()));
+                entry.setQ(BSON(
+                    UserWriteBlockingCriticalSectionDocument::kNssFieldName
+                    << NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault())));
                 // At most one doc can possibly match the above query.
                 entry.setMulti(false);
                 return entry;
             }()});
 
-            return deleteOp.serialize({});
+            return deleteOp.serialize();
         }());
 
         const auto commandReply = cmdResponse->getCommandReply();
         uassertStatusOK(getStatusFromWriteCommandReply(commandReply));
     }
 
-    LOGV2_DEBUG(
-        6351911, 2, "Released user writes recoverable critical section", "namespace"_attr = nss);
+    LOGV2_DEBUG(6351911, 2, "Released user writes recoverable critical section", logAttrs(nss));
 }
 
 void UserWritesRecoverableCriticalSectionService::recoverRecoverableCriticalSections(

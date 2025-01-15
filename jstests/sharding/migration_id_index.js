@@ -1,14 +1,12 @@
 // This tests that when a chunk migration occurs, all replica set members of the destination shard
 // get the correct _id index version for the collection.
-(function() {
-"use strict";
-
-load("jstests/libs/index_catalog_helpers.js");
+import {IndexCatalogHelpers} from "jstests/libs/index_catalog_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 2, rs: {nodes: 2}});
 var testDB = st.s.getDB("test");
-assert.commandWorked(testDB.adminCommand({enableSharding: testDB.getName()}));
-st.ensurePrimaryShard(testDB.getName(), st.shard0.shardName);
+assert.commandWorked(
+    testDB.adminCommand({enableSharding: testDB.getName(), primaryShard: st.shard0.shardName}));
 
 // Create a collection with a v:1 _id index.
 var coll = testDB.getCollection("migration_id_index");
@@ -36,6 +34,7 @@ assert.commandWorked(
     testDB.adminCommand({moveChunk: coll.getFullName(), find: {a: 6}, to: st.shard1.shardName}));
 
 // Check that the collection was created with a v:1 _id index on the non-primary shard.
+st.rs1.awaitReplication();
 spec = IndexCatalogHelpers.findByName(
     st.rs1.getPrimary().getDB("test").migration_id_index.getIndexes(), "_id_");
 assert.neq(spec, null, "_id index spec not found");
@@ -46,4 +45,3 @@ assert.neq(spec, null, "_id index spec not found");
 assert.eq(spec.v, 1, tojson(spec));
 
 st.stop();
-})();

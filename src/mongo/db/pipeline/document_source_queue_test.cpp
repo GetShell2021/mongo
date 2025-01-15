@@ -27,9 +27,21 @@
  *    it in the license file.
  */
 
+#include <boost/smart_ptr.hpp>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_queue.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -73,9 +85,18 @@ TEST_F(QueueStageTest, QueueStageSerialize) {
 
     ASSERT_TRUE(queueStage);
 
-    auto res = queueStage->serialize(boost::none);
+    auto res = queueStage->serialize();
 
     ASSERT_VALUE_EQ(res, Value{DOC("$queue" << DOC_ARRAY(DOC("a1" << 1) << DOC("a2" << 2)))});
+}
+
+TEST_F(QueueStageTest, RedactsCorrectly) {
+    auto queueDoc = BSON("$queue" << BSON_ARRAY(BSON("a" << 1)));
+    auto queueStage = DocumentSourceQueue::createFromBson(queueDoc.firstElement(), getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({"$queue":"?array<?object>"})",
+        redact(*queueStage));
 }
 
 }  // namespace

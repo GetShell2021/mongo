@@ -29,23 +29,45 @@
 
 #pragma once
 
-#include "mongo/db/exec/document_value/document_internal.h"
-
 #include <boost/functional/hash.hpp>
 #include <boost/intrusive_ptr.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstring>
+#include <initializer_list>
+#include <iosfwd>
+#include <string>
+#include <typeinfo>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #include "mongo/base/string_data.h"
-#include "mongo/base/string_data_comparator_interface.h"
+#include "mongo/base/string_data_comparator.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/document_value/document_internal.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_internal.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
+#include "mongo/util/intrusive_counter.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 class BSONObj;
+
 class FieldIterator;
 class FieldPath;
 class Value;
 class MutableDocument;
-
 /** An internal class that represents the position of a field in a document.
  *
  *  This is a low-level class that you usually don't need to worry about.
@@ -100,7 +122,13 @@ public:
     static constexpr StringData metaFieldSearchScore = "$searchScore"_sd;
     static constexpr StringData metaFieldSearchHighlights = "$searchHighlights"_sd;
     static constexpr StringData metaFieldSearchScoreDetails = "$searchScoreDetails"_sd;
+    static constexpr StringData metaFieldSearchSortValues = "$searchSortValues"_sd;
     static constexpr StringData metaFieldIndexKey = "$indexKey"_sd;
+    static constexpr StringData metaFieldVectorSearchScore = "$vectorSearchScore"_sd;
+    static constexpr StringData metaFieldSearchSequenceToken = "$searchSequenceToken"_sd;
+    static constexpr StringData metaFieldScore = "$score"_sd;
+    static constexpr StringData metaFieldScoreDetails = "$scoreDetails"_sd;
+    static constexpr StringData metaFieldStream = "$stream"_sd;
 
     static const StringDataSet allMetadataFieldNames;
 
@@ -117,7 +145,7 @@ public:
     /**
      * Create a new document from key, value pairs. Enables constructing a document using this
      * syntax:
-     * auto document = Document{{"hello", "world"}, {"number": 1}};
+     * auto document = Document{{"hello", "world"}, {"number", 1}};
      */
     Document(std::initializer_list<std::pair<StringData, ImplicitValue>> initializerList);
     Document(std::vector<std::pair<StringData, Value>> fields);
@@ -158,19 +186,12 @@ public:
     Value getNestedField(const FieldPath& path, std::vector<Position>* positions = nullptr) const;
 
     /**
-     * Returns field at given path as either BSONElement or Value, depending on how it is
-     * stored. If an array is encountered in the middle of the path the TraversesArrayTag is
-     * returned.
+     * Returns field at given path coerced to a Value. If an array is encountered in the middle of
+     * the path or at the leaf then boost::none is returned.
      *
-     * It is possible, however, for the returned BSONElement/Value to be an array if the given path
-     * ends with an array. For example, the document {a: {b:[1,2]}} and the path "a.b" will return
-     * a BSONElement or Value for the array [1, 2].
-     *
-     * If the field is not found, stdx::monostate is returned.
+     * If the field is not found, an empty Value() is returned.
      */
-    struct TraversesArrayTag {};
-    stdx::variant<BSONElement, Value, TraversesArrayTag, stdx::monostate> getNestedFieldNonCaching(
-        const FieldPath& dottedField) const;
+    boost::optional<Value> getNestedScalarFieldNonCaching(const FieldPath& dottedField) const;
 
     // Number of fields in this document. Exp. runtime O(n).
     size_t computeSize() const {
@@ -190,7 +211,8 @@ public:
 
     /**
      * Get the approximate size of the Document, plus its underlying storage and sub-values. Returns
-     * size in bytes.
+     * size in bytes. The return value of this function is snapshotted. All subsequent calls of this
+     * method will return the same value.
      *
      * Note: Some memory may be shared with other Documents or between fields within a single
      * Document so this can overestimate usage.
@@ -199,6 +221,11 @@ public:
      * the document.
      */
     size_t getApproximateSize() const;
+
+    /**
+     * Same as 'getApproximateSize()', but this method re-computes the size on every call.
+     */
+    size_t getCurrentApproximateSize() const;
 
     /**
      * Return the approximate amount of space used by metadata.
@@ -216,7 +243,7 @@ public:
      *  as strings are compared, but comparing one field at a time instead
      *  of one character at a time.
      *
-     *  Pass a non-null StringData::ComparatorInterface if special string comparison semantics are
+     *  Pass a non-null StringDataComparator if special string comparison semantics are
      *  required. If the comparator is null, then a simple binary compare is used for strings. This
      *  comparator is only used for string *values*; field names are always compared using simple
      *  binary compare.
@@ -229,7 +256,7 @@ public:
      */
     static int compare(const Document& lhs,
                        const Document& rhs,
-                       const StringData::ComparatorInterface* stringComparator);
+                       const StringDataComparator* stringComparator);
 
     std::string toString() const;
 
@@ -238,10 +265,17 @@ public:
     }
 
     /**
-     * Populates the internal cache by recursively walking the underlying BSON.
+     * Returns a cache-only copy of the document with no backing bson.
      */
-    void fillCache() const {
-        storage().fillCache();
+    Document shred() const {
+        return storage().shred();
+    }
+
+    /**
+     * Loads the whole document into cache.
+     */
+    void loadIntoCache() const {
+        return storage().loadIntoCache();
     }
 
     /** Calculate a hash value.
@@ -249,7 +283,23 @@ public:
      * Meant to be used to create composite hashes suitable for
      * hashed container classes such as unordered_map.
      */
-    void hash_combine(size_t& seed, const StringData::ComparatorInterface* stringComparator) const;
+    void hash_combine(size_t& seed, const StringDataComparator* stringComparator) const;
+
+    /**
+     * Returns true, if this document is trivially convertible to BSON, meaning the underlying
+     * storage is already in BSON format and there are no damages.
+     */
+    bool isTriviallyConvertible() const {
+        return !storage().isModified() && !storage().bsonHasMetadata();
+    }
+
+    /**
+     * Returns true, if this document is trivially convertible to BSON with metadata, meaning the
+     * underlying storage is already in BSON format and there are no damages.
+     */
+    bool isTriviallyConvertibleWithMetadata() const {
+        return !storage().isModified() && !storage().isMetadataModified();
+    }
 
     /**
      * Serializes this document to the BSONObj under construction in 'builder'. Metadata is not
@@ -257,7 +307,17 @@ public:
      * depth.
      */
     void toBson(BSONObjBuilder* builder, size_t recursionLevel = 1) const;
-    BSONObj toBson() const;
+
+    template <typename BSONTraits = BSONObj::DefaultSizeTrait>
+    BSONObj toBson() const {
+        if (isTriviallyConvertible()) {
+            return storage().bsonObj();
+        }
+
+        BSONObjBuilder bb;
+        toBson(&bb);
+        return bb.obj<BSONTraits>();
+    }
 
     /**
      * Serializes this document iff the conversion is "trivial," meaning that the underlying storage
@@ -271,7 +331,18 @@ public:
     /**
      * Like the 'toBson()' method, but includes metadata as top-level fields.
      */
-    BSONObj toBsonWithMetaData() const;
+    void toBsonWithMetaData(BSONObjBuilder* builder) const;
+
+    template <typename BSONTraits = BSONObj::DefaultSizeTrait>
+    BSONObj toBsonWithMetaData() const {
+        if (isTriviallyConvertibleWithMetadata()) {
+            return storage().bsonObj();
+        }
+
+        BSONObjBuilder bb;
+        toBsonWithMetaData(&bb);
+        return bb.obj<BSONTraits>();
+    }
 
     /**
      * Like Document(BSONObj) but treats top-level fields with special names as metadata.
@@ -330,6 +401,13 @@ public:
     Document getOwned() &&;
 
     /**
+     * Needed to satisfy the Sorter interface. This method throws an assertion.
+     */
+    void makeOwned() {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
      * Returns true if the underlying BSONObj is owned.
      */
     bool isOwned() const {
@@ -365,16 +443,10 @@ private:
         return (_storage ? *_storage : DocumentStorage::emptyDoc());
     }
 
-    stdx::variant<BSONElement, Value, TraversesArrayTag, stdx::monostate>
-    getNestedFieldNonCachingHelper(const FieldPath& dottedField, size_t level) const;
+    boost::optional<Value> getNestedScalarFieldNonCachingHelper(const FieldPath& dottedField,
+                                                                size_t level) const;
 
     boost::intrusive_ptr<const DocumentStorage> _storage;
-
-    /**
-     * Returns the approximate size of this `Document` instance without considering the size of its
-     * backing BSON object.
-     */
-    size_t getApproximateSizeWithoutBackingBSON() const;
 };
 
 //
@@ -510,13 +582,11 @@ public:
     }
 
     /**
-     * Replace the current base Document with bson.
-     *
-     * The paramater 'stripMetadata' controls whether we strip the metadata fields from the
-     * underlying bson when converting the document object back to bson.
+     * Replace the current base Document with the BSON object. Setting 'bsonHasMetadata' to true
+     * signals that the BSON object contains metadata fields.
      */
-    void reset(const BSONObj& bson, bool stripMetadata) {
-        storage().reset(bson, stripMetadata);
+    void reset(const BSONObj& bson, bool bsonHasMetadata) {
+        storage().reset(bson, bsonHasMetadata);
     }
 
     /** Add the given field to the Document.
@@ -653,6 +723,7 @@ public:
      *  TODO: there are some optimizations that may make sense at freeze time.
      */
     Document freeze() {
+        resetSnapshottedApproximateSize();
         // This essentially moves _storage into a new Document by way of temp.
         Document ret;
         boost::intrusive_ptr<const DocumentStorage> temp(storagePtr(), /*inc_ref_count=*/false);
@@ -671,8 +742,12 @@ public:
      *  Note that unlike freeze(), this indicates intention to continue
      *  modifying this document. The returned Document will not observe
      *  future changes to this MutableDocument.
+     *
+     *  Note that the computed snapshotted approximate size of the Document
+     *  is not preserved across calls.
      */
     Document peek() {
+        resetSnapshottedApproximateSize();
         return Document(storagePtr());
     }
 
@@ -692,16 +767,6 @@ public:
      */
     void makeOwned() {
         storage().makeOwned();
-    }
-
-    /** Create a new document storage with the BSON object.
-     *
-     *  The optional paramater 'stripMetadata' controls whether we strip the metadata fields (the
-     *  complete list is in Document::allMetadataFieldNames).
-     */
-    DocumentStorage& newStorageWithBson(const BSONObj& bson, bool stripMetadata) {
-        reset(make_intrusive<DocumentStorage>(bson, stripMetadata, false, 0));
-        return const_cast<DocumentStorage&>(*storagePtr());
     }
 
 private:
@@ -738,10 +803,17 @@ private:
     MutableValue getNestedFieldHelper(const FieldPath& dottedField, size_t level);
     MutableValue getNestedFieldHelper(const std::vector<Position>& positions, size_t level);
 
-    // this should only be called by storage methods and peek/freeze
+    // this should only be called by storage methods and peek/freeze/resetsnapshottedApproximateSize
     const DocumentStorage* storagePtr() const {
         dassert(!_storage || typeid(*_storage) == typeid(const DocumentStorage));
         return static_cast<const DocumentStorage*>(_storage);
+    }
+
+    void resetSnapshottedApproximateSize() {
+        auto mutableStorage = const_cast<DocumentStorage*>(storagePtr());
+        if (mutableStorage) {
+            mutableStorage->resetSnapshottedApproximateSize();
+        }
     }
 
     // These are both const to prevent modifications bypassing storage() method.
@@ -762,7 +834,7 @@ public:
 
     /// Get next item and advance iterator
     Document::FieldPair next() {
-        verify(more());
+        MONGO_verify(more());
 
         Document::FieldPair fp(_it->nameSD(), _it->val);
         _it.advance();

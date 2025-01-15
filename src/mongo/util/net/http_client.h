@@ -38,6 +38,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/net/cidr.h"
 
 namespace mongo {
 
@@ -49,11 +50,7 @@ constexpr Seconds kTotalRequestTimeout{120};
  */
 class HttpClient {
 public:
-    enum class HttpMethod {
-        kGET,
-        kPOST,
-        kPUT,
-    };
+    enum class HttpMethod { kGET, kPOST, kPUT, kPATCH, kDELETE };
 
     struct HttpReply {
         std::uint16_t code;
@@ -71,6 +68,15 @@ public:
      * By default, only https:// is allowed.
      */
     virtual void allowInsecureHTTP(bool allow) = 0;
+
+    /**
+     * Returns Status::OK iff the provided URL endpoint is "secure".
+     *
+     * HTTPS endpoints are secure. If test commands are enabled, localhost endpoints
+     * over HTTP with only a host, optional port, and optionally a slash and trailing
+     * content are considered secure.
+     */
+    static Status endpointIsSecure(StringData url);
 
     /**
      * Assign a set of headers for this request.
@@ -137,6 +143,13 @@ public:
     static std::unique_ptr<HttpClient> createWithoutConnectionPool();
 
     /**
+     * Factory method provided by client implementation.
+     *
+     * Used by Atlas Stream Processing.
+     */
+    static std::unique_ptr<HttpClient> createWithFirewall(const std::vector<CIDR>& cidrDenyList);
+
+    /**
      * Content for ServerStatus http_client section.
      */
     static BSONObj getServerStatus();
@@ -173,6 +186,12 @@ public:
      * Factory method provided by client implementation.
      */
     virtual std::unique_ptr<HttpClient> createWithoutConnectionPool() = 0;
+
+    /**
+     * Factory method provided by client implementation.
+     */
+    virtual std::unique_ptr<HttpClient> createWithFirewall(
+        const std::vector<CIDR>& cidrDenyList) = 0;
 
     /**
      * Content for ServerStatus http_client section.

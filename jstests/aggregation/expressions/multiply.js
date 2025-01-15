@@ -1,9 +1,7 @@
 // Tests for $multiply aggregation expression.
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-load("jstests/aggregation/extras/utils.js");        // For assertErrorCode().
-load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.jstests_aggregation_multiply;
 coll.drop();
@@ -55,6 +53,7 @@ const binaryTestCases = [
     },
     {document: {left: NumberDecimal("12.5"), right: null}, expected: null},
 
+    // Test null
     {document: {left: null, right: NumberInt(2)}, expected: null},
     {document: {left: null, right: 2.55}, expected: null},
     {document: {left: null, right: NumberLong("2")}, expected: null},
@@ -199,4 +198,3 @@ errorTestCases.forEach(function(testCase) {
 
     assert(coll.drop());
 });
-}());

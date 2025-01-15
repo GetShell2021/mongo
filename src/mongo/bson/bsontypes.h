@@ -30,13 +30,18 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <cstdint>
+#include <fmt/format.h>
 #include <iosfwd>
+#include <limits>
 #include <type_traits>
 
 #include "mongo/base/counter.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/config.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/assert_util.h"
 
@@ -198,8 +203,10 @@ enum BinDataType {
     bdtUUID = 3,             /* deprecated */
     newUUID = 4,             /* language-independent UUID format across all drivers */
     MD5Type = 5,
-    Encrypt = 6, /* encryption placeholder or encrypted data */
-    Column = 7,  /* compressed column */
+    Encrypt = 6,   /* encryption placeholder or encrypted data */
+    Column = 7,    /* compressed column */
+    Sensitive = 8, /* data that should be redacted and protected from unnecessary exposure */
+    Vector = 9,    /* A denser format of an array of numbers representing a vector */
     bdtCustom = 128
 };
 

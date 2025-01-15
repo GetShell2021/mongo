@@ -29,49 +29,106 @@
 
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
 
+#include "mongo/s/resharding/common_types_gen.h"
+#include <absl/container/node_hash_map.h>
+#include <algorithm>
+#include <boost/cstdint.hpp>
+#include <boost/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
+#include <fmt/format.h>
+#include <iterator>
+#include <mutex>
+#include <set>
+#include <string>
+#include <tuple>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/json.h"
-#include "mongo/db/auth/authorization_session_impl.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands/notify_sharding_event_gen.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_cache.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/db/repl/optime_with.h"
 #include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/balancer/balance_stats.h"
 #include "mongo/db/s/balancer/balancer_policy.h"
 #include "mongo/db/s/config/initial_split_policy.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/resharding/recipient_document_gen.h"
 #include "mongo/db/s/resharding/resharding_coordinator_commit_monitor.h"
 #include "mongo/db/s/resharding/resharding_future_util.h"
+#include "mongo/db/s/resharding/resharding_metrics_helpers.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding/resharding_util.h"
-#include "mongo/db/s/sharding_data_transform_cumulative_metrics.h"
-#include "mongo/db/s/sharding_data_transform_metrics.h"
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_logging.h"
-#include "mongo/db/s/sharding_util.h"
-#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/analyze_shard_key_documents_gen.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection_gen.h"
+#include "mongo/s/catalog/type_index_catalog_gen.h"
+#include "mongo/s/catalog/type_namespace_placement_gen.h"
 #include "mongo/s/catalog/type_tags.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/abort_reshard_collection_gen.h"
 #include "mongo/s/request_types/commit_reshard_collection_gen.h"
 #include "mongo/s/request_types/drop_collection_if_uuid_not_matching_gen.h"
 #include "mongo/s/request_types/flush_resharding_state_change_gen.h"
 #include "mongo/s/request_types/flush_routing_table_cache_updates_gen.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/s/resharding/resharding_coordinator_service_conflicting_op_in_progress_info.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/routing_information_cache.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/sharding_index_catalog_cache.h"
 #include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/future_util.h"
-#include "mongo/util/string_map.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
@@ -86,14 +143,18 @@ MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeInitializing);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeCloning);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeBlockingWrites);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeDecisionPersisted);
+MONGO_FAIL_POINT_DEFINE(reshardingPauseBeforeTellingParticipantsToCommit);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeRemovingStateDoc);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeCompletion);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforeStartingErrorFlow);
 MONGO_FAIL_POINT_DEFINE(reshardingPauseCoordinatorBeforePersistingStateTransition);
 MONGO_FAIL_POINT_DEFINE(pauseBeforeTellDonorToRefresh);
-MONGO_FAIL_POINT_DEFINE(pauseBeforeInsertCoordinatorDoc);
+MONGO_FAIL_POINT_DEFINE(pauseAfterInsertCoordinatorDoc);
+MONGO_FAIL_POINT_DEFINE(pauseBeforeCTHolderInitialization);
+MONGO_FAIL_POINT_DEFINE(pauseAfterEngagingCriticalSection);
 
 const std::string kReshardingCoordinatorActiveIndexName = "ReshardingCoordinatorActiveIndex";
+const int kReshardingNumInitialChunksDefault = 90;
 const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
 const WriteConcernOptions kMajorityWriteConcern{
     WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, Seconds(0)};
@@ -107,14 +168,14 @@ Date_t getCurrentTime() {
     return svcCtx->getFastClockSource()->now();
 }
 
-void assertNumDocsModifiedMatchesExpected(const BatchedCommandRequest& request,
-                                          const BSONObj& response,
-                                          int expected) {
-    auto numDocsModified = response.getIntField("n");
+void assertNumDocsMatchedEqualsExpected(const BatchedCommandRequest& request,
+                                        const BSONObj& response,
+                                        int expected) {
+    auto numDocsMatched = response.getIntField("n");
     uassert(5030401,
             str::stream() << "Expected to match " << expected << " docs, but only matched "
-                          << numDocsModified << " for write request " << request.toString(),
-            expected == numDocsModified);
+                          << numDocsMatched << " for write request " << request.toString(),
+            expected == numDocsMatched);
 }
 
 void appendShardEntriesToSetBuilder(const ReshardingCoordinatorDocument& coordinatorDoc,
@@ -146,38 +207,57 @@ using resharding_metrics::getIntervalStartFieldName;
 using DocT = ReshardingCoordinatorDocument;
 const auto metricsPrefix = resharding_metrics::getMetricsPrefix<DocT>();
 
-void buildStateDocumentCloneMetricsForUpdate(BSONObjBuilder& bob, ReshardingMetrics* metrics) {
+void buildStateDocumentCloneMetricsForUpdate(BSONObjBuilder& bob, Date_t timestamp) {
     bob.append(getIntervalStartFieldName<DocT>(ReshardingRecipientMetrics::kDocumentCopyFieldName),
-               metrics->getCopyingBegin());
+               timestamp);
 }
 
-void buildStateDocumentApplyMetricsForUpdate(BSONObjBuilder& bob, ReshardingMetrics* metrics) {
+void buildStateDocumentApplyMetricsForUpdate(BSONObjBuilder& bob, Date_t timestamp) {
     bob.append(getIntervalEndFieldName<DocT>(ReshardingRecipientMetrics::kDocumentCopyFieldName),
-               metrics->getCopyingEnd());
+               timestamp);
+
     bob.append(
         getIntervalEndFieldName<DocT>(ReshardingRecipientMetrics::kOplogApplicationFieldName),
-        metrics->getApplyingBegin());
+        timestamp);
 }
 
-void buildStateDocumentBlockingWritesMetricsForUpdate(BSONObjBuilder& bob,
-                                                      ReshardingMetrics* metrics) {
+void buildStateDocumentBlockingWritesMetricsForUpdate(BSONObjBuilder& bob, Date_t timestamp) {
     bob.append(
         getIntervalEndFieldName<DocT>(ReshardingRecipientMetrics::kOplogApplicationFieldName),
-        metrics->getApplyingEnd());
+        timestamp);
 }
 
 void buildStateDocumentMetricsForUpdate(BSONObjBuilder& bob,
-                                        ReshardingMetrics* metrics,
-                                        CoordinatorStateEnum newState) {
+                                        CoordinatorStateEnum newState,
+                                        Date_t timestamp) {
     switch (newState) {
         case CoordinatorStateEnum::kCloning:
-            buildStateDocumentCloneMetricsForUpdate(bob, metrics);
+            buildStateDocumentCloneMetricsForUpdate(bob, timestamp);
             return;
         case CoordinatorStateEnum::kApplying:
-            buildStateDocumentApplyMetricsForUpdate(bob, metrics);
+            buildStateDocumentApplyMetricsForUpdate(bob, timestamp);
             return;
         case CoordinatorStateEnum::kBlockingWrites:
-            buildStateDocumentBlockingWritesMetricsForUpdate(bob, metrics);
+            buildStateDocumentBlockingWritesMetricsForUpdate(bob, timestamp);
+            return;
+        default:
+            return;
+    }
+}
+
+void setMeticsAfterWrite(ReshardingMetrics* metrics,
+                         CoordinatorStateEnum newState,
+                         Date_t timestamp) {
+    switch (newState) {
+        case CoordinatorStateEnum::kCloning:
+            metrics->setStartFor(ReshardingMetrics::TimedPhase::kCloning, timestamp);
+            return;
+        case CoordinatorStateEnum::kApplying:
+            metrics->setEndFor(ReshardingMetrics::TimedPhase::kCloning, timestamp);
+            metrics->setStartFor(ReshardingMetrics::TimedPhase::kApplying, timestamp);
+            return;
+        case CoordinatorStateEnum::kBlockingWrites:
+            metrics->setEndFor(ReshardingMetrics::TimedPhase::kApplying, timestamp);
             return;
         default:
             return;
@@ -188,8 +268,9 @@ void writeToCoordinatorStateNss(OperationContext* opCtx,
                                 ReshardingMetrics* metrics,
                                 const ReshardingCoordinatorDocument& coordinatorDoc,
                                 TxnNumber txnNumber) {
+    Date_t timestamp = getCurrentTime();
+    auto nextState = coordinatorDoc.getState();
     BatchedCommandRequest request([&] {
-        auto nextState = coordinatorDoc.getState();
         switch (nextState) {
             case CoordinatorStateEnum::kInitializing:
                 // Insert the new coordinator document.
@@ -239,7 +320,21 @@ void writeToCoordinatorStateNss(OperationContext* opCtx,
                             *approxDocumentsToCopy);
                     }
 
-                    buildStateDocumentMetricsForUpdate(setBuilder, metrics, nextState);
+                    if (auto quiescePeriodEnd = coordinatorDoc.getQuiescePeriodEnd()) {
+                        // If the quiescePeriodEnd exists, include it in the update.
+                        setBuilder.append(ReshardingCoordinatorDocument::kQuiescePeriodEndFieldName,
+                                          *quiescePeriodEnd);
+                    }
+
+                    if (auto criticalSectionExpiresAt =
+                            coordinatorDoc.getCriticalSectionExpiresAt()) {
+                        // If the criticalSectionExpiresAt exists, include it in the update.
+                        setBuilder.append(
+                            ReshardingCoordinatorDocument::kCriticalSectionExpiresAtFieldName,
+                            *criticalSectionExpiresAt);
+                    }
+
+                    buildStateDocumentMetricsForUpdate(setBuilder, nextState, timestamp);
 
                     if (nextState == CoordinatorStateEnum::kPreparingToDonate) {
                         appendShardEntriesToSetBuilder(coordinatorDoc, setBuilder);
@@ -259,15 +354,21 @@ void writeToCoordinatorStateNss(OperationContext* opCtx,
         }
     }());
 
-    auto expectedNumModified = (request.getBatchType() == BatchedCommandRequest::BatchType_Insert)
+    auto expectedNumMatched = (request.getBatchType() == BatchedCommandRequest::BatchType_Insert)
         ? boost::none
         : boost::make_optional(1);
 
     auto res = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
         opCtx, NamespaceString::kConfigReshardingOperationsNamespace, request, txnNumber);
 
-    if (expectedNumModified) {
-        assertNumDocsModifiedMatchesExpected(request, res, *expectedNumModified);
+    if (expectedNumMatched) {
+        assertNumDocsMatchedEqualsExpected(request, res, *expectedNumMatched);
+    }
+
+    // When moving from quiescing to done, we don't have metrics available.
+    invariant(metrics || nextState == CoordinatorStateEnum::kDone);
+    if (metrics) {
+        setMeticsAfterWrite(metrics, nextState, timestamp);
     }
 }
 
@@ -294,7 +395,9 @@ TypeCollectionRecipientFields constructRecipientFields(
     resharding::emplaceCloneTimestampIfExists(recipientFields, coordinatorDoc.getCloneTimestamp());
     resharding::emplaceApproxBytesToCopyIfExists(
         recipientFields, coordinatorDoc.getReshardingApproxCopySizeStruct());
-
+    resharding::emplaceOplogBatchTaskCountIfExists(
+        recipientFields, coordinatorDoc.getRecipientOplogBatchTaskCount());
+    resharding::emplaceRelaxedIfExists(recipientFields, coordinatorDoc.getRelaxed());
     return recipientFields;
 }
 
@@ -302,7 +405,8 @@ BSONObj createReshardingFieldsUpdateForOriginalNss(
     OperationContext* opCtx,
     const ReshardingCoordinatorDocument& coordinatorDoc,
     boost::optional<OID> newCollectionEpoch,
-    boost::optional<Timestamp> newCollectionTimestamp) {
+    boost::optional<Timestamp> newCollectionTimestamp,
+    boost::optional<CollectionIndexes> newCollectionIndexVersion) {
     auto nextState = coordinatorDoc.getState();
     switch (nextState) {
         case CoordinatorStateEnum::kInitializing: {
@@ -311,6 +415,12 @@ BSONObj createReshardingFieldsUpdateForOriginalNss(
                 coordinatorDoc.getReshardingUUID());
             originalEntryReshardingFields.setState(coordinatorDoc.getState());
             originalEntryReshardingFields.setStartTime(coordinatorDoc.getStartTime());
+            originalEntryReshardingFields.setProvenance(
+                coordinatorDoc.getCommonReshardingMetadata().getProvenance());
+            originalEntryReshardingFields.setImplicitlyCreateIndex(
+                coordinatorDoc.getCommonReshardingMetadata().getImplicitlyCreateIndex());
+            originalEntryReshardingFields.setPerformVerification(
+                coordinatorDoc.getCommonReshardingMetadata().getPerformVerification());
 
             return BSON("$set" << BSON(CollectionType::kReshardingFieldsFieldName
                                        << originalEntryReshardingFields.toBSON()
@@ -355,17 +465,28 @@ BSONObj createReshardingFieldsUpdateForOriginalNss(
             BSONObj setFields =
                 BSON("uuid" << coordinatorDoc.getReshardingUUID() << "key"
                             << coordinatorDoc.getReshardingKey().toBSON() << "lastmodEpoch"
-                            << newCollectionEpoch.get() << "lastmod"
+                            << newCollectionEpoch.value() << "lastmod"
                             << opCtx->getServiceContext()->getPreciseClockSource()->now()
                             << "reshardingFields.state"
                             << CoordinatorState_serializer(coordinatorDoc.getState()).toString()
                             << "reshardingFields.recipientFields" << recipientFields.toBSON());
             if (newCollectionTimestamp.has_value()) {
-                setFields = setFields.addFields(BSON("timestamp" << newCollectionTimestamp.get()));
+                setFields =
+                    setFields.addFields(BSON("timestamp" << newCollectionTimestamp.value()));
+            }
+            if (newCollectionIndexVersion.has_value()) {
+                setFields = setFields.addFields(
+                    BSON("indexVersion" << newCollectionIndexVersion->indexVersion()));
+            }
+
+            auto provenance = coordinatorDoc.getCommonReshardingMetadata().getProvenance();
+            if (provenance && provenance.get() == ProvenanceEnum::kUnshardCollection) {
+                setFields = setFields.addFields(BSON("unsplittable" << true));
             }
 
             return BSON("$set" << setFields);
         }
+        case mongo::CoordinatorStateEnum::kQuiesced:
         case mongo::CoordinatorStateEnum::kDone:
             // Remove 'reshardingFields' from the config.collections entry
             return BSON(
@@ -412,13 +533,16 @@ void updateConfigCollectionsForOriginalNss(OperationContext* opCtx,
                                            const ReshardingCoordinatorDocument& coordinatorDoc,
                                            boost::optional<OID> newCollectionEpoch,
                                            boost::optional<Timestamp> newCollectionTimestamp,
+                                           boost::optional<CollectionIndexes> newCollectionIndexes,
                                            TxnNumber txnNumber) {
     auto writeOp = createReshardingFieldsUpdateForOriginalNss(
-        opCtx, coordinatorDoc, newCollectionEpoch, newCollectionTimestamp);
+        opCtx, coordinatorDoc, newCollectionEpoch, newCollectionTimestamp, newCollectionIndexes);
 
     auto request = BatchedCommandRequest::buildUpdateOp(
         CollectionType::ConfigNS,
-        BSON(CollectionType::kNssFieldName << coordinatorDoc.getSourceNss().ns()),  // query
+        BSON(CollectionType::kNssFieldName
+             << NamespaceStringUtil::serialize(coordinatorDoc.getSourceNss(),
+                                               SerializationContext::stateDefault())),  // query
         writeOp,
         false,  // upsert
         false   // multi
@@ -427,21 +551,52 @@ void updateConfigCollectionsForOriginalNss(OperationContext* opCtx,
     auto res = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
         opCtx, CollectionType::ConfigNS, request, txnNumber);
 
-    assertNumDocsModifiedMatchesExpected(request, res, 1 /* expected */);
+    assertNumDocsMatchedEqualsExpected(request, res, 1 /* expected */);
+}
+
+/*
+ * Updates the collection UUID of the QueryAnalyzerDocument for a collection being resharded if
+ * query sampling is enabled.
+ */
+void updateQueryAnalyzerMetadata(OperationContext* opCtx,
+                                 const ReshardingCoordinatorDocument& coordinatorDoc,
+                                 TxnNumber txnNumber) {
+
+    auto writeOp =
+        BSON("$set" << BSON(analyze_shard_key::QueryAnalyzerDocument::kCollectionUuidFieldName
+                            << coordinatorDoc.getReshardingUUID()));
+
+    auto request = BatchedCommandRequest::buildUpdateOp(
+        NamespaceString::kConfigQueryAnalyzersNamespace,
+        BSON(analyze_shard_key::QueryAnalyzerDocument::kCollectionUuidFieldName
+             << coordinatorDoc.getSourceUUID()),  // query
+        writeOp,
+        false,  // upsert
+        false   // multi
+    );
+
+    auto res = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
+        opCtx, NamespaceString::kConfigQueryAnalyzersNamespace, request, txnNumber);
 }
 
 void writeToConfigCollectionsForTempNss(OperationContext* opCtx,
                                         const ReshardingCoordinatorDocument& coordinatorDoc,
                                         boost::optional<ChunkVersion> chunkVersion,
                                         boost::optional<const BSONObj&> collation,
+                                        boost::optional<CollectionIndexes> indexVersion,
+                                        boost::optional<bool> isUnsplittable,
                                         TxnNumber txnNumber) {
     BatchedCommandRequest request([&] {
         auto nextState = coordinatorDoc.getState();
         switch (nextState) {
             case CoordinatorStateEnum::kPreparingToDonate: {
                 // Insert new entry for the temporary nss into config.collections
-                auto collType = resharding::createTempReshardingCollectionType(
-                    opCtx, coordinatorDoc, chunkVersion.get(), collation.get());
+                auto collType = resharding::createTempReshardingCollectionType(opCtx,
+                                                                               coordinatorDoc,
+                                                                               chunkVersion.value(),
+                                                                               collation.value(),
+                                                                               indexVersion,
+                                                                               isUnsplittable);
                 return BatchedCommandRequest::buildInsertOp(
                     CollectionType::ConfigNS, std::vector<BSONObj>{collType.toBSON()});
             }
@@ -460,16 +615,17 @@ void writeToConfigCollectionsForTempNss(OperationContext* opCtx,
                 return BatchedCommandRequest::buildUpdateOp(
                     CollectionType::ConfigNS,
                     BSON(CollectionType::kNssFieldName
-                         << coordinatorDoc.getTempReshardingNss().ns()),
+                         << NamespaceStringUtil::serialize(coordinatorDoc.getTempReshardingNss(),
+                                                           SerializationContext::stateDefault())),
                     BSON("$set" << BSON(
                              "reshardingFields.state"
                              << CoordinatorState_serializer(nextState).toString()
                              << "reshardingFields.recipientFields.approxDocumentsToCopy"
-                             << coordinatorDoc.getApproxDocumentsToCopy().get()
+                             << coordinatorDoc.getApproxDocumentsToCopy().value()
                              << "reshardingFields.recipientFields.approxBytesToCopy"
-                             << coordinatorDoc.getApproxBytesToCopy().get()
+                             << coordinatorDoc.getApproxBytesToCopy().value()
                              << "reshardingFields.recipientFields.cloneTimestamp"
-                             << coordinatorDoc.getCloneTimestamp().get()
+                             << coordinatorDoc.getCloneTimestamp().value()
                              << "reshardingFields.recipientFields.donorShards"
                              << donorShardsBuilder.arr() << "lastmod"
                              << opCtx->getServiceContext()->getPreciseClockSource()->now())),
@@ -482,7 +638,8 @@ void writeToConfigCollectionsForTempNss(OperationContext* opCtx,
                 return BatchedCommandRequest::buildDeleteOp(
                     CollectionType::ConfigNS,
                     BSON(CollectionType::kNssFieldName
-                         << coordinatorDoc.getTempReshardingNss().ns()),
+                         << NamespaceStringUtil::serialize(coordinatorDoc.getTempReshardingNss(),
+                                                           SerializationContext::stateDefault())),
                     false  // multi
                 );
             default: {
@@ -509,7 +666,8 @@ void writeToConfigCollectionsForTempNss(OperationContext* opCtx,
                 return BatchedCommandRequest::buildUpdateOp(
                     CollectionType::ConfigNS,
                     BSON(CollectionType::kNssFieldName
-                         << coordinatorDoc.getTempReshardingNss().ns()),
+                         << NamespaceStringUtil::serialize(coordinatorDoc.getTempReshardingNss(),
+                                                           SerializationContext::stateDefault())),
                     updateBuilder.obj(),
                     true,  // upsert
                     false  // multi
@@ -518,16 +676,100 @@ void writeToConfigCollectionsForTempNss(OperationContext* opCtx,
         }
     }());
 
-    auto expectedNumModified = (request.getBatchType() == BatchedCommandRequest::BatchType_Insert)
+    auto expectedNumMatched = (request.getBatchType() == BatchedCommandRequest::BatchType_Insert)
         ? boost::none
         : boost::make_optional(1);
 
     auto res = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
         opCtx, CollectionType::ConfigNS, request, txnNumber);
 
-    if (expectedNumModified) {
-        assertNumDocsModifiedMatchesExpected(request, res, *expectedNumModified);
+    if (expectedNumMatched) {
+        assertNumDocsMatchedEqualsExpected(request, res, *expectedNumMatched);
     }
+}
+
+void writeToConfigIndexesForTempNss(OperationContext* opCtx,
+                                    const ReshardingCoordinatorDocument& coordinatorDoc,
+                                    TxnNumber txnNumber) {
+    if (!feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        return;
+    }
+    auto nextState = coordinatorDoc.getState();
+
+    switch (nextState) {
+        case CoordinatorStateEnum::kPreparingToDonate: {
+            auto [_, optSii] =
+                uassertStatusOK(RoutingInformationCache::get(opCtx)->getCollectionRoutingInfo(
+                    opCtx, coordinatorDoc.getSourceNss()));
+            if (optSii) {
+                std::vector<BSONObj> indexes;
+                optSii->forEachIndex([&](const auto index) {
+                    IndexCatalogType copyIdx(index);
+                    copyIdx.setCollectionUUID(coordinatorDoc.getReshardingUUID());
+                    // TODO SERVER-73304: add the new index collection UUID here if neccessary.
+                    indexes.push_back(copyIdx.toBSON());
+                    return true;
+                });
+
+                BatchedCommandRequest request([&] {
+                    return BatchedCommandRequest::buildInsertOp(
+                        NamespaceString::kConfigsvrIndexCatalogNamespace, indexes);
+                }());
+                ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
+                    opCtx, NamespaceString::kConfigsvrIndexCatalogNamespace, request, txnNumber);
+            }
+        } break;
+        case CoordinatorStateEnum::kCommitting: {
+            BatchedCommandRequest request([&] {
+                return BatchedCommandRequest::buildDeleteOp(
+                    NamespaceString::kConfigsvrIndexCatalogNamespace,
+                    BSON(IndexCatalogType::kCollectionUUIDFieldName
+                         << coordinatorDoc.getSourceUUID()),
+                    true  // multi
+                );
+            }());
+            ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
+                opCtx, NamespaceString::kConfigsvrIndexCatalogNamespace, request, txnNumber);
+        } break;
+        case CoordinatorStateEnum::kAborting: {
+            BatchedCommandRequest request([&] {
+                return BatchedCommandRequest::buildDeleteOp(
+                    NamespaceString::kConfigsvrIndexCatalogNamespace,
+                    BSON(IndexCatalogType::kCollectionUUIDFieldName
+                         << coordinatorDoc.getReshardingUUID()),
+                    true  // multi
+                );
+            }());
+            ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
+                opCtx, NamespaceString::kConfigsvrIndexCatalogNamespace, request, txnNumber);
+        } break;
+        default:
+            break;
+    }
+}
+
+void writeToConfigPlacementHistoryForOriginalNss(
+    OperationContext* opCtx,
+    const ReshardingCoordinatorDocument& coordinatorDoc,
+    const Timestamp& newCollectionTimestamp,
+    const std::vector<ShardId>& reshardedCollectionPlacement,
+    TxnNumber txnNumber) {
+    invariant(coordinatorDoc.getState() == CoordinatorStateEnum::kCommitting,
+              "New placement data on the collection being resharded can only be persisted at "
+              "commit time");
+
+    NamespacePlacementType placementInfo(
+        coordinatorDoc.getSourceNss(), newCollectionTimestamp, reshardedCollectionPlacement);
+    placementInfo.setUuid(coordinatorDoc.getReshardingUUID());
+
+    auto request = BatchedCommandRequest::buildInsertOp(
+        NamespaceString::kConfigsvrPlacementHistoryNamespace, {placementInfo.toBSON()});
+
+    auto response = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
+        opCtx, NamespaceString::kConfigsvrPlacementHistoryNamespace, request, txnNumber);
+
+    assertNumDocsMatchedEqualsExpected(request, response, 1);
 }
 
 void insertChunkAndTagDocsForTempNss(OperationContext* opCtx,
@@ -541,51 +783,41 @@ void insertChunkAndTagDocsForTempNss(OperationContext* opCtx,
                    [](ChunkType chunk) { return chunk.toConfigBSON(); });
 
     ShardingCatalogManager::get(opCtx)->insertConfigDocuments(
-        opCtx, ChunkType::ConfigNS, std::move(initialChunksBSON));
+        opCtx, NamespaceString::kConfigsvrChunksNamespace, std::move(initialChunksBSON));
 
 
     ShardingCatalogManager::get(opCtx)->insertConfigDocuments(opCtx, TagsType::ConfigNS, newZones);
+}
+
+void removeTagsDocs(OperationContext* opCtx, const BSONObj& tagsQuery, TxnNumber txnNumber) {
+    // Remove tag documents with the specified tagsQuery.
+    const auto tagDeleteOperationHint = BSON(TagsType::ns() << 1 << TagsType::min() << 1);
+    ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
+        opCtx,
+        TagsType::ConfigNS,
+        BatchedCommandRequest::buildDeleteOp(TagsType::ConfigNS,
+                                             tagsQuery,              // query
+                                             true,                   // multi
+                                             tagDeleteOperationHint  // hint
+                                             ),
+        txnNumber);
 }
 
 // Requires that there be no session information on the opCtx.
 void removeChunkAndTagsDocs(OperationContext* opCtx,
                             const BSONObj& tagsQuery,
                             const UUID& collUUID) {
-    // Remove all chunk documents for the original nss. We do not know how many chunk docs
-    // currently exist, so cannot pass a value for expectedNumModified
-    const auto chunksQuery = BSON(ChunkType::collectionUUID() << collUUID);
+    // Remove all chunk documents and specified tag documents.
+    resharding::removeChunkDocs(opCtx, collUUID);
+
     const auto tagDeleteOperationHint = BSON(TagsType::ns() << 1 << TagsType::min() << 1);
-
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-
-    uassertStatusOK(catalogClient->removeConfigDocuments(
-        opCtx, ChunkType::ConfigNS, chunksQuery, kMajorityWriteConcern));
+    const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
     uassertStatusOK(catalogClient->removeConfigDocuments(
         opCtx, TagsType::ConfigNS, tagsQuery, kMajorityWriteConcern, tagDeleteOperationHint));
 }
 
-void updateChunkAndTagsDocsForTempNss(OperationContext* opCtx,
-                                      const ReshardingCoordinatorDocument& coordinatorDoc,
-                                      OID newCollectionEpoch,
-                                      TxnNumber txnNumber) {
-    auto hint = BSON("ns" << 1 << "min" << 1);
-    auto tagsRequest = BatchedCommandRequest::buildUpdateOp(
-        TagsType::ConfigNS,
-        BSON(TagsType::ns(coordinatorDoc.getTempReshardingNss().ns())),    // query
-        BSON("$set" << BSON("ns" << coordinatorDoc.getSourceNss().ns())),  // update
-        false,                                                             // upsert
-        true,                                                              // multi
-        hint                                                               // hint
-    );
-
-    // Update the 'ns' field to be the original collection namespace for all tags documents that
-    // currently have 'ns' as the temporary collection namespace
-    auto tagsRes = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
-        opCtx, TagsType::ConfigNS, tagsRequest, txnNumber);
-}
-
 /**
- * Executes metadata changes in a transaction without bumping the collection version.
+ * Executes metadata changes in a transaction without bumping the collection placement version.
  */
 void executeMetadataChangesInTxn(
     OperationContext* opCtx,
@@ -596,16 +828,18 @@ void executeMetadataChangesInTxn(
                                             ShardingCatalogClient::kLocalWriteConcern);
 }
 
-BSONObj makeFlushRoutingTableCacheUpdatesCmd(const NamespaceString& nss) {
+std::shared_ptr<async_rpc::AsyncRPCOptions<FlushRoutingTableCacheUpdatesWithWriteConcern>>
+makeFlushRoutingTableCacheUpdatesOptions(const NamespaceString& nss,
+                                         const std::shared_ptr<executor::TaskExecutor>& exec,
+                                         CancellationToken token) {
     auto cmd = FlushRoutingTableCacheUpdatesWithWriteConcern(nss);
     cmd.setSyncFromConfig(true);
-    cmd.setDbName(nss.db());
-    return cmd.toBSON(
-        BSON(WriteConcernOptions::kWriteConcernField << kMajorityWriteConcern.toBSON()));
-}
-
-ReshardingMetrics::CoordinatorState toMetricsState(CoordinatorStateEnum state) {
-    return ReshardingMetrics::CoordinatorState(state);
+    cmd.setDbName(nss.dbName());
+    generic_argument_util::setMajorityWriteConcern(cmd, &kMajorityWriteConcern);
+    auto opts =
+        std::make_shared<async_rpc::AsyncRPCOptions<FlushRoutingTableCacheUpdatesWithWriteConcern>>(
+            exec, token, cmd);
+    return opts;
 }
 
 }  // namespace
@@ -615,7 +849,9 @@ CollectionType createTempReshardingCollectionType(
     OperationContext* opCtx,
     const ReshardingCoordinatorDocument& coordinatorDoc,
     const ChunkVersion& chunkVersion,
-    const BSONObj& collation) {
+    const BSONObj& collation,
+    boost::optional<CollectionIndexes> indexVersion,
+    boost::optional<bool> isUnsplittable) {
     CollectionType collType(coordinatorDoc.getTempReshardingNss(),
                             chunkVersion.epoch(),
                             chunkVersion.getTimestamp(),
@@ -624,72 +860,132 @@ CollectionType createTempReshardingCollectionType(
                             coordinatorDoc.getReshardingKey());
     collType.setDefaultCollation(collation);
 
+    if (isUnsplittable.has_value() && isUnsplittable.get()) {
+        collType.setUnsplittable(isUnsplittable.get());
+    }
+
     TypeCollectionReshardingFields tempEntryReshardingFields(coordinatorDoc.getReshardingUUID());
     tempEntryReshardingFields.setState(coordinatorDoc.getState());
     tempEntryReshardingFields.setStartTime(coordinatorDoc.getStartTime());
+    tempEntryReshardingFields.setProvenance(
+        coordinatorDoc.getCommonReshardingMetadata().getProvenance());
+    tempEntryReshardingFields.setImplicitlyCreateIndex(
+        coordinatorDoc.getCommonReshardingMetadata().getImplicitlyCreateIndex());
+    tempEntryReshardingFields.setPerformVerification(
+        coordinatorDoc.getCommonReshardingMetadata().getPerformVerification());
 
     auto recipientFields = constructRecipientFields(coordinatorDoc);
     tempEntryReshardingFields.setRecipientFields(std::move(recipientFields));
     collType.setReshardingFields(std::move(tempEntryReshardingFields));
     collType.setAllowMigrations(false);
+
+    if (indexVersion) {
+        collType.setIndexVersion(*indexVersion);
+    }
     return collType;
 }
 
-void cleanupSourceConfigCollections(OperationContext* opCtx,
-                                    const ReshardingCoordinatorDocument& coordinatorDoc) {
-    using Doc = Document;
-    using Arr = std::vector<Value>;
-    using V = Value;
+void removeChunkDocs(OperationContext* opCtx, const UUID& collUUID) {
+    // Remove all chunk documents for the specified collUUID. We do not know how many chunk docs
+    // currently exist, so cannot pass a value for expectedNumModified
+    const auto chunksQuery = BSON(ChunkType::collectionUUID() << collUUID);
+    const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
 
-    auto createTagFilter = [](const V value) {
-        return V{Doc{{"$map",
-                      V{Doc{{"input", V{Doc{{"$objectToArray", value}}}},
-                            {"in", V{StringData("$$this.k")}}}}}}};
-    };
-
-
-    auto skipNewTagsFilter = Doc{
-        {"$ne",
-         Arr{createTagFilter(V{StringData("$min")}),
-             createTagFilter(V{Doc{{"$literal", coordinatorDoc.getReshardingKey().toBSON()}}})}}};
-
-    const auto removeTagsQuery =
-        BSON(TagsType::ns(coordinatorDoc.getSourceNss().ns()) << "$expr" << skipNewTagsFilter);
-
-    removeChunkAndTagsDocs(opCtx, removeTagsQuery, coordinatorDoc.getSourceUUID());
+    uassertStatusOK(catalogClient->removeConfigDocuments(
+        opCtx, NamespaceString::kConfigsvrChunksNamespace, chunksQuery, kMajorityWriteConcern));
 }
 
 void writeDecisionPersistedState(OperationContext* opCtx,
                                  ReshardingMetrics* metrics,
                                  const ReshardingCoordinatorDocument& coordinatorDoc,
                                  OID newCollectionEpoch,
-                                 Timestamp newCollectionTimestamp) {
+                                 Timestamp newCollectionTimestamp,
+                                 boost::optional<CollectionIndexes> collectionIndexes,
+                                 const std::vector<ShardId>& reshardedCollectionPlacement) {
 
     // No need to bump originalNss version because its epoch will be changed.
     executeMetadataChangesInTxn(
         opCtx,
-        [&metrics, &coordinatorDoc, &newCollectionEpoch, &newCollectionTimestamp](
-            OperationContext* opCtx, TxnNumber txnNumber) {
+        [&metrics,
+         &coordinatorDoc,
+         &newCollectionEpoch,
+         &newCollectionTimestamp,
+         &collectionIndexes,
+         &reshardedCollectionPlacement](OperationContext* opCtx, TxnNumber txnNumber) {
             // Update the config.reshardingOperations entry
             writeToCoordinatorStateNss(opCtx, metrics, coordinatorDoc, txnNumber);
 
+            // Copy the original indexes to the temporary uuid.
+            writeToConfigIndexesForTempNss(opCtx, coordinatorDoc, txnNumber);
+
             // Remove the config.collections entry for the temporary collection
-            writeToConfigCollectionsForTempNss(
-                opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
+            writeToConfigCollectionsForTempNss(opCtx,
+                                               coordinatorDoc,
+                                               boost::none,
+                                               boost::none,
+                                               boost::none,
+                                               boost::none,
+                                               txnNumber);
 
             // Update the config.collections entry for the original namespace to reflect the new
             // shard key, new epoch, and new UUID
-            updateConfigCollectionsForOriginalNss(
-                opCtx, coordinatorDoc, newCollectionEpoch, newCollectionTimestamp, txnNumber);
+            updateConfigCollectionsForOriginalNss(opCtx,
+                                                  coordinatorDoc,
+                                                  newCollectionEpoch,
+                                                  newCollectionTimestamp,
+                                                  collectionIndexes,
+                                                  txnNumber);
 
-            updateChunkAndTagsDocsForTempNss(opCtx, coordinatorDoc, newCollectionEpoch, txnNumber);
+            // Insert the list of recipient shard IDs (together with the new timestamp and UUID) as
+            // the latest entry in config.placementHistory about the original namespace
+            writeToConfigPlacementHistoryForOriginalNss(opCtx,
+                                                        coordinatorDoc,
+                                                        newCollectionTimestamp,
+                                                        reshardedCollectionPlacement,
+                                                        txnNumber);
+
+            // Update the QueryAnalyzerDocument for the resharded collection with the new collection
+            // UUID.
+            updateQueryAnalyzerMetadata(opCtx, coordinatorDoc, txnNumber);
+
+            // Delete all of the config.tags entries for the user collection namespace.
+            const auto removeTagsQuery = BSON(TagsType::ns(NamespaceStringUtil::serialize(
+                coordinatorDoc.getSourceNss(), SerializationContext::stateDefault())));
+            removeTagsDocs(opCtx, removeTagsQuery, txnNumber);
+
+            // Update all of the config.tags entries for the temporary resharding namespace
+            // to refer to the user collection namespace.
+            updateTagsDocsForTempNss(opCtx, coordinatorDoc, txnNumber);
         });
+}
+
+void updateTagsDocsForTempNss(OperationContext* opCtx,
+                              const ReshardingCoordinatorDocument& coordinatorDoc,
+                              TxnNumber txnNumber) {
+    auto hint = BSON("ns" << 1 << "min" << 1);
+    auto tagsRequest = BatchedCommandRequest::buildUpdateOp(
+        TagsType::ConfigNS,
+        BSON(TagsType::ns(
+            NamespaceStringUtil::serialize(coordinatorDoc.getTempReshardingNss(),
+                                           SerializationContext::stateDefault()))),  // query
+        BSON("$set" << BSON("ns" << NamespaceStringUtil::serialize(
+                                coordinatorDoc.getSourceNss(),
+                                SerializationContext::stateDefault()))),  // update
+        false,                                                            // upsert
+        true,                                                             // multi
+        hint                                                              // hint
+    );
+
+    // Update the 'ns' field to be the original collection namespace for all tags documents that
+    // currently have 'ns' as the temporary collection namespace.
+    auto tagsRes = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
+        opCtx, TagsType::ConfigNS, tagsRequest, txnNumber);
 }
 
 void insertCoordDocAndChangeOrigCollEntry(OperationContext* opCtx,
                                           ReshardingMetrics* metrics,
                                           const ReshardingCoordinatorDocument& coordinatorDoc) {
-    ShardingCatalogManager::get(opCtx)->bumpCollectionVersionAndChangeMetadataInTxn(
+    ShardingCatalogManager::get(opCtx)->bumpCollectionPlacementVersionAndChangeMetadataInTxn(
         opCtx,
         coordinatorDoc.getSourceNss(),
         [&](OperationContext* opCtx, TxnNumber txnNumber) {
@@ -697,11 +993,12 @@ void insertCoordDocAndChangeOrigCollEntry(OperationContext* opCtx,
                 opCtx,
                 CollectionType::ConfigNS,
                 txnNumber,
-                BSON(CollectionType::kNssFieldName << coordinatorDoc.getSourceNss().ns()));
+                BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(
+                         coordinatorDoc.getSourceNss(), SerializationContext::stateDefault())));
 
             uassert(5808200,
                     str::stream() << "config.collection entry not found for "
-                                  << coordinatorDoc.getSourceNss().ns(),
+                                  << coordinatorDoc.getSourceNss().toStringForErrorMsg(),
                     doc);
 
             CollectionType configCollDoc(*doc);
@@ -712,25 +1009,12 @@ void insertCoordDocAndChangeOrigCollEntry(OperationContext* opCtx,
 
             // Insert the coordinator document to config.reshardingOperations.
             invariant(coordinatorDoc.getActive());
-            try {
-                writeToCoordinatorStateNss(opCtx, metrics, coordinatorDoc, txnNumber);
-            } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
-                auto extraInfo = ex.extraInfo<DuplicateKeyErrorInfo>();
-                if (extraInfo->getKeyPattern().woCompare(BSON("active" << 1)) == 0) {
-                    uasserted(ErrorCodes::ReshardCollectionInProgress,
-                              str::stream()
-                                  << "Only one resharding operation is allowed to be active at a "
-                                     "time, aborting resharding op for "
-                                  << coordinatorDoc.getSourceNss());
-                }
-
-                throw;
-            }
+            writeToCoordinatorStateNss(opCtx, metrics, coordinatorDoc, txnNumber);
 
             // Update the config.collections entry for the original collection to include
             // 'reshardingFields'
             updateConfigCollectionsForOriginalNss(
-                opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
+                opCtx, coordinatorDoc, boost::none, boost::none, boost::none, txnNumber);
         },
         ShardingCatalogClient::kLocalWriteConcern);
 }
@@ -740,13 +1024,16 @@ void writeParticipantShardsAndTempCollInfo(
     ReshardingMetrics* metrics,
     const ReshardingCoordinatorDocument& updatedCoordinatorDoc,
     std::vector<ChunkType> initialChunks,
-    std::vector<BSONObj> zones) {
-    const auto tagsQuery = BSON(TagsType::ns(updatedCoordinatorDoc.getTempReshardingNss().ns()));
+    std::vector<BSONObj> zones,
+    boost::optional<CollectionIndexes> indexVersion,
+    boost::optional<bool> isUnsplittable) {
+    const auto tagsQuery = BSON(TagsType::ns(NamespaceStringUtil::serialize(
+        updatedCoordinatorDoc.getTempReshardingNss(), SerializationContext::stateDefault())));
 
     removeChunkAndTagsDocs(opCtx, tagsQuery, updatedCoordinatorDoc.getReshardingUUID());
     insertChunkAndTagDocsForTempNss(opCtx, initialChunks, zones);
 
-    ShardingCatalogManager::get(opCtx)->bumpCollectionVersionAndChangeMetadataInTxn(
+    ShardingCatalogManager::get(opCtx)->bumpCollectionPlacementVersionAndChangeMetadataInTxn(
         opCtx,
         updatedCoordinatorDoc.getSourceNss(),
         [&](OperationContext* opCtx, TxnNumber txnNumber) {
@@ -754,17 +1041,24 @@ void writeParticipantShardsAndTempCollInfo(
             // chunks all have the same epoch, so picking the last chunk here is arbitrary.
             invariant(initialChunks.size() != 0);
             auto chunkVersion = initialChunks.back().getVersion();
-            writeToConfigCollectionsForTempNss(
-                opCtx, updatedCoordinatorDoc, chunkVersion, CollationSpec::kSimpleSpec, txnNumber);
+            writeToConfigCollectionsForTempNss(opCtx,
+                                               updatedCoordinatorDoc,
+                                               chunkVersion,
+                                               CollationSpec::kSimpleSpec,
+                                               indexVersion,
+                                               isUnsplittable,
+                                               txnNumber);
+            // Copy the original indexes to the temporary uuid.
+            writeToConfigIndexesForTempNss(opCtx, updatedCoordinatorDoc, txnNumber);
             // Update on-disk state to reflect latest state transition.
             writeToCoordinatorStateNss(opCtx, metrics, updatedCoordinatorDoc, txnNumber);
             updateConfigCollectionsForOriginalNss(
-                opCtx, updatedCoordinatorDoc, boost::none, boost::none, txnNumber);
+                opCtx, updatedCoordinatorDoc, boost::none, boost::none, boost::none, txnNumber);
         },
         ShardingCatalogClient::kLocalWriteConcern);
 }
 
-void writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(
+void writeStateTransitionAndCatalogUpdatesThenBumpCollectionPlacementVersions(
     OperationContext* opCtx,
     ReshardingMetrics* metrics,
     const ReshardingCoordinatorDocument& coordinatorDoc) {
@@ -776,62 +1070,87 @@ void writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(
         collNames.emplace_back(coordinatorDoc.getTempReshardingNss());
     }
 
-    ShardingCatalogManager::get(opCtx)->bumpMultipleCollectionVersionsAndChangeMetadataInTxn(
-        opCtx,
-        collNames,
-        [&](OperationContext* opCtx, TxnNumber txnNumber) {
-            // Update the config.reshardingOperations entry
-            writeToCoordinatorStateNss(opCtx, metrics, coordinatorDoc, txnNumber);
+    ShardingCatalogManager::get(opCtx)
+        ->bumpMultipleCollectionPlacementVersionsAndChangeMetadataInTxn(
+            opCtx,
+            collNames,
+            [&](OperationContext* opCtx, TxnNumber txnNumber) {
+                // Update the config.reshardingOperations entry
+                writeToCoordinatorStateNss(opCtx, metrics, coordinatorDoc, txnNumber);
 
-            // Update the config.collections entry for the original collection
-            updateConfigCollectionsForOriginalNss(
-                opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
+                // Update the config.collections entry for the original collection
+                updateConfigCollectionsForOriginalNss(
+                    opCtx, coordinatorDoc, boost::none, boost::none, boost::none, txnNumber);
 
-            // Update the config.collections entry for the temporary resharding collection. If we've
-            // already successfully committed that the operation will succeed, we've removed the
-            // entry for the temporary collection and updated the entry with original namespace to
-            // have the new shard key, UUID, and epoch
-            if (nextState < CoordinatorStateEnum::kCommitting) {
-                writeToConfigCollectionsForTempNss(
-                    opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
-            }
-        },
-        ShardingCatalogClient::kLocalWriteConcern);
+                // Update the config.collections entry for the temporary resharding collection. If
+                // we've already successfully committed that the operation will succeed, we've
+                // removed the entry for the temporary collection and updated the entry with
+                // original namespace to have the new shard key, UUID, and epoch
+                if (nextState < CoordinatorStateEnum::kCommitting) {
+                    writeToConfigCollectionsForTempNss(opCtx,
+                                                       coordinatorDoc,
+                                                       boost::none,
+                                                       boost::none,
+                                                       boost::none,
+                                                       boost::none,
+                                                       txnNumber);
+
+                    // Copy the original indexes to the temporary uuid.
+                    writeToConfigIndexesForTempNss(opCtx, coordinatorDoc, txnNumber);
+                }
+            },
+            ShardingCatalogClient::kLocalWriteConcern);
 }
 
-void removeCoordinatorDocAndReshardingFields(OperationContext* opCtx,
-                                             ReshardingMetrics* metrics,
-                                             const ReshardingCoordinatorDocument& coordinatorDoc,
-                                             boost::optional<Status> abortReason) {
+ReshardingCoordinatorDocument removeOrQuiesceCoordinatorDocAndRemoveReshardingFields(
+    OperationContext* opCtx,
+    ReshardingMetrics* metrics,
+    const ReshardingCoordinatorDocument& coordinatorDoc,
+    boost::optional<Status> abortReason) {
     // If the coordinator needs to abort and isn't in kInitializing, additional collections need to
     // be cleaned up in the final transaction. Otherwise, cleanup for abort and success are the
     // same.
     const bool wasDecisionPersisted =
-        coordinatorDoc.getState() == CoordinatorStateEnum::kCommitting;
+        coordinatorDoc.getState() >= CoordinatorStateEnum::kCommitting;
     invariant((wasDecisionPersisted && !abortReason) || abortReason);
 
+    if (coordinatorDoc.getState() > CoordinatorStateEnum::kQuiesced) {
+        return coordinatorDoc;
+    }
+
     ReshardingCoordinatorDocument updatedCoordinatorDoc = coordinatorDoc;
-    updatedCoordinatorDoc.setState(CoordinatorStateEnum::kDone);
+    // If a user resharding ID was provided, move the coordinator doc to "quiesced" rather than
+    // "done".
+    if (coordinatorDoc.getUserReshardingUUID()) {
+        updatedCoordinatorDoc.setState(CoordinatorStateEnum::kQuiesced);
+        updatedCoordinatorDoc.setQuiescePeriodEnd(
+            opCtx->getServiceContext()->getFastClockSource()->now() +
+            Milliseconds(resharding::gReshardingCoordinatorQuiescePeriodMillis));
+    } else {
+        updatedCoordinatorDoc.setState(CoordinatorStateEnum::kDone);
+    }
     emplaceTruncatedAbortReasonIfExists(updatedCoordinatorDoc, abortReason);
 
-    const auto tagsQuery = BSON(TagsType::ns(coordinatorDoc.getTempReshardingNss().ns()));
+    const auto tagsQuery = BSON(TagsType::ns(NamespaceStringUtil::serialize(
+        coordinatorDoc.getTempReshardingNss(), SerializationContext::stateDefault())));
     // Once the decision has been persisted, the coordinator would have modified the
     // config.chunks and config.collections entry. This means that the UUID of the
     // non-temp collection is now the UUID of what was previously the UUID of the temp
     // collection. So don't try to call remove as it will end up removing the metadata
     // for the real collection.
     if (!wasDecisionPersisted) {
-        const auto catalogClient = Grid::get(opCtx)->catalogClient();
+        const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
 
         uassertStatusOK(catalogClient->removeConfigDocuments(
             opCtx,
             CollectionType::ConfigNS,
-            BSON(CollectionType::kNssFieldName << coordinatorDoc.getTempReshardingNss().ns()),
+            BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(
+                     coordinatorDoc.getTempReshardingNss(), SerializationContext::stateDefault())),
             kMajorityWriteConcern));
 
         removeChunkAndTagsDocs(opCtx, tagsQuery, coordinatorDoc.getReshardingUUID());
     }
-    ShardingCatalogManager::get(opCtx)->bumpCollectionVersionAndChangeMetadataInTxn(
+    ShardingCatalogManager::get(opCtx)->bumpCollectionPlacementVersionAndChangeMetadataInTxn(
         opCtx,
         updatedCoordinatorDoc.getSourceNss(),
         [&](OperationContext* opCtx, TxnNumber txnNumber) {
@@ -840,12 +1159,12 @@ void removeCoordinatorDocAndReshardingFields(OperationContext* opCtx,
 
             // Remove the resharding fields from the config.collections entry
             updateConfigCollectionsForOriginalNss(
-                opCtx, updatedCoordinatorDoc, boost::none, boost::none, txnNumber);
+                opCtx, updatedCoordinatorDoc, boost::none, boost::none, boost::none, txnNumber);
         },
         ShardingCatalogClient::kLocalWriteConcern);
 
-    metrics->onStateTransition(toMetricsState(coordinatorDoc.getState()),
-                               toMetricsState(updatedCoordinatorDoc.getState()));
+    metrics->onStateTransition(coordinatorDoc.getState(), updatedCoordinatorDoc.getState());
+    return updatedCoordinatorDoc;
 }
 }  // namespace resharding
 
@@ -854,6 +1173,36 @@ ChunkVersion ReshardingCoordinatorExternalState::calculateChunkVersionForInitial
     const auto now = VectorClock::get(opCtx)->getTime();
     const auto timestamp = now.clusterTime().asTimestamp();
     return ChunkVersion({OID::gen(), timestamp}, {1, 0});
+}
+
+boost::optional<CollectionIndexes> ReshardingCoordinatorExternalState::getCatalogIndexVersion(
+    OperationContext* opCtx, const NamespaceString& nss, const UUID& uuid) {
+    auto [_, optSii] =
+        uassertStatusOK(RoutingInformationCache::get(opCtx)->getCollectionRoutingInfo(opCtx, nss));
+    if (optSii) {
+        VectorClock::VectorTime vt = VectorClock::get(opCtx)->getTime();
+        auto time = vt.clusterTime().asTimestamp();
+        return CollectionIndexes{uuid, time};
+    }
+    return boost::none;
+}
+
+bool ReshardingCoordinatorExternalState::getIsUnsplittable(OperationContext* opCtx,
+                                                           const NamespaceString& nss) {
+    auto [cm, _] =
+        uassertStatusOK(RoutingInformationCache::get(opCtx)->getCollectionRoutingInfo(opCtx, nss));
+    return cm.isUnsplittable();
+}
+
+boost::optional<CollectionIndexes>
+ReshardingCoordinatorExternalState::getCatalogIndexVersionForCommit(OperationContext* opCtx,
+                                                                    const NamespaceString& nss) {
+    auto [_, optSii] =
+        uassertStatusOK(RoutingInformationCache::get(opCtx)->getCollectionRoutingInfo(opCtx, nss));
+    if (optSii) {
+        return optSii->getCollectionIndexes();
+    }
+    return boost::none;
 }
 
 std::vector<DonorShardEntry> constructDonorShardEntries(const std::set<ShardId>& donorShardIds) {
@@ -886,8 +1235,9 @@ std::vector<RecipientShardEntry> constructRecipientShardEntries(
 ReshardingCoordinatorExternalState::ParticipantShardsAndChunks
 ReshardingCoordinatorExternalStateImpl::calculateParticipantShardsAndChunks(
     OperationContext* opCtx, const ReshardingCoordinatorDocument& coordinatorDoc) {
-    const auto cm = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
+
+    const auto cm =
+        uassertStatusOK(RoutingInformationCache::get(opCtx)->getCollectionPlacementInfoWithRefresh(
             opCtx, coordinatorDoc.getSourceNss()));
 
     std::set<ShardId> donorShardIds;
@@ -898,7 +1248,14 @@ ReshardingCoordinatorExternalStateImpl::calculateParticipantShardsAndChunks(
 
     // The database primary must always be a recipient to ensure it ends up with consistent
     // collection metadata.
-    recipientShardIds.emplace(cm.dbPrimary());
+    const auto dbPrimaryShard = Grid::get(opCtx)
+                                    ->catalogClient()
+                                    ->getDatabase(opCtx,
+                                                  coordinatorDoc.getSourceNss().dbName(),
+                                                  repl::ReadConcernLevel::kMajorityReadConcern)
+                                    .getPrimary();
+
+    recipientShardIds.emplace(dbPrimaryShard);
 
     if (const auto& chunks = coordinatorDoc.getPresetReshardedChunks()) {
         auto version = calculateChunkVersionForInitialChunks(opCtx);
@@ -917,7 +1274,11 @@ ReshardingCoordinatorExternalStateImpl::calculateParticipantShardsAndChunks(
     } else {
         int numInitialChunks = coordinatorDoc.getNumInitialChunks()
             ? *coordinatorDoc.getNumInitialChunks()
-            : cm.numChunks();
+            : kReshardingNumInitialChunksDefault;
+
+        int numSamplesPerChunk = coordinatorDoc.getNumSamplesPerChunk()
+            ? *coordinatorDoc.getNumSamplesPerChunk()
+            : SamplingBasedSplitPolicy::kDefaultSamplesPerChunk;
 
         ShardKeyPattern shardKey(coordinatorDoc.getReshardingKey());
         const auto tempNs = coordinatorDoc.getTempReshardingNss();
@@ -937,18 +1298,55 @@ ReshardingCoordinatorExternalStateImpl::calculateParticipantShardsAndChunks(
             }
         }
 
-        auto initialSplitter = ReshardingSplitPolicy::make(opCtx,
-                                                           coordinatorDoc.getSourceNss(),
-                                                           tempNs,
-                                                           shardKey,
-                                                           numInitialChunks,
-                                                           std::move(parsedZones));
+        InitialSplitPolicy::ShardCollectionConfig splitResult;
 
-        // Note: The resharding initial split policy doesn't care about what is the real primary
-        // shard, so just pass in a random shard.
-        const SplitPolicyParams splitParams{coordinatorDoc.getReshardingUUID(),
-                                            *donorShardIds.begin()};
-        auto splitResult = initialSplitter.createFirstChunks(opCtx, shardKey, splitParams);
+        // If shardDistribution is specified with min/max, use ShardDistributionSplitPolicy.
+        if (const auto& shardDistribution = coordinatorDoc.getShardDistribution()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "Resharding improvements is not enabled, should not have "
+                    "shardDistribution in coordinatorDoc",
+                    resharding::gFeatureFlagReshardingImprovements.isEnabled(
+                        serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
+            uassert(ErrorCodes::InvalidOptions,
+                    "ShardDistribution should not be empty if provided",
+                    shardDistribution->size() > 0);
+            const SplitPolicyParams splitParams{coordinatorDoc.getReshardingUUID(),
+                                                *donorShardIds.begin()};
+            // If shardDistribution is specified with min/max, create chunks based on the shard
+            // min/max. If not, do sampling based split on limited shards.
+            if ((*shardDistribution)[0].getMin()) {
+                auto initialSplitter = ShardDistributionSplitPolicy::make(
+                    opCtx, shardKey, *shardDistribution, std::move(parsedZones));
+                splitResult = initialSplitter.createFirstChunks(opCtx, shardKey, splitParams);
+            } else {
+                std::vector<ShardId> availableShardIds;
+                for (const auto& shardDist : *shardDistribution) {
+                    availableShardIds.emplace_back(shardDist.getShard());
+                }
+                auto initialSplitter = SamplingBasedSplitPolicy::make(opCtx,
+                                                                      coordinatorDoc.getSourceNss(),
+                                                                      shardKey,
+                                                                      numInitialChunks,
+                                                                      std::move(parsedZones),
+                                                                      availableShardIds,
+                                                                      numSamplesPerChunk);
+                splitResult = initialSplitter.createFirstChunks(opCtx, shardKey, splitParams);
+            }
+        } else {
+            auto initialSplitter = SamplingBasedSplitPolicy::make(opCtx,
+                                                                  coordinatorDoc.getSourceNss(),
+                                                                  shardKey,
+                                                                  numInitialChunks,
+                                                                  std::move(parsedZones),
+                                                                  boost::none /*availableShardIds*/,
+                                                                  numSamplesPerChunk);
+            // Note: The resharding initial split policy doesn't care about what is the real
+            // primary shard, so just pass in a random shard.
+            const SplitPolicyParams splitParams{coordinatorDoc.getReshardingUUID(),
+                                                *donorShardIds.begin()};
+            splitResult = initialSplitter.createFirstChunks(opCtx, shardKey, splitParams);
+        }
+
         initialChunks = std::move(splitResult.chunks);
 
         for (const auto& chunk : initialChunks) {
@@ -956,18 +1354,21 @@ ReshardingCoordinatorExternalStateImpl::calculateParticipantShardsAndChunks(
         }
     }
 
+    if (recipientShardIds.size() != 1 || donorShardIds != recipientShardIds) {
+        sharding_ddl_util::assertDataMovementAllowed();
+    }
+
     return {constructDonorShardEntries(donorShardIds),
             constructRecipientShardEntries(recipientShardIds),
             initialChunks};
 }
 
-void ReshardingCoordinatorExternalStateImpl::sendCommandToShards(
+template <typename CommandType>
+void ReshardingCoordinatorExternalState::sendCommandToShards(
     OperationContext* opCtx,
-    StringData dbName,
-    const BSONObj& command,
-    const std::vector<ShardId>& shardIds,
-    const std::shared_ptr<executor::TaskExecutor>& executor) {
-    sharding_ddl_util::sendAuthenticatedCommandToShards(opCtx, dbName, command, shardIds, executor);
+    std::shared_ptr<async_rpc::AsyncRPCOptions<CommandType>> opts,
+    const std::vector<ShardId>& shardIds) {
+    sharding_ddl_util::sendAuthenticatedCommandToShards(opCtx, opts, shardIds);
 }
 
 ThreadPool::Limits ReshardingCoordinatorService::getThreadPoolLimits() const {
@@ -976,17 +1377,80 @@ ThreadPool::Limits ReshardingCoordinatorService::getThreadPoolLimits() const {
     return threadPoolLimit;
 }
 
+void ReshardingCoordinatorService::checkIfConflictsWithOtherInstances(
+    OperationContext* opCtx,
+    BSONObj initialState,
+    const std::vector<const PrimaryOnlyService::Instance*>& existingInstances) {
+    auto coordinatorDoc = ReshardingCoordinatorDocument::parse(
+        IDLParserContext("ReshardingCoordinatorService::checkIfConflictsWithOtherInstances"),
+        initialState);
+
+    for (const auto& instance : existingInstances) {
+        auto typedInstance = checked_cast<const ReshardingCoordinator*>(instance);
+        // Instances which have already completed do not conflict with other instances, unless
+        // their user resharding UUIDs are the same.
+        const bool isUserReshardingUUIDSame =
+            typedInstance->getMetadata().getUserReshardingUUID() ==
+            coordinatorDoc.getUserReshardingUUID();
+        if (!isUserReshardingUUIDSame && typedInstance->getCompletionFuture().isReady()) {
+            LOGV2_DEBUG(7760400,
+                        1,
+                        "Ignoring 'conflict' with completed instance of resharding",
+                        "newNss"_attr = coordinatorDoc.getSourceNss(),
+                        "oldNss"_attr = typedInstance->getMetadata().getSourceNss(),
+                        "newUUID"_attr = coordinatorDoc.getReshardingUUID(),
+                        "oldUUID"_attr = typedInstance->getMetadata().getReshardingUUID());
+            continue;
+        }
+        // For resharding commands with no UUID provided by the user, we will re-connect to an
+        // instance with the same NS and resharding key, if that instance was originally started
+        // with no user-provided UUID. If a UUID is provided by the user, we will connect only
+        // to the original instance.
+        const bool isNssSame =
+            typedInstance->getMetadata().getSourceNss() == coordinatorDoc.getSourceNss();
+        const bool isReshardingKeySame = SimpleBSONObjComparator::kInstance.evaluate(
+            typedInstance->getMetadata().getReshardingKey().toBSON() ==
+            coordinatorDoc.getReshardingKey().toBSON());
+
+        const bool isProvenanceSame =
+            (typedInstance->getMetadata().getProvenance() ==
+             coordinatorDoc.getCommonReshardingMetadata().getProvenance());
+
+        iassert(ErrorCodes::ConflictingOperationInProgress,
+                str::stream() << "Only one resharding operation is allowed to be active at a "
+                                 "time, aborting resharding op for "
+                              << coordinatorDoc.getSourceNss().toStringForErrorMsg(),
+                isUserReshardingUUIDSame && isNssSame && isReshardingKeySame && isProvenanceSame);
+
+        std::string userReshardingIdMsg;
+        if (coordinatorDoc.getUserReshardingUUID()) {
+            userReshardingIdMsg = str::stream()
+                << " and user resharding UUID " << coordinatorDoc.getUserReshardingUUID();
+        }
+
+        iasserted(ReshardingCoordinatorServiceConflictingOperationInProgressInfo(
+                      typedInstance->shared_from_this()),
+                  str::stream() << "Found an active resharding operation for "
+                                << coordinatorDoc.getSourceNss().toStringForErrorMsg()
+                                << " with resharding key "
+                                << coordinatorDoc.getReshardingKey().toString()
+                                << userReshardingIdMsg);
+    }
+}
+
 std::shared_ptr<repl::PrimaryOnlyService::Instance> ReshardingCoordinatorService::constructInstance(
     BSONObj initialState) {
     return std::make_shared<ReshardingCoordinator>(
         this,
-        ReshardingCoordinatorDocument::parse(IDLParserErrorContext("ReshardingCoordinatorStateDoc"),
-                                             std::move(initialState)),
-        std::make_shared<ReshardingCoordinatorExternalStateImpl>());
+        ReshardingCoordinatorDocument::parse(IDLParserContext("ReshardingCoordinatorStateDoc"),
+                                             initialState),
+        std::make_shared<ReshardingCoordinatorExternalStateImpl>(),
+        _serviceContext);
 }
 
 ExecutorFuture<void> ReshardingCoordinatorService::_rebuildService(
     std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancellationToken& token) {
+
     return AsyncTry([this] {
                auto nss = getStateDocumentsNS();
 
@@ -995,15 +1459,30 @@ ExecutorFuture<void> ReshardingCoordinatorService::_rebuildService(
                auto opCtx = opCtxHolder.get();
                DBDirectClient client(opCtx);
                BSONObj result;
-               client.runCommand(
-                   nss.db().toString(),
-                   BSON("createIndexes"
-                        << nss.coll().toString() << "indexes"
-                        << BSON_ARRAY(BSON("key" << BSON("active" << 1) << "name"
-                                                 << kReshardingCoordinatorActiveIndexName
-                                                 << "unique" << true))),
-                   result);
-               uassertStatusOK(getStatusFromCommandResult(result));
+               // We don't need a unique index on "active" any more since
+               // checkIfConflictsWithOtherInstances was implemented, and once we allow quiesced
+               // instances it breaks them, so don't create it.
+               //
+               // TODO(SERVER-67712): We create the collection only to make index creation during
+               // downgrade simpler, so we can remove all of this initialization when the flag is
+               // removed.
+               if (!resharding::gFeatureFlagReshardingImprovements.isEnabled(
+                       serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+                   client.runCommand(
+                       nss.dbName(),
+                       BSON("createIndexes"
+                            << nss.coll().toString() << "indexes"
+                            << BSON_ARRAY(BSON("key" << BSON("active" << 1) << "name"
+                                                     << kReshardingCoordinatorActiveIndexName
+                                                     << "unique" << true))),
+                       result);
+                   uassertStatusOK(getStatusFromCommandResult(result));
+               } else {
+                   client.runCommand(nss.dbName(), BSON("create" << nss.coll().toString()), result);
+                   const auto& status = getStatusFromCommandResult(result);
+                   if (status.code() != ErrorCodes::NamespaceExists)
+                       uassertStatusOK(status);
+               }
            })
         .until([token](Status status) { return shouldStopAttemptingToCreateIndex(status, token); })
         .withBackoffBetweenIterations(kExponentialBackoff)
@@ -1014,10 +1493,10 @@ void ReshardingCoordinatorService::abortAllReshardCollection(OperationContext* o
     std::vector<SharedSemiFuture<void>> reshardingCoordinatorFutures;
 
     for (auto& instance : getAllInstances(opCtx)) {
-        auto reshardingCoordinator =
-            checked_pointer_cast<ReshardingCoordinatorService::ReshardingCoordinator>(instance);
-        reshardingCoordinatorFutures.push_back(reshardingCoordinator->getCompletionFuture());
-        reshardingCoordinator->abort();
+        auto reshardingCoordinator = checked_pointer_cast<ReshardingCoordinator>(instance);
+        reshardingCoordinatorFutures.push_back(
+            reshardingCoordinator->getQuiescePeriodFinishedFuture());
+        reshardingCoordinator->abort(true /* skip quiesce period */);
     }
 
     for (auto&& future : reshardingCoordinatorFutures) {
@@ -1025,23 +1504,20 @@ void ReshardingCoordinatorService::abortAllReshardCollection(OperationContext* o
     }
 }
 
-ReshardingCoordinatorService::ReshardingCoordinator::ReshardingCoordinator(
-    const ReshardingCoordinatorService* coordinatorService,
+ReshardingCoordinator::ReshardingCoordinator(
+    ReshardingCoordinatorService* coordinatorService,
     const ReshardingCoordinatorDocument& coordinatorDoc,
-    std::shared_ptr<ReshardingCoordinatorExternalState> externalState)
-    : PrimaryOnlyService::TypedInstance<ReshardingCoordinator>(),
-      _id(coordinatorDoc.getReshardingUUID().toBSON()),
+    std::shared_ptr<ReshardingCoordinatorExternalState> externalState,
+    ServiceContext* serviceContext)
+    : repl::PrimaryOnlyService::TypedInstance<ReshardingCoordinator>(),
+      _id(BSON("_id" << coordinatorDoc.getReshardingUUID())),
       _coordinatorService(coordinatorService),
-      _metrics{ReshardingMetrics::initializeFrom(coordinatorDoc, getGlobalServiceContext())},
+      _serviceContext(serviceContext),
+      _metrics{ReshardingMetrics::initializeFrom(coordinatorDoc, _serviceContext)},
       _metadata(coordinatorDoc.getCommonReshardingMetadata()),
       _coordinatorDoc(coordinatorDoc),
-      _markKilledExecutor(std::make_shared<ThreadPool>([] {
-          ThreadPool::Options options;
-          options.poolName = "ReshardingCoordinatorCancelableOpCtxPool";
-          options.minThreads = 1;
-          options.maxThreads = 1;
-          return options;
-      }())),
+      _markKilledExecutor{resharding::makeThreadPoolForMarkKilledExecutor(
+          "ReshardingCoordinatorCancelableOpCtxPool")},
       _reshardingCoordinatorExternalState(externalState) {
     _reshardingCoordinatorObserver = std::make_shared<ReshardingCoordinatorObserver>();
 
@@ -1051,17 +1527,39 @@ ReshardingCoordinatorService::ReshardingCoordinator::ReshardingCoordinator(
         _reshardingCoordinatorObserver->onReshardingParticipantTransition(coordinatorDoc);
     }
 
-    _metrics->onStateTransition(boost::none, toMetricsState(coordinatorDoc.getState()));
+    /*
+     * _originalReshardingStatus is used to return the final status of the operation
+     * if set. If we are in the quiesced state here, it means we completed the
+     * resharding operation on a different primary and failed over. Since we
+     * completed the operation previously we do not want to report a failure status
+     * from aborting (if _originalReshardingStatus is empty). Explicitly set the
+     * previous status to Status:OK() unless we actually had an abort reason from
+     * before the failover.
+     *
+     * If we are in the aborting state, we do want to preserve the original abort reason
+     * to report in the final status.
+     */
+    if (coordinatorDoc.getAbortReason()) {
+        invariant(coordinatorDoc.getState() == CoordinatorStateEnum::kQuiesced ||
+                  coordinatorDoc.getState() == CoordinatorStateEnum::kAborting);
+        _originalReshardingStatus.emplace(resharding::getStatusFromAbortReason(coordinatorDoc));
+    } else if (coordinatorDoc.getState() == CoordinatorStateEnum::kQuiesced) {
+        _originalReshardingStatus.emplace(Status::OK());
+    }
+
+    _metrics->onStateTransition(boost::none, coordinatorDoc.getState());
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::installCoordinatorDoc(
+void ReshardingCoordinator::installCoordinatorDoc(
     OperationContext* opCtx, const ReshardingCoordinatorDocument& doc) noexcept {
     invariant(doc.getReshardingUUID() == _coordinatorDoc.getReshardingUUID());
 
     BSONObjBuilder bob;
     bob.append("newState", CoordinatorState_serializer(doc.getState()));
     bob.append("oldState", CoordinatorState_serializer(_coordinatorDoc.getState()));
-    bob.append("namespace", doc.getSourceNss().toString());
+    bob.append(
+        "namespace",
+        NamespaceStringUtil::serialize(doc.getSourceNss(), SerializationContext::stateDefault()));
     bob.append("collectionUUID", doc.getSourceUUID().toString());
     bob.append("reshardingUUID", doc.getReshardingUUID().toString());
 
@@ -1069,19 +1567,18 @@ void ReshardingCoordinatorService::ReshardingCoordinator::installCoordinatorDoc(
                "Transitioned resharding coordinator state",
                "newState"_attr = CoordinatorState_serializer(doc.getState()),
                "oldState"_attr = CoordinatorState_serializer(_coordinatorDoc.getState()),
-               "namespace"_attr = doc.getSourceNss(),
+               logAttrs(doc.getSourceNss()),
                "collectionUUID"_attr = doc.getSourceUUID(),
                "reshardingUUID"_attr = doc.getReshardingUUID());
 
     const auto previousState = _coordinatorDoc.getState();
     _coordinatorDoc = doc;
 
-    _metrics->onStateTransition(toMetricsState(previousState),
-                                toMetricsState(_coordinatorDoc.getState()));
+    _metrics->onStateTransition(previousState, _coordinatorDoc.getState());
 
     ShardingLogging::get(opCtx)->logChange(opCtx,
                                            "resharding.coordinator.transition",
-                                           doc.getSourceNss().toString(),
+                                           doc.getSourceNss(),
                                            bob.obj(),
                                            kMajorityWriteConcern);
 }
@@ -1096,26 +1593,34 @@ void markCompleted(const Status& status, ReshardingMetrics* metrics) {
     }
 }
 
-BSONObj createFlushReshardingStateChangeCommand(const NamespaceString& nss,
-                                                const UUID& reshardingUUID) {
+std::shared_ptr<async_rpc::AsyncRPCOptions<_flushReshardingStateChange>>
+createFlushReshardingStateChangeOptions(const NamespaceString& nss,
+                                        const UUID& reshardingUUID,
+                                        const std::shared_ptr<executor::TaskExecutor>& exec,
+                                        CancellationToken token) {
     _flushReshardingStateChange cmd(nss);
-    cmd.setDbName(NamespaceString::kAdminDb);
+    cmd.setDbName(DatabaseName::kAdmin);
     cmd.setReshardingUUID(reshardingUUID);
-    return cmd.toBSON(
-        BSON(WriteConcernOptions::kWriteConcernField << WriteConcernOptions::Majority));
+    auto opts =
+        std::make_shared<async_rpc::AsyncRPCOptions<_flushReshardingStateChange>>(exec, token, cmd);
+    return opts;
 }
 
-BSONObj createShardsvrCommitReshardCollectionCmd(const NamespaceString& nss,
-                                                 const UUID& reshardingUUID) {
+std::shared_ptr<async_rpc::AsyncRPCOptions<ShardsvrCommitReshardCollection>>
+createShardsvrCommitReshardCollectionOptions(const NamespaceString& nss,
+                                             const UUID& reshardingUUID,
+                                             const std::shared_ptr<executor::TaskExecutor>& exec,
+                                             CancellationToken token) {
     ShardsvrCommitReshardCollection cmd(nss);
-    cmd.setDbName(NamespaceString::kAdminDb);
+    cmd.setDbName(DatabaseName::kAdmin);
     cmd.setReshardingUUID(reshardingUUID);
-    return cmd.toBSON(
-        BSON(WriteConcernOptions::kWriteConcernField << WriteConcernOptions::Majority));
+    generic_argument_util::setMajorityWriteConcern(cmd, &kMajorityWriteConcern);
+    auto opts = std::make_shared<async_rpc::AsyncRPCOptions<ShardsvrCommitReshardCollection>>(
+        exec, token, cmd);
+    return opts;
 }
 
-ExecutorFuture<void>
-ReshardingCoordinatorService::ReshardingCoordinator::_tellAllParticipantsReshardingStarted(
+ExecutorFuture<void> ReshardingCoordinator::_tellAllParticipantsReshardingStarted(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     if (_coordinatorDoc.getState() > CoordinatorStateEnum::kPreparingToDonate) {
         return ExecutorFuture<void>(**executor, Status::OK());
@@ -1129,6 +1634,7 @@ ReshardingCoordinatorService::ReshardingCoordinator::_tellAllParticipantsReshard
                        _cancelableOpCtxFactory.emplace(_ctHolder->getStepdownToken(),
                                                        _markKilledExecutor);
                    })
+                   .then([this] { return _waitForMajority(_ctHolder->getStepdownToken()); })
                    .then([this, executor]() {
                        pauseBeforeTellDonorToRefresh.pauseWhileSet();
                        _establishAllDonorsAsParticipants(executor);
@@ -1154,13 +1660,12 @@ ReshardingCoordinatorService::ReshardingCoordinator::_tellAllParticipantsReshard
         .on(**executor, _ctHolder->getStepdownToken());
 }
 
-ExecutorFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::_initializeCoordinator(
+ExecutorFuture<void> ReshardingCoordinator::_initializeCoordinator(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     return resharding::WithAutomaticRetry([this, executor] {
                return ExecutorFuture<void>(**executor)
-                   .then([this, executor] { _insertCoordDocAndChangeOrigCollEntry(); })
-                   .then([this, executor] { _calculateParticipantsAndChunksThenWriteToDisk(); })
-                   .then([this] { return _waitForMajority(_ctHolder->getAbortToken()); });
+                   .then([this] { _insertCoordDocAndChangeOrigCollEntry(); })
+                   .then([this] { _calculateParticipantsAndChunksThenWriteToDisk(); });
            })
         .onTransientError([](const Status& status) {
             LOGV2(5093703,
@@ -1175,7 +1680,7 @@ ExecutorFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::_initi
                 return ExecutorFuture<void>(**executor, status);
             }
 
-            if (_coordinatorDoc.getState() < CoordinatorStateEnum::kPreparingToDonate) {
+            if (_coordinatorDoc.getState() != CoordinatorStateEnum::kPreparingToDonate) {
                 return ExecutorFuture<void>(**executor, status);
             }
 
@@ -1204,16 +1709,27 @@ ExecutorFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::_initi
             }
 
             auto nss = _coordinatorDoc.getSourceNss();
+
+            // If we have an original resharding status due to a failover occurring, we want to
+            // log the original abort reason from before the failover in lieu of the generic
+            // ReshardCollectionAborted status.
             LOGV2(4956903,
                   "Resharding failed",
-                  "namespace"_attr = nss.ns(),
+                  logAttrs(nss),
                   "newShardKeyPattern"_attr = _coordinatorDoc.getReshardingKey(),
-                  "error"_attr = status);
+                  "error"_attr = _originalReshardingStatus ? *_originalReshardingStatus : status);
 
             // Allow abort to continue except when stepped down.
             _cancelableOpCtxFactory.emplace(_ctHolder->getStepdownToken(), _markKilledExecutor);
 
-            if (_coordinatorDoc.getState() < CoordinatorStateEnum::kPreparingToDonate) {
+            // If we're already quiesced here it means we failed over and need to preserve the
+            // original abort reason.
+            if (_coordinatorDoc.getState() == CoordinatorStateEnum::kQuiesced) {
+                markCompleted(*_originalReshardingStatus, _metrics.get());
+                // We must return status here, not _originalReshardingStatus, because the latter
+                // may be Status::OK() and not abort the future flow.
+                return ExecutorFuture<void>(**executor, status);
+            } else if (_coordinatorDoc.getState() < CoordinatorStateEnum::kPreparingToDonate) {
                 return _onAbortCoordinatorOnly(executor, status);
             } else {
                 return _onAbortCoordinatorAndParticipants(executor, status);
@@ -1221,8 +1737,7 @@ ExecutorFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::_initi
         });
 }
 
-ExecutorFuture<ReshardingCoordinatorDocument>
-ReshardingCoordinatorService::ReshardingCoordinator::_runUntilReadyToCommit(
+ExecutorFuture<ReshardingCoordinatorDocument> ReshardingCoordinator::_runUntilReadyToCommit(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) noexcept {
     return resharding::WithAutomaticRetry([this, executor] {
                return ExecutorFuture<void>(**executor)
@@ -1280,7 +1795,7 @@ ReshardingCoordinatorService::ReshardingCoordinator::_runUntilReadyToCommit(
             auto nss = _coordinatorDoc.getSourceNss();
             LOGV2(4956902,
                   "Resharding failed",
-                  "namespace"_attr = nss.ns(),
+                  logAttrs(nss),
                   "newShardKeyPattern"_attr = _coordinatorDoc.getReshardingKey(),
                   "error"_attr = status);
 
@@ -1293,41 +1808,16 @@ ReshardingCoordinatorService::ReshardingCoordinator::_runUntilReadyToCommit(
         });
 }
 
-ExecutorFuture<void>
-ReshardingCoordinatorService::ReshardingCoordinator::_commitAndFinishReshardOperation(
+ExecutorFuture<void> ReshardingCoordinator::_commitAndFinishReshardOperation(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
     const ReshardingCoordinatorDocument& updatedCoordinatorDoc) noexcept {
     return resharding::WithAutomaticRetry([this, executor, updatedCoordinatorDoc] {
                return ExecutorFuture<void>(**executor)
-                   .then([this, executor, updatedCoordinatorDoc] {
-                       return _commit(updatedCoordinatorDoc);
-                   })
-                   .then([this] { return _waitForMajority(_ctHolder->getStepdownToken()); })
-                   .thenRunOn(**executor)
-                   .then([this, executor] {
-                       _tellAllParticipantsToCommit(_coordinatorDoc.getSourceNss(), executor);
-                   })
-                   .then([this] { _updateChunkImbalanceMetrics(_coordinatorDoc.getSourceNss()); })
-                   .then([this, updatedCoordinatorDoc] {
-                       auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
-                       resharding::cleanupSourceConfigCollections(opCtx.get(),
-                                                                  updatedCoordinatorDoc);
-                       return Status::OK();
-                   })
-                   .then([this, executor] { return _awaitAllParticipantShardsDone(executor); })
-                   .then([this, executor] {
-                       _metrics->onCriticalSectionEnd();
-
-                       // Best-effort attempt to trigger a refresh on the participant shards so
-                       // they see the collection metadata without reshardingFields and no longer
-                       // throw ReshardCollectionInProgress. There is no guarantee this logic ever
-                       // runs if the config server primary steps down after having removed the
-                       // coordinator state document.
-                       return _tellAllRecipientsToRefresh(executor);
-                   });
+                   .then(
+                       [this, executor, updatedCoordinatorDoc] { _commit(updatedCoordinatorDoc); });
            })
         .onTransientError([](const Status& status) {
-            LOGV2(5093705,
+            LOGV2(7698801,
                   "Resharding coordinator encountered transient error while committing",
                   "error"_attr = status);
         })
@@ -1335,28 +1825,163 @@ ReshardingCoordinatorService::ReshardingCoordinator::_commitAndFinishReshardOper
         .until<Status>([](const Status& status) { return status.isOK(); })
         .on(**executor, _ctHolder->getStepdownToken())
         .onError([this, executor](Status status) {
-            {
-                auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
-                reshardingPauseCoordinatorBeforeStartingErrorFlow.pauseWhileSet(opCtx.get());
+            if (status == ErrorCodes::TransactionTooLargeForCache) {
+                return _onAbortCoordinatorAndParticipants(executor, status);
             }
+            return ExecutorFuture<void>(**executor, status);
+        })
+        .then([this, executor, updatedCoordinatorDoc] {
+            return resharding::WithAutomaticRetry([this, executor, updatedCoordinatorDoc] {
+                       return ExecutorFuture<void>(**executor)
+                           .then([this] { return _waitForMajority(_ctHolder->getStepdownToken()); })
+                           .thenRunOn(**executor)
+                           .then(
+                               [this, executor] { _generateOpEventOnCoordinatingShard(executor); })
+                           .then([this, executor] {
+                               _tellAllParticipantsToCommit(_coordinatorDoc.getSourceNss(),
+                                                            executor);
+                           })
+                           .then([this] {
+                               _updateChunkImbalanceMetrics(_coordinatorDoc.getSourceNss());
+                           })
+                           .then([this, updatedCoordinatorDoc] {
+                               auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+                               resharding::removeChunkDocs(opCtx.get(),
+                                                           updatedCoordinatorDoc.getSourceUUID());
+                               return Status::OK();
+                           })
+                           .then([this, executor] {
+                               return _awaitAllParticipantShardsDone(executor);
+                           })
+                           .then([this, executor] {
+                               _metrics->setEndFor(ReshardingMetrics::TimedPhase::kCriticalSection,
+                                                   getCurrentTime());
 
-            if (_ctHolder->isSteppingOrShuttingDown()) {
-                return status;
-            }
+                               // Best-effort attempt to trigger a refresh on the participant shards
+                               // so they see the collection metadata without reshardingFields and
+                               // no longer throw ReshardCollectionInProgress. There is no guarantee
+                               // this logic ever runs if the config server primary steps down after
+                               // having removed the coordinator state document.
+                               return _tellAllRecipientsToRefresh(executor);
+                           });
+                   })
+                .onTransientError([](const Status& status) {
+                    LOGV2(5093705,
+                          "Resharding coordinator encountered transient error while committing",
+                          "error"_attr = status);
+                })
+                .onUnrecoverableError([](const Status& status) {})
+                .until<Status>([](const Status& status) { return status.isOK(); })
+                .on(**executor, _ctHolder->getStepdownToken())
+                .onError([this, executor](Status status) {
+                    {
+                        auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+                        reshardingPauseCoordinatorBeforeStartingErrorFlow.pauseWhileSet(
+                            opCtx.get());
+                    }
 
-            LOGV2_FATAL(5277000,
+                    if (_ctHolder->isSteppingOrShuttingDown()) {
+                        return status;
+                    }
+
+                    LOGV2_FATAL(
+                        5277000,
                         "Unrecoverable error past the point resharding was guaranteed to succeed",
                         "error"_attr = redact(status));
+                });
         });
 }
 
-SemiFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::run(
-    std::shared_ptr<executor::ScopedTaskExecutor> executor,
-    const CancellationToken& stepdownToken) noexcept {
-    _ctHolder = std::make_unique<CoordinatorCancellationTokenHolder>(stepdownToken);
+SemiFuture<void> ReshardingCoordinator::run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                            const CancellationToken& stepdownToken) noexcept {
+    getObserver()->reshardingCoordinatorRunCalled();
+    pauseBeforeCTHolderInitialization.pauseWhileSet();
+
+    auto abortCalled = [&] {
+        stdx::lock_guard<stdx::mutex> lk(_abortCalledMutex);
+        _ctHolder = std::make_unique<CoordinatorCancellationTokenHolder>(stepdownToken);
+        return _abortCalled;
+    }();
+
+    if (abortCalled) {
+        if (abortCalled == AbortType::kAbortSkipQuiesce) {
+            _ctHolder->cancelQuiescePeriod();
+        }
+        _ctHolder->abort();
+    }
+
     _markKilledExecutor->startup();
     _cancelableOpCtxFactory.emplace(_ctHolder->getAbortToken(), _markKilledExecutor);
 
+    return _isReshardingOpRedundant(executor)
+        .thenRunOn(_coordinatorService->getInstanceCleanupExecutor())
+        .onCompletion([this, self = shared_from_this(), executor](
+                          StatusWith<bool> isOpRedundantSW) -> ExecutorFuture<void> {
+            if (isOpRedundantSW.isOK() && isOpRedundantSW.getValue()) {
+                this->_coordinatorService->releaseInstance(this->_id, isOpRedundantSW.getStatus());
+                _coordinatorDocWrittenPromise.emplaceValue();
+                _completionPromise.emplaceValue();
+                _reshardingCoordinatorObserver->fulfillPromisesBeforePersistingStateDoc();
+                return ExecutorFuture<void>(**executor, isOpRedundantSW.getStatus());
+            } else if (!isOpRedundantSW.isOK()) {
+                this->_coordinatorService->releaseInstance(this->_id, isOpRedundantSW.getStatus());
+                _coordinatorDocWrittenPromise.setError(isOpRedundantSW.getStatus());
+                _completionPromise.setError(isOpRedundantSW.getStatus());
+                _reshardingCoordinatorObserver->interrupt(isOpRedundantSW.getStatus());
+                return ExecutorFuture<void>(**executor, isOpRedundantSW.getStatus());
+            }
+            return _runReshardingOp(executor);
+        })
+        .onCompletion([this, self = shared_from_this(), executor](Status status) {
+            _cancelableOpCtxFactory.emplace(_ctHolder->getStepdownToken(), _markKilledExecutor);
+            return _quiesce(executor, std::move(status));
+        })
+        .semi();
+}
+
+ExecutorFuture<void> ReshardingCoordinator::_quiesce(
+    const std::shared_ptr<executor::ScopedTaskExecutor>& executor, Status status) {
+    if (_coordinatorDoc.getState() == CoordinatorStateEnum::kQuiesced) {
+        return (*executor)
+            ->sleepUntil(*_coordinatorDoc.getQuiescePeriodEnd(), _ctHolder->getCancelQuiesceToken())
+            .onCompletion([this, self = shared_from_this(), executor, status](Status sleepStatus) {
+                LOGV2_DEBUG(7760405,
+                            1,
+                            "Resharding coordinator quiesce period done",
+                            "reshardingUUID"_attr = _coordinatorDoc.getReshardingUUID());
+                if (!_ctHolder->isSteppingOrShuttingDown()) {
+                    auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+                    ReshardingCoordinatorDocument updatedCoordinatorDoc = _coordinatorDoc;
+                    updatedCoordinatorDoc.setState(CoordinatorStateEnum::kDone);
+                    executeMetadataChangesInTxn(
+                        opCtx.get(),
+                        [&updatedCoordinatorDoc](OperationContext* opCtx, TxnNumber txnNumber) {
+                            writeToCoordinatorStateNss(opCtx,
+                                                       nullptr /* metrics have already been freed */
+                                                       ,
+                                                       updatedCoordinatorDoc,
+                                                       txnNumber);
+                        });
+                    LOGV2_DEBUG(7760406,
+                                1,
+                                "Resharding coordinator removed state doc after quiesce",
+                                "reshardingUUID"_attr = _coordinatorDoc.getReshardingUUID());
+                }
+                return status;
+            })
+            .thenRunOn(_coordinatorService->getInstanceCleanupExecutor())
+            .onCompletion([this, self = shared_from_this(), executor, status](Status deleteStatus) {
+                _quiescePeriodFinishedPromise.emplaceValue();
+                return status;
+            });
+    }
+    // No quiesce period is required.
+    _quiescePeriodFinishedPromise.emplaceValue();
+    return ExecutorFuture<void>(**executor, status);
+}
+
+ExecutorFuture<void> ReshardingCoordinator::_runReshardingOp(
+    const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     return _initializeCoordinator(executor)
         .then([this, executor] { return _runUntilReadyToCommit(executor); })
         .then([this, executor](const ReshardingCoordinatorDocument& updatedCoordinatorDoc) {
@@ -1364,22 +1989,36 @@ SemiFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::run(
         })
         .onCompletion([this, executor](Status status) {
             auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
-            reshardingPauseCoordinatorBeforeCompletion.pauseWhileSetAndNotCanceled(
-                opCtx.get(), _ctHolder->getStepdownToken());
+            reshardingPauseCoordinatorBeforeCompletion.executeIf(
+                [&](const BSONObj&) {
+                    reshardingPauseCoordinatorBeforeCompletion.pauseWhileSetAndNotCanceled(
+                        opCtx.get(), _ctHolder->getStepdownToken());
+                },
+                [&](const BSONObj& data) {
+                    auto ns = data.getStringField("sourceNamespace");
+                    return ns.empty() ? true
+                                      : ns.toString() ==
+                            NamespaceStringUtil::serialize(_coordinatorDoc.getSourceNss(),
+                                                           SerializationContext::stateDefault());
+                });
 
             {
                 auto lg = stdx::lock_guard(_fulfillmentMutex);
-                if (status.isOK()) {
+                // reportStatus is the status reported back to the caller, which may be
+                // different than the status if we interrupted the future chain because the
+                // resharding was already completed on a previous primary.
+                auto reportStatus = _originalReshardingStatus.value_or(status);
+                if (reportStatus.isOK()) {
                     _completionPromise.emplaceValue();
 
                     if (!_coordinatorDocWrittenPromise.getFuture().isReady()) {
                         _coordinatorDocWrittenPromise.emplaceValue();
                     }
                 } else {
-                    _completionPromise.setError(status);
+                    _completionPromise.setError(reportStatus);
 
                     if (!_coordinatorDocWrittenPromise.getFuture().isReady()) {
-                        _coordinatorDocWrittenPromise.setError(status);
+                        _coordinatorDocWrittenPromise.setError(reportStatus);
                     }
                 }
             }
@@ -1399,13 +2038,17 @@ SemiFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::run(
                 .onCompletion([outerStatus](Status) { return outerStatus; });
         })
         .onCompletion([this, self = shared_from_this()](Status status) {
-            _metrics->onStateTransition(toMetricsState(_coordinatorDoc.getState()), boost::none);
+            _metrics->onStateTransition(_coordinatorDoc.getState(), boost::none);
+            if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+                _logStatsOnCompletion(status.isOK());
+            }
 
-            // Destroy metrics early so it's lifetime will not be tied to the lifetime of this
-            // state machine. This is because we have future callbacks copy shared pointers to this
-            // state machine that causes it to live longer than expected and potentially overlap
-            // with a newer instance when stepping up.
-            _metrics.reset();
+            // Unregister metrics early so the cumulative metrics do not continue to track these
+            // metrics for the lifetime of this state machine. We have future callbacks copy shared
+            // pointers to this state machine that causes it to live longer than expected, and can
+            // potentially overlap with a newer instance when stepping up.
+            _metrics->deregisterMetrics();
 
             if (!status.isOK()) {
                 {
@@ -1420,11 +2063,10 @@ SemiFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::run(
                 }
                 _reshardingCoordinatorObserver->interrupt(status);
             }
-        })
-        .semi();
+        });
 }
 
-ExecutorFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::_onAbortCoordinatorOnly(
+ExecutorFuture<void> ReshardingCoordinator::_onAbortCoordinatorOnly(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor, const Status& status) {
     if (_coordinatorDoc.getState() == CoordinatorStateEnum::kUnused) {
         return ExecutorFuture<void>(**executor, status);
@@ -1438,8 +2080,7 @@ ExecutorFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::_onAbo
 
                // The temporary collection and its corresponding entries were never created. Only
                // the coordinator document and reshardingFields require cleanup.
-               resharding::removeCoordinatorDocAndReshardingFields(
-                   opCtx.get(), _metrics.get(), _coordinatorDoc, status);
+               _removeOrQuiesceCoordinatorDocAndRemoveReshardingFields(opCtx.get(), status);
                return status;
            })
         .onTransientError([](const Status& retryStatus) {
@@ -1454,8 +2095,7 @@ ExecutorFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::_onAbo
         .then([status] { return status; });
 }
 
-ExecutorFuture<void>
-ReshardingCoordinatorService::ReshardingCoordinator::_onAbortCoordinatorAndParticipants(
+ExecutorFuture<void> ReshardingCoordinator::_onAbortCoordinatorAndParticipants(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor, const Status& status) {
     // Participants should never be waited upon to complete the abort if they were never made aware
     // of the resharding operation (the coordinator flushing its state change to
@@ -1501,27 +2141,37 @@ ReshardingCoordinatorService::ReshardingCoordinator::_onAbortCoordinatorAndParti
         .then([status] { return status; });
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::abort() {
-    _ctHolder->abort();
+void ReshardingCoordinator::abort(bool skipQuiescePeriod) {
+    auto ctHolderInitialized = [&] {
+        stdx::lock_guard<stdx::mutex> lk(_abortCalledMutex);
+        skipQuiescePeriod = skipQuiescePeriod || _abortCalled == AbortType::kAbortSkipQuiesce;
+        _abortCalled =
+            skipQuiescePeriod ? AbortType::kAbortSkipQuiesce : AbortType::kAbortWithQuiesce;
+        return !(_ctHolder == nullptr);
+    }();
+
+    if (ctHolderInitialized) {
+        if (skipQuiescePeriod)
+            _ctHolder->cancelQuiescePeriod();
+        _ctHolder->abort();
+    }
 }
 
-boost::optional<BSONObj> ReshardingCoordinatorService::ReshardingCoordinator::reportForCurrentOp(
+boost::optional<BSONObj> ReshardingCoordinator::reportForCurrentOp(
     MongoProcessInterface::CurrentOpConnectionsMode,
     MongoProcessInterface::CurrentOpSessionsMode) noexcept {
     return _metrics->reportForCurrentOp();
 }
 
-std::shared_ptr<ReshardingCoordinatorObserver>
-ReshardingCoordinatorService::ReshardingCoordinator::getObserver() {
+std::shared_ptr<ReshardingCoordinatorObserver> ReshardingCoordinator::getObserver() {
     return _reshardingCoordinatorObserver;
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::onOkayToEnterCritical() {
+void ReshardingCoordinator::onOkayToEnterCritical() {
     _fulfillOkayToEnterCritical(Status::OK());
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_fulfillOkayToEnterCritical(
-    Status status) {
+void ReshardingCoordinator::_fulfillOkayToEnterCritical(Status status) {
     auto lg = stdx::lock_guard(_fulfillmentMutex);
     if (_canEnterCritical.getFuture().isReady())
         return;
@@ -1534,23 +2184,110 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_fulfillOkayToEnterCri
     }
 }
 
-SemiFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::_waitForMajority(
-    const CancellationToken& token) {
+SemiFuture<void> ReshardingCoordinator::_waitForMajority(const CancellationToken& token) {
     auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
     auto client = opCtx->getClient();
     repl::ReplClientInfo::forClient(client).setLastOpToSystemLastOpTime(opCtx.get());
     auto opTime = repl::ReplClientInfo::forClient(client).getLastOp();
     return WaitForMajorityService::get(client->getServiceContext())
-        .waitUntilMajority(opTime, token);
+        .waitUntilMajorityForWrite(opTime, token);
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_insertCoordDocAndChangeOrigCollEntry() {
+ExecutorFuture<bool> ReshardingCoordinator::_isReshardingOpRedundant(
+    const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
+    // We only check for redundancy when the resharding op first starts as it would be unsafe to
+    // skip the remainder of the cleanup for the resharding operation if there was a primary
+    // failover after the CoordinatorStateEnum::kCommitting state had been reached.
+    if (_coordinatorDoc.getState() != CoordinatorStateEnum::kUnused) {
+        return ExecutorFuture<bool>(**executor, false);
+    }
+
+    return resharding::WithAutomaticRetry([this, executor] {
+               auto cancelableOpCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+               auto opCtx = cancelableOpCtx.get();
+
+               // Ensure indexes are loaded in the catalog cache, along with the collection
+               // placement.
+               if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
+                       serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+
+                   uassertStatusOK(
+                       RoutingInformationCache::get(opCtx)->getCollectionIndexInfoWithRefresh(
+                           opCtx, _coordinatorDoc.getSourceNss()));
+               }
+
+               const auto cm = uassertStatusOK(
+                   RoutingInformationCache::get(opCtx)->getCollectionPlacementInfoWithRefresh(
+                       opCtx, _coordinatorDoc.getSourceNss()));
+
+               uassert(ErrorCodes::NamespaceNotFound,
+                       fmt::format("Expected collection '{}' to be tracked on cluster catalog",
+                                   _coordinatorDoc.getSourceNss().toStringForErrorMsg()),
+                       cm.hasRoutingTable());
+
+               if (resharding::isMoveCollection(_metadata.getProvenance())) {
+                   // Verify if the moveCollection is redundant by checking if the operation is
+                   // attempting to move to the same shard.
+                   std::set<ShardId> shardIdsSet;
+                   cm.getAllShardIds(&shardIdsSet);
+                   const auto toShard =
+                       _coordinatorDoc.getShardDistribution().get().front().getShard();
+                   return shardIdsSet.find(toShard) != shardIdsSet.end();
+               } else if (_metadata.getProvenance() &&
+                          _metadata.getProvenance().get() == ProvenanceEnum::kUnshardCollection) {
+                   std::set<ShardId> shardIdsSet;
+                   cm.getAllShardIds(&shardIdsSet);
+                   const auto toShard =
+                       _coordinatorDoc.getShardDistribution().get().front().getShard();
+                   return !cm.isSharded() && shardIdsSet.find(toShard) != shardIdsSet.end();
+               }
+
+               const auto currentShardKey = cm.getShardKeyPattern().getKeyPattern();
+               // Verify if there is any work to be done by the resharding operation by checking
+               // if the existing shard key matches the desired new shard key.
+               bool isOpRedundant = SimpleBSONObjComparator::kInstance.evaluate(
+                   currentShardKey.toBSON() == _coordinatorDoc.getReshardingKey().toBSON());
+
+               // If forceRedistribution is true, still do resharding.
+               if (isOpRedundant && _coordinatorDoc.getForceRedistribution() &&
+                   *_coordinatorDoc.getForceRedistribution()) {
+                   return false;
+               }
+
+               // If this is not forced same-key resharding, set forceRedistribution to false so
+               // we can identify forced same-key resharding by this field later.
+               _coordinatorDoc.setForceRedistribution(false);
+               return isOpRedundant;
+           })
+        .onTransientError([](const StatusWith<bool>& status) {
+            LOGV2(7074600,
+                  "Resharding coordinator encountered transient error refreshing routing info",
+                  "error"_attr = status.getStatus());
+        })
+        .onUnrecoverableError([](const StatusWith<bool>& status) {})
+        .until<StatusWith<bool>>([](const StatusWith<bool>& status) { return status.isOK(); })
+        .on(**executor, _ctHolder->getAbortToken())
+        .onError(([this, executor](StatusWith<bool> status) {
+            if (_ctHolder->isAborted()) {
+                // If the abort cancellation token was triggered, implying that a user ran the
+                // abort command, override status with a resharding abort error.
+                //
+                // Note for debugging purposes: Ensure the original error status is recorded in
+                // the logs before replacing it.
+                status = {ErrorCodes::ReshardCollectionAborted, "aborted"};
+            }
+            return status;
+        }));
+}
+
+void ReshardingCoordinator::_insertCoordDocAndChangeOrigCollEntry() {
     if (_coordinatorDoc.getState() > CoordinatorStateEnum::kUnused) {
         if (!_coordinatorDocWrittenPromise.getFuture().isReady()) {
             _coordinatorDocWrittenPromise.emplaceValue();
         }
 
-        if (_coordinatorDoc.getState() == CoordinatorStateEnum::kAborting) {
+        if (_coordinatorDoc.getState() == CoordinatorStateEnum::kAborting ||
+            _coordinatorDoc.getState() == CoordinatorStateEnum::kQuiesced) {
             _ctHolder->abort();
         }
 
@@ -1568,20 +2305,43 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_insertCoordDocAndChan
 
     {
         // Note: don't put blocking or interruptible code in this block.
+        const bool isSameKeyResharding =
+            _coordinatorDoc.getForceRedistribution() && *_coordinatorDoc.getForceRedistribution();
         _coordinatorDocWrittenPromise.emplaceValue();
+        // We need to call setIsSameKeyResharding first so the metrics can count same key resharding
+        // correctly.
+        _metrics->setIsSameKeyResharding(isSameKeyResharding);
         _metrics->onStarted();
     }
 
-    pauseBeforeInsertCoordinatorDoc.pauseWhileSet();
+    pauseAfterInsertCoordinatorDoc.pauseWhileSet();
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::
-    _calculateParticipantsAndChunksThenWriteToDisk() {
+void ReshardingCoordinator::_calculateParticipantsAndChunksThenWriteToDisk() {
     if (_coordinatorDoc.getState() > CoordinatorStateEnum::kInitializing) {
         return;
     }
     auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
     ReshardingCoordinatorDocument updatedCoordinatorDoc = _coordinatorDoc;
+    auto provenance = updatedCoordinatorDoc.getCommonReshardingMetadata().getProvenance();
+
+    if (resharding::isUnshardCollection(provenance)) {
+        // Since the resulting collection of an unshardCollection operation cannot have zones, we do
+        // not need to account for existing zones in the original collection. Existing zones from
+        // the original collection will be deleted after the unsharding operation commits.
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot specify zones when unsharding a collection.",
+                !updatedCoordinatorDoc.getZones());
+    } else {
+        // If zones are not provided by the user, we should use the existing zones for
+        // this resharding operation.
+        if (updatedCoordinatorDoc.getForceRedistribution() &&
+            *updatedCoordinatorDoc.getForceRedistribution() && !updatedCoordinatorDoc.getZones()) {
+            auto zones = resharding::getZonesFromExistingCollection(
+                opCtx.get(), updatedCoordinatorDoc.getSourceNss());
+            updatedCoordinatorDoc.setZones(std::move(zones));
+        }
+    }
 
     auto shardsAndChunks = _reshardingCoordinatorExternalState->calculateParticipantShardsAndChunks(
         opCtx.get(), updatedCoordinatorDoc);
@@ -1592,30 +2352,47 @@ void ReshardingCoordinatorService::ReshardingCoordinator::
 
     // Remove the presetReshardedChunks and zones from the coordinator document to reduce
     // the possibility of the document reaching the BSONObj size constraint.
+    ShardKeyPattern shardKey(updatedCoordinatorDoc.getReshardingKey());
     std::vector<BSONObj> zones;
     if (updatedCoordinatorDoc.getZones()) {
         zones = resharding::buildTagsDocsFromZones(updatedCoordinatorDoc.getTempReshardingNss(),
-                                                   *updatedCoordinatorDoc.getZones());
+                                                   *updatedCoordinatorDoc.getZones(),
+                                                   shardKey);
     }
     updatedCoordinatorDoc.setPresetReshardedChunks(boost::none);
     updatedCoordinatorDoc.setZones(boost::none);
+
+    auto indexVersion = _reshardingCoordinatorExternalState->getCatalogIndexVersion(
+        opCtx.get(),
+        updatedCoordinatorDoc.getSourceNss(),
+        updatedCoordinatorDoc.getReshardingUUID());
+
+    auto isUnsplittable = _reshardingCoordinatorExternalState->getIsUnsplittable(
+                              opCtx.get(), updatedCoordinatorDoc.getSourceNss()) ||
+        (provenance && provenance.get() == ProvenanceEnum::kUnshardCollection);
 
     resharding::writeParticipantShardsAndTempCollInfo(opCtx.get(),
                                                       _metrics.get(),
                                                       updatedCoordinatorDoc,
                                                       std::move(shardsAndChunks.initialChunks),
-                                                      std::move(zones));
+                                                      std::move(zones),
+                                                      std::move(indexVersion),
+                                                      isUnsplittable);
     installCoordinatorDoc(opCtx.get(), updatedCoordinatorDoc);
 
     reshardingPauseCoordinatorAfterPreparingToDonate.pauseWhileSetAndNotCanceled(
         opCtx.get(), _ctHolder->getAbortToken());
 }
 
-ReshardingApproxCopySize computeApproxCopySize(ReshardingCoordinatorDocument& coordinatorDoc) {
-    const auto numRecipients = coordinatorDoc.getRecipientShards().size();
+ReshardingApproxCopySize computeApproxCopySize(OperationContext* opCtx,
+                                               ReshardingCoordinatorDocument& coordinatorDoc) {
+    const auto cm =
+        uassertStatusOK(RoutingInformationCache::get(opCtx)->getCollectionPlacementInfoWithRefresh(
+            opCtx, coordinatorDoc.getTempReshardingNss()));
+    const auto numRecipientsToCopy = cm.getNShardsOwningChunks();
     iassert(ErrorCodes::BadValue,
-            "Expected to find at least one recipient in the coordinator document",
-            numRecipients > 0);
+            "Expected to find at least one recipient for the collection",
+            numRecipientsToCopy > 0);
 
     // Compute the aggregate for the number of documents and bytes to copy.
     long aggBytesToCopy = 0, aggDocumentsToCopy = 0;
@@ -1631,13 +2408,12 @@ ReshardingApproxCopySize computeApproxCopySize(ReshardingCoordinatorDocument& co
 
     // Calculate the approximate number of documents and bytes that each recipient will clone.
     ReshardingApproxCopySize approxCopySize;
-    approxCopySize.setApproxBytesToCopy(aggBytesToCopy / numRecipients);
-    approxCopySize.setApproxDocumentsToCopy(aggDocumentsToCopy / numRecipients);
+    approxCopySize.setApproxBytesToCopy(aggBytesToCopy / numRecipientsToCopy);
+    approxCopySize.setApproxDocumentsToCopy(aggDocumentsToCopy / numRecipientsToCopy);
     return approxCopySize;
 }
 
-ExecutorFuture<void>
-ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllDonorsReadyToDonate(
+ExecutorFuture<void> ReshardingCoordinator::_awaitAllDonorsReadyToDonate(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     if (_coordinatorDoc.getState() > CoordinatorStateEnum::kPreparingToDonate) {
         return ExecutorFuture<void>(**executor, Status::OK());
@@ -1656,18 +2432,19 @@ ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllDonorsReadyToDonat
 
             auto highestMinFetchTimestamp = resharding::getHighestMinFetchTimestamp(
                 coordinatorDocChangedOnDisk.getDonorShards());
-            _updateCoordinatorDocStateAndCatalogEntries(
-                CoordinatorStateEnum::kCloning,
-                coordinatorDocChangedOnDisk,
-                highestMinFetchTimestamp,
-                computeApproxCopySize(coordinatorDocChangedOnDisk));
-            _metrics->onCopyingBegin();
+            auto approxCopySize = [&] {
+                auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+                return computeApproxCopySize(opCtx.get(), coordinatorDocChangedOnDisk);
+            }();
+            _updateCoordinatorDocStateAndCatalogEntries(CoordinatorStateEnum::kCloning,
+                                                        coordinatorDocChangedOnDisk,
+                                                        highestMinFetchTimestamp,
+                                                        approxCopySize);
         })
         .then([this] { return _waitForMajority(_ctHolder->getAbortToken()); });
 }
 
-ExecutorFuture<void>
-ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllRecipientsFinishedCloning(
+ExecutorFuture<void> ReshardingCoordinator::_awaitAllRecipientsFinishedCloning(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     if (_coordinatorDoc.getState() > CoordinatorStateEnum::kCloning) {
         return ExecutorFuture<void>(**executor, Status::OK());
@@ -1680,13 +2457,11 @@ ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllRecipientsFinished
         .then([this](ReshardingCoordinatorDocument coordinatorDocChangedOnDisk) {
             this->_updateCoordinatorDocStateAndCatalogEntries(CoordinatorStateEnum::kApplying,
                                                               coordinatorDocChangedOnDisk);
-            _metrics->onCopyingEnd();
-            _metrics->onApplyingBegin();
         })
         .then([this] { return _waitForMajority(_ctHolder->getAbortToken()); });
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_startCommitMonitor(
+void ReshardingCoordinator::_startCommitMonitor(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     if (_commitMonitor) {
         return;
@@ -1697,7 +2472,8 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_startCommitMonitor(
         _coordinatorDoc.getSourceNss(),
         resharding::extractShardIdsFromParticipantEntries(_coordinatorDoc.getRecipientShards()),
         **executor,
-        _ctHolder->getCommitMonitorToken());
+        _ctHolder->getCommitMonitorToken(),
+        resharding::gReshardingDelayBeforeRemainingOperationTimeQueryMillis.load());
 
     _commitMonitorQuiesced = _commitMonitor->waitUntilRecipientsAreWithinCommitThreshold()
                                  .thenRunOn(**executor)
@@ -1708,8 +2484,7 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_startCommitMonitor(
                                  .share();
 }
 
-ExecutorFuture<void>
-ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllRecipientsFinishedApplying(
+ExecutorFuture<void> ReshardingCoordinator::_awaitAllRecipientsFinishedApplying(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     if (_coordinatorDoc.getState() > CoordinatorStateEnum::kApplying) {
         return ExecutorFuture<void>(**executor, Status::OK());
@@ -1751,10 +2526,18 @@ ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllRecipientsFinished
                     opCtx.get(), _ctHolder->getAbortToken());
             }
 
+            // set the criticalSectionExpiresAt on the coordinator doc
+            const auto criticalSectionTimeout =
+                Milliseconds(resharding::gReshardingCriticalSectionTimeoutMillis.load());
+            const auto criticalSectionExpiresAt = (*executor)->now() + criticalSectionTimeout;
+
+            ReshardingCoordinatorDocument updatedCSExpirationDoc = _coordinatorDoc;
+            updatedCSExpirationDoc.setCriticalSectionExpiresAt(criticalSectionExpiresAt);
             this->_updateCoordinatorDocStateAndCatalogEntries(CoordinatorStateEnum::kBlockingWrites,
-                                                              _coordinatorDoc);
-            _metrics->onApplyingEnd();
-            _metrics->onCriticalSectionBegin();
+                                                              updatedCSExpirationDoc);
+
+            _metrics->setStartFor(ReshardingMetrics::TimedPhase::kCriticalSection,
+                                  getCurrentTime());
         })
         .then([this] { return _waitForMajority(_ctHolder->getAbortToken()); })
         .thenRunOn(**executor)
@@ -1762,45 +2545,59 @@ ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllRecipientsFinished
             const auto criticalSectionTimeout =
                 Milliseconds(resharding::gReshardingCriticalSectionTimeoutMillis.load());
             const auto criticalSectionExpiresAt = (*executor)->now() + criticalSectionTimeout;
+
             LOGV2_INFO(
                 5573001, "Engaging critical section", "timeoutAt"_attr = criticalSectionExpiresAt);
 
-            auto swCbHandle = (*executor)->scheduleWorkAt(
-                criticalSectionExpiresAt,
-                [this](const executor::TaskExecutor::CallbackArgs& cbData) {
-                    if (!cbData.status.isOK()) {
-                        return;
-                    }
-                    _reshardingCoordinatorObserver->onCriticalSectionTimeout();
-                });
+            _setCriticalSectionTimeoutCallback(executor, criticalSectionExpiresAt);
 
-            if (!swCbHandle.isOK()) {
-                _reshardingCoordinatorObserver->interrupt(swCbHandle.getStatus());
-            }
-
-            _criticalSectionTimeoutCbHandle = swCbHandle.getValue();
+            pauseAfterEngagingCriticalSection.pauseWhileSet();
         });
 }
 
 ExecutorFuture<ReshardingCoordinatorDocument>
-ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllRecipientsInStrictConsistency(
+ReshardingCoordinator::_awaitAllRecipientsInStrictConsistency(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     if (_coordinatorDoc.getState() > CoordinatorStateEnum::kBlockingWrites) {
         // If in recovery, just return the existing _stateDoc.
         return ExecutorFuture<ReshardingCoordinatorDocument>(**executor, _coordinatorDoc);
     }
 
+    // ensure that the critical section timeout handler is still set
+    if (!_criticalSectionTimeoutCbHandle &&
+        _coordinatorDoc.getCriticalSectionExpiresAt().has_value()) {
+        _setCriticalSectionTimeoutCallback(executor,
+                                           _coordinatorDoc.getCriticalSectionExpiresAt().value());
+    }
     return future_util::withCancellation(
                _reshardingCoordinatorObserver->awaitAllRecipientsInStrictConsistency(),
                _ctHolder->getAbortToken())
         .thenRunOn(**executor);
 }
 
-Future<void> ReshardingCoordinatorService::ReshardingCoordinator::_commit(
-    const ReshardingCoordinatorDocument& coordinatorDoc) {
+void ReshardingCoordinator::_setCriticalSectionTimeoutCallback(
+    const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+    Date_t criticalSectionExpiresAt) {
+    auto swCbHandle = (*executor)->scheduleWorkAt(
+        criticalSectionExpiresAt, [this](const executor::TaskExecutor::CallbackArgs& cbData) {
+            if (!cbData.status.isOK()) {
+                return;
+            }
+            _reshardingCoordinatorObserver->onCriticalSectionTimeout();
+        });
+
+    if (!swCbHandle.isOK()) {
+        _reshardingCoordinatorObserver->interrupt(swCbHandle.getStatus());
+    }
+
+    _criticalSectionTimeoutCbHandle = swCbHandle.getValue();
+}
+
+
+void ReshardingCoordinator::_commit(const ReshardingCoordinatorDocument& coordinatorDoc) {
     if (_coordinatorDoc.getState() > CoordinatorStateEnum::kBlockingWrites) {
         invariant(_coordinatorDoc.getState() != CoordinatorStateEnum::kAborting);
-        return Status::OK();
+        return;
     }
 
     ReshardingCoordinatorDocument updatedCoordinatorDoc = coordinatorDoc;
@@ -1818,21 +2615,84 @@ Future<void> ReshardingCoordinatorService::ReshardingCoordinator::_commit(
         return now.clusterTime().asTimestamp();
     }();
 
+    auto indexVersion = _reshardingCoordinatorExternalState->getCatalogIndexVersionForCommit(
+        opCtx.get(), updatedCoordinatorDoc.getTempReshardingNss());
+
+    // Retrieve the exact placement of the resharded collection from the routing table.
+    // The 'recipientShards' field of the coordinator doc cannot be used for this purpose as it
+    // always includes the primary shard for the parent database (even when it doesn't own any chunk
+    // under the new key pattern).
+    auto reshardedCollectionPlacement = [&] {
+        std::set<ShardId> collectionPlacement;
+        std::vector<ShardId> collectionPlacementAsVector;
+
+        const auto cm =
+            uassertStatusOK(RoutingInformationCache::get(opCtx.get())
+                                ->getCollectionPlacementInfoWithRefresh(
+                                    opCtx.get(), coordinatorDoc.getTempReshardingNss()));
+
+        cm.getAllShardIds(&collectionPlacement);
+
+        collectionPlacementAsVector.reserve(collectionPlacement.size());
+        for (auto& elem : collectionPlacement) {
+            collectionPlacementAsVector.emplace_back(elem);
+        }
+        return collectionPlacementAsVector;
+    }();
 
     resharding::writeDecisionPersistedState(opCtx.get(),
                                             _metrics.get(),
                                             updatedCoordinatorDoc,
                                             std::move(newCollectionEpoch),
-                                            std::move(newCollectionTimestamp));
+                                            std::move(newCollectionTimestamp),
+                                            std::move(indexVersion),
+                                            reshardedCollectionPlacement);
 
     // Update the in memory state
     installCoordinatorDoc(opCtx.get(), updatedCoordinatorDoc);
-
-    return Status::OK();
 }
 
-ExecutorFuture<void>
-ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllParticipantShardsDone(
+void ReshardingCoordinator::_generateOpEventOnCoordinatingShard(
+    const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
+    auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+
+    CollectionResharded eventNotification(_coordinatorDoc.getSourceNss(),
+                                          _coordinatorDoc.getSourceUUID(),
+                                          _coordinatorDoc.getReshardingUUID(),
+                                          _coordinatorDoc.getReshardingKey().toBSON());
+    eventNotification.setSourceKey(_coordinatorDoc.getSourceKey());
+    eventNotification.setNumInitialChunks(_coordinatorDoc.getNumInitialChunks());
+    eventNotification.setUnique(_coordinatorDoc.getUnique());
+    eventNotification.setCollation(_coordinatorDoc.getCollation());
+
+    ShardsvrNotifyShardingEventRequest request(notify_sharding_event::kCollectionResharded,
+                                               eventNotification.toBSON());
+
+    const auto dbPrimaryShard = Grid::get(opCtx.get())
+                                    ->catalogClient()
+                                    ->getDatabase(opCtx.get(),
+                                                  _coordinatorDoc.getSourceNss().dbName(),
+                                                  repl::ReadConcernLevel::kMajorityReadConcern)
+                                    .getPrimary();
+
+    // In case the recipient is running a legacy binary, swallow the error.
+    try {
+        generic_argument_util::setMajorityWriteConcern(request, &kMajorityWriteConcern);
+        const auto opts =
+            std::make_shared<async_rpc::AsyncRPCOptions<ShardsvrNotifyShardingEventRequest>>(
+                **executor, _ctHolder->getStepdownToken(), request);
+        opts->cmd.setDbName(DatabaseName::kAdmin);
+        _reshardingCoordinatorExternalState->sendCommandToShards(
+            opCtx.get(), opts, {dbPrimaryShard});
+    } catch (const ExceptionFor<ErrorCodes::UnsupportedShardingEventNotification>& e) {
+        LOGV2_WARNING(7403100,
+                      "Unable to generate op entry on reshardCollection commit",
+                      "error"_attr = redact(e.toStatus()));
+    }
+}
+
+
+ExecutorFuture<void> ReshardingCoordinator::_awaitAllParticipantShardsDone(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     std::vector<ExecutorFuture<ReshardingCoordinatorDocument>> futures;
     futures.emplace_back(
@@ -1861,11 +2721,15 @@ ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllParticipantShardsD
                     Grid::get(opCtx.get())->shardRegistry()->getAllShardIds(opCtx.get());
                 const auto& nss = coordinatorDoc.getSourceNss();
                 const auto& notMatchingThisUUID = coordinatorDoc.getReshardingUUID();
-                const auto cmdObj =
-                    ShardsvrDropCollectionIfUUIDNotMatchingRequest(nss, notMatchingThisUUID)
-                        .toBSON({});
+                auto cmd = ShardsvrDropCollectionIfUUIDNotMatchingWithWriteConcernRequest(
+                    nss, notMatchingThisUUID);
+
+                generic_argument_util::setMajorityWriteConcern(cmd, &kMajorityWriteConcern);
+                auto opts = std::make_shared<async_rpc::AsyncRPCOptions<
+                    ShardsvrDropCollectionIfUUIDNotMatchingWithWriteConcernRequest>>(
+                    **executor, _ctHolder->getStepdownToken(), cmd);
                 _reshardingCoordinatorExternalState->sendCommandToShards(
-                    opCtx.get(), nss.db(), cmdObj, allShardIds, **executor);
+                    opCtx.get(), opts, allShardIds);
             }
 
             reshardingPauseCoordinatorBeforeRemovingStateDoc.pauseWhileSetAndNotCanceled(
@@ -1874,18 +2738,16 @@ ReshardingCoordinatorService::ReshardingCoordinator::_awaitAllParticipantShardsD
             // Notify metrics as the operation is now complete for external observers.
             markCompleted(abortReason ? *abortReason : Status::OK(), _metrics.get());
 
-            resharding::removeCoordinatorDocAndReshardingFields(
-                opCtx.get(), _metrics.get(), coordinatorDoc, abortReason);
+            _removeOrQuiesceCoordinatorDocAndRemoveReshardingFields(opCtx.get(), abortReason);
         });
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::
-    _updateCoordinatorDocStateAndCatalogEntries(
-        CoordinatorStateEnum nextState,
-        ReshardingCoordinatorDocument coordinatorDoc,
-        boost::optional<Timestamp> cloneTimestamp,
-        boost::optional<ReshardingApproxCopySize> approxCopySize,
-        boost::optional<Status> abortReason) {
+void ReshardingCoordinator::_updateCoordinatorDocStateAndCatalogEntries(
+    CoordinatorStateEnum nextState,
+    ReshardingCoordinatorDocument coordinatorDoc,
+    boost::optional<Timestamp> cloneTimestamp,
+    boost::optional<ReshardingApproxCopySize> approxCopySize,
+    boost::optional<Status> abortReason) {
     // Build new state doc for coordinator state update
     ReshardingCoordinatorDocument updatedCoordinatorDoc = coordinatorDoc;
     updatedCoordinatorDoc.setState(nextState);
@@ -1894,15 +2756,26 @@ void ReshardingCoordinatorService::ReshardingCoordinator::
     resharding::emplaceTruncatedAbortReasonIfExists(updatedCoordinatorDoc, abortReason);
 
     auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
-    resharding::writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(
+    resharding::writeStateTransitionAndCatalogUpdatesThenBumpCollectionPlacementVersions(
         opCtx.get(), _metrics.get(), updatedCoordinatorDoc);
 
     // Update in-memory coordinator doc
     installCoordinatorDoc(opCtx.get(), updatedCoordinatorDoc);
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_sendCommandToAllParticipants(
-    const std::shared_ptr<executor::ScopedTaskExecutor>& executor, const BSONObj& command) {
+void ReshardingCoordinator::_removeOrQuiesceCoordinatorDocAndRemoveReshardingFields(
+    OperationContext* opCtx, boost::optional<Status> abortReason) {
+    auto updatedCoordinatorDoc = resharding::removeOrQuiesceCoordinatorDocAndRemoveReshardingFields(
+        opCtx, _metrics.get(), _coordinatorDoc, abortReason);
+
+    // Update in-memory coordinator doc.
+    installCoordinatorDoc(opCtx, updatedCoordinatorDoc);
+}
+
+template <typename CommandType>
+void ReshardingCoordinator::_sendCommandToAllParticipants(
+    const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+    std::shared_ptr<async_rpc::AsyncRPCOptions<CommandType>> opts) {
     auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
     auto donorShardIds =
         resharding::extractShardIdsFromParticipantEntries(_coordinatorDoc.getDonorShards());
@@ -1912,56 +2785,54 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_sendCommandToAllParti
     participantShardIds.insert(recipientShardIds.begin(), recipientShardIds.end());
 
     _reshardingCoordinatorExternalState->sendCommandToShards(
-        opCtx.get(),
-        NamespaceString::kAdminDb,
-        command,
-        {participantShardIds.begin(), participantShardIds.end()},
-        **executor);
+        opCtx.get(), opts, {participantShardIds.begin(), participantShardIds.end()});
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_sendCommandToAllRecipients(
-    const std::shared_ptr<executor::ScopedTaskExecutor>& executor, const BSONObj& command) {
+template <typename CommandType>
+void ReshardingCoordinator::_sendCommandToAllRecipients(
+    const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+    std::shared_ptr<async_rpc::AsyncRPCOptions<CommandType>> opts) {
     auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
     auto recipientShardIds =
         resharding::extractShardIdsFromParticipantEntries(_coordinatorDoc.getRecipientShards());
 
     _reshardingCoordinatorExternalState->sendCommandToShards(
-        opCtx.get(),
-        NamespaceString::kAdminDb,
-        command,
-        {recipientShardIds.begin(), recipientShardIds.end()},
-        **executor);
+        opCtx.get(), opts, {recipientShardIds.begin(), recipientShardIds.end()});
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_sendCommandToAllDonors(
-    const std::shared_ptr<executor::ScopedTaskExecutor>& executor, const BSONObj& command) {
+template <typename CommandType>
+void ReshardingCoordinator::_sendCommandToAllDonors(
+    const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+    std::shared_ptr<async_rpc::AsyncRPCOptions<CommandType>> opts) {
     auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
     auto donorShardIds =
         resharding::extractShardIdsFromParticipantEntries(_coordinatorDoc.getDonorShards());
 
     _reshardingCoordinatorExternalState->sendCommandToShards(
-        opCtx.get(),
-        NamespaceString::kAdminDb,
-        command,
-        {donorShardIds.begin(), donorShardIds.end()},
-        **executor);
+        opCtx.get(), opts, {donorShardIds.begin(), donorShardIds.end()});
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_establishAllDonorsAsParticipants(
+void ReshardingCoordinator::_establishAllDonorsAsParticipants(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     invariant(_coordinatorDoc.getState() == CoordinatorStateEnum::kPreparingToDonate);
-    auto flushCmd = makeFlushRoutingTableCacheUpdatesCmd(_coordinatorDoc.getSourceNss());
-    _sendCommandToAllDonors(executor, flushCmd);
+    auto opts = makeFlushRoutingTableCacheUpdatesOptions(
+        _coordinatorDoc.getSourceNss(), **executor, _ctHolder->getStepdownToken());
+    opts->cmd.setDbName(DatabaseName::kAdmin);
+    generic_argument_util::setMajorityWriteConcern(opts->cmd, &kMajorityWriteConcern);
+    _sendCommandToAllDonors(executor, opts);
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_establishAllRecipientsAsParticipants(
+void ReshardingCoordinator::_establishAllRecipientsAsParticipants(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     invariant(_coordinatorDoc.getState() == CoordinatorStateEnum::kPreparingToDonate);
-    auto flushCmd = makeFlushRoutingTableCacheUpdatesCmd(_coordinatorDoc.getTempReshardingNss());
-    _sendCommandToAllRecipients(executor, flushCmd);
+    auto opts = makeFlushRoutingTableCacheUpdatesOptions(
+        _coordinatorDoc.getTempReshardingNss(), **executor, _ctHolder->getStepdownToken());
+    opts->cmd.setDbName(DatabaseName::kAdmin);
+    generic_argument_util::setMajorityWriteConcern(opts->cmd, &kMajorityWriteConcern);
+    _sendCommandToAllRecipients(executor, opts);
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_tellAllRecipientsToRefresh(
+void ReshardingCoordinator::_tellAllRecipientsToRefresh(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     NamespaceString nssToRefresh;
     // Refresh the temporary namespace if the coordinator is in a state prior to 'kCommitting'.
@@ -1973,46 +2844,61 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_tellAllRecipientsToRe
         nssToRefresh = _coordinatorDoc.getSourceNss();
     }
 
-    auto refreshCmd =
-        createFlushReshardingStateChangeCommand(nssToRefresh, _coordinatorDoc.getReshardingUUID());
-    _sendCommandToAllRecipients(executor, refreshCmd);
+    auto opts = createFlushReshardingStateChangeOptions(nssToRefresh,
+                                                        _coordinatorDoc.getReshardingUUID(),
+                                                        **executor,
+                                                        _ctHolder->getStepdownToken());
+    opts->cmd.setDbName(DatabaseName::kAdmin);
+    generic_argument_util::setMajorityWriteConcern(opts->cmd, &kMajorityWriteConcern);
+    _sendCommandToAllRecipients(executor, opts);
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_tellAllDonorsToRefresh(
+void ReshardingCoordinator::_tellAllDonorsToRefresh(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
-    auto refreshCmd = createFlushReshardingStateChangeCommand(_coordinatorDoc.getSourceNss(),
-                                                              _coordinatorDoc.getReshardingUUID());
-    _sendCommandToAllDonors(executor, refreshCmd);
+    auto opts = createFlushReshardingStateChangeOptions(_coordinatorDoc.getSourceNss(),
+                                                        _coordinatorDoc.getReshardingUUID(),
+                                                        **executor,
+                                                        _ctHolder->getStepdownToken());
+    generic_argument_util::setMajorityWriteConcern(opts->cmd, &kMajorityWriteConcern);
+    opts->cmd.setDbName(DatabaseName::kAdmin);
+    _sendCommandToAllDonors(executor, opts);
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_tellAllParticipantsToCommit(
+void ReshardingCoordinator::_tellAllParticipantsToCommit(
     const NamespaceString& nss, const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
-    auto commitCmd =
-        createShardsvrCommitReshardCollectionCmd(nss, _coordinatorDoc.getReshardingUUID());
-    _sendCommandToAllParticipants(executor, commitCmd);
+    {
+        auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+        reshardingPauseBeforeTellingParticipantsToCommit.pauseWhileSetAndNotCanceled(
+            opCtx.get(), _ctHolder->getAbortToken());
+    }
+
+    auto opts = createShardsvrCommitReshardCollectionOptions(
+        nss, _coordinatorDoc.getReshardingUUID(), **executor, _ctHolder->getStepdownToken());
+    opts->cmd.setDbName(DatabaseName::kAdmin);
+    _sendCommandToAllParticipants(executor, opts);
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_tellAllParticipantsToAbort(
+void ReshardingCoordinator::_tellAllParticipantsToAbort(
     const std::shared_ptr<executor::ScopedTaskExecutor>& executor, bool isUserAborted) {
     ShardsvrAbortReshardCollection abortCmd(_coordinatorDoc.getReshardingUUID(), isUserAborted);
-    abortCmd.setDbName("admin");
-    _sendCommandToAllParticipants(executor,
-                                  abortCmd.toBSON(BSON(WriteConcernOptions::kWriteConcernField
-                                                       << WriteConcernOptions::Majority)));
+    abortCmd.setDbName(DatabaseName::kAdmin);
+    generic_argument_util::setMajorityWriteConcern(abortCmd, &kMajorityWriteConcern);
+    auto opts = std::make_shared<async_rpc::AsyncRPCOptions<ShardsvrAbortReshardCollection>>(
+        **executor, _ctHolder->getStepdownToken(), abortCmd);
+    _sendCommandToAllParticipants(executor, opts);
 }
 
-void ReshardingCoordinatorService::ReshardingCoordinator::_updateChunkImbalanceMetrics(
-    const NamespaceString& nss) {
+void ReshardingCoordinator::_updateChunkImbalanceMetrics(const NamespaceString& nss) {
     auto cancellableOpCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
     auto opCtx = cancellableOpCtx.get();
 
     try {
-        auto routingInfo = uassertStatusOK(
-            Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
-                                                                                         nss));
+        const auto routingInfo = uassertStatusOK(
+            RoutingInformationCache::get(opCtx)->getCollectionPlacementInfoWithRefresh(opCtx, nss));
 
+        const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
         const auto collectionZones =
-            uassertStatusOK(Grid::get(opCtx)->catalogClient()->getTagsForCollection(opCtx, nss));
+            uassertStatusOK(catalogClient->getTagsForCollection(opCtx, nss));
 
         const auto& keyPattern = routingInfo.getShardKeyPattern().getKeyPattern();
 
@@ -2024,9 +2910,8 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_updateChunkImbalanceM
                           tag.getTag())));
         }
 
-        const auto allShardsWithOpTime =
-            uassertStatusOK(Grid::get(opCtx)->catalogClient()->getAllShards(
-                opCtx, repl::ReadConcernLevel::kLocalReadConcern));
+        const auto allShardsWithOpTime = uassertStatusOK(
+            catalogClient->getAllShards(opCtx, repl::ReadConcernLevel::kLocalReadConcern));
 
         auto imbalanceCount =
             getMaxChunkImbalanceCount(routingInfo, allShardsWithOpTime.value, zoneInfo);
@@ -2035,9 +2920,82 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_updateChunkImbalanceM
     } catch (const DBException& ex) {
         LOGV2_WARNING(5543000,
                       "Encountered error while trying to update resharding chunk imbalance metrics",
-                      "namespace"_attr = nss,
+                      logAttrs(nss),
                       "error"_attr = redact(ex.toStatus()));
     }
+}
+
+void ReshardingCoordinator::_logStatsOnCompletion(bool success) {
+    BSONObjBuilder builder;
+    BSONObjBuilder statsBuilder;
+    builder.append("uuid", _coordinatorDoc.getReshardingUUID().toBSON());
+    builder.append("status", success ? "success" : "failed");
+    statsBuilder.append("ns", toStringForLogging(_coordinatorDoc.getSourceNss()));
+    statsBuilder.append("sourceUUID", _coordinatorDoc.getSourceUUID().toBSON());
+    statsBuilder.append("newUUID", _coordinatorDoc.getReshardingUUID().toBSON());
+    if (_coordinatorDoc.getSourceKey()) {
+        statsBuilder.append("oldShardKey", _coordinatorDoc.getSourceKey()->toString());
+    }
+    statsBuilder.append("newShardKey", _coordinatorDoc.getReshardingKey().toString());
+    if (_coordinatorDoc.getStartTime()) {
+        auto startTime = *_coordinatorDoc.getStartTime();
+        statsBuilder.append("startTime", startTime);
+
+        auto endTime = getCurrentTime();
+        statsBuilder.append("endTime", endTime);
+
+        auto elapsedMillis = (endTime - startTime).count();
+        statsBuilder.append("operationDuration", elapsedMillis);
+    } else {
+        statsBuilder.append("endTime", getCurrentTime());
+    }
+    _metrics->reportOnCompletion(&statsBuilder);
+
+    int64_t totalWritesDuringCriticalSection = 0;
+    for (auto shard : _coordinatorDoc.getDonorShards()) {
+        totalWritesDuringCriticalSection +=
+            shard.getMutableState().getWritesDuringCriticalSection().value_or(0);
+    }
+    statsBuilder.append("writesDuringCriticalSection", totalWritesDuringCriticalSection);
+
+    for (auto shard : _coordinatorDoc.getRecipientShards()) {
+        BSONObjBuilder shardBuilder;
+        shardBuilder.append("bytesCopied", shard.getMutableState().getBytesCopied().value_or(0));
+        shardBuilder.append("oplogFetched", shard.getMutableState().getOplogFetched().value_or(0));
+        shardBuilder.append("oplogApplied", shard.getMutableState().getOplogApplied().value_or(0));
+        statsBuilder.append(shard.getId(), shardBuilder.obj());
+    }
+
+    int64_t totalDocuments = 0;
+    int64_t docSize = 0;
+    int64_t totalIndexes = 0;
+    for (auto shard : _coordinatorDoc.getRecipientShards()) {
+        totalDocuments += shard.getMutableState().getTotalNumDocuments().value_or(0);
+        docSize += shard.getMutableState().getTotalDocumentSize().value_or(0);
+        if (shard.getMutableState().getNumOfIndexes().value_or(0) > totalIndexes) {
+            totalIndexes = shard.getMutableState().getNumOfIndexes().value_or(0);
+        }
+    }
+    statsBuilder.append("numberOfTotalDocuments", totalDocuments);
+    statsBuilder.append("averageDocSize", totalDocuments > 0 ? (docSize / totalDocuments) : 0);
+    statsBuilder.append("numberOfIndexes", totalIndexes);
+
+    statsBuilder.append("numberOfSourceShards", (int64_t)(_coordinatorDoc.getDonorShards().size()));
+
+    auto numDestinationShards = 0;
+    if (const auto& shardDistribution = _coordinatorDoc.getShardDistribution()) {
+        std::set<ShardId> destinationShards;
+        for (const auto& shardDist : *shardDistribution) {
+            destinationShards.emplace(shardDist.getShard());
+        }
+        numDestinationShards = destinationShards.size();
+    } else {
+        numDestinationShards = _coordinatorDoc.getRecipientShards().size();
+    }
+    statsBuilder.append("numberOfDestinationShards", (int64_t)numDestinationShards);
+
+    builder.append("statistics", statsBuilder.obj());
+    LOGV2(7763800, "Resharding complete", "info"_attr = builder.obj());
 }
 
 }  // namespace mongo

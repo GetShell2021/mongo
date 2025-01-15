@@ -7,10 +7,9 @@
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
 
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/index_catalog_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {IndexCatalogHelpers} from "jstests/libs/index_catalog_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
@@ -134,4 +133,3 @@ assert.commandWorked(
 
 assert.commandWorked(session.abortTransaction_forTesting());
 rst.stopSet();
-})();

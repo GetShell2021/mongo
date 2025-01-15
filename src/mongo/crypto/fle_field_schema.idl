@@ -27,10 +27,13 @@
 
 global:
     cpp_namespace: "mongo"
+    cpp_includes:
+      - "mongo/crypto/fle_fields_util.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/crypto/encryption_fields.idl"
+    - "mongo/crypto/fle_tokens.idl"
 
 enums:
     EncryptedBinDataType:
@@ -55,6 +58,19 @@ enums:
           # same as BinDataGeneral but redacted
           kFLE2TransientRaw : 8
 
+          kFLE2RangeIndexedValue : 9      # see FLE2IndexedRangeEncryptedValue
+          kFLE2FindRangePayload : 10      # see FLE2FindRangePayload
+
+          # QE protocol version 2 - client-side payloads
+          kFLE2InsertUpdatePayloadV2: 11
+          kFLE2FindEqualityPayloadV2: 12
+          kFLE2FindRangePayloadV2: 13
+
+          # QE protocol version 2 - server-side payloads
+          kFLE2EqualityIndexedValueV2: 14
+          kFLE2RangeIndexedValueV2: 15
+          kFLE2UnindexedEncryptedValueV2: 16
+
     FleVersion:
         description: "The version / type of field-level encryption in use."
         type: int
@@ -77,6 +93,8 @@ enums:
         values:
             kUnindexed: 1
             kEquality: 2
+            kRange: 3
+            kTextSearch: 4
 
     Fle2PlaceholderType:
         description: "The type of payload to generate from a placeholder"
@@ -84,6 +102,29 @@ enums:
         values:
             kInsert: 1
             kFind: 2
+
+    Fle2RangeOperator:
+      description: "Enum representing valid range operators that an encrypted payload can be under."
+      type: int
+      values:
+        kGt: 1
+        kGte: 2
+        kLt: 3
+        kLte: 4
+
+types:
+  encrypted_numeric_element:
+    bson_serialization_type:
+    - date
+    - decimal
+    - double
+    - int
+    - long
+    description: A value with any encrypted range numeric BSON type.
+    cpp_type: "mongo::IDLAnyType"
+    serializer: mongo::IDLAnyType::serializeToBSON
+    deserializer: mongo::IDLAnyType::parseFromBSON
+    is_view: true
 
 structs:
     EncryptionPlaceholder:
@@ -112,9 +153,10 @@ structs:
             cpp_name: value
 
     FLE2EncryptionPlaceholder:
-        description: "Implements Encryption BinData (subtype 6) sub-subtype 0, the intent-to-encrypt
+        description: "Implements Encryption BinData (subtype 6) sub-subtype 3, the intent-to-encrypt
             mapping. Contains a value to encrypt and a description of how it should be encrypted."
         strict: true
+        cpp_validator_func: "validateIDLFLE2EncryptionPlaceholder"
         fields:
           t:
             description: "The type number, determines what payload to replace the placeholder with"
@@ -141,26 +183,49 @@ structs:
             description: "Queryable Encryption max contention counter"
             type: long
             cpp_name: maxContentionCounter
+          s:
+            description: "Queryable Encryption range hypergraph sparsity factor"
+            type: long
+            cpp_name: sparsity
+            optional: true
+            validator: { gte: 1, lte: 8 }
 
-    FLE2InsertUpdatePayload:
-        description: "Payload of an indexed field to insert or update"
+    EdgeTokenSetV2:
+        description: "Payload of an indexed field to insert or update. Version 2"
         strict: true
         fields:
           d:
-            description: "EDCDerivedFromDataTokenAndCounter"
-            type: bindata_generic
+            description: "EDCDerivedFromDataTokenAndContentionFactorToken"
+            type: EDCDerivedFromDataTokenAndContentionFactorToken
             cpp_name: edcDerivedToken
           s:
-            description: "ESCDerivedFromDataTokenAndCounter"
-            type: bindata_generic
+            description: "ESCDerivedFromDataTokenAndContentionFactorToken"
+            type: ESCDerivedFromDataTokenAndContentionFactorToken
             cpp_name: escDerivedToken
-          c:
-            description: "ECCDerivedFromDataTokenAndCounter"
-            type: bindata_generic
-            cpp_name: eccDerivedToken
+          l:
+            description: "ServerDerivedFromDataToken"
+            type: ServerDerivedFromDataToken
+            cpp_name: serverDerivedFromDataToken
           p:
             description: "Encrypted tokens"
-            type: bindata_generic
+            type: EncryptedStateCollectionTokensV2
+            cpp_name: encryptedTokens
+
+    FLE2InsertUpdatePayloadV2:
+        description: "Payload of an indexed field to insert or update. Version 2"
+        strict: true
+        fields:
+          d:
+            description: "EDCDerivedFromDataTokenAndContentionFactorToken"
+            type: EDCDerivedFromDataTokenAndContentionFactorToken
+            cpp_name: edcDerivedToken
+          s:
+            description: "ESCDerivedFromDataTokenAndContentionFactorToken"
+            type: ESCDerivedFromDataTokenAndContentionFactorToken
+            cpp_name: escDerivedToken
+          p:
+            description: "Encrypted tokens"
+            type: EncryptedStateCollectionTokensV2
             cpp_name: encryptedTokens
           u:
             description: "Index KeyId"
@@ -176,49 +241,152 @@ structs:
             cpp_name: value
           e:
             description: "ServerDataEncryptionLevel1Token"
-            type: bindata_generic
+            type: ServerDataEncryptionLevel1Token
             cpp_name: serverEncryptionToken
+          l:
+            description: "ServerDerivedFromDataToken"
+            type: ServerDerivedFromDataToken
+            cpp_name: serverDerivedFromDataToken
+          k:
+            description: "Randomly sampled contention factor value"
+            type: long
+            cpp_name: contentionFactor
+            validator: { gte: 0 }
+          g:
+            description: "Array of Edges"
+            type: array<EdgeTokenSetV2>
+            cpp_name: edgeTokenSet
+            optional: true
+          sp:
+            description: "Queryable Encryption range hypergraph sparsity factor"
+            type: long
+            cpp_name: sparsity
+            optional: true
+            validator: { gte: 1, lte: 8 }
+          pn:
+            cpp_name: precision
+            description: "Determines the number of digits after the decimal point for floating point values"
+            type: safeInt
+            optional: true
+            validator: { gte: 0 }
+          tf:
+            cpp_name: trimFactor
+            description: "Determines how many levels of the hypergraph to trim"
+            type: safeInt
+            optional: true
+            validator: { gte: 0 }
+          mn:
+            cpp_name: indexMin
+            description: "Minimum value for the encrypted index that this query is using."
+            type: encrypted_numeric_element
+            optional: true
+          mx:
+            cpp_name: indexMax
+            description: "Maximum value for the encrypted index that this query is using."
+            type: encrypted_numeric_element
+            optional: true
 
-    FLE2DeletePayload:
-        description: "Payload of an indexed field to delete"
-        strict: true
-        fields:
-          o:
-            description: "ECOCToken"
-            type: bindata_generic
-            cpp_name: ecocToken
-          e:
-            description: "ServerDataEncryptionLevel1Token"
-            type: bindata_generic
-            cpp_name: serverEncryptionToken
-
-    FLE2FindEqualityPayload:
-        description: "Payload for an equality find"
+    FLE2FindEqualityPayloadV2:
+        description: "Payload for an equality find. Version 2"
         strict: true
         fields:
           d:
             description: "EDCDerivedFromDataToken"
-            type: bindata_generic
+            type: EDCDerivedFromDataToken
             cpp_name: edcDerivedToken
           s:
             description: "ESCDerivedFromDataToken"
-            type: bindata_generic
+            type: ESCDerivedFromDataToken
             cpp_name: escDerivedToken
-          c:
-            description: "ECCDerivedFromDataToken"
-            type: bindata_generic
-            cpp_name: eccDerivedToken
-          e:
-            description: "ServerDataEncryptionLevel1Token"
-            type: bindata_generic
-            cpp_name: serverEncryptionToken
-            optional: true # For backwards compat, make this optional
+          l:
+            description: "ServerDerivedFromDataToken"
+            type: ServerDerivedFromDataToken
+            cpp_name: serverDerivedFromDataToken
           cm:
             description: "Queryable Encryption max counter"
             type: long
             cpp_name: maxCounter
             optional: true
 
+    EdgeFindTokenSetV2:
+        description: "Payload of an edge to query for. Version 2"
+        strict: true
+        fields:
+          d:
+            description: "EDCDerivedFromDataToken"
+            type: EDCDerivedFromDataToken
+            cpp_name: edcDerivedToken
+          s:
+            description: "ESCDerivedFromDataToken"
+            type: ESCDerivedFromDataToken
+            cpp_name: escDerivedToken
+          l:
+            description: "ServerDerivedFromDataToken"
+            type: ServerDerivedFromDataToken
+            cpp_name: serverDerivedFromDataToken
+
+    FLE2FindRangePayloadEdgesInfoV2:
+        description: "Token information for find range payload."
+        strict: true
+        fields:
+          g:
+            description: "Array of Edges"
+            type: array<EdgeFindTokenSetV2>
+            cpp_name: edges
+          cm:
+            description: "Queryable Encryption max counter"
+            type: long
+            cpp_name: maxCounter
+
+    FLE2FindRangePayloadV2:
+        description: "Payload for a range find. Version 2"
+        strict: true
+        fields:
+          payload:
+            description: "Token information for a find range payload"
+            type: FLE2FindRangePayloadEdgesInfoV2
+            optional: true
+          payloadId:
+            description: "Id of payload - must be paired with another payload"
+            type: safeInt
+            optional: false
+          firstOperator:
+            description: "First query operator for which this payload was generated."
+            type: Fle2RangeOperator
+            optional: false
+          secondOperator:
+            description: "Second query operator for which this payload was generated. Only populated for two-sided ranges."
+            type: Fle2RangeOperator
+            optional: true
+          sp:
+            description: "Queryable Encryption range hypergraph sparsity factor"
+            type: long
+            cpp_name: sparsity
+            optional: true
+            validator: { gte: 1, lte: 8 }
+          pn:
+            cpp_name: precision
+            description: "Determines the number of digits after the decimal point for floating point values"
+            type: safeInt
+            optional: true
+            validator: { gte: 0 }
+          tf:
+            cpp_name: trimFactor
+            description: "Determines how many levels of the hypergraph to trim"
+            type: safeInt
+            optional: true
+            validator: { gte: 0 }
+          mn:
+            cpp_name: indexMin
+            description: "Minimum value for the encrypted index that this query is using."
+            type: encrypted_numeric_element
+            optional: true
+          mx:
+            cpp_name: indexMax
+            description: "Maximum value for the encrypted index that this query is using."
+            type: encrypted_numeric_element
+            optional: true
+            
     EncryptionInformation:
         description: "Implements Encryption Information which includes the schema for Queryable Encryption that is consumed by query_analysis, queries and write_ops"
         strict: true
@@ -227,24 +395,33 @@ structs:
             description: "The version number"
             type: safeInt
             default: 1
-            unstable: true
-          deleteTokens:
-            description: "A map of field paths to FLEDeletePayload"
-            type: object_owned
-            optional: true
-            unstable: true
+            stability: unstable
           schema:
             description: "A map of NamespaceString to EncryptedFieldConfig"
             type: object_owned
-            unstable: true
+            stability: unstable
           crudProcessed:
             description: "A boolean to indicate whether the CRUD layer has already processed this Queryable Encryption request. Used to prevent infinite recursion."
             type: bool
             optional: true
-            unstable: true
+            stability: unstable
+
+    EncryptionSchemaCSFLE:
+        description: "Implements Encryption Schema for CSFLE."
+        strict: true
+        fields:
+          jsonSchema:
+            description: "Object containing json schema specification."
+            type: object_owned
+            stability: unstable
+          isRemoteSchema:
+            description: "Boolean field indicating whether the schema was fetched from the server ahead of being sent to query analysis."
+            type: bool
+            optional: false
+            stability: unstable
 
     ecocDocument:
-        description: "foo"
+        description: "This represents a document stored in an encrypted compaction collection."
         strict: true
         fields:
           _id:
@@ -255,5 +432,172 @@ structs:
             type: string
           value:
             description: "Encrypted value"
-            type: bindata_generic
+            type: EncryptedStateCollectionTokensV2
 
+    FLE2RangeFindSpecEdgesInfo:
+        description: "Edges Information for FLE2 Range Spec"
+        strict: true
+        fields:
+          lowerBound:
+            description: "The lower bound for an encrypted range query."
+            type: IDLAnyType
+          lbIncluded:
+            description: "Indicates if the lower bound should be included in the range."
+            type: bool
+          upperBound:
+            description: "The upper bound for an encrypted range query."
+            type: IDLAnyType
+          ubIncluded:
+            description: "Indicates if the upper bound should be included in the range."
+            type: bool
+          precision:
+            description: "Determines the number of digits after the decimal point for floating point values"
+            type: safeInt
+            optional: true
+            validator: { gte: 0 }
+          trimFactor:
+            description: "Determines how many levels of the hypergraph to trim"
+            type: safeInt
+            optional: true
+            validator: { gte: 0 }
+          indexMin:
+            description: "Minimum value for the encrypted index that this query is using."
+            type: encrypted_numeric_element
+          indexMax:
+            description: "Maximum value for the encrypted index that this query is using."
+            type: encrypted_numeric_element
+
+    FLE2RangeFindSpec:
+        description: "Range find specification that is encoded inside of a FLE2EncryptionPlaceholder."
+        strict: true
+        cpp_validator_func: "validateIDLFLE2RangeFindSpec"
+        fields:
+          edgesInfo:
+            description: "Information about the edges in an FLE2 find payload."
+            type: FLE2RangeFindSpecEdgesInfo
+            optional: true
+          payloadId:
+            description: "Id of payload - must be paired with another payload"
+            type: safeInt
+            optional: false
+          firstOperator:
+            description: "First query operator for which this payload was generated."
+            type: Fle2RangeOperator
+            optional: false
+          secondOperator:
+            description: "Second query operator for which this payload was generated. Only populated for two-sided ranges."
+            type: Fle2RangeOperator
+            optional: true
+
+    FLE2RangeInsertSpec:
+        description: "Range insert specification that is encoded inside of a FLE2EncryptionPlaceholder."
+        strict: true
+        cpp_validator_func: "validateIDLFLE2RangeInsertSpec"
+        fields:
+          v:
+            description: "Value to encrypt"
+            type: encrypted_numeric_element
+            cpp_name: value
+          min:
+            description: "Queryable Encryption min bound for range"
+            type: encrypted_numeric_element
+            optional: true
+            cpp_name: minBound
+          max:
+            description: "Queryable Encryption max bound for range"
+            type: encrypted_numeric_element
+            optional: true
+            cpp_name: maxBound
+          precision:
+            description: "Determines the number of digits after the decimal point for floating point values"
+            type: safeInt
+            optional: true
+            validator: { gte: 0 }
+          trimFactor:
+            description: "Determines how many levels of the hypergraph to trim"
+            type: safeInt
+            optional: true
+            validator: { gte: 0 }
+
+    FLE2SubstringInsertSpec:
+        description: "Holds parameters applicable to substring indexed fields."
+        strict: true
+        fields:
+          mlen:
+            description: "max substring code point length to be indexed"
+            type: safeInt
+            validator: { gt: 0 }
+            cpp_name: maxLength
+          ub:
+            description: "upper bound code point length of valid substring queries"
+            type: safeInt
+            validator: { gt: 0 }
+            cpp_name: maxQueryLength
+          lb:
+            description: "lower bound code point length of valid substring queries"
+            type: safeInt
+            validator: { gt: 0 }
+            cpp_name: minQueryLength
+
+    FLE2SuffixInsertSpec:
+        description: "Holds parameters applicable to suffix indexed fields."
+        strict: true
+        fields:
+          ub:
+            description: "upper bound code point length of valid suffix queries"
+            type: safeInt
+            validator: { gt: 0 }
+            cpp_name: maxQueryLength
+          lb:
+            description: "lower bound length of valid suffix queries"
+            type: safeInt
+            validator: { gt: 0 }
+            cpp_name: minQueryLength
+
+    FLE2PrefixInsertSpec:
+        description: "Holds parameters applicable to prefix indexed fields."
+        strict: true
+        fields:
+          ub:
+            description: "upper bound code point length of valid prefix queries"
+            type: safeInt
+            validator: { gt: 0 }
+            cpp_name: maxQueryLength
+          lb:
+            description: "lower bound code point length of valid prefix queries"
+            type: safeInt
+            validator: { gt: 0 }
+            cpp_name: minQueryLength
+
+    FLE2TextSearchInsertSpec:
+        description: "Text search struct that is encoded inside of a FLE2EncryptionPlaceholder."
+        strict: true
+        cpp_validator_func: "validateIDLFLE2TextSearchInsertSpec"
+        fields:
+          v:
+            description: "value to encrypt"
+            type: string
+            cpp_name: value
+          casef:
+            description: "case folding enabled?"
+            type: bool
+            cpp_name: caseFold
+          diacf:
+            description: "diacritic folding enabled?"
+            type: bool
+            cpp_name: diacriticFold
+          substr:
+            description: "parameters for substring indexing"
+            type: FLE2SubstringInsertSpec
+            optional: true
+            cpp_name: substringSpec
+          suffix:
+            description: "parameters for suffix indexing"
+            type: FLE2SuffixInsertSpec
+            optional: true
+            cpp_name: suffixSpec
+          prefix:
+            description: "parameters for prefix indexing"
+            type: FLE2PrefixInsertSpec
+            optional: true
+            cpp_name: prefixSpec

@@ -10,9 +10,8 @@
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
@@ -89,4 +88,3 @@ assert.eq(
     secondary.getDB(dbName).getCollection(collName).find({x: 1000}).hint({x: 1}).toArray()[0].x);
 jsTestLog("Shutting down the set");
 replTest.stopSet();
-}());

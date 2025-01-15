@@ -27,27 +27,65 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <ratio>
+#include <utility>
+#include <vector>
 
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/batched_delete_stage.h"
 #include "mongo/db/exec/collection_scan.h"
+#include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/exec/delete_stage.h"
-#include "mongo/db/exec/queued_data_stage.h"
-#include "mongo/db/op_observer_noop.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/service_context.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/db/storage/checkpointer.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/tick_source.h"
 #include "mongo/util/tick_source_mock.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 namespace QueryStageBatchedDelete {
 
-static const NamespaceString nss("unittests.QueryStageBatchedDelete");
+static const NamespaceString nss =
+    NamespaceString::createNamespaceString_forTest("unittests.QueryStageBatchedDelete");
 
 // For the following tests, fix the targetBatchDocs to 10 documents.
 static const int targetBatchDocs = 10;
@@ -62,10 +100,13 @@ static const Milliseconds targetBatchTimeMS = Milliseconds(5);
  */
 class ClockAdvancingOpObserver : public OpObserverNoop {
 public:
-    void aboutToDelete(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       const UUID& uuid,
-                       const BSONObj& doc) override {
+    void onDelete(OperationContext* opCtx,
+                  const CollectionPtr& coll,
+                  StmtId stmtId,
+                  const BSONObj& doc,
+                  const DocumentKey& documentKey,
+                  const OplogDeleteEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) override {
 
         if (docDurationMap.find(doc) != docDurationMap.end()) {
             tickSource->advance(docDurationMap.find(doc)->second);
@@ -83,19 +124,19 @@ public:
 class QueryStageBatchedDeleteTest : public unittest::Test {
 public:
     QueryStageBatchedDeleteTest() : _client(&_opCtx) {
-        auto tickSource = std::make_unique<TickSourceMock<Milliseconds>>();
-        tickSource->reset(1);
-        _tickSource = tickSource.get();
-        _opCtx.getServiceContext()->setTickSource(std::move(tickSource));
+        auto service = _opCtx.getServiceContext();
+        _tickSource = checked_cast<decltype(_tickSource)>(service->getTickSource());
+        _tickSource->reset(1);
+
         std::unique_ptr<ClockAdvancingOpObserver> opObserverUniquePtr =
             std::make_unique<ClockAdvancingOpObserver>();
         opObserverUniquePtr->tickSource = _tickSource;
         _opObserver = opObserverUniquePtr.get();
-        _opCtx.getServiceContext()->setOpObserver(std::move(opObserverUniquePtr));
+        service->resetOpObserver_forTest(std::move(opObserverUniquePtr));
     }
 
-    virtual ~QueryStageBatchedDeleteTest() {
-        _client.dropCollection(nss.ns());
+    ~QueryStageBatchedDeleteTest() override {
+        _client.dropCollection(nss);
     }
 
     TickSourceMock<Milliseconds>* tickSource() {
@@ -110,7 +151,7 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(nss.ns(), obj);
+        _client.insert(nss, obj);
     }
 
     // Inserts documents later deleted in a single 'batch' due to targetBatchTimMS or
@@ -120,8 +161,8 @@ public:
     void insertTimedBatch(std::vector<std::pair<BSONObj, Milliseconds>> timedBatch,
                           bool verifyBatchTimeWithDefaultTargetBatchTimeMS = true) {
         Milliseconds totalDurationOfBatch{0};
-        for (auto [doc, duration] : timedBatch) {
-            _client.insert(nss.ns(), doc);
+        for (const auto& [doc, duration] : timedBatch) {
+            _client.insert(nss, doc);
             _opObserver->setDeleteRecordDurationMillis(doc, duration);
             totalDurationOfBatch += duration;
         }
@@ -139,14 +180,15 @@ public:
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(nss.ns(), obj);
+        _client.remove(nss, obj);
     }
 
     void update(BSONObj& query, BSONObj& updateSpec) {
-        _client.update(nss.ns(), query, updateSpec);
+        _client.update(nss, query, updateSpec);
     }
 
-    void getRecordIds(const CollectionPtr& collection,
+    void getRecordIds(OperationContext* opCtx,
+                      const CollectionPtr& collection,
                       CollectionScanParams::Direction direction,
                       std::vector<RecordId>* out) {
         WorkingSet ws;
@@ -154,15 +196,15 @@ public:
         CollectionScanParams params;
         params.direction = direction;
         params.tailable = false;
-
+        auto expCtx = ExpressionContextBuilder{}.opCtx(opCtx).ns(collection->ns()).build();
         std::unique_ptr<CollectionScan> scan(
-            new CollectionScan(_expCtx.get(), collection, params, &ws, nullptr));
+            new CollectionScan(expCtx.get(), &collection, params, &ws, nullptr));
         while (!scan->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state = scan->work(&id);
             if (PlanStage::ADVANCED == state) {
                 WorkingSetMember* member = ws.get(id);
-                verify(member->hasRecordId());
+                MONGO_verify(member->hasRecordId());
                 out->push_back(member->recordId);
             }
         }
@@ -171,24 +213,23 @@ public:
     std::unique_ptr<CanonicalQuery> canonicalize(const BSONObj& query) {
         auto findCommand = std::make_unique<FindCommandRequest>(nss);
         findCommand->setFilter(query);
-        auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(findCommand));
-        ASSERT_OK(statusWithCQ.getStatus());
-        return std::move(statusWithCQ.getValue());
+        return std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+            .expCtx = ExpressionContextBuilder{}.fromRequest(&_opCtx, *findCommand).build(),
+            .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
     }
 
     // Uses the default _expCtx tied to the test suite.
     std::unique_ptr<BatchedDeleteStage> makeBatchedDeleteStage(
-        WorkingSet* ws, const CollectionPtr& coll, CanonicalQuery* deleteParamsFilter = nullptr) {
+        WorkingSet* ws, CollectionAcquisition coll, CanonicalQuery* deleteParamsFilter = nullptr) {
         return makeBatchedDeleteStage(ws, coll, _expCtx.get(), deleteParamsFilter);
     }
 
     // Defaults batch params to be test defaults for targetBatchTimeMS and targetBatchDocs.
     std::unique_ptr<BatchedDeleteStage> makeBatchedDeleteStage(
         WorkingSet* ws,
-        const CollectionPtr& coll,
+        CollectionAcquisition coll,
         ExpressionContext* expCtx,
         CanonicalQuery* deleteParamsFilter = nullptr) {
-
         auto batchedDeleteParams = std::make_unique<BatchedDeleteStageParams>();
         batchedDeleteParams->targetBatchDocs = targetBatchDocs;
         batchedDeleteParams->targetBatchTimeMS = targetBatchTimeMS;
@@ -198,11 +239,10 @@ public:
 
     std::unique_ptr<BatchedDeleteStage> makeBatchedDeleteStage(
         WorkingSet* ws,
-        const CollectionPtr& coll,
+        CollectionAcquisition coll,
         ExpressionContext* expCtx,
         std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams,
         CanonicalQuery* deleteParamsFilter = nullptr) {
-
         // DeleteStageParams must always be multi.
         auto deleteParams = std::make_unique<DeleteStageParams>();
         deleteParams->isMulti = true;
@@ -223,22 +263,27 @@ protected:
     OperationContext& _opCtx = *_opCtxPtr;
 
     boost::intrusive_ptr<ExpressionContext> _expCtx =
-        make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss);
+        ExpressionContextBuilder{}.opCtx(&_opCtx).ns(nss).build();
     ClockAdvancingOpObserver* _opObserver;
-    TickSourceMock<Milliseconds>* _tickSource;
+    static TickSourceMock<Milliseconds>* _tickSource;
 
 private:
     DBDirectClient _client;
 };
 
+// static
+TickSourceMock<Milliseconds>* QueryStageBatchedDeleteTest::_tickSource = nullptr;
+
 // Confirms batched deletes wait until a batch meets the targetBatchDocs before deleting documents.
 TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchDocsBasic) {
-    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     auto nDocs = 52;
     prePopulateCollection(nDocs);
 
-    const CollectionPtr& coll = ctx.getCollection();
-    ASSERT(coll);
+    const auto coll = acquireCollection(
+        &_opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(coll.exists());
 
     WorkingSet ws;
     auto deleteStage = makeBatchedDeleteStage(&ws, coll);
@@ -252,9 +297,9 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchDocsBasic) {
         ASSERT_EQUALS(state, PlanStage::NEED_TIME);
 
         // Only delete documents once the current batch reaches targetBatchDocs.
+        nIterations++;
         int batch = nIterations / (int)targetBatchDocs;
         ASSERT_EQUALS(stats->docsDeleted, targetBatchDocs * batch);
-        nIterations++;
     }
 
     // There should be 2 more docs deleted by the time the command returns EOF.
@@ -269,16 +314,18 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchDocsBasic) {
 // state, BatchedDeleteStage's snapshot is incremented and it can see the document has been removed
 // and skips over it.
 TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsDeleted) {
-    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     auto nDocs = 11;
     prePopulateCollection(nDocs);
 
-    const CollectionPtr& coll = ctx.getCollection();
-    ASSERT(coll);
+    const auto coll = acquireCollection(
+        &_opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(coll.exists());
 
     // Get the RecordIds that would be returned by an in-order scan.
     std::vector<RecordId> recordIds;
-    getRecordIds(coll, CollectionScanParams::FORWARD, &recordIds);
+    getRecordIds(&_opCtx, coll.getCollectionPtr(), CollectionScanParams::FORWARD, &recordIds);
 
     WorkingSet ws;
     auto deleteStage = makeBatchedDeleteStage(&ws, coll);
@@ -299,11 +346,12 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsDeleted) {
     {
         // Delete a document that has already been added to the delete batch.
         deleteStage->saveState();
-        BSONObj targetDoc = coll->docFor(&_opCtx, recordIds[pauseBatchingIdx - 2]).value();
+        BSONObj targetDoc =
+            coll.getCollectionPtr()->docFor(&_opCtx, recordIds[pauseBatchingIdx - 2]).value();
         ASSERT(!targetDoc.isEmpty());
         remove(targetDoc);
         // Increases the snapshotId.
-        deleteStage->restoreState(&coll);
+        deleteStage->restoreState(&coll.getCollectionPtr());
     }
 
     while ((state = deleteStage->work(&id)) != PlanStage::IS_EOF) {
@@ -325,10 +373,10 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsDeletedWriteConflict
     auto serviceContext = getGlobalServiceContext();
 
     // Issue the batched delete through different client than the default _client test member.
-    auto batchedDeleteClient = serviceContext->makeClient("batchedDeleteClient");
+    auto batchedDeleteClient = serviceContext->getService()->makeClient("batchedDeleteClient");
     auto batchedDeleteOpCtx = batchedDeleteClient->makeOperationContext();
     boost::intrusive_ptr<ExpressionContext> batchedDeleteExpCtx =
-        make_intrusive<ExpressionContext>(batchedDeleteOpCtx.get(), nullptr, nss);
+        ExpressionContextBuilder{}.opCtx(batchedDeleteOpCtx.get()).ns(nss).build();
 
     // Acquire locks for the batched delete.
     Lock::DBLock dbLk1(batchedDeleteOpCtx.get(), nss.dbName(), LockMode::MODE_IX);
@@ -336,14 +384,20 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsDeletedWriteConflict
 
     auto nDocs = 11;
     prePopulateCollection(nDocs);
-    const CollectionPtr& coll = CollectionCatalog::get(batchedDeleteOpCtx.get())
-                                    ->lookupCollectionByNamespace(batchedDeleteOpCtx.get(), nss);
 
-    ASSERT(coll);
+    const auto coll =
+        acquireCollection(batchedDeleteOpCtx.get(),
+                          CollectionAcquisitionRequest::fromOpCtx(
+                              batchedDeleteOpCtx.get(), nss, AcquisitionPrerequisites::kWrite),
+                          MODE_IX);
+    ASSERT(coll.exists());
 
     // Get the RecordIds that would be returned by an in-order scan.
     std::vector<RecordId> recordIds;
-    getRecordIds(coll, CollectionScanParams::FORWARD, &recordIds);
+    getRecordIds(batchedDeleteOpCtx.get(),
+                 coll.getCollectionPtr(),
+                 CollectionScanParams::FORWARD,
+                 &recordIds);
 
 
     WorkingSet ws;
@@ -363,8 +417,9 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsDeletedWriteConflict
     }
 
     // Find the document to delete with the same OpertionContext that holds the locks.
-    BSONObj targetDoc =
-        coll->docFor(batchedDeleteOpCtx.get(), recordIds[pauseBatchingIdx - 2]).value();
+    BSONObj targetDoc = coll.getCollectionPtr()
+                            ->docFor(batchedDeleteOpCtx.get(), recordIds[pauseBatchingIdx - 2])
+                            .value();
     ASSERT(!targetDoc.isEmpty());
 
     {
@@ -398,12 +453,14 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsDeletedWriteConflict
 // One of the staged documents is updated and then the BatchedDeleteStage increments its snapshot
 // before discovering the mismatch.
 TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsUpdatedToNotMatch) {
-    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
     auto nDocs = 11;
     prePopulateCollection(nDocs);
 
-    const CollectionPtr& coll = ctx.getCollection();
-    ASSERT(coll);
+    const auto coll = acquireCollection(
+        &_opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(coll.exists());
 
     // Only delete documents whose 'a' field is greater than or equal to 0.
     const BSONObj query = BSON("a" << BSON("$gte" << 0));
@@ -432,7 +489,7 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsUpdatedToNotMatch) {
         BSONObj updateObj = BSON("a" << -1);
         update(queryObj, updateObj);
         // Increases the snapshotId.
-        deleteStage->restoreState(&coll);
+        deleteStage->restoreState(&coll.getCollectionPtr());
     }
 
     while ((state = deleteStage->work(&id)) != PlanStage::IS_EOF) {
@@ -454,10 +511,10 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsUpdatedToNotMatchCli
     auto serviceContext = getGlobalServiceContext();
 
     // Issue the batched delete through different client than the default _client test member.
-    auto batchedDeleteClient = serviceContext->makeClient("batchedDeleteClient");
+    auto batchedDeleteClient = serviceContext->getService()->makeClient("batchedDeleteClient");
     auto batchedDeleteOpCtx = batchedDeleteClient->makeOperationContext();
     boost::intrusive_ptr<ExpressionContext> batchedDeleteExpCtx =
-        make_intrusive<ExpressionContext>(batchedDeleteOpCtx.get(), nullptr, nss);
+        ExpressionContextBuilder{}.opCtx(batchedDeleteOpCtx.get()).ns(nss).build();
 
     // Acquire locks for the batched delete.
     Lock::DBLock dbLk1(batchedDeleteOpCtx.get(), nss.dbName(), LockMode::MODE_IX);
@@ -465,10 +522,13 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsUpdatedToNotMatchCli
 
     auto nDocs = 11;
     prePopulateCollection(nDocs);
-    const CollectionPtr& coll = CollectionCatalog::get(batchedDeleteOpCtx.get())
-                                    ->lookupCollectionByNamespace(batchedDeleteOpCtx.get(), nss);
 
-    ASSERT(coll);
+    const auto coll =
+        acquireCollection(batchedDeleteOpCtx.get(),
+                          CollectionAcquisitionRequest::fromOpCtx(
+                              batchedDeleteOpCtx.get(), nss, AcquisitionPrerequisites::kWrite),
+                          MODE_IX);
+    ASSERT(coll.exists());
 
     // Only delete documents whose 'a' field is greater than or equal to 0.
     const BSONObj query = BSON("a" << BSON("$gte" << 0));
@@ -522,7 +582,7 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteStagedDocIsUpdatedToNotMatchCli
 
 // Tests targetBatchTimeMS is enforced.
 TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchTimeMSBasic) {
-    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
 
     std::vector<std::pair<BSONObj, Milliseconds>> timedBatch0{
         {BSON("_id" << 1 << "a" << 1), Milliseconds(2)},
@@ -541,8 +601,11 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchTimeMSBasic) {
     int batchSize1 = timedBatch1.size();
     int nDocs = batchSize0 + batchSize1;
 
-    const CollectionPtr& coll = ctx.getCollection();
-    ASSERT(coll);
+    const auto coll = acquireCollection(
+        &_opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(coll.exists());
 
     WorkingSet ws;
     auto deleteStage = makeBatchedDeleteStage(&ws, coll);
@@ -556,7 +619,7 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchTimeMSBasic) {
     // targetBatchDocs.
     {
         ASSERT_LTE(nDocs, targetBatchDocs);
-        for (auto i = 0; i <= nDocs; i++) {
+        for (auto i = 0; i < nDocs; i++) {
             state = deleteStage->work(&id);
             ASSERT_EQ(stats->docsDeleted, 0);
             ASSERT_EQ(state, PlanStage::NEED_TIME);
@@ -587,7 +650,7 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchTimeMSBasic) {
 
 // Tests when the total time it takes to delete targetBatchDocs exceeds targetBatchTimeMS.
 TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchTimeMSWithTargetBatchDocs) {
-    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
 
     std::vector<std::pair<BSONObj, Milliseconds>> timedBatch0{
         {BSON("_id" << 1 << "a" << 1), Milliseconds(1)},
@@ -620,8 +683,11 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchTimeMSWithTargetBatc
     int batchSize2 = timedBatch2.size();
     int nDocs = batchSize0 + batchSize1 + batchSize2;
 
-    const CollectionPtr& coll = ctx.getCollection();
-    ASSERT(coll);
+    const auto coll = acquireCollection(
+        &_opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(coll.exists());
 
     WorkingSet ws;
     auto deleteStage = makeBatchedDeleteStage(&ws, coll);
@@ -634,7 +700,7 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchTimeMSWithTargetBatc
 
     // Stages up to targetBatchDocs - 1 documents in the buffer.
     {
-        for (auto i = 0; i < targetBatchDocs; i++) {
+        for (auto i = 0; i < targetBatchDocs - 1; i++) {
             state = deleteStage->work(&id);
             ASSERT_EQ(stats->docsDeleted, 0);
             ASSERT_EQ(state, PlanStage::NEED_TIME);
@@ -684,12 +750,15 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetBatchTimeMSWithTargetBatc
 }
 
 TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassDocsBasic) {
-    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
     auto nDocs = 52;
     prePopulateCollection(nDocs);
 
-    const CollectionPtr& coll = ctx.getCollection();
-    ASSERT(coll);
+    const auto coll = acquireCollection(
+        &_opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(coll.exists());
 
     WorkingSet ws;
 
@@ -711,10 +780,9 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassDocsBasic) {
     PlanStage::StageState state = PlanStage::NEED_TIME;
     WorkingSetID id = WorkingSet::INVALID_ID;
 
-    // Stages up to 'targetBatchDocs' - 1 documents in the buffer. The first work() initiates the
-    // collection scan and doesn't fetch a document to stage.
+    // Stages up to 'targetBatchDocs' - 1 documents in the buffer.
     {
-        for (auto i = 0; i < targetBatchDocs; i++) {
+        for (auto i = 0; i < targetBatchDocs - 1; i++) {
             state = deleteStage->work(&id);
             ASSERT_EQ(stats->docsDeleted, 0);
             ASSERT_FALSE(stats->passTargetMet);
@@ -754,12 +822,15 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassDocsBasic) {
 // No limits on batch targets means all deletes will be committed in a single batch, and the
 // 'targetPassDocs' will be ignored.
 TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassDocsWithUnlimitedBatchTargets) {
-    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
     auto nDocs = 52;
     prePopulateCollection(nDocs);
 
-    const CollectionPtr& coll = ctx.getCollection();
-    ASSERT(coll);
+    const auto coll = acquireCollection(
+        &_opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(coll.exists());
 
     WorkingSet ws;
 
@@ -784,7 +855,7 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassDocsWithUnlimitedBatc
 
     // Stage a batch of documents (all the documents).
     {
-        for (auto i = 0; i <= nDocs; i++) {
+        for (auto i = 0; i < nDocs; i++) {
             state = deleteStage->work(&id);
             ASSERT_EQ(stats->docsDeleted, 0);
             ASSERT_FALSE(stats->passTargetMet);
@@ -807,12 +878,15 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassDocsWithUnlimitedBatc
 }
 
 TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassTimeMSBasic) {
-    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
     auto nDocs = 52;
     prePopulateCollection(nDocs);
 
-    const CollectionPtr& coll = ctx.getCollection();
-    ASSERT(coll);
+    const auto coll = acquireCollection(
+        &_opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(coll.exists());
 
     WorkingSet ws;
 
@@ -822,7 +896,7 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassTimeMSBasic) {
     batchedDeleteParams->targetBatchTimeMS = Milliseconds(0);
     batchedDeleteParams->targetBatchDocs = targetBatchDocs;
 
-    auto targetPassTimeMS = Milliseconds(3);
+    auto targetPassTimeMS = Milliseconds(targetBatchDocs - 1);
     batchedDeleteParams->targetPassTimeMS = targetPassTimeMS;
 
     auto deleteStage =
@@ -835,7 +909,7 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassTimeMSBasic) {
 
     // Stages the first batch.
     {
-        for (auto i = 0; i < targetBatchDocs; i++) {
+        for (auto i = 0; i < targetBatchDocs - 1; i++) {
             state = deleteStage->work(&id);
             ASSERT_EQ(stats->docsDeleted, 0);
             ASSERT_FALSE(stats->passTargetMet);
@@ -855,12 +929,15 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassTimeMSBasic) {
 
 // Demonstrates 'targetPassTimeMS' has no impact when there are no batch limits.
 TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassTimeMSWithUnlimitedBatchTargets) {
-    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
     auto nDocs = 52;
     prePopulateCollection(nDocs);
 
-    const CollectionPtr& coll = ctx.getCollection();
-    ASSERT(coll);
+    const auto coll = acquireCollection(
+        &_opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(coll.exists());
 
     WorkingSet ws;
 
@@ -882,7 +959,7 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassTimeMSWithUnlimitedBa
 
     // Stages the first batch (all the documents).
     {
-        for (auto i = 0; i <= nDocs; i++) {
+        for (auto i = 0; i < nDocs; i++) {
             state = deleteStage->work(&id);
             ASSERT_EQ(stats->docsDeleted, 0);
             ASSERT_FALSE(stats->passTargetMet);
@@ -909,7 +986,7 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassTimeMSWithUnlimitedBa
 // Tests a more realistic scenario where both batch and pass targets are set. In this case,
 // 'targetPassTimeMS' is met before 'targetPassDocs' is.
 TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassTimeMSReachedBeforeTargetPassDocs) {
-    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+    dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
 
     // Prepare the targets such that 'targetPassTimeMS' will be reached before 'targetPassDocs'.
     auto targetBatchDocs = 3;
@@ -958,8 +1035,11 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassTimeMSReachedBeforeTa
     batchedDeleteParams->targetPassTimeMS = targetPassTimeMS;
     batchedDeleteParams->targetPassDocs = targetPassDocs;
 
-    const CollectionPtr& coll = ctx.getCollection();
-    ASSERT(coll);
+    const auto coll = acquireCollection(
+        &_opCtx,
+        CollectionAcquisitionRequest::fromOpCtx(&_opCtx, nss, AcquisitionPrerequisites::kWrite),
+        MODE_IX);
+    ASSERT(coll.exists());
 
     WorkingSet ws;
 
@@ -974,10 +1054,9 @@ TEST_F(QueryStageBatchedDeleteTest, BatchedDeleteTargetPassTimeMSReachedBeforeTa
     // Track the total amount of time the pass takes.
     Timer passTimer(tickSource());
 
-    // Stages up to 'targetBatchDocs' - 1 documents in the buffer. The first work() initiates the
-    // collection scan and doesn't fetch a document to stage.
+    // Stages up to 'targetBatchDocs' - 1 documents in the buffer.
     {
-        for (auto i = 0; i < targetBatchDocs; i++) {
+        for (auto i = 0; i < targetBatchDocs - 1; i++) {
             state = deleteStage->work(&id);
             ASSERT_EQ(stats->docsDeleted, 0);
             ASSERT_FALSE(stats->passTargetMet);

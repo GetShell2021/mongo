@@ -29,9 +29,28 @@
 
 #include "mongo/db/pipeline/document_source_change_stream_oplog_match.h"
 
-#include "mongo/bson/bsonmisc.h"
+#include <algorithm>
+#include <iterator>
+#include <list>
+#include <memory>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/change_stream_filter_helpers.h"
-#include "mongo/db/pipeline/document_source_change_stream_unwind_transaction.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/idl/idl_parser.h"
 
 namespace mongo {
 
@@ -51,7 +70,7 @@ namespace change_stream_filter {
  * entries that would definitely be filtered out by the 'userMatch' filter.
  *
  * NB: When passing a non-NULL 'userMatch' expression, the resulting expression is built using a
- * "shallow clone" of the 'userMatch' (i.e., the result of 'MatchExpression::shallowClone()') and
+ * "shallow clone" of the 'userMatch' (i.e., the result of 'MatchExpression::clone()') and
  * can contain references to strings in the BSONObj that 'userMatch' originated from. Callers that
  * keep the new filter long-term should serialize and re-parse it to guard against the possibility
  * of stale string references.
@@ -59,53 +78,63 @@ namespace change_stream_filter {
 std::unique_ptr<MatchExpression> buildOplogMatchFilter(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     Timestamp startFromInclusive,
+    std::vector<BSONObj>& backingBsonObjs,
     const MatchExpression* userMatch = nullptr) {
     tassert(6394401,
             "Expected changeStream spec to be present while building the oplog match filter",
-            expCtx->changeStreamSpec);
+            expCtx->getChangeStreamSpec());
 
     // Start building the oplog filter by adding predicates that apply to every entry.
     auto oplogFilter = std::make_unique<AndMatchExpression>();
-    oplogFilter->add(buildTsFilter(expCtx, startFromInclusive, userMatch));
-    if (!expCtx->changeStreamSpec->getShowMigrationEvents()) {
-        oplogFilter->add(buildNotFromMigrateFilter(expCtx, userMatch));
+    oplogFilter->add(buildTsFilter(expCtx, startFromInclusive, userMatch, backingBsonObjs));
+
+    if (!expCtx->getChangeStreamSpec()->getShowMigrationEvents()) {
+        oplogFilter->add(buildNotFromMigrateFilter(expCtx, userMatch, backingBsonObjs));
     }
 
     // Create an $or filter which only captures relevant events in the oplog.
     auto eventFilter = std::make_unique<OrMatchExpression>();
-    eventFilter->add(buildOperationFilter(expCtx, userMatch));
-    eventFilter->add(buildInvalidationFilter(expCtx, userMatch));
-    eventFilter->add(buildTransactionFilter(expCtx, userMatch));
-    eventFilter->add(buildInternalOpFilter(expCtx, userMatch));
+    eventFilter->add(buildOperationFilter(expCtx, userMatch, backingBsonObjs));
+    eventFilter->add(buildInvalidationFilter(expCtx, userMatch, backingBsonObjs));
+    eventFilter->add(buildTransactionFilter(expCtx, userMatch, backingBsonObjs));
+    eventFilter->add(buildInternalOpFilter(expCtx, userMatch, backingBsonObjs));
 
     // We currently do not support opening a change stream on a view namespace. So we only need to
     // add this filter when the change stream type is whole-db or whole cluster.
-    if (expCtx->changeStreamSpec->getShowExpandedEvents() &&
-        expCtx->ns.isCollectionlessAggregateNS()) {
-        eventFilter->add(buildViewDefinitionEventFilter(expCtx, userMatch));
+    if (expCtx->getChangeStreamSpec()->getShowExpandedEvents() &&
+        expCtx->getNamespaceString().isCollectionlessAggregateNS()) {
+        eventFilter->add(buildViewDefinitionEventFilter(expCtx, userMatch, backingBsonObjs));
     }
 
     // Build the final $match filter to be applied to the oplog.
     oplogFilter->add(std::move(eventFilter));
 
     // Perform a final optimization pass on the complete filter before returning.
-    return MatchExpression::optimize(std::move(oplogFilter));
+    // TODO SERVER-81846: Enable the Boolean Expression Simplifier in change streams.
+    return MatchExpression::optimize(std::move(oplogFilter), /* enableSimplification */ false);
 }
 }  // namespace change_stream_filter
 
 DocumentSourceChangeStreamOplogMatch::DocumentSourceChangeStreamOplogMatch(
-    Timestamp clusterTime, const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSourceMatch(change_stream_filter::buildOplogMatchFilter(expCtx, clusterTime),
-                          expCtx) {
+    Timestamp clusterTime,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    std::unique_ptr<MatchExpression> opLogMatchFilter,
+    std::vector<BSONObj> backingBsonObjs)
+    : DocumentSourceInternalChangeStreamMatch(std::move(opLogMatchFilter), expCtx),
+      _backingBsonObjs(std::move(backingBsonObjs)) {
     _clusterTime = clusterTime;
-    expCtx->tailableMode = TailableModeEnum::kTailableAndAwaitData;
+    expCtx->setTailableMode(TailableModeEnum::kTailableAndAwaitData);
 }
 
 boost::intrusive_ptr<DocumentSourceChangeStreamOplogMatch>
 DocumentSourceChangeStreamOplogMatch::create(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                              const DocumentSourceChangeStreamSpec& spec) {
-    auto resumeToken = DocumentSourceChangeStream::resolveResumeTokenFromSpec(expCtx, spec);
-    return make_intrusive<DocumentSourceChangeStreamOplogMatch>(resumeToken.clusterTime, expCtx);
+    auto resumeToken = change_stream::resolveResumeTokenFromSpec(expCtx, spec);
+    std::vector<BSONObj> backingBsonObjs;
+    auto opLogMatchFilter = change_stream_filter::buildOplogMatchFilter(
+        expCtx, resumeToken.clusterTime, backingBsonObjs);
+    return make_intrusive<DocumentSourceChangeStreamOplogMatch>(
+        resumeToken.clusterTime, expCtx, std::move(opLogMatchFilter), std::move(backingBsonObjs));
 }
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceChangeStreamOplogMatch::createFromBson(
@@ -114,7 +143,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceChangeStreamOplogMatch::creat
             "the match filter must be an expression in an object",
             elem.type() == BSONType::Object);
     auto parsedSpec = DocumentSourceChangeStreamOplogMatchSpec::parse(
-        IDLParserErrorContext("DocumentSourceChangeStreamOplogMatchSpec"), elem.Obj());
+        IDLParserContext("DocumentSourceChangeStreamOplogMatchSpec"), elem.Obj());
 
     // Note: raw new used here to access private constructor.
     return new DocumentSourceChangeStreamOplogMatch(parsedSpec.getFilter(), pExpCtx);
@@ -138,7 +167,7 @@ StageConstraints DocumentSourceChangeStreamOplogMatch::constraints(
                                  UnionRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage);
     constraints.isIndependentOfAnyCollection =
-        pExpCtx->ns.isCollectionlessAggregateNS() ? true : false;
+        pExpCtx->getNamespaceString().isCollectionlessAggregateNS() ? true : false;
     return constraints;
 }
 
@@ -147,9 +176,6 @@ Pipeline::SourceContainer::iterator DocumentSourceChangeStreamOplogMatch::doOpti
     tassert(5687203, "Iterator mismatch during optimization", *itr == this);
 
     auto nextChangeStreamStageItr = std::next(itr);
-    if (!feature_flags::gFeatureFlagChangeStreamsRewrite.isEnabledAndIgnoreFCV()) {
-        return nextChangeStreamStageItr;
-    }
 
     // It is not safe to combine any parts of a user $match with this stage when the $user match has
     // a non-simple collation, because this stage's MatchExpression always executes wtih the simple
@@ -193,26 +219,37 @@ Pipeline::SourceContainer::iterator DocumentSourceChangeStreamOplogMatch::doOpti
     tassert(5687204, "Attempt to rewrite an interalOplogMatch after deserialization", _clusterTime);
 
     // Recreate the change stream filter with additional predicates from the user's $match.
+    std::vector<BSONObj> backingBsonObjs;
     auto filterWithUserPredicates = change_stream_filter::buildOplogMatchFilter(
-        pExpCtx, *_clusterTime, matchStage->getMatchExpression());
+        pExpCtx, *_clusterTime, backingBsonObjs, matchStage->getMatchExpression());
 
     // Set the internal DocumentSourceMatch state to the new filter.
     rebuild(filterWithUserPredicates->serialize());
+
+    // After serializing the predicate, remove all the BSONObjs from _backingBsonObjs.
+    _backingBsonObjs.clear();
 
     // Continue optimization at the next change stream stage.
     return nextChangeStreamStageItr;
 }
 
-Value DocumentSourceChangeStreamOplogMatch::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {
-        return Value(
-            Document{{DocumentSourceChangeStream::kStageName,
-                      Document{{"stage"_sd, "internalOplogMatch"_sd}, {"filter"_sd, _predicate}}}});
-    }
+Value DocumentSourceChangeStreamOplogMatch::doSerialize(const SerializationOptions& opts) const {
+    BSONObjBuilder builder;
+    if (opts.verbosity) {
+        BSONObjBuilder sub(builder.subobjStart(DocumentSourceChangeStream::kStageName));
+        sub.append("stage"_sd, kStageName);
+        sub.append(DocumentSourceChangeStreamOplogMatchSpec::kFilterFieldName,
+                   getMatchExpression()->serialize(opts));
+        sub.done();
+    } else {
+        BSONObjBuilder sub(builder.subobjStart(kStageName));
 
-    DocumentSourceChangeStreamOplogMatchSpec spec(_predicate);
-    return Value(Document{{DocumentSourceChangeStreamOplogMatch::kStageName, spec.toBSON()}});
+        // 'SerializationOptions' are not required here, since serialization for explain and query
+        // stats occur before this function call.
+        DocumentSourceChangeStreamOplogMatchSpec(getPredicate()).serialize(&sub);
+        sub.done();
+    }
+    return Value(builder.obj());
 }
 
 }  // namespace mongo

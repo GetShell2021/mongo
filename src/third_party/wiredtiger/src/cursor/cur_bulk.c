@@ -23,7 +23,7 @@ __bulk_col_keycmp_err(WT_CURSOR_BULK *cbulk)
 
     WT_RET_MSG(session, EINVAL,
       "bulk-load presented with out-of-order keys: %" PRIu64
-      " is less than previously inserted key %" PRIu64,
+      " is less than or equal to the previously inserted key %" PRIu64,
       cursor->recno, cbulk->recno);
 }
 
@@ -47,8 +47,8 @@ __curbulk_insert_fix(WT_CURSOR *cursor)
      * Bulk cursor inserts are updates, but don't need auto-commit transactions because they are
      * single-threaded and not visible until the bulk cursor is closed.
      */
-    CURSOR_API_CALL(cursor, session, insert, btree);
-    WT_STAT_CONN_DATA_INCR(session, cursor_insert_bulk);
+    CURSOR_API_CALL(cursor, session, ret, insert, btree);
+    WT_STAT_CONN_DSRC_INCR(session, cursor_insert_bulk);
 
     /*
      * If the "append" flag was configured, the application doesn't have to supply a key, else
@@ -96,8 +96,8 @@ __curbulk_insert_fix_bitmap(WT_CURSOR *cursor)
      * Bulk cursor inserts are updates, but don't need auto-commit transactions because they are
      * single-threaded and not visible until the bulk cursor is closed.
      */
-    CURSOR_API_CALL(cursor, session, insert, btree);
-    WT_STAT_CONN_DATA_INCR(session, cursor_insert_bulk);
+    CURSOR_API_CALL(cursor, session, ret, insert, btree);
+    WT_STAT_CONN_DSRC_INCR(session, cursor_insert_bulk);
 
     WT_ERR(__cursor_checkvalue(cursor));
 
@@ -128,8 +128,8 @@ __curbulk_insert_var(WT_CURSOR *cursor)
      * Bulk cursor inserts are updates, but don't need auto-commit transactions because they are
      * single-threaded and not visible until the bulk cursor is closed.
      */
-    CURSOR_API_CALL(cursor, session, insert, btree);
-    WT_STAT_CONN_DATA_INCR(session, cursor_insert_bulk);
+    CURSOR_API_CALL(cursor, session, ret, insert, btree);
+    WT_STAT_CONN_DSRC_INCR(session, cursor_insert_bulk);
 
     /*
      * If the "append" flag was configured, the application doesn't have to supply a key, else
@@ -150,7 +150,8 @@ __curbulk_insert_var(WT_CURSOR *cursor)
          * against the last value; if the same, just increment the RLE count.
          */
         if (recno == cbulk->recno + 1 && cbulk->last->size == cursor->value.size &&
-          memcmp(cbulk->last->data, cursor->value.data, cursor->value.size) == 0) {
+          (cursor->value.size == 0 ||
+            memcmp(cbulk->last->data, cursor->value.data, cursor->value.size) == 0)) {
             ++cbulk->rle;
             ++cbulk->recno;
             goto duplicate;
@@ -200,7 +201,8 @@ __bulk_row_keycmp_err(WT_CURSOR_BULK *cbulk)
     WT_ERR(__wt_scr_alloc(session, 512, &b));
 
     WT_ERR_MSG(session, EINVAL,
-      "bulk-load presented with out-of-order keys: %s compares smaller than previously inserted "
+      "bulk-load presented with out-of-order keys: %s is less than or equal to the previously "
+      "inserted "
       "key %s",
       __wt_buf_set_printable(session, cursor->key.data, cursor->key.size, false, a),
       __wt_buf_set_printable(session, cbulk->last->data, cbulk->last->size, false, b));
@@ -231,8 +233,8 @@ __curbulk_insert_row(WT_CURSOR *cursor)
      * Bulk cursor inserts are updates, but don't need auto-commit transactions because they are
      * single-threaded and not visible until the bulk cursor is closed.
      */
-    CURSOR_API_CALL(cursor, session, insert, btree);
-    WT_STAT_CONN_DATA_INCR(session, cursor_insert_bulk);
+    CURSOR_API_CALL(cursor, session, ret, insert, btree);
+    WT_STAT_CONN_DSRC_INCR(session, cursor_insert_bulk);
 
     WT_ERR(__cursor_checkkey(cursor));
     WT_ERR(__cursor_checkvalue(cursor));
@@ -276,8 +278,8 @@ __curbulk_insert_row_skip_check(WT_CURSOR *cursor)
      * Bulk cursor inserts are updates, but don't need auto-commit transactions because they are
      * single-threaded and not visible until the bulk cursor is closed.
      */
-    CURSOR_API_CALL(cursor, session, insert, btree);
-    WT_STAT_CONN_DATA_INCR(session, cursor_insert_bulk);
+    CURSOR_API_CALL(cursor, session, ret, insert, btree);
+    WT_STAT_CONN_DSRC_INCR(session, cursor_insert_bulk);
 
     WT_ERR(__cursor_checkkey(cursor));
     WT_ERR(__cursor_checkvalue(cursor));
@@ -289,11 +291,11 @@ err:
 }
 
 /*
- * __wt_curbulk_init --
+ * __wti_curbulk_init --
  *     Initialize a bulk cursor.
  */
 int
-__wt_curbulk_init(
+__wti_curbulk_init(
   WT_SESSION_IMPL *session, WT_CURSOR_BULK *cbulk, bool bitmap, bool skip_sort_check)
 {
     WT_CURSOR *cursor;
@@ -303,7 +305,7 @@ __wt_curbulk_init(
     cbt = &cbulk->cbt;
 
     /* Bulk cursors only support insert and close (reset is a no-op). */
-    __wt_cursor_set_notsup(cursor);
+    __wti_cursor_set_notsup(cursor);
     switch (CUR2BT(cbt)->type) {
     case BTREE_COL_FIX:
         cursor->insert = bitmap ? __curbulk_insert_fix_bitmap : __curbulk_insert_fix;
@@ -341,15 +343,17 @@ __wt_curbulk_init(
 }
 
 /*
- * __wt_curbulk_close --
+ * __wti_curbulk_close --
  *     Close a bulk cursor.
  */
 int
-__wt_curbulk_close(WT_SESSION_IMPL *session, WT_CURSOR_BULK *cbulk)
+__wti_curbulk_close(WT_SESSION_IMPL *session, WT_CURSOR_BULK *cbulk)
 {
     WT_DECL_RET;
 
     ret = __wt_bulk_wrapup(session, cbulk);
+    if (ret == 0)
+        WT_STAT_CONN_DECR_ATOMIC(session, cursor_bulk_count);
 
     __wt_scr_free(session, &cbulk->last);
     return (ret);

@@ -3,17 +3,13 @@
 The new log system adds capability to produce structured logs in the [Relaxed
 Extended JSON 2.0.0][relaxed_json_2] format. The new API requires names to be
 given to variables, forming field names for the variables in structured JSON
-logs. Named variables are called attributes in the log system. Human readable
-log messages are built with a [libfmt][libfmt] inspired API, where attributes
-are inserted using replacement fields instead of being streamed together using
-the streaming operator `<<`.
+logs. Named variables are called attributes in the log system.
 
 # Style guide
 
 ## In general
 
-Log lines are composed primarily of a message (`msg`) and attributes (`attr.*`
-fields).
+Log lines are composed primarily of a message (`msg`) and attributes (`attr` fields).
 
 ## Philosophy
 
@@ -37,16 +33,15 @@ repetition possible, and shares attribute names with other related log lines.
 The `msg` field predicates a reader's interpretation of the log line. It should
 be crafted with care and attention.
 
-* Concisely describe what the log line is reporting, providing enough
+- Concisely describe what the log line is reporting, providing enough
   context necessary for interpreting attribute field names and values
-* Capitalize the first letter, as in a sentence
-* Avoid unnecessary punctuation, but punctuate between sentences if using 
+- Capitalize the first letter, as in a sentence
+- Avoid unnecessary punctuation, but punctuate between sentences if using
   multiple sentences
-* Do not conclude with punctuation
-* For new log messages, do __not__ use a format string/substitution for
-  new log messages
-* For updating existing log messages, provide both a format
-  string/substitution, __and__ a substitution-free message string
+- Do not conclude with punctuation
+- You may occasionally encounter `msg` strings containing fmt-style
+  `{expr}` braces. These are legacy artifacts and should be rephrased
+  according to these guidelines.
 
 ### Attributes (fields in the attr subdocument)
 
@@ -62,9 +57,9 @@ For `attr` field names, do the following:
 
 The bar for understanding should be:
 
-* Someone with reasonable understanding of mongod behavior should understand
+- Someone with reasonable understanding of mongod behavior should understand
   immediately what is being logged
-* Someone with reasonable troubleshooting skill should be able to extract doc-
+- Someone with reasonable troubleshooting skill should be able to extract doc-
   or code-searchable phrases to learn about what is being logged
 
 #### Precisely describe values and units
@@ -82,26 +77,24 @@ attribute name.
 Alternatively, specify an `attr` name of “durationMillis” and provide the
 number of milliseconds as an integer type.
 
-__Importantly__: downstream analysis tools will rely on this convention, as a
+**Importantly**: downstream analysis tools will rely on this convention, as a
 replacement for the "[0-9]+ms$" format of prior logs.
 
 #### Use certain specific terms whenever possible
 
 When logging the below information, do so with these specific terms:
 
-* __namespace__ - when logging a value of the form
+- **namespace** - when logging a value of the form
   "\<db name\>.\<collection name\>". Do not use "collection" or abbreviate to "ns"
-* __db__ - instead of "database"
-* __error__ - when an error occurs, instead of "status". Use this for objects
+- **db** - instead of "database"
+- **error** - when an error occurs, instead of "status". Use this for objects
   of type Status and DBException
-* __reason__ - to provide rationale for an event/action when "error" isn't
+- **reason** - to provide rationale for an event/action when "error" isn't
   appropriate
 
 ### Examples
 
-- For new log lines:
-
-  C++ expression:
+- Example 1:
 
       LOGV2(1041, "Transition to PRIMARY complete");
 
@@ -109,9 +102,7 @@ When logging the below information, do so with these specific terms:
 
       { ... , "id": 1041, "msg": "Transition to PRIMARY complete", "attr": {} }
 
-- Another new log line:
-
-  C++ expression:
+- Example 2:
 
       LOGV2(1042, "Slow query", "duration"_attr = getDurationMillis());
 
@@ -119,28 +110,11 @@ When logging the below information, do so with these specific terms:
 
       { ..., "id": 1042, "msg": "Slow query", "attr": { "durationMillis": 1000 } }
 
-
-- For updating existing log lines:
-
-  C++ expression:
-
-      LOGV2(1040,
-            "Replica set state transition from {oldState} to {newState} on this node",
-            "Replica set state transition on this node",
-            "oldState"_attr = getOldState(),
-            "newState"_attr = getNewState());
-
-  JSON Output:
-
-      { ..., "id": 1040, "msg": "Replica set state transition on this node",
-          "attr": { "oldState": "SECONARY", "newState": "PRIMARY" } }
-
 - For adding STL containers as dynamic attributes, see
-    [RollbackImpl::_summarizeRollback][_summarizeRollback]
+  [RollbackImpl::\_summarizeRollback][_summarizeRollback]
 
 - For sharing a string between a log line and a status see [this section of
-    InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp][
-    _lastOplogEntryFetcherCallbackForStopTimestamp]
+  InitialSyncer::\_lastOplogEntryFetcherCallbackForStopTimestamp][ _lastOplogEntryFetcherCallbackForStopTimestamp]
 
 # Basic Usage
 
@@ -150,22 +124,15 @@ The log system is made available with the following header:
 
 The macro `MONGO_LOGV2_DEFAULT_COMPONENT` is expanded by all logging macros.
 This configuration macro must expand at their point of use to a `LogComponent`
-expression, which is implicitly attached to the emitted message.  It is
-conventionally defined near the top of a `.cpp` file before any logging macros
-are invoked. Example:
+expression, which is implicitly attached to the emitted message. It is
+conventionally defined near the top of a `.cpp` file after headers are included,
+and before any logging macros are invoked. Example:
 
     #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 Logging is performed using function style macros:
 
     LOGV2(ID,
-          format-string,
-          "name0"_attr = var0,
-          ...,
-          "nameN"_attr = varN);
-
-    LOGV2(ID,
-          format-string,
           message-string,
           "name0"_attr = var0,
           ...,
@@ -177,13 +144,6 @@ code, using a new ID is strongly advised to avoid any parsing ambiguity. When
 selecting ID during work on JIRA ticket `SERVER-ABCDE` you can use the JIRA
 ticket number to avoid ID collisions with other engineers by taking ID from the
 range `ABCDE00` - `ABCDE99`.
-
-The format string contains the description of the log event with libfmt style
-replacement fields optionally embedded within it. The format string must comply
-with the [format syntax][libfmt_syn] from libfmt. The purpose of embedding the
-replacement fields is to be able to create a human readable message used by the
-text output format or a tool that converts JSON logs to a human readable
-format.
 
 Replacement fields are placed in the format string with curly braces `{}`.
 Everything not surrounded with curly braces is part of the message text. Curly
@@ -203,15 +163,7 @@ It is allowed to have more attributes than replacement fields in a log
 statement. However, having fewer attributes than replacement fields is not
 allowed.
 
-As shown above there is also an API taking both a format string and a message
-string. This is an API to help with the transition from text output to JSON
-output. JSON logs have no need for embedded replacement fields in the
-description, if written in a short and descriptive manner providing context for
-the attribute names. But a format string may still be needed to provide good
-JSON to human readable text conversion. See the JSON output format and style
-guide below for more information.
-
-Both the format string and the message string must be compile time constants.
+The message string must be a compile time constant.
 This is to avoid dynamic attribute names in the log output and to be able to
 add compile time verification of log statements in the future. If the string
 needs to be shared with anything else (like constructing a Status object) you
@@ -221,20 +173,11 @@ can use this pattern:
 
 ##### Examples
 
-- No replacement fields
+- No attributes.
 
       LOGV2(1000, "Logging event, no replacement fields is OK");
 
-- With replacement fields.
-
-      const BSONObj& slowOperation = ...;
-      Milliseconds time = ...;
-      LOGV2(1001,
-            "Operation {op} is slow, took: {duration}",
-            "op"_attr = slowOperation,
-            "duration"_attr = time);
-
-- No replacement fields, and unused attributes.
+- Some attributes.
 
       LOGV2(1002,
             "Replication state change",
@@ -261,17 +204,17 @@ log statement.
 to different severities there are separate logging macros to be used, they all
 take paramaters like `LOGV2`:
 
-* `LOGV2_WARNING`
-* `LOGV2_ERROR`
-* `LOGV2_FATAL`
-* `LOGV2_FATAL_NOTRACE`
-* `LOGV2_FATAL_CONTINUE`
+- `LOGV2_WARNING`
+- `LOGV2_ERROR`
+- `LOGV2_FATAL`
+- `LOGV2_FATAL_NOTRACE`
+- `LOGV2_FATAL_CONTINUE`
 
 There is also variations that take `LogOptions` if needed:
 
-* `LOGV2_WARNING_OPTIONS`
-* `LOGV2_ERROR_OPTIONS`
-* `LOGV2_FATAL_OPTIONS`
+- `LOGV2_WARNING_OPTIONS`
+- `LOGV2_ERROR_OPTIONS`
+- `LOGV2_FATAL_OPTIONS`
 
 Fatal level log statements using `LOGV2_FATAL` perform `fassert` after logging,
 using the provided ID as assert id. `LOGV2_FATAL_NOTRACE` perform
@@ -303,15 +246,27 @@ integer) required to indicate the desired debug level:
         message-string,
         attr0, ...);
 
+`LOGV2_PROD_ONLY` logs like a default `LOGV2` log in production, but debug-1 log
+in internal testing. It accepts the same arguments as `LOGV2`. This log level is
+for log lines that may be spammy in testing but are more rare in production. As
+such, they may be useful in investigations. This level also preserves backwards
+compatibility for logs that are no longer as useful as when they were introduced.
+To determine whether to log, this macro uses the `LogSeverity::ProdOnly()`
+level, which returns level `LogSeverity::Debug(1)` when in a testing environment
+and `LogSeverity::Log()` otherwise. Whether the server is in a testing
+environment is determined using the `enableTestCommands` server parameter.
+It is preferred to use other macros over this one as it introduces a difference
+between testing and production. There is also the `LOGV2_PROD_ONLY_OPTIONS`
+variation that takes `LogOptions`.
+
 ##### Example
 
     Status status = ...;
     int remainingAttempts = ...;
-    LOGV2_ERROR(
-        1004,
-        "Initial sync failed. {remaining} attempts left. Reason: {reason}",
-        "reason"_attr = status,
-        "remaining"_attr = remainingAttempts);
+    LOGV2_ERROR(1004,
+                "Initial sync failed.",
+                "reason"_attr = status,
+                "remainingAttempts"_attr = remainingAttempts);
 
 ### Log Tags
 
@@ -344,7 +299,7 @@ When finished, it is logged using the regular logging API but the
 `_attr` literals with the `DynamicAttributes` is not supported.
 
 When using the `DynamicAttributes` you need to be careful about parameter
-lifetimes. The `DynamicAttributes` binds attributes *by reference* and the
+lifetimes. The `DynamicAttributes` binds attributes _by reference_ and the
 reference must be valid when passing the `DynamicAttributes` to the log
 statement.
 
@@ -365,67 +320,61 @@ statement.
 
 Many basic types have built in support:
 
-* Boolean
-* Integral types
-  * Single `char` is logged as integer
-* Enums
-  * Logged as their underlying integral type
-* Floating point types
-  * `long double` is prohibited
-* String types
-  * `std::string`
-  * `StringData`
-  * `const char*`
-* Duration types
-  * Special formatting, see below
-* BSON types
-  * `BSONObj`
-  * `BSONArray`
-  * `BSONElement`
-* BSON appendable types
-  * `BSONObjBuilder::append` overload available
-* `boost::optional<T>` of any loggable type `T`
+- Boolean
+- Integral types
+  - Single `char` is logged as integer
+- Enums
+  - Logged as their underlying integral type
+- Floating point types
+  - `long double` is prohibited
+- String types
+  - `std::string`
+  - `StringData`
+  - `const char*`
+- Duration types
+  - Special formatting, see below
+- BSON types
+  - `BSONObj`
+  - `BSONArray`
+  - `BSONElement`
+- BSON appendable types
+  - `BSONObjBuilder::append` overload available
+- `boost::optional<T>` of any loggable type `T`
 
-### User defined types
+### User-defined types
 
-To make a user defined type loggable it needs a serialization member function
+To make a user-defined type loggable it needs a serialization member function
 that the log system can bind to.
 
 The system binds and uses serialization functions by looking for functions in
 the following priority order:
 
-##### Structured serialization function signatures
+- Structured serialization functions
+  - `void x.serialize(BSONObjBuilder*) const` (member)
+  - `BSONObj x.toBSON() const` (member)
+  - `BSONArray x.toBSONArray() const` (member)
+  - `toBSON(x)` (non-member)
+- Stringification functions
+  - `toStringForLogging(x)` (non-member)
+  - `x.serialize(&fmtMemoryBuffer)` (member)
+  - `x.toString() ` (member)
+  - `toString(x)` (non-member)
 
-Member functions:
-
-- `void serialize(BSONObjBuilder*) const`
-- `BSONObj toBSON() const`
-- `BSONArray toBSONArray() const`
-
-Non-member functions:
-
-- `toBSON(const T& val)` (non-member function)
-
-##### Stringification function signatures
-
-Member functions:
-
-- `void serialize(fmt::memory_buffer&) const`
-- `std::string toString() const`
-
-Non-member functions:
-
-- `toString(const T& val)` (non-member function)
-
-Enums will only try to bind a `toString(const T& val)` non-member function. If
-one is not available the enum value will be logged as its underlying integral
-type.
+Enums cannot have member functions, but they will still try to bind to the
+`toStringForLogging(e)` or `toString(e)` non-members. If neither is available,
+the enum value will be logged as its underlying integral type.
 
 In order to offer structured serialization and output, a type would need to
-supply a structured serialization function (functions 1 to 4 above), otherwise
-if only stringification is provided the output will be an escaped string.
+supply a structured serialization function. Otherwise, if only stringification
+is provided, the output will be an escaped string.
 
-*NOTE: No `operator<<` overload is used even if available*
+The `toStringForLogging` non-member is an ADL customization hook used to
+override `toString` for very rare cases where `toString` is inappropriate for
+logging perhaps because it's needed for other non-logging formatting. Usually a
+`toString` (member or nonmember) is a sufficient customization point and should
+be preferred as a canonical stringification of the object.
+
+_NOTE: No `operator<<` overload is used even if available_
 
 ##### Example
 
@@ -462,8 +411,8 @@ is a JSON object where the field names are the key.
 
 Ranges is loggable via helpers to indicate what type of range it is
 
-* `seqLog(begin, end)`
-* `mapLog(begin, end)`
+- `seqLog(begin, end)`
+- `mapLog(begin, end)`
 
 seqLog indicates that it is a sequential range where the iterators point to
 loggable value directly.
@@ -477,23 +426,23 @@ the iterators point to a key-value pair.
 
       std::array<int, 20> arrayOfInts = ...;
       LOGV2(1010,
-            "Log container directly: {values}",
+            "Log container directly",
             "values"_attr = arrayOfInts);
       LOGV2(1011,
-            "Log iterator range: {values}",
+            "Log iterator range",
             "values"_attr = seqLog(arrayOfInts.begin(), arrayOfInts.end());
       LOGV2(1012,
-            "Log first five elements: {values}",
+            "Log first five elements",
             "values"_attr = seqLog(arrayOfInts.data(), arrayOfInts.data() + 5);
 
 - Logging a map-like container:
 
       StringMap<BSONObj> bsonMap = ...;
       LOGV2(1013,
-            "Log map directly: {values}",
+            "Log map directly",
             "values"_attr = bsonMap);
       LOGV2(1014,
-            "Log map iterator range: {values}",
+            "Log map iterator range",
             "values"_attr = mapLog(bsonMap.begin(), bsonMap.end());
 
 #### Containers and `uint64_t`
@@ -509,15 +458,15 @@ type.
 
     // If we know casting to signed is safe
     auto asSigned = [](uint64_t i) { return static_cast<int64_t>(i); };
-    LOGV2(2000, "As signed array: {values}", "values"_attr = seqLog(
-      boost::make_transform_iterator(vec.begin(), asSigned),
-      boost::make_transform_iterator(vec.end(), asSigned)
-    ));
+    LOGV2(2000,
+          "As signed array",
+          "values"_attr = seqLog(
+              boost::make_transform_iterator(vec.begin(), asSigned),
+              boost::make_transform_iterator(vec.end(), asSigned)));
 
     // Otherwise we can log as any of these types instead of using asSigned
     auto asDecimal128 = [](uint64_t i) { return Decimal128(i); };
     auto asString = [](uint64_t i) { return std::to_string(i); };
-
 
 ### Duration types
 
@@ -537,25 +486,24 @@ formatted as a BSON object.
 
 - "duration" attribute
 
-    C++ expression:
+  C++ expression:
 
         "duration"_attr = Milliseconds(10)
 
-    JSON format:
+  JSON format:
 
         "durationMillis": 10
 
 - Container of Duration objects
 
-    C++ expression:
+  C++ expression:
 
         "samples"_attr = std::vector<Nanoseconds>{Nanoseconds(200),
                                                   Nanoseconds(400)}
 
-    JSON format:
+  JSON format:
 
         "samples": [{"durationNanos": 200}, {"durationNanos": 400}]
-
 
 # Attribute naming abstraction
 
@@ -606,7 +554,6 @@ functions implemented.
     // These two log statements are equivalent:
     LOGV2(2002, "Statement", logAttrs(t));
     LOGV2(2002, "Statement", "name"_attr=t.name, "data"_attr=t.data);
-
 
 ## Handling temporary lifetime with multiple attributes
 
@@ -665,7 +612,6 @@ The assertion reason string will be a plain text formatted log (replacement
 fields filled in format-string). If replacement fields are not provided in the
 message string, attribute values will be missing from the assertion message.
 
-
 ##### Examples
 
     LOGV2_ERROR_OPTIONS(1050000,
@@ -681,14 +627,13 @@ Using a named error code:
     LOGV2_ERROR_OPTIONS(
         1050,
         {UserAssertAfterLog(ErrorCodes::DataCorruptionDetected)},
-        "Data corruption detected for {recordId}",
+        "Data corruption detected",
         "recordId"_attr=RecordId(123456));
 
 Would emit a `uassert` after performing the log that is equivalent to:
 
     uasserted(ErrorCodes::DataCorruptionDetected,
               "Data corruption detected for RecordId(123456)");
-
 
 ## Unstructured logging for local development
 
@@ -733,7 +678,7 @@ C++ statement:
     std::vector<int> vec = {1, 2, 3};
 
     LOGV2_ERROR(1020,
-                "Example (b: {bson}), (vec: {vector})",
+                "Example",
                 "bson"_attr = builder.obj(),
                 "vector"_attr = vec,
                 "optional"_attr = boost::none);
@@ -748,7 +693,7 @@ Output:
         "c": "NETWORK",
         "ctx": "conn1",
         "id": 23453,
-        "msg": "Example (b: {bson}), (vec: {vector})",
+        "msg": "Example",
         "attr": {
             "bson": {
                 "first": 1,
@@ -759,36 +704,8 @@ Output:
         }
     }
 
-
-# FAQ
-
-### Why are we doing this?
-
-Structured logging brings __significant__ potential for log analysis to the
-codebase that isn't present with earlier logging facilities. This is an
-improvement that facilitates many future improvements.
-
-Not only that, logv2 removes most parsing/post-processing concerns for
-automated downstream consumption of logs.
-
-### Why are we doing this so fast?
-
-Maintaining multiple output formats for even a single version would present
-serious overhead for both support and engineering. This dual support would last
-for years given the adoption curve, and effectively creates __four__ formats
-(old, new, new-old, and newer).
-
-By making a full cutover in a single release, we are in a much better position.
-
-### Why shouldn't we use formatting strings and substitution for new log lines?
-
-Human readability suffers significantly when `attr` field names are included
-both in the `attr` subdocument and within `msg` string. This is a powerful
-feature that we don't want to exclude entirely, but it makes sense to lean on
-it only when absolutely necessary.
+---
 
 [relaxed_json_2]: https://github.com/mongodb/specifications/blob/master/source/extended-json.rst
-[libfmt]: https://fmt.dev/7.1.3/index.html
-[libfmt_syn]: https://fmt.dev/7.1.3/syntax.html#formatspec
 [_lastOplogEntryFetcherCallbackForStopTimestamp]: https://github.com/mongodb/mongo/blob/13caf3c499a22c2274bd533043eb7e06e6f8e8a4/src/mongo/db/repl/initial_syncer.cpp#L1500-L1512
 [_summarizeRollback]: https://github.com/mongodb/mongo/blob/13caf3c499a22c2274bd533043eb7e06e6f8e8a4/src/mongo/db/repl/rollback_impl.cpp#L1263-L1305

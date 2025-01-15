@@ -36,7 +36,7 @@ leading to an on-disk page size greater than this maximum, WiredTiger creates
 multiple smaller on-disk pages.
  - A component of WiredTiger called the Block Manager divides the on-disk pages
 into smaller chunks called blocks, which then get written to the disk. The size
-of these blocks is defined by a parameter called allocation_size, which is the
+of these blocks is defined by a parameter called @ref allocation_size, which is the
 underlying unit of allocation for the file the data gets stored in.  An
 application might choose to have data compressed before it gets stored to disk
 by enabling block compression.
@@ -195,12 +195,12 @@ This is the underlying unit of allocation for the file. As the unit of file
 allocation, it sets the minimum page size and how much space is wasted when
 storing small amounts of data and overflow items.
  - an integer between 512B and 128 MB
- - must a power-of-two
+ - must be a power-of-two
  - default : 4 KB
  - Motivation to tune the value:
 \n Most applications should not need to tune the allocation size.
-   - To be compatible with virtual memory page sizes and direct I/O requirements
-on the platform (4KB for most common server platforms)
+   - To be compatible with virtual memory page sizes
+on the platform (4KB for most common server platforms).
    - Smaller values decrease the file space required by overflow items.
    - For example, if the allocation size is set to 4KB, an overflow item of
 18,000 bytes requires 5 allocation units and wastes about 2KB of space. If the
@@ -353,23 +353,6 @@ such a configuration string is as follows:
 "key_format=S,value_format=S,dictionary=1000"
 </pre>
 
-- Huffman
-\n
-Reduces the size requirement by compressing individual value items, and
-can be configured for values. The additional CPU cost of Huffman encoding
-can be high, and should be considered. (See @ref huffman for details.)
-\n\n
-Huffman configuration:
-\n
-Specified using the \c huffman_value configuration
-options to WT_SESSION::create. These options can take values of "english"
-(to use a built-in English language frequency table), "utf8<file>" or
-"utf16<file>" (to use a custom UTF-8 or UTF-16 symbol frequency table file).
-An example of such a configuration string is as follows:
-<pre>
-"key_format=S,value_format=S,huffman_value=english"
-</pre>
-
 - Block Compression
 \n
 Reduces the size requirement of on-disk objects by compressing blocks of
@@ -405,7 +388,6 @@ different compression options.
       Reduces on-disk size, CPU and Memory cost}
 @row{Key-prefix, yes, no, no, disabled, yes, yes, minor}
 @row{Dictionary, yes, yes, no, disabled, yes, yes, minor}
-@row{Huffman, yes, yes, no, disabled, yes, yes, can be high}
 @row{Block, yes, yes, yes, disabled, no, yes, can be high}
 </table>
 

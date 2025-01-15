@@ -30,27 +30,107 @@ global:
     cpp_namespace: "mongo"
 
 feature_flags:
-    featureFlagMongoStore:
-        description: "Enable mongod operation in MongoStore mode"
-        cpp_varname: gFeatureFlagMongoStore
+    featureFlagSecurityToken:
+        description: "Enable parsing and handling of SecurityTokens in multitenancy mode"
+        cpp_varname: gFeatureFlagSecurityToken
         default: false
-    featureFlagRequireTenantID:
-        # Only available with the server parameter "multitenancySupport".
-        description: >-
-            When enabled in conjunction with the server parameter "multitenancySupport",
-            require tenantID to be a part of NamespaceString and TenantDatabase.
-        cpp_varname: gFeatureFlagRequireTenantID
-        default: false
-    featureFlagUserWriteBlocking:
-        description: "Enable user write blocking for C2C replication"
-        cpp_varname: gFeatureFlagUserWriteBlocking
+        shouldBeFCVGated: true
+    featureFlagAllowAdditionalParticipants:
+        description: "Enable adding additional participants to active transaction"
+        cpp_varname: gFeatureFlagAllowAdditionalParticipants
         default: true
-        version: "6.0"
-    featureFlagOptionalCfgSvr:
-        description: "Optional config server for small clusters"
-        cpp_varname: gFeatureFlagOptionalCfgSvr
+        version: 8.0
+        shouldBeFCVGated: true
+    featureFlagBulkWriteCommand:
+        description: "Support for bulkWrite command and one-shot transactions"
+        cpp_varname: gFeatureFlagBulkWriteCommand
+        default: true
+        shouldBeFCVGated: false
+    featureFlagRecordIdsReplicated:
+        description: "Enable creating collections with the RecordIdsReplicated option."
+        cpp_varname: gFeatureFlagRecordIdsReplicated
         default: false
-    featureFlagConnHealthMetrics:
-        description: "Enable newly added cluster connection health metrics"
-        cpp_varname: gFeatureFlagConnHealthMetrics
+        shouldBeFCVGated: true
+    featureFlagStreams:
+        description: "Enable support for streams"
+        cpp_varname: gFeatureFlagStreams
         default: false
+        shouldBeFCVGated: true
+    featureFlagUseUnreplicatedTruncatesForDeletions:
+        description: "Feature flag to enable pre-image collection and change collection maintenance
+        using unreplicated truncates instead of normal document deletions replicated from the
+        primary."
+        cpp_varname: feature_flags::gFeatureFlagUseUnreplicatedTruncatesForDeletions
+        default: true
+        shouldBeFCVGated: false
+    featureFlagEndOfTransactionChangeEvent:
+        description: "Feature flag to enable endOfTransaction oplog entry and change stream event"
+        cpp_varname: feature_flags::gFeatureFlagEndOfTransactionChangeEvent
+        default: false
+        shouldBeFCVGated: true
+    featureFlagAllMongodsAreSharded:
+        description: "Feature flag to enable and autobootstrap sharding for all mongods"
+        cpp_varname: gFeatureFlagAllMongodsAreSharded
+        default: false
+        shouldBeFCVGated: true
+    featureFlagBanEncryptionOptionsInCollectionCreation:
+        description: "Feature flag that bans encryption options from being used in createCollection
+        commands"
+        cpp_varname: gFeatureFlagBanEncryptionOptionsInCollectionCreation
+        default: true
+        version: 7.2
+        shouldBeFCVGated: true
+    featureFlagRearchitectUserAcquisition:
+        description: "Enable new flow for authentication and authorization"
+        cpp_varname: gFeatureFlagRearchitectUserAcquisition
+        default: true
+        shouldBeFCVGated: false
+    featureFlagOIDCInternalAuthorization:
+        description: "Feature flag gating OIDC authentication with internal authorization"
+        cpp_varname: gFeatureFlagOIDCInternalAuthorization
+        default: true
+        shouldBeFCVGated: false
+    featureFlagAutoCompact:
+        description: "Feature flag to execute background compaction"
+        cpp_varname: gFeatureFlagAutoCompact
+        default: true
+        shouldBeFCVGated: false
+    featureFlagCompactOptions:
+        description: "Feature flag to execute compaction with more options"
+        cpp_varname: gFeatureFlagCompactOptions
+        default: true
+        shouldBeFCVGated: false
+    # TODO SERVER-89999 remove once the version becomes last LTS
+    featureFlagDisallowBucketCollectionWithoutTimeseriesOptions:
+        description: "Disallow creation of timeseries bucket collection without timeseries options"
+        cpp_varname: gFeatureFlagDisallowBucketCollectionWithoutTimeseriesOptions
+        default: true
+        shouldBeFCVGated: true
+        version: 8.0
+    featureFlagPrefetch:
+        description: "Feature flag to make pre-fetching available"
+        cpp_varname: gFeatureFlagPrefetch
+        default: true
+        shouldBeFCVGated: false
+    featureFlagErrorAndLogValidationAction:
+        description: "Feature flag to enable errorAndLog validatio action in collection options"
+        cpp_varname: gFeatureFlagErrorAndLogValidationAction
+        default: true
+        version: 8.1
+        shouldBeFCVGated: true
+    featureFlagDistinguishMetadataInconsistencyFromConflictingOperation:
+         description: "Feature flag to distinguish ChunkMetadataInconsistency from ConflictingOperationInProgress error"
+         cpp_varname: gDistinguishMetadataInconsistencyFromConflictingOperation
+         default: true
+         version: 8.1
+         shouldBeFCVGated: true
+    featureFlagQETextSearchPreview:
+         description: "Queryable Encryption text search"
+         cpp_varname: gFeatureFlagQETextSearchPreview
+         default: false
+         shouldBeFCVGated: true
+    featureFlagExposeClientIpInAuditLogs:
+         description: "Expose client IP in audit logs for load-balanced connections"
+         cpp_varname: gFeatureFlagExposeClientIpInAuditLogs
+         default: false
+         shouldBeFCVGated: true

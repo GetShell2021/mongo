@@ -2,11 +2,12 @@
  * Confirms that the aggregate command accepts writeConcern and that a read-only aggregation will
  * not wait for the writeConcern specified to be satisfied.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    restartReplicationOnSecondaries,
+    stopReplicationOnSecondaries
+} from "jstests/libs/write_concern_util.js";
 
-load("jstests/libs/write_concern_util.js");  // For stopReplicationOnSecondaries,
-                                             // restartReplicationOnSecondaries
 const name = "aggregation_write_concern";
 
 const replTest = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
@@ -41,9 +42,8 @@ assert.commandFailedWithCode(testDB.runCommand({
     cursor: {},
     writeConcern: {w: "majority", wtimeout: 1000}
 }),
-                             ErrorCodes.WriteConcernFailed);
+                             ErrorCodes.WriteConcernTimeout);
 
 restartReplicationOnSecondaries(replTest);
 replTest.awaitLastOpCommitted();
 replTest.stopSet();
-})();

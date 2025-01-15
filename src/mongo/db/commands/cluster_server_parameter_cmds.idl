@@ -30,11 +30,12 @@ global:
     cpp_namespace: "mongo"  
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
     GetClusterParameterReply:
         description: "Reply to getClusterParameter command"
+        is_command_reply: true
         fields:
             clusterParameters: array<object>
 
@@ -55,6 +56,12 @@ commands:
         api_version: ""
         namespace: type
         type:
-            variant: [string, array<string>] 
+            variant: [string, array<string>]
+        fields:
+            omitInFTDC:
+                description: >- 
+                    Indicates that getClusterParameter should omit any CSPs with omitInFTDC=true
+                type: bool
+                default: false 
         reply_type: GetClusterParameterReply
         strict: false 

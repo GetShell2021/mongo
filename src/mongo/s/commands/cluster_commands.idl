@@ -30,42 +30,37 @@ global:
   cpp_namespace: "mongo"
 
 imports:
-  - "mongo/idl/basic_types.idl"
+  - "mongo/db/basic_types.idl"
   - "mongo/s/sharding_types.idl"
-
-server_parameters:
-    KillSessionsMaxConcurrency:
-        description: >-
-            The maximum number of hosts to for killSessionsRemote to kill sessions on at the same time.
-        set_at: startup
-        cpp_vartype: int
-        cpp_varname: gKillSessionsMaxConcurrency
-        default: 100
-
-    KillSessionsPerHostTimeoutMS:
-        description: >-
-            The maximum number of miliseconds for killSessionsRemote to wait for host to respond.
-        set_at: startup
-        cpp_vartype: int
-        cpp_varname: gKillSessionsPerHostTimeoutMS
-        default: 60000
 
 structs:
 
-  ClusterMulticast:
-    description: "A struct representing the 'multicast' command's arguments"
-    strict: false
-    fields:
-      multicast: object
-      $db:
-        type: string
-        cpp_name: db
-      concurrency:
-        type: int
-        optional: true
-      timeout:
-        type: int
-        optional: true
+    ClusterMulticast:
+        description: "A struct representing the 'multicast' command's arguments"
+        strict: false
+        fields:
+            multicast: object
+            $db:
+                cpp_name: db
+                type: database_name
+                description: The database name.
+            concurrency:
+                type: int
+                optional: true
+            timeout:
+                type: int
+                optional: true
+
+    GetDatabaseVersionResponse:
+        description: Structure representing the 'getDatabaseVersion' command's response.
+        strict: false
+        fields:
+            primaryShard:
+                description: Primary shard known by the node for the given database.
+                type: shard_id
+            dbVersion:
+                description: Version known by the node for the given database.
+                type: database_version
 
 commands:
 
@@ -110,9 +105,9 @@ commands:
 
     moveChunk:
         description : "The public moveChunk command on mongos."
-        command_name : moveChunk 
+        command_name : moveChunk
         command_alias: movechunk
-        cpp_name: ClusterMoveChunkRequest 
+        cpp_name: ClusterMoveChunkRequest
         strict: false
         namespace: type
         api_version: ""
@@ -125,7 +120,7 @@ commands:
             find:
                 type: object
                 description: "An equality match on the shard key that specifies the shard-key value of the chunk to move. Specify either the bounds field or the find field but not both."
-                optional: true         
+                optional: true
             to:
                 type: string
                 description: "The name of the destination shard for the chunk."
@@ -134,11 +129,6 @@ commands:
                 type: bool
                 description: "Specifies whether or not forcing jumbo chunks move"
                 default: false
-
-            writeConcern:
-                type: object_owned
-                description: "A document that expresses the write concern that the _secondaryThrottle will use to wait for secondaries during the chunk migration." 
-                default: BSONObj()
 
             # Secondary throttle can be specified by passing one of the following 2 parameters
             secondaryThrottle:
@@ -150,9 +140,17 @@ commands:
 
            # Wait for delete can be specified with one of the following 2 parameters
             waitForDelete:
-                type: optionalBool 
+                type: optionalBool
                 description: "Internal option for testing purposes. The default is false. If set to true, the delete phase of a moveChunk operation blocks."
             _waitForDelete:
-                type: optionalBool 
+                type: optionalBool
                 description: "Internal option for testing purposes. The default is false. If set to true, the delete phase of a moveChunk operation blocks."
 
+    getDatabaseVersion:
+        command_name: getDatabaseVersion
+        description: Returns the routing information cached by the node for the passed database.
+        cpp_name: ClusterGetDatabaseVersion
+        namespace: type
+        type: database_name
+        api_version:
+        strict: false

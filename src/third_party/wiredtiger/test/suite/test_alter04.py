@@ -40,7 +40,6 @@ class test_alter04(TieredConfigMixin, wttest.WiredTigerTestCase):
     # Settings for os_cache[_dirty]_max.
     types = [
         ('file', dict(uri='file:', use_cg=False, use_index=False)),
-        ('lsm', dict(uri='lsm:', use_cg=False, use_index=False)),
         ('table-cg', dict(uri='table:', use_cg=True, use_index=False)),
         ('table-index', dict(uri='table:', use_cg=False, use_index=True)),
         ('table-simple', dict(uri='table:', use_cg=False, use_index=False)),
@@ -75,8 +74,7 @@ class test_alter04(TieredConfigMixin, wttest.WiredTigerTestCase):
             if ret != 0:
                 break
             key = cursor.get_key()
-            check_meta = ((key.find("lsm:") != -1 or key.find("file:") != -1) \
-                and key.find(self.name) != -1)
+            check_meta = key.find("file:") != -1 and key.find(self.name) != -1
             if check_meta:
                 value = cursor[key]
                 found = True
@@ -86,9 +84,9 @@ class test_alter04(TieredConfigMixin, wttest.WiredTigerTestCase):
 
     # Alter: Change the setting after creation
     def test_alter04_cache(self):
-        if self.is_tiered_scenario() and (self.uri == 'lsm:' or self.uri == 'file:'):
-            self.skipTest('Tiered storage does not support LSM or file URIs.')
-        
+        if self.is_tiered_scenario() and (self.uri == 'file:'):
+            self.skipTest('Tiered storage does not support file URIs.')
+
         uri = self.uri + self.name
         create_params = 'key_format=i,value_format=i,'
         complex_params = ''
@@ -144,6 +142,3 @@ class test_alter04(TieredConfigMixin, wttest.WiredTigerTestCase):
             else:
                 self.session.alter(suburi, alter_param)
                 self.verify_metadata(alter_param)
-
-if __name__ == '__main__':
-    wttest.run()

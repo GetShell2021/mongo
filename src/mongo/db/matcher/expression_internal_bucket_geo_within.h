@@ -29,9 +29,28 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <s2cellid.h>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/geo/geometry_container.h"
 #include "mongo/db/geo/geoparser.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/matcher/match_details.h"
+#include "mongo/db/matcher/matchable.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -70,6 +89,7 @@ public:
         : MatchExpression(MatchExpression::INTERNAL_BUCKET_GEO_WITHIN, std::move(annotation)),
           _geoContainer(container),
           _indexField("data." + field),
+          _fieldRef(_indexField),
           _field(std::move(field)) {}
 
     void debugString(StringBuilder& debug, int indentationLevel) const final;
@@ -94,9 +114,11 @@ public:
         return false;
     }
 
-    void serialize(BSONObjBuilder* builder, bool includePath) const final;
+    void serialize(BSONObjBuilder* builder,
+                   const SerializationOptions& opts = {},
+                   bool includePath = true) const final;
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
     std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
@@ -107,10 +129,10 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
-        MONGO_UNREACHABLE;
+        MONGO_UNREACHABLE_TASSERT(6400208);
     }
 
-    void resetChild(size_t, MatchExpression*) {
+    void resetChild(size_t, MatchExpression*) override {
         MONGO_UNREACHABLE;
     };
 
@@ -127,8 +149,7 @@ public:
     }
 
     const FieldRef* fieldRef() const final {
-        MONGO_UNREACHABLE_TASSERT(5837104);
-        return nullptr;
+        return &_fieldRef;
     }
 
     void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
@@ -141,7 +162,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     /**
@@ -149,12 +172,9 @@ private:
      */
     bool _matchesBSONObj(const BSONObj& obj) const;
 
-    void _doAddDependencies(DepsTracker* deps) const final {
-        deps->needWholeDocument = true;
-    }
-
     std::shared_ptr<GeometryContainer> _geoContainer;
     std::string _indexField;
+    FieldRef _fieldRef;
     std::string _field;
 };
 

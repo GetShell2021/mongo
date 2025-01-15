@@ -29,7 +29,19 @@
 
 #pragma once
 
-#include "mongo/s/database_version_gen.h"
+#include <iosfwd>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/database_version_base_gen.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -54,7 +66,7 @@ public:
     DatabaseVersion() = default;
 
     explicit DatabaseVersion(const BSONObj& obj) {
-        DatabaseVersionBase::parseProtected(IDLParserErrorContext("DatabaseVersion"), obj);
+        DatabaseVersionBase::parseProtected(IDLParserContext("DatabaseVersion"), obj);
     }
 
     explicit DatabaseVersion(const DatabaseVersionBase& dbv) : DatabaseVersionBase(dbv) {}

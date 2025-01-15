@@ -7,8 +7,7 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 jsTestLog("Testing that the reindex command cannot be run on a primary or secondary");
 
@@ -72,4 +71,3 @@ assert.commandFailedWithCode(nonExistentDb.getCollection('test').reIndex(),
 assert.eq(2, testColl.getIndexes().length, "Standalone didn't have proper indexes after reindex");
 
 MongoRunner.stopMongod(standalone);
-})();

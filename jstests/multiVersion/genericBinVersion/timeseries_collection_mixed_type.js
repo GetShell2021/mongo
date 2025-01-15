@@ -2,15 +2,23 @@
  * Test that variable-type fields are found correctly in upgraded timeseries collections with dirty
  * data.
  *
- * @tags: [disabled_for_fcv_6_1_upgrade]
+ * Specifically, tests handling of the 'TimeseriesBucketsMayHaveMixedSchemaData' metadata flag that
+ * is set in the 5.0 -> 6.0 upgrade. The test inserts data into a timeseries collection on 5.0, then
+ * upgrades through every following version to ensure that the data is still queryable.
  */
+import "jstests/multiVersion/libs/multi_rs.js";
 
-(function() {
-"use strict";
-
-load('jstests/multiVersion/libs/multi_rs.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const timeFieldName = "time";
+
+// Note that this list will need to be kept up to date as versions are added/dropped.
+const upgradeVersions = [
+    {binVersion: "6.0", fcv: "6.0"},
+    {binVersion: "7.0", fcv: "7.0"},
+    {binVersion: "last-lts", fcv: lastLTSFCV},
+    {binVersion: "latest"}
+];
 
 /*
  * Creates a collection, populates it with `docs`, runs the `query` and ensures that the result set
@@ -19,7 +27,9 @@ const timeFieldName = "time";
  * one bucket was created.
  */
 function runTest(docs, query, results, path, bounds) {
-    const oldVersion = "last-lts";
+    // Since v5.0 no longer supports writing mixed schema buckets as of 5.0.29, pin the version
+    // to 5.0.28 to retain coverage as v5.0 still supports the presence of mixed schema data.
+    const oldVersion = "5.0.28";
     const nodes = {
         n1: {binVersion: oldVersion},
         n2: {binVersion: oldVersion},
@@ -29,7 +39,7 @@ function runTest(docs, query, results, path, bounds) {
     const rst = new ReplSetTest({nodes: nodes});
 
     rst.startSet();
-    rst.initiate();
+    rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
     let db = rst.getPrimary().getDB("test");
 
@@ -49,20 +59,45 @@ function runTest(docs, query, results, path, bounds) {
     // Populate the collection with documents.
     docs.forEach(d => tsColl.insert(Object.assign({[timeFieldName]: new Date("2021-01-01")}, d)));
 
-    rst.upgradeSet({binVersion: "latest"});
-    db = rst.getPrimary().getDB("test");
-    tsColl = db.getCollection(jsTestName());
-    bucketColl = db.getCollection('system.buckets.' + tsColl.getName());
+    // We may need to upgrade through several versions to reach the latest. This ensures that each
+    // subsequent upgrade preserves the mixed-schema data upon upgrading.
+    for (const {binVersion, fcv} of upgradeVersions) {
+        rst.upgradeSet({binVersion});
+        db = rst.getPrimary().getDB("test");
 
-    // Confirm expected results.
-    assert.docEq(tsColl.aggregate(pipeline).toArray(), results);
-    const buckets = bucketColl.aggregate(controlPipeline).toArray();
+        // Set the fcv if needed.
+        if (fcv) {
+            const res = db.adminCommand({"setFeatureCompatibilityVersion": fcv});
+            if (!res.ok && res.code === 7369100) {
+                // We failed due to requiring 'confirm: true' on the command. This will only
+                // occur on 7.0+ nodes that have 'enableTestCommands' set to false. Retry the
+                // setFCV command with 'confirm: true'.
+                assert.commandWorked(
+                    db.adminCommand({"setFeatureCompatibilityVersion": fcv, confirm: true}));
+            } else {
+                assert.commandWorked(res);
+            }
+            rst.awaitReplication();
+            // We need to ensure that the FCV is committed to the oplog before we shut down.
+            // Otherwise the nodes may start up post-upgrade and check FCV before reconstructing the
+            // journal, which will raise an invalid version error because they will see the old FCV.
+            rst.awaitLastOpCommitted();
+        }
 
-    // Check that we only have one bucket.
-    assert.eq(buckets.length, 1);
+        tsColl = db.getCollection(jsTestName());
+        bucketColl = db.getCollection('system.buckets.' + tsColl.getName());
 
-    // Check that the bounds are what we expect.
-    assert.docEq(buckets[0].value, bounds);
+        // Confirm expected results.
+        assert.docEq(results, tsColl.aggregate(pipeline).toArray());
+        const buckets = bucketColl.aggregate(controlPipeline).toArray();
+
+        // Check that we only have one bucket.
+        assert.eq(buckets.length, 1);
+
+        // Check that the bounds are what we expect.
+        assert.docEq(bounds, buckets[0].value);
+    }
+
     rst.stopSet();
 }
 
@@ -156,4 +191,3 @@ runTest([{a: {b: [3, 4]}}, {a: [{b: 1}, {b: 2}]}],
         [{a: {b: [3, 4]}}],
         "a",
         [{b: [3, 4]}, [{b: 1}, {b: 2}]]);
-})();

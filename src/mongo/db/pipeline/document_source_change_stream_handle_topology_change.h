@@ -29,13 +29,31 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <memory>
+#include <set>
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/change_stream_constants.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
-#include "mongo/s/query/document_source_merge_cursors.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/query/exec/async_results_merger_params_gen.h"
+#include "mongo/s/query/exec/document_source_merge_cursors.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -46,10 +64,14 @@ namespace mongo {
  * the first time. When this event is detected, this stage will establish a new cursor on that
  * shard and add it to the cursors being merged.
  */
-class DocumentSourceChangeStreamHandleTopologyChange final : public DocumentSource {
+class DocumentSourceChangeStreamHandleTopologyChange final
+    : public DocumentSourceInternalChangeStreamStage {
 public:
-    static constexpr StringData kStageName = "$_internalChangeStreamHandleTopologyChange"_sd;
+    static constexpr StringData kStageName =
+        change_stream_constants::stage_names::kHandleTopologyChange;
 
+    static boost::intrusive_ptr<DocumentSourceChangeStreamHandleTopologyChange> createFromBson(
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
     /**
      * Creates a new stage which will establish a new cursor and add it to the cursors being merged
      * by 'mergeCursorsStage' whenever a new shard is detected by a change stream.
@@ -61,18 +83,20 @@ public:
         return kStageName.rawData();
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value doSerialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     StageConstraints constraints(Pipeline::SplitState) const final;
 
     GetModPathsReturn getModifiedPaths() const final {
         // This stage neither modifies nor renames any field.
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return DistributedPlanLogic{nullptr, this, change_stream_constants::kSortSpec};
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
 private:
     DocumentSourceChangeStreamHandleTopologyChange(const boost::intrusive_ptr<ExpressionContext>&);

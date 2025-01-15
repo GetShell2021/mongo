@@ -27,17 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/flat_hash_map.h>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <iterator>
+#include <list>
+#include <memory>
 
-#include "mongo/bson/bsonmisc.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_test_optimizations.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/semantic_analysis.h"
-#include "mongo/db/service_context_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -54,7 +64,7 @@ public:
     GetModPathsReturn getModifiedPaths() const final {
         // Pretend this stage simply renames the "a" field to be "b", leaving the value of "a" the
         // same. This would be the equivalent of an {$addFields: {b: "$a"}}.
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"b", "a"}}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {{"b", "a"}}};
     }
 };
 
@@ -132,9 +142,7 @@ public:
         : DocumentSourceTestOptimizations(expCtx) {}
 
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kAllExcept,
-                std::set<std::string>{"e", "f", "g"},
-                {{"d", "c"}}};
+        return {GetModPathsReturn::Type::kAllExcept, OrderedPathSet{"e", "f", "g"}, {{"d", "c"}}};
     }
 };
 
@@ -196,7 +204,7 @@ public:
         : DocumentSourceTestOptimizations(expCtx) {}
 
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kAllExcept, std::set<std::string>{"f.g"}, {{"e", "c.d"}}};
+        return {GetModPathsReturn::Type::kAllExcept, OrderedPathSet{"f.g"}, {{"e", "c.d"}}};
     }
 };
 
@@ -295,7 +303,7 @@ public:
         : DocumentSourceTestOptimizations(expCtx) {}
 
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{"c.d"}, {{"x.y", "a"}}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{"c.d"}, {{"x.y", "a"}}};
     }
 };
 
@@ -386,7 +394,7 @@ public:
     ModifiesAllPaths(const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : DocumentSourceTestOptimizations(expCtx) {}
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kAllPaths, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kAllPaths, OrderedPathSet{}, {}};
     }
 };
 
@@ -415,7 +423,7 @@ public:
     ModificationsUnknown(const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : DocumentSourceTestOptimizations(expCtx) {}
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kNotSupported, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kNotSupported, OrderedPathSet{}, {}};
     }
 };
 
@@ -699,10 +707,10 @@ TEST_F(SemanticAnalysisFindLongestViablePrefix, FindsPrefixWithoutReplaceRoot) {
         ASSERT(renames["y"] == "x");
     }
     {
-        // TODO (SERVER-55815): "x" should be considered modified in the $set stage.
+        // "x" is overwritten by the $set, so is not preserved.
         auto [itr, renames] = findLongestViablePrefixPreservingPaths(
             pipeline->getSources().begin(), pipeline->getSources().end(), {"x"});
-        ASSERT(itr == pipeline->getSources().end());
+        ASSERT(itr == std::prev(pipeline->getSources().end()));
         ASSERT(renames["x"] == "x");
     }
 }
@@ -732,8 +740,8 @@ TEST_F(SemanticAnalysisFindLongestViablePrefix, FindsLastPossibleStageWithCallba
 
 TEST_F(SemanticAnalysisFindLongestViablePrefix, CorrectlyAnswersReshardingUseCase) {
     auto expCtx = getExpCtx();
-    auto lookupNss = NamespaceString{"config.cache.chunks.test"};
-    expCtx->setResolvedNamespace(lookupNss, ExpressionContext::ResolvedNamespace{lookupNss, {}});
+    auto lookupNss = NamespaceString::createNamespaceString_forTest("config.cache.chunks.test");
+    expCtx->setResolvedNamespace(lookupNss, ResolvedNamespace{lookupNss, {}});
     auto pipeline =
         Pipeline::parse({fromjson("{$replaceWith: {original: '$$ROOT'}}"),
                          fromjson("{$lookup: {from: {db: 'config', coll: 'cache.chunks.test'}, "

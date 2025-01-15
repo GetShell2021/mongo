@@ -30,16 +30,30 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/db/views/view.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 namespace view_catalog_helpers {
+
+/**
+ * Exclusively returns the namespace of the underlying/backing source collection. It does not
+ * resolve the view definition.
+ *
+ * This function doesn't descend into sub-pipelines like in $lookup or $unionWith.
+ */
+NamespaceString findSourceCollectionNamespace(OperationContext* opCtx,
+                                              std::shared_ptr<const CollectionCatalog> catalog,
+                                              const NamespaceString& nss);
 
 /**
  * Returns Status::OK with the set of involved namespaces if the given pipeline is eligible to
@@ -57,8 +71,6 @@ StatusWith<stdx::unordered_set<NamespaceString>> validatePipeline(OperationConte
  * collations. So in the case of queries on timeseries collections, we create a ResolvedView
  * with the request's collation (timeSeriesCollator) rather than the collection's default
  * collator.
- *
- * Caller must ensure corresponding database exists.
  */
 StatusWith<ResolvedView> resolveView(OperationContext* opCtx,
                                      std::shared_ptr<const CollectionCatalog> catalog,

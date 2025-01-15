@@ -26,8 +26,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef TRANSACTION_H
-#define TRANSACTION_H
+#pragma once
 
 #include <string>
 
@@ -41,7 +40,7 @@ extern "C" {
 namespace test_harness {
 
 class transaction {
-    public:
+public:
     transaction(configuration *config, timestamp_manager *timestamp_manager, WT_SESSION *session);
 
     bool active() const;
@@ -66,13 +65,12 @@ class transaction {
      * the transaction.
      */
     bool can_commit();
-    /*
-     * Returns true if a transaction can be rolled back as determined by the op count and the state
-     * of the transaction.
-     */
-    bool can_rollback();
+    /* Get the current number of operations executed. */
+    int64_t get_op_count() const;
+    /* Get the number of operations this transaction needs before it can commit */
+    int64_t get_target_op_count() const;
 
-    private:
+private:
     bool _in_txn = false;
     bool _needs_rollback = false;
 
@@ -95,5 +93,3 @@ class transaction {
 };
 
 } // namespace test_harness
-
-#endif

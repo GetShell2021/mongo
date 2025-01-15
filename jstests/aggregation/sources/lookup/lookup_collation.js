@@ -3,23 +3,15 @@
  * when performing comparisons on a foreign collection with a different default collation. Exercises
  * the fix for SERVER-43350.
  *
- * Collation can be set at three different levels for $lookup stage
+ * Collation can be set at two different levels for $lookup stage
  *  1. on the local collection (collation on the foreign collection is always ignored)
- *  2. on the $lookup stage via '_internalCollation' property
- *  3. on the aggregation command via 'collation' property in options
+ *  2. on the aggregation command via 'collation' property in options
  *
- * The three settings have the following precedence:
- *  1. '_internalCollation' overrides all others
- *  2. 'collation' option overrides local collection's collation
+ * The 'collation' command option overrides local collection's collation.
  */
-load("jstests/aggregation/extras/utils.js");  // For anyEq.
-load("jstests/libs/analyze_plan.js");         // For getAggPlanStages, getWinningPlan.
-
-(function() {
-
-"use strict";
-
-load("jstests/libs/fixture_helpers.js");  // For isSharded.
+import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {getAggPlanStages, getWinningPlanFromExplain} from "jstests/libs/query/analyze_plan.js";
 
 const testDB = db.getSiblingDB(jsTestName());
 assert.commandWorked(testDB.dropDatabase());
@@ -41,15 +33,6 @@ const collAa_indexed = testDB.case_sensitive_indexed;
 
 assert.commandWorked(testDB.createCollection("case_insensitive", {collation: caseInsensitive}));
 const collAA = testDB.case_insensitive;
-
-// Do not run the rest of the tests if the foreign collection is implicitly sharded but the flag to
-// allow $lookup/$graphLookup into a sharded collection is disabled.
-const getShardedLookupParam = db.adminCommand({getParameter: 1, featureFlagShardedLookup: 1});
-const isShardedLookupEnabled = getShardedLookupParam.hasOwnProperty("featureFlagShardedLookup") &&
-    getShardedLookupParam.featureFlagShardedLookup.value;
-if (FixtureHelpers.isSharded(collAA) && !isShardedLookupEnabled) {
-    return;
-}
 
 const records = [{_id: 0, key: "a"}, {_id: 1, key: "A"}];
 assert.commandWorked(collAa.insert(records));
@@ -77,7 +60,7 @@ const lookupNoPipeline = (foreignColl) => {
     };
 };
 
-const resultCaseSensistive = [
+const resultCaseSensitive = [
     {_id: 0, key: "a", matched: [{_id: 0, key: "a"}]},
     {_id: 1, key: "A", matched: [{_id: 1, key: "A"}]},
 ];
@@ -94,7 +77,7 @@ let explain;
         results = collAa.aggregate([lookupInto(collAA)]).toArray();
         assertArrayEq({
             actual: results,
-            expected: resultCaseSensistive,
+            expected: resultCaseSensitive,
             extraErrorMsg: " Default collation on local, running: " + tojson(lookupInto)
         });
 
@@ -131,31 +114,8 @@ let explain;
         results = collAA.aggregate([lookupInto(collAa)], {collation: caseSensitive}).toArray();
         assertArrayEq({
             actual: results,
-            expected: resultCaseSensistive,
+            expected: resultCaseSensitive,
             extraErrorMsg: " Case-sensitive collation on command, running: " + tojson(lookupInto)
-        });
-    }
-})();
-
-// Collation set on $lookup stage with '_internalCollation' should override collation of the local
-// collection and on the command.
-(function testStageCollationPrecedence() {
-    for (let lookupInto of [lookupWithPipeline, lookupNoPipeline]) {
-        let lookupStage = lookupInto(collAa);
-        lookupStage.$lookup._internalCollation = caseInsensitive;
-        results = collAa.aggregate([lookupStage], {collation: caseSensitive}).toArray();
-        assertArrayEq({
-            actual: results,
-            expected: resultCaseInsensitive,
-            extraErrorMsg: " Case-insensitive collation on stage, running: " + tojson(lookupInto)
-        });
-
-        lookupStage.$lookup._internalCollation = caseSensitive;
-        results = collAA.aggregate([lookupStage], {collation: caseInsensitive}).toArray();
-        assertArrayEq({
-            actual: results,
-            expected: resultCaseSensistive,
-            extraErrorMsg: " Case-sensitive collation on stage, running: " + tojson(lookupInto)
         });
     }
 })();
@@ -166,7 +126,7 @@ let explain;
     function assertIndexJoinStrategy(explain) {
         // Check join strategy when $lookup is pushed down.
         if (getAggPlanStages(explain, "$cursor").length === 0) {
-            const winningPlan = getWinningPlan(explain.queryPlanner);
+            const winningPlan = getWinningPlanFromExplain(explain);
             assert.eq("EQ_LOOKUP", winningPlan.stage, explain);
             assert.eq("IndexedLoopJoin", winningPlan.strategy, explain);
             // Will choose the index with the matching collation.
@@ -177,7 +137,7 @@ let explain;
     function assertNestedLoopJoinStrategy(explain) {
         // Check join strategy when $lookup is pushed down.
         if (getAggPlanStages(explain, "$cursor").length === 0) {
-            const winningPlan = getWinningPlan(explain.queryPlanner);
+            const winningPlan = getWinningPlanFromExplain(explain);
             assert.eq("EQ_LOOKUP", winningPlan.stage, explain);
             assert.eq("NestedLoopJoin", winningPlan.strategy, explain);
         }
@@ -192,8 +152,13 @@ let explain;
             extraErrorMsg: " Case-insensitive collation on local, foreign is indexed, running: " +
                 tojson(lookupInto)
         });
-        explain = collAA.explain().aggregate([lookupInto(collAa_indexed)]);
-        assertIndexJoinStrategy(explain);
+
+        let areCollectionsCollocated =
+            FixtureHelpers.areCollectionsColocated([collAA, collAa_indexed]);
+        if (areCollectionsCollocated) {
+            explain = collAA.explain().aggregate([lookupInto(collAa_indexed)]);
+            assertIndexJoinStrategy(explain);
+        }
 
         // Command-level collation overrides collection-level collation.
         results =
@@ -204,28 +169,18 @@ let explain;
             extraErrorMsg: " Case-insensitive collation on command, foreign is indexed, running: " +
                 tojson(lookupInto)
         });
-        explain =
-            collAa.explain().aggregate([lookupInto(collAa_indexed)], {collation: caseInsensitive});
-        assertIndexJoinStrategy(explain);
 
-        // If no index is compatible with the requested collation and disk use is not allowed,
-        // nested loop join will be chosen instead.
-        explain = collAa.explain().aggregate([lookupInto(collAa_indexed)],
-                                             {collation: {locale: "fr"}, allowDiskUse: false});
-        assertNestedLoopJoinStrategy(explain);
+        areCollectionsCollocated = FixtureHelpers.areCollectionsColocated([collAa, collAa_indexed]);
+        if (areCollectionsCollocated) {
+            explain = collAa.explain().aggregate([lookupInto(collAa_indexed)],
+                                                 {collation: caseInsensitive});
+            assertIndexJoinStrategy(explain);
 
-        // Stage-level collation overrides collection-level and command-level collations.
-        let lookupStage = lookupInto(collAa_indexed);
-        lookupStage.$lookup._internalCollation = caseInsensitive;
-        results = collAa.aggregate([lookupStage], {collation: caseSensitive}).toArray();
-        assertArrayEq({
-            actual: results,
-            expected: resultCaseInsensitive,
-            extraErrorMsg: " Case-insensitive collation on stage, foreign is indexed, running: " +
-                tojson(lookupInto)
-        });
-        explain = collAa.explain().aggregate([lookupStage], {collation: caseSensitive});
-        assertIndexJoinStrategy(explain);
+            // If no index is compatible with the requested collation and disk use is not allowed,
+            // nested loop join will be chosen instead.
+            explain = collAa.explain().aggregate([lookupInto(collAa_indexed)],
+                                                 {collation: {locale: "fr"}, allowDiskUse: false});
+            assertNestedLoopJoinStrategy(explain);
+        }
     }
-})();
 })();

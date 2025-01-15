@@ -28,18 +28,27 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/commit_reshard_collection_gen.h"
-#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
-#include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -56,17 +65,17 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            LOGV2(5391600, "Beginning commitReshardCollection", "namespace"_attr = ns());
+            LOGV2(5391600, "Beginning commitReshardCollection", logAttrs(ns()));
             ConfigsvrCommitReshardCollection cmd(ns());
             cmd.setDbName(request().getDbName());
+            generic_argument_util::setMajorityWriteConcern(cmd, &opCtx->getWriteConcern());
 
             auto cfg = Grid::get(opCtx)->shardRegistry()->getConfigShard();
             auto response = uassertStatusOK(cfg->runCommandWithFixedRetryAttempts(
                 opCtx,
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                "admin",
-                CommandHelpers::appendMajorityWriteConcern(cmd.toBSON({}),
-                                                           opCtx->getWriteConcern()),
+                DatabaseName::kAdmin,
+                cmd.toBSON(),
                 Shard::RetryPolicy::kIdempotent));
             uassertStatusOK(response.commandStatus);
             uassertStatusOK(response.writeConcernStatus);
@@ -104,9 +113,7 @@ public:
                "during which writes are blocked.";
     }
 };
-
-MONGO_REGISTER_FEATURE_FLAGGED_COMMAND(CommitReshardCollectionCmd,
-                                       resharding::gFeatureFlagResharding);
+MONGO_REGISTER_COMMAND(CommitReshardCollectionCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

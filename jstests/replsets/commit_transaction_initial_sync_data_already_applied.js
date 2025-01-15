@@ -15,10 +15,9 @@
  * ]
  */
 
-(function() {
-"use strict";
-load("jstests/libs/fail_point_util.js");
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0, votes: 0}}]});
 replTest.startSet();
@@ -93,7 +92,7 @@ assert.commandWorked(secondary.adminCommand(
     {configureFailPoint: "initialSyncHangBeforeCopyingDatabases", mode: "off"}));
 
 // Wait for the secondary to complete initial sync.
-replTest.waitForState(secondary, ReplSetTest.State.SECONDARY);
+replTest.awaitSecondaryNodes(null, [secondary]);
 
 jsTestLog("Initial sync completed");
 
@@ -103,4 +102,3 @@ let res = secondary.getDB(dbName).getCollection(collName).find();
 assert.eq(res.toArray(), [{_id: 1, a: 0}, {_id: 2}, {_id: 3, a: 1}], res);
 
 replTest.stopSet();
-})();

@@ -1,7 +1,7 @@
 /**
  * Utilities for testing when sessions are killed.
  */
-var KilledSessionUtil = (function() {
+export var KilledSessionUtil = (function() {
     // Returns if the code is one that could come from a session being killed.
     function isKilledSessionCode(code) {
         return code === ErrorCodes.Interrupted || code === ErrorCodes.CursorKilled ||
@@ -9,7 +9,11 @@ var KilledSessionUtil = (function() {
     }
 
     function hasKilledSessionError(errOrRes) {
-        return isKilledSessionCode(errOrRes.code) ||
+        let hasOriginalErrorKilledSessionCode =
+            errOrRes.code == ErrorCodes.TransactionParticipantFailedUnyield
+            ? isKilledSessionCode(errOrRes.originalError.code)
+            : false;
+        return hasOriginalErrorKilledSessionCode || isKilledSessionCode(errOrRes.code) ||
             (Array.isArray(errOrRes.writeErrors) &&
              errOrRes.writeErrors.every(writeError => isKilledSessionCode(writeError.code)));
     }

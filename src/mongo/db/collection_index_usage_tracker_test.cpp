@@ -27,20 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/flat_hash_map.h>
+#include <string>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace {
 
 class CollectionIndexUsageTrackerTest : public unittest::Test {
 protected:
-    CollectionIndexUsageTrackerTest() : _tracker(&_globalIndexUsage, &_clockSource) {}
+    CollectionIndexUsageTrackerTest()
+        : _aggregatedIndexUsage(), _tracker(&_aggregatedIndexUsage, &_clockSource) {}
 
     /**
      * Returns an unowned pointer to the tracker owned by this test fixture.
@@ -56,28 +64,32 @@ protected:
         return &_clockSource;
     }
 
-    GlobalIndexUsageTracker* getGlobalIndexUsage() {
-        return &_globalIndexUsage;
+    AggregatedIndexUsageTracker* getAggregatedIndexUsage() {
+        return &_aggregatedIndexUsage;
+    }
+
+    void resetToZero() {
+        _aggregatedIndexUsage.resetToZero();
     }
 
 private:
-    GlobalIndexUsageTracker _globalIndexUsage;
+    AggregatedIndexUsageTracker _aggregatedIndexUsage;
     ClockSourceMock _clockSource;
     CollectionIndexUsageTracker _tracker;
 };
 
 // Test that a newly contructed tracker has an empty map.
 TEST_F(CollectionIndexUsageTrackerTest, Empty) {
-    ASSERT(getTracker()->getUsageStats()->empty());
+    ASSERT(getTracker()->getUsageStats().empty());
 }
 
 // Test that recording of a single index hit is reflected in returned stats map.
 TEST_F(CollectionIndexUsageTrackerTest, SingleHit) {
     getTracker()->registerIndex("foo", BSON("foo" << 1), {});
     getTracker()->recordIndexAccess("foo");
-    auto statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") != statsMap->end());
-    ASSERT_EQUALS(1, statsMap->at("foo")->accesses.loadRelaxed());
+    const auto& statsMap = getTracker()->getUsageStats();
+    ASSERT(statsMap.find("foo") != statsMap.end());
+    ASSERT_EQUALS(1, statsMap.at("foo")->accesses.loadRelaxed());
 }
 
 // Test that recording of multiple index hits are reflected in stats map.
@@ -85,36 +97,36 @@ TEST_F(CollectionIndexUsageTrackerTest, MultipleHit) {
     getTracker()->registerIndex("foo", BSON("foo" << 1), {});
     getTracker()->recordIndexAccess("foo");
     getTracker()->recordIndexAccess("foo");
-    auto statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") != statsMap->end());
-    ASSERT_EQUALS(2, statsMap->at("foo")->accesses.loadRelaxed());
+    const auto& statsMap = getTracker()->getUsageStats();
+    ASSERT(statsMap.find("foo") != statsMap.end());
+    ASSERT_EQUALS(2, statsMap.at("foo")->accesses.loadRelaxed());
 }
 
 // Test that an index is registered correctly with indexKey.
 TEST_F(CollectionIndexUsageTrackerTest, IndexKey) {
     getTracker()->registerIndex("foo", BSON("foo" << 1), {});
-    auto statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") != statsMap->end());
-    ASSERT_BSONOBJ_EQ(BSON("foo" << 1), statsMap->at("foo")->indexKey);
+    const auto& statsMap = getTracker()->getUsageStats();
+    ASSERT(statsMap.find("foo") != statsMap.end());
+    ASSERT_BSONOBJ_EQ(BSON("foo" << 1), statsMap.at("foo")->indexKey);
 }
 
 // Test that index registration generates an entry in the stats map.
 TEST_F(CollectionIndexUsageTrackerTest, Register) {
     getTracker()->registerIndex("foo", BSON("foo" << 1), {});
-    ASSERT_EQUALS(1U, getTracker()->getUsageStats()->size());
+    ASSERT_EQUALS(1U, getTracker()->getUsageStats().size());
     getTracker()->registerIndex("bar", BSON("bar" << 1), {});
-    ASSERT_EQUALS(2U, getTracker()->getUsageStats()->size());
+    ASSERT_EQUALS(2U, getTracker()->getUsageStats().size());
 }
 
 // Test that index deregistration results in removal of an entry from the stats map.
 TEST_F(CollectionIndexUsageTrackerTest, Deregister) {
     getTracker()->registerIndex("foo", BSON("foo" << 1), {});
     getTracker()->registerIndex("bar", BSON("bar" << 1), {});
-    ASSERT_EQUALS(2U, getTracker()->getUsageStats()->size());
+    ASSERT_EQUALS(2U, getTracker()->getUsageStats().size());
     getTracker()->unregisterIndex("foo");
-    ASSERT_EQUALS(1U, getTracker()->getUsageStats()->size());
+    ASSERT_EQUALS(1U, getTracker()->getUsageStats().size());
     getTracker()->unregisterIndex("bar");
-    ASSERT_EQUALS(0U, getTracker()->getUsageStats()->size());
+    ASSERT_EQUALS(0U, getTracker()->getUsageStats().size());
 }
 
 // Test that index deregistration results in reset of the usage counter.
@@ -122,206 +134,154 @@ TEST_F(CollectionIndexUsageTrackerTest, HitAfterDeregister) {
     getTracker()->registerIndex("foo", BSON("foo" << 1), {});
     getTracker()->recordIndexAccess("foo");
     getTracker()->recordIndexAccess("foo");
-    auto statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") != statsMap->end());
-    ASSERT_EQUALS(2, statsMap->at("foo")->accesses.loadRelaxed());
+    const auto& statsMap = getTracker()->getUsageStats();
+    ASSERT(statsMap.find("foo") != statsMap.end());
+    ASSERT_EQUALS(2, statsMap.at("foo")->accesses.loadRelaxed());
 
     getTracker()->unregisterIndex("foo");
-    statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") == statsMap->end());
+    ASSERT(statsMap.find("foo") == statsMap.end());
 
     getTracker()->registerIndex("foo", BSON("foo" << 1), {});
     getTracker()->recordIndexAccess("foo");
-    statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") != statsMap->end());
-    ASSERT_EQUALS(1, statsMap->at("foo")->accesses.loadRelaxed());
+    ASSERT(statsMap.find("foo") != statsMap.end());
+    ASSERT_EQUALS(1, statsMap.at("foo")->accesses.loadRelaxed());
 }
 
 // Test that index tracker start date/time is reset on index deregistration/registration.
 TEST_F(CollectionIndexUsageTrackerTest, DateTimeAfterDeregister) {
     getTracker()->registerIndex("foo", BSON("foo" << 1), {});
-    auto statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") != statsMap->end());
-    ASSERT_EQUALS(statsMap->at("foo")->trackerStartTime, getClockSource()->now());
+    const auto& statsMap = getTracker()->getUsageStats();
+    ASSERT(statsMap.find("foo") != statsMap.end());
+    ASSERT_EQUALS(statsMap.at("foo")->trackerStartTime, getClockSource()->now());
 
     getTracker()->unregisterIndex("foo");
-    statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") == statsMap->end());
+    ASSERT(statsMap.find("foo") == statsMap.end());
 
     // Increment clock source so that a new index registration has different start time.
     getClockSource()->advance(Milliseconds(1));
 
     getTracker()->registerIndex("foo", BSON("foo" << 1), {});
-    statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") != statsMap->end());
-    ASSERT_EQUALS(statsMap->at("foo")->trackerStartTime, getClockSource()->now());
-}
-
-// Test that the fetched stats map retains an index after the entry is concurrently removed.
-TEST_F(CollectionIndexUsageTrackerTest, UsageStatsMapRemainsValidAfterIndexErasure) {
-    // Set up an index in the tracker.
-    getTracker()->registerIndex("foo", BSON("foo" << 1), {});
-    getTracker()->recordIndexAccess("foo");
-    getTracker()->recordIndexAccess("foo");
-    auto statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") != statsMap->end());
-    ASSERT_EQUALS(2, statsMap->at("foo")->accesses.loadRelaxed());
-
-    // Fetch the map with the index and then erase the index from the map. The previously fetched
-    // map should still safely retain the index.
-    auto staleStatsMap = getTracker()->getUsageStats();
-
-    getTracker()->unregisterIndex("foo");
-    statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") == statsMap->end());
-
-    ASSERT(staleStatsMap->find("foo") != staleStatsMap->end());
-    ASSERT_EQUALS(2, staleStatsMap->at("foo")->accesses.loadRelaxed());
-}
-
-// Test that a stale stats map copy's index remains unmodified after the up-to-date map removes and
-// recreates the index.
-TEST_F(CollectionIndexUsageTrackerTest, StaleUsageStatsMapEntryIsNotUpdatedAfterErasure) {
-    // Set up an index in the tracker.
-    getTracker()->registerIndex("foo", BSON("foo" << 1), {});
-    getTracker()->recordIndexAccess("foo");
-    auto statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") != statsMap->end());
-    ASSERT_EQUALS(1, statsMap->at("foo")->accesses.loadRelaxed());
-
-    // Fetch a copy of the map with the index and then erase and recreate the index in the map with
-    // a different usage count. The previously fetched copy of the map should still safely retain
-    // the prior index version of the index with a different usage count.
-    auto staleStatsMap = getTracker()->getUsageStats();
-
-    getTracker()->unregisterIndex("foo");
-    getTracker()->registerIndex("foo", BSON("foo" << 1), {});
-    getTracker()->recordIndexAccess("foo");
-    getTracker()->recordIndexAccess("foo");
-    statsMap = getTracker()->getUsageStats();
-    ASSERT(statsMap->find("foo") != statsMap->end());
-    ASSERT_EQUALS(2, statsMap->at("foo")->accesses.loadRelaxed());
-
-    ASSERT(staleStatsMap->find("foo") != staleStatsMap->end());
-    ASSERT_EQUALS(1, staleStatsMap->at("foo")->accesses.loadRelaxed());
+    ASSERT(statsMap.find("foo") != statsMap.end());
+    ASSERT_EQUALS(statsMap.at("foo")->trackerStartTime, getClockSource()->now());
 }
 
 namespace {
-int getFeatureUseCount(GlobalIndexUsageTracker* globalIndexUsage, std::string featureSearch) {
-    int count = 0;
-    globalIndexUsage->forEachFeature([&](auto feature, auto& stats) {
-        if (featureSearch == feature) {
-            count += stats.count.load();
-        }
-    });
-    return count;
-}
-
-int getFeatureAccessCount(GlobalIndexUsageTracker* globalIndexUsage, std::string featureSearch) {
-    int accesses = 0;
-    globalIndexUsage->forEachFeature([&](auto feature, auto& stats) {
-        if (featureSearch == feature) {
-            accesses += stats.accesses.load();
-        }
-    });
-    return accesses;
-}
+struct TestCase {
+    BSONObj spec;
+    std::vector<std::string> features;
+};
+std::vector<TestCase>
+    testCases =
+        {
+            {BSON("key" << BSON("_id" << 1) << "v" << 2), {"id"}},
+            {BSON("key" << BSON("foo" << 1) << "v" << 2), {"normal", "single"}},
+            {BSON("key" << BSON("foo" << 1) << "sparse" << true << "v" << 2),
+             {"normal", "single", "sparse"}},
+            {BSON("key" << BSON("foo" << 1) << "unique" << true << "v" << 2),
+             {"normal", "single", "unique"}},
+            {BSON("key" << BSON("foo" << 1) << "unique" << false << "v" << 2),
+             {"normal", "single"}},
+            {BSON("key" << BSON("foo" << 1) << "partialFilterExpression" << BSON("foo" << 1) << "v"
+                        << 2),
+             {"normal", "single", "partial"}},
+            {BSON("key" << BSON("foo" << 1) << "prepareUnique" << true << "v" << 2),
+             {"normal", "single", "prepareUnique"}},
+            {BSON("key" << BSON("foo" << 1) << "prepareUnique" << false << "v" << 2),
+             {"normal", "single"}},
+            {BSON("key" << BSON("foo"
+                                << "2d")
+                        << "v" << 2),
+             {"2d", "single"}},
+            {BSON("key" << BSON("foo"
+                                << "2dsphere")
+                        << "v" << 2),
+             {"2dsphere", "single"}},
+            {BSON("key" << BSON("foo"
+                                << "2dsphere_bucket")
+                        << "v" << 2),
+             {"2dsphere_bucket", "single"}},
+            {BSON("key" << BSON("foo" << 1) << "collation"
+                        << BSON("locale"
+                                << "en")
+                        << "v" << 2),
+             {"normal", "single", "collation"}},
+            {BSON("key" << BSON("foo" << 1 << "bar" << 1) << "v" << 2), {"normal", "compound"}},
+            {BSON("key" << BSON("foo"
+                                << "hashed")
+                        << "v" << 2),
+             {"hashed", "single"}},
+            {BSON("key" << BSON("foo"
+                                << "text")
+                        << "v" << 2),
+             {"text", "single"}},
+            {BSON("key" << BSON("foo" << 1) << "expireAfterSeconds" << 100 << "v" << 2),
+             {"normal", "single", "ttl"}},
+            {BSON("key" << BSON("wild.$**" << 1) << "v" << 2), {"wildcard", "single"}},
+};
 }  // namespace
 
-TEST_F(CollectionIndexUsageTrackerTest, GlobalFeatureUsageBasic) {
-    auto idSpec = BSON("key" << BSON("_id" << 1) << "unique" << true << "v" << 2);
-    auto idDesc = IndexDescriptor("", idSpec);
-    getTracker()->registerIndex("_id_", idSpec, IndexFeatures::make(&idDesc, false /* internal */));
-    getTracker()->recordIndexAccess("_id_");
+TEST_F(CollectionIndexUsageTrackerTest, CheckForUntestedFeatures) {
+    std::set<std::string> testedFeatures;
+    for (auto&& testCase : testCases) {
+        for (auto&& feature : testCase.features) {
+            testedFeatures.insert(feature);
+        }
+    }
 
-    ASSERT_EQ(1, getGlobalIndexUsage()->getCount());
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "unique"));
+    getAggregatedIndexUsage()->forEachFeature([&](auto f, auto& stats) {
+        ASSERT(testedFeatures.contains(f)) << "untested feature: " << f;
+    });
+}
 
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(0, getFeatureAccessCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(0, getFeatureAccessCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(0, getFeatureAccessCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(0, getFeatureAccessCount(getGlobalIndexUsage(), "unique"));
+TEST_F(CollectionIndexUsageTrackerTest, ExhaustiveFeatures) {
+    for (auto&& testCase : testCases) {
+        resetToZero();
 
-    auto spec = BSON("key" << BSON("foo" << 1) << "unique" << true << "sparse" << true << "v" << 2);
-    auto desc = IndexDescriptor("", spec);
-    getTracker()->registerIndex("foo", spec, IndexFeatures::make(&desc, false /* internal */));
-    getTracker()->recordIndexAccess("foo");
+        const auto& spec = testCase.spec;
+        const auto& features = testCase.features;
 
-    ASSERT_EQ(2, getGlobalIndexUsage()->getCount());
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "unique"));
+        const std::string pluginName = IndexNames::findPluginName(spec["key"].Obj());
+        const auto desc = IndexDescriptor(pluginName, spec);
+        const auto name = "test";
+        getTracker()->registerIndex(name, spec, IndexFeatures::make(&desc, false /* internal */));
+        ASSERT_EQ(1, getAggregatedIndexUsage()->getCount());
 
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "unique"));
+        getAggregatedIndexUsage()->forEachFeature([&](auto f, auto& stats) {
+            if (std::find(features.begin(), features.end(), f) != features.end()) {
+                ASSERT_EQ(1, stats.count.load()) << f << " in " << spec;
+            } else {
+                ASSERT_EQ(0, stats.count.load()) << f << " in " << spec;
+            }
+        });
 
-    // Register an internal index and expect nothing to change.
-    getTracker()->registerIndex("foo2", spec, IndexFeatures::make(&desc, true /* internal */));
+        getTracker()->recordIndexAccess(name);
+        getAggregatedIndexUsage()->forEachFeature([&](auto f, auto& stats) {
+            if (std::find(features.begin(), features.end(), f) != features.end()) {
+                ASSERT_EQ(1, stats.accesses.load()) << f << " in " << spec;
+            } else {
+                ASSERT_EQ(0, stats.accesses.load()) << f << " in " << spec;
+            }
+        });
 
-    ASSERT_EQ(2, getGlobalIndexUsage()->getCount());
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "unique"));
+        getTracker()->unregisterIndex(name);
+        ASSERT_EQ(0, getAggregatedIndexUsage()->getCount());
 
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "unique"));
+        getAggregatedIndexUsage()->forEachFeature([&](auto f, auto& stats) {
+            if (std::find(features.begin(), features.end(), f) != features.end()) {
+                ASSERT_EQ(0, stats.count.load()) << f << " in " << spec;
+            } else {
+                ASSERT_EQ(0, stats.count.load()) << f << " in " << spec;
+            }
+        });
 
-    getTracker()->unregisterIndex("foo2");
-    ASSERT_EQ(2, getGlobalIndexUsage()->getCount());
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "unique"));
-
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "unique"));
-
-    getTracker()->unregisterIndex("foo");
-    ASSERT_EQ(1, getGlobalIndexUsage()->getCount());
-    ASSERT_EQ(1, getFeatureUseCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "unique"));
-
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "unique"));
-
-    getTracker()->unregisterIndex("_id_");
-    ASSERT_EQ(0, getGlobalIndexUsage()->getCount());
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(0, getFeatureUseCount(getGlobalIndexUsage(), "unique"));
-
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "id"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "normal"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "single"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "sparse"));
-    ASSERT_EQ(1, getFeatureAccessCount(getGlobalIndexUsage(), "unique"));
+        getAggregatedIndexUsage()->forEachFeature([&](auto f, auto& stats) {
+            if (std::find(features.begin(), features.end(), f) != features.end()) {
+                ASSERT_EQ(1, stats.accesses.load()) << f << " in " << spec;
+            } else {
+                ASSERT_EQ(0, stats.accesses.load()) << f << " in " << spec;
+            }
+        });
+    }
 }
 
 }  // namespace

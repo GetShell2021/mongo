@@ -29,14 +29,14 @@
 import wttest, threading, time
 from wtdataset import SimpleDataSet
 from wtthread import checkpoint_thread
-from helper import simulate_crash_restart
 from wiredtiger import stat
 from helper import copy_wiredtiger_home
 from wtscenario import make_scenarios
-from test_rollback_to_stable01 import test_rollback_to_stable_base
+from rollback_to_stable_util import test_rollback_to_stable_base
 
 # test_rollback_to_stable35.py
 # Test that log is flushed for all writes that occurred in the checkpoint.
+@wttest.skip_for_hook("tiered", "Fails with tiered storage")
 class test_rollback_to_stable35(test_rollback_to_stable_base):
 
     format_values = [
@@ -80,7 +80,7 @@ class test_rollback_to_stable35(test_rollback_to_stable_base):
         cursor_2.close()
 
     def conn_config(self):
-        config = 'cache_size=50MB,statistics=(all),log=(enabled,force_write_wait=60),timing_stress_for_test=[checkpoint_slow, checkpoint_stop]'
+        config = 'cache_size=50MB,statistics=(all),log=(enabled,force_write_wait=60),timing_stress_for_test=[checkpoint_slow, checkpoint_stop],verbose=(rts:5)'
         return config
 
     def test_rollback_to_stable(self):
@@ -125,10 +125,10 @@ class test_rollback_to_stable35(test_rollback_to_stable_base):
             ckpt_started = 0
             while not ckpt_started:
                 stat_cursor = self.session.open_cursor('statistics:', None, None)
-                ckpt_started = stat_cursor[stat.conn.txn_checkpoint_running][2]
+                ckpt_started = stat_cursor[stat.conn.checkpoint_state][2] != 0
                 stat_cursor.close()
                 time.sleep(1)
-            
+
             self.large_updates(uri_1, uri_2, valuec, ds_1, ds_2, nrows)
             self.check(valuec, uri_1, uri_2, nrows)
 
@@ -140,7 +140,7 @@ class test_rollback_to_stable35(test_rollback_to_stable_base):
             while not ckpt_stop_timing_stress:
                 time.sleep(1)
                 stat_cursor = self.session.open_cursor('statistics:', None, None)
-                ckpt_stop_timing_stress = stat_cursor[stat.conn.txn_checkpoint_stop_stress_active][2]
+                ckpt_stop_timing_stress = stat_cursor[stat.conn.checkpoint_stop_stress_active][2]
                 stat_cursor.close()
 
             copy_wiredtiger_home(self, '.', "RESTART")
@@ -177,6 +177,3 @@ class test_rollback_to_stable35(test_rollback_to_stable_base):
         self.assertEqual(pages_visited, 0)
         self.assertEqual(upd_aborted, 0)
         self.assertGreaterEqual(hs_removed, 0)
-
-if __name__ == '__main__':
-    wttest.run()

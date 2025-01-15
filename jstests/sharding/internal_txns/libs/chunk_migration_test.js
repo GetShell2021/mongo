@@ -11,29 +11,28 @@
  * Note that this fixture runs each runTest() against its own collection so it is illegal to make
  * more than one runTest() call.
  */
-'use strict';
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {runCommandDuringTransferMods} from "jstests/libs/chunk_manipulation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    getTxnEntriesForSession,
+    makeAbortTransactionCmdObj,
+    makeCommitTransactionCmdObj,
+    makePrepareTransactionCmdObj,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
-load('jstests/libs/chunk_manipulation_util.js');
-load('jstests/sharding/internal_txns/libs/fixture_helpers.js');
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
-
-function InternalTransactionChunkMigrationTest(storeFindAndModifyImagesInSideCollection = true) {
-    jsTest.log(`Running chunk migration test with options ${
-        tojson({storeFindAndModifyImagesInSideCollection})}`);
+export function InternalTransactionChunkMigrationTest() {
+    jsTest.log(`Running chunk migration test`);
 
     let st = new ShardingTest({
         mongos: 1,
         shards: 3,
         rs: {nodes: 2},
-        rsOptions: {
-            oplogSize: 256,
-            setParameter:
-                {storeFindAndModifyImagesInSideCollection: storeFindAndModifyImagesInSideCollection}
-        }
+        rsOptions:
+            {oplogSize: 256, setParameter: {maxNumberOfTransactionOperationsInSingleOplogEntry: 1}}
     });
     let staticMongod = MongoRunner.runMongod({});
 
-    const kSize10MB = 10 * 1024 * 1024;
     const kInternalTxnType = {kRetryable: 1, kNonRetryable: 2};
     const kImageType = {kPreImage: 1, kPostImage: 2};
 
@@ -278,9 +277,8 @@ function InternalTransactionChunkMigrationTest(storeFindAndModifyImagesInSideCol
             const numLargeDocs = 2;
             for (let i = 0; i < numLargeDocs; i++) {
                 const docToInsert = {
-                    insert10MB: i.toString() + new Array(kSize10MB).join("x"),
+                    insert: i.toString(),
                     shardKey: -testId,
-
                 };
                 testCase.commands.push({
                     // Use stmtId -1 to get test coverage for "applyOps" entries without a stmtId.
@@ -360,7 +358,7 @@ function InternalTransactionChunkMigrationTest(storeFindAndModifyImagesInSideCol
         testCase.setUpFunc();
 
         const lsid = getTransactionSessionId(txnType, testCase);
-        runTxnRetryOnLockTimeoutError(() => {
+        withRetryOnTransientTxnError(() => {
             const txnNumber = getNextTxnNumber(txnType, testCase);
 
             for (let i = 0; i < testCase.commands.length; i++) {
@@ -401,7 +399,7 @@ function InternalTransactionChunkMigrationTest(storeFindAndModifyImagesInSideCol
         const lsid = getTransactionSessionId(txnType, testCase);
         // Give the session a different txnUUID to simulate a retry from a different mongos.
         lsid.txnUUID = UUID();
-        runTxnRetryOnLockTimeoutError(() => {
+        withRetryOnTransientTxnError(() => {
             const txnNumber = getNextTxnNumber(txnType, testCase);
 
             for (let i = 0; i < testCase.commands.length; i++) {

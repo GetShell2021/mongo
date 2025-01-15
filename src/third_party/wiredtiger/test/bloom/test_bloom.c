@@ -69,7 +69,7 @@ main(int argc, char *argv[])
 
     /* Set default configuration values. */
     g.c_cache = 10;
-    g.c_ops = 100000;
+    g.c_ops = 100 * WT_THOUSAND;
     g.c_key_max = 100;
     g.c_k = 8;
     g.c_factor = 16;
@@ -118,10 +118,8 @@ setup(void)
 
     testutil_work_dir_from_path(home, HOME_SIZE, "WT_TEST");
 
-    /* Clean the test directory if it already exists. */
-    testutil_clean_work_dir(home);
-    /* Create the home test directory for the test. */
-    testutil_make_work_dir(home);
+    /* Create the home test directory for the test (delete the previous directory if it exists). */
+    testutil_recreate_dir(home);
 
     /*
      * This test doesn't test public Wired Tiger functionality, it still needs connection and
@@ -132,9 +130,9 @@ setup(void)
      * Open configuration -- put command line configuration options at the end so they can override
      * "standard" configuration.
      */
-    testutil_check(__wt_snprintf(config, sizeof(config),
-      "create,error_prefix=\"%s\",cache_size=%" PRIu32 "MB,%s", progname, g.c_cache,
-      g.config_open == NULL ? "" : g.config_open));
+    testutil_snprintf(config, sizeof(config),
+      "create,statistics=(all),error_prefix=\"%s\",cache_size=%" PRIu32 "MB,%s", progname,
+      g.c_cache, g.config_open == NULL ? "" : g.config_open);
 
     testutil_check(wiredtiger_open(home, NULL, config, &conn));
 

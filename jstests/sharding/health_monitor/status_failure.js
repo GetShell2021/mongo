@@ -1,10 +1,13 @@
 /**
  * Tests behavior of fault manager when health observer returns status failure.
  *
- *  @tags: [multiversion_incompatible]
+ * @tags: [
+ *   multiversion_incompatible,
+ *   # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *   embedded_router_incompatible,
+ * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const kWaitForCompletedChecksCount = 12;
 const kWaitForPassedChecksCount = 8;
@@ -18,7 +21,6 @@ const params = {
                 {type: "dns", intensity: "off"}
             ]
         }),
-        featureFlagHealthMonitoring: true
     }
 };
 
@@ -67,4 +69,3 @@ const checkServerStats = function() {
 checkServerStats();
 
 st.stop();
-})();

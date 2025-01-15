@@ -32,6 +32,7 @@
 
 #define ALIGN_UP(p, n) ((p) % (n) == 0 ? (p) : ((p) + (n) - ((p) % (n))))
 #define ALIGN_DOWN(p, n) ((p) - ((p) % (n)))
+#define BUFFER_ALIGNMENT_DEFAULT 4096
 
 /*
  * util.c
@@ -77,8 +78,8 @@ copy_directory_int(const char *fromdir, const char *todir, bool directio)
          */
         if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0)
             continue;
-        testutil_check(__wt_snprintf(fromfile, sizeof(fromfile), "%s/%s", fromdir, dp->d_name));
-        testutil_check(__wt_snprintf(tofile, sizeof(tofile), "%s/%s", todir, dp->d_name));
+        testutil_snprintf(fromfile, sizeof(fromfile), "%s/%s", fromdir, dp->d_name);
+        testutil_snprintf(tofile, sizeof(tofile), "%s/%s", todir, dp->d_name);
         if (dp->d_type == DT_DIR) {
             copy_directory_int(fromfile, tofile, directio);
             continue;
@@ -105,7 +106,7 @@ copy_directory_int(const char *fromdir, const char *todir, bool directio)
          */
         if (buf == NULL) {
             if (directio) {
-                blksize = (size_t)WT_MAX(sb.st_blksize, WT_BUFFER_ALIGNMENT_DEFAULT);
+                blksize = (size_t)WT_MAX(sb.st_blksize, BUFFER_ALIGNMENT_DEFAULT);
                 testutil_assert(blksize < COPY_BUF_SIZE);
                 /*
                  * Make sure we have plenty of room for adjusting the pointer.
@@ -147,21 +148,6 @@ copy_directory_int(const char *fromdir, const char *todir, bool directio)
 }
 
 /*
- * clean_directory --
- *     Clean up a directory, use system to remove sub-directories too.
- */
-static void
-clean_directory(const char *todir)
-{
-    int status;
-    char buf[512];
-
-    testutil_check(__wt_snprintf(buf, sizeof(buf), "rm -rf %s", todir));
-    if ((status = system(buf)) < 0)
-        testutil_die(status, "system: %s", buf);
-}
-
-/*
  * copy_directory --
  *     Copy a directory, using direct IO if indicated. Wrapper because the sub functions can be
  *     called recursively if there are sub-directories present.
@@ -169,6 +155,6 @@ clean_directory(const char *todir)
 void
 copy_directory(const char *fromdir, const char *todir, bool directio)
 {
-    clean_directory(todir);
+    testutil_remove(todir);
     copy_directory_int(fromdir, todir, directio);
 }

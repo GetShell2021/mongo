@@ -10,16 +10,34 @@
 // sequence), idle (connection is connected but not used before a shard change), and new
 // (connection connected after shard change).
 
-// Checking UUID and index consistency involves talking to shard primaries, but by the end of this
-// test, one shard does not have a primary.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// The following checks involve talking to shard primaries, as by the end of this test, one shard
+// does not have a primary.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
+TestData.skipCheckMetadataConsistency = true;
 
-(function() {
-'use strict';
+// The routing table consistency check runs with 'snapshot' level readConcern. This readConcern
+// level cannot be satisfied without a replica set primary, which we won't have because this test
+// removes the replica set primary from a shard.
+TestData.skipCheckRoutingTableConsistency = true;
 
-var st = new ShardingTest({shards: 3, mongos: 1, other: {rs: true, rsOptions: {nodes: 2}}});
+var st = new ShardingTest({
+    shards: 3,
+    other: {
+        rs: true,
+        // Disables elections to avoid secondaries becoming primaries after stepdowns. The test
+        // relies on specific topology changes done explicitly.
+        rsOptions: {nodes: 2, settings: {electionTimeoutMillis: ReplSetTest.kForeverMillis}},
+        // ShardingTest use a high config command timeout to avoid spurious failures but this test
+        // may require a timeout to complete, so we restore the default value to avoid failures.
+        mongosOptions: {setParameter: {defaultConfigCommandTimeoutMS: 30000}}
+    },
+});
 
 var mongos = st.s0;
 var admin = mongos.getDB("admin");
@@ -29,16 +47,15 @@ assert.commandWorked(admin.runCommand({setParameter: 1, traceExceptions: true}))
 var collSharded = mongos.getCollection("fooSharded.barSharded");
 var collUnsharded = mongos.getCollection("fooUnsharded.barUnsharded");
 
-// Create the unsharded database
+// Create the database for the unsharded collection
+assert.commandWorked(admin.runCommand(
+    {enableSharding: collUnsharded.getDB().toString(), primaryShard: st.shard0.shardName}));
 assert.commandWorked(collUnsharded.insert({some: "doc"}));
 assert.commandWorked(collUnsharded.remove({}));
-assert.commandWorked(
-    admin.runCommand({movePrimary: collUnsharded.getDB().toString(), to: st.shard0.shardName}));
 
-// Create the sharded database
-assert.commandWorked(admin.runCommand({enableSharding: collSharded.getDB().toString()}));
-assert.commandWorked(
-    admin.runCommand({movePrimary: collSharded.getDB().toString(), to: st.shard0.shardName}));
+// Create the database for the sharded collection
+assert.commandWorked(admin.runCommand(
+    {enableSharding: collSharded.getDB().toString(), primaryShard: st.shard0.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: collSharded.toString(), key: {_id: 1}}));
 assert.commandWorked(admin.runCommand({split: collSharded.toString(), middle: {_id: 0}}));
 assert.commandWorked(
@@ -426,4 +443,3 @@ assert.writeError(mongosConnNew.getCollection(collUnsharded.toString()).insert({
 gc();  // Clean up new connections
 
 st.stop();
-})();

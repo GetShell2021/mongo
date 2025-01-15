@@ -27,16 +27,19 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 from helper import simulate_crash_restart
-from test_rollback_to_stable01 import test_rollback_to_stable_base
-from wiredtiger import stat, WT_NOTFOUND
+from rollback_to_stable_util import test_rollback_to_stable_base
+from wiredtiger import stat
 from wtdataset import SimpleDataSet
 from wtscenario import make_scenarios
+import wttest
 
-# test_rollback_to_stable33.py
+# test_rollback_to_stable34.py
 # Test interaction between fast-delete and RTS.
-class test_rollback_to_stable33(test_rollback_to_stable_base):
+@wttest.skip_for_hook("nonstandalone", "timestamped truncate not supported for nonstandalone")
+@wttest.skip_for_hook("tiered", "Fails with tiered storage")
+class test_rollback_to_stable34(test_rollback_to_stable_base):
     session_config = 'isolation=snapshot'
-    conn_config = 'cache_size=50MB,statistics=(all),log=(enabled=false)'
+    conn_config = 'cache_size=50MB,statistics=(all),log=(enabled=false),verbose=(rts:5)'
 
     format_values = [
         ('column', dict(key_format='r', value_format='S', extraconfig='')),
@@ -58,8 +61,14 @@ class test_rollback_to_stable33(test_rollback_to_stable_base):
         ('recovery', dict(crash=True)),
     ]
 
+    worker_thread_values = [
+        ('0', dict(threads=0)),
+        ('4', dict(threads=4)),
+        ('8', dict(threads=8))
+    ]
+
     scenarios = make_scenarios(format_values, prepare_values, second_checkpoint_values,
-        rollback_modes)
+        rollback_modes, worker_thread_values)
 
     # Make all the values different so it's easier to see what happens if ranges go missing.
     def mkdata(self, basevalue, i):
@@ -76,8 +85,8 @@ class test_rollback_to_stable33(test_rollback_to_stable_base):
         # each page once when we get a suitable interface for that.
         for i in range(lo, hi, 3):
             evict_cursor.set_key(ds.key(i))
-            self.assertEquals(evict_cursor.search(), 0)
-            self.assertEquals(evict_cursor.get_value(), self.mkdata(basevalue, i))
+            self.assertEqual(evict_cursor.search(), 0)
+            self.assertEqual(evict_cursor.get_value(), self.mkdata(basevalue, i))
             evict_cursor.reset()
         self.session.rollback_transaction()
         evict_cursor.close()
@@ -104,7 +113,7 @@ class test_rollback_to_stable33(test_rollback_to_stable_base):
         nrows = 10000
 
         # Create a table without logging.
-        uri = "table:rollback_to_stable33"
+        uri = "table:rollback_to_stable34"
         ds = SimpleDataSet(
             self, uri, 0, key_format=self.key_format, value_format=self.value_format,
             config='log=(enabled=false)' + self.extraconfig)
@@ -172,10 +181,10 @@ class test_rollback_to_stable33(test_rollback_to_stable_base):
         lo_cursor.close()
 
         # Check stats to make sure we fast-deleted at least one page.
-        # Since VLCS and FLCS do not (yet) support fast-delete, instead assert we didn't.
+        # (Except for FLCS, where it's not supported and we should fast-delete zero pages.)
         stat_cursor = self.session.open_cursor('statistics:', None, None)
         fastdelete_pages = stat_cursor[stat.conn.rec_page_delete_fast][2]
-        if self.key_format == 'r':
+        if self.value_format == '8t':
             self.assertEqual(fastdelete_pages, 0)
         else:
             self.assertGreater(fastdelete_pages, 0)
@@ -188,7 +197,7 @@ class test_rollback_to_stable33(test_rollback_to_stable_base):
         if self.crash:
             simulate_crash_restart(self, ".", "RESTART")
         else:
-            self.conn.rollback_to_stable()
+            self.conn.rollback_to_stable('threads=' + str(self.threads))
 
         # We should see the original data at read-ts 20 and 30.
         self.checkx(ds, nrows, 20, valuea)

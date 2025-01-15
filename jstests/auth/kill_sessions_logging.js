@@ -2,7 +2,7 @@
 //
 // @tags: [requires_sharding]
 
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function testFixtureSimple(name) {
     this.name = name + " (simple)";

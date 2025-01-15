@@ -27,18 +27,37 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/db/pipeline/plan_executor_pipeline.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/change_stream_start_after_invalidate_info.h"
 #include "mongo/db/pipeline/change_stream_topology_change_info.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/pipeline/plan_executor_pipeline.h"
 #include "mongo/db/pipeline/plan_explainer_pipeline.h"
 #include "mongo/db/pipeline/resume_token.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
+#include "mongo/util/str.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 
 namespace mongo {
+namespace {
+auto& changeStreamsLargeEventsFailedCounter =
+    *MetricBuilder<Counter64>{"changeStreams.largeEventsFailed"};
+}
 
 PlanExecutorPipeline::PlanExecutorPipeline(boost::intrusive_ptr<ExpressionContext> expCtx,
                                            std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
@@ -63,24 +82,22 @@ PlanExecutorPipeline::PlanExecutorPipeline(boost::intrusive_ptr<ExpressionContex
 
 PlanExecutor::ExecState PlanExecutorPipeline::getNext(BSONObj* objOut, RecordId* recordIdOut) {
     // The pipeline-based execution engine does not track the record ids associated with documents,
-    // so it is an error for the caller to ask for one. For the same reason, we expect the caller to
-    // provide a non-null BSONObj pointer for 'objOut'.
+    // so it is an error for the caller to ask for one.
     invariant(!recordIdOut);
-    invariant(objOut);
 
     if (!_stash.empty()) {
-        *objOut = std::move(_stash.front());
+        if (objOut) {
+            *objOut = std::move(_stash.front());
+        }
         _stash.pop();
         _planExplainer.incrementNReturned();
         return PlanExecutor::ADVANCED;
     }
 
     Document docOut;
-    auto execState = getNextDocument(&docOut, nullptr);
-    if (execState == PlanExecutor::ADVANCED) {
-        // Include metadata if the output will be consumed by a merging node.
-        *objOut = _expCtx->needsMerge || _expCtx->forPerShardCursor ? docOut.toBsonWithMetaData()
-                                                                    : docOut.toBson();
+    auto execState = getNextDocument(objOut ? &docOut : nullptr, nullptr);
+    if (objOut && execState == PlanExecutor::ADVANCED) {
+        *objOut = _trySerializeToBson(docOut);
     }
     return execState;
 }
@@ -88,17 +105,17 @@ PlanExecutor::ExecState PlanExecutorPipeline::getNext(BSONObj* objOut, RecordId*
 PlanExecutor::ExecState PlanExecutorPipeline::getNextDocument(Document* docOut,
                                                               RecordId* recordIdOut) {
     // The pipeline-based execution engine does not track the record ids associated with documents,
-    // so it is an error for the caller to ask for one. For the same reason, we expect the caller to
-    // provide a non-null pointer for 'docOut'.
+    // so it is an error for the caller to ask for one.
     invariant(!recordIdOut);
-    invariant(docOut);
 
     // Callers which use 'stashResult()' are not allowed to use 'getNextDocument()', and must
     // instead use 'getNext()'.
     invariant(_stash.empty());
 
     if (auto next = _getNext()) {
-        *docOut = std::move(*next);
+        if (docOut) {
+            *docOut = std::move(*next);
+        }
         _planExplainer.incrementNReturned();
         return PlanExecutor::ADVANCED;
     }
@@ -106,7 +123,7 @@ PlanExecutor::ExecState PlanExecutorPipeline::getNextDocument(Document* docOut,
     return PlanExecutor::IS_EOF;
 }
 
-bool PlanExecutorPipeline::isEOF() {
+bool PlanExecutorPipeline::isEOF() const {
     if (!_stash.empty()) {
         return false;
     }
@@ -140,6 +157,19 @@ boost::optional<Document> PlanExecutorPipeline::_tryGetNext() try {
     return Document::fromBsonWithMetaData(extraInfo->getStartAfterInvalidateEvent());
 }
 
+BSONObj PlanExecutorPipeline::_trySerializeToBson(const Document& doc) try {
+    // Include metadata if the output will be consumed by a merging node.
+    return _expCtx->getNeedsMerge() || _expCtx->getForPerShardCursor() ? doc.toBsonWithMetaData()
+                                                                       : doc.toBson();
+} catch (const ExceptionFor<ErrorCodes::BSONObjectTooLarge>&) {
+    // If in a change stream pipeline, increment change stream large event failed error
+    // count metric.
+    if (ResumableScanType::kChangeStream == _resumableScanType) {
+        changeStreamsLargeEventsFailedCounter.increment();
+    }
+    throw;
+}
+
 void PlanExecutorPipeline::_updateResumableScanState(const boost::optional<Document>& document) {
     switch (_resumableScanType) {
         case ResumableScanType::kChangeStream:
@@ -147,6 +177,9 @@ void PlanExecutorPipeline::_updateResumableScanState(const boost::optional<Docum
             break;
         case ResumableScanType::kOplogScan:
             _performResumableOplogScanAccounting();
+            break;
+        case ResumableScanType::kNaturalOrderScan:
+            _performResumableNaturalOrderScanAccounting();
             break;
         case ResumableScanType::kNone:
             break;
@@ -175,7 +208,7 @@ void PlanExecutorPipeline::_performChangeStreamsAccounting(const boost::optional
         auto highWaterMark = PipelineD::getLatestOplogTimestamp(_pipeline.get());
         if (highWaterMark > _latestOplogTimestamp) {
             auto token = ResumeToken::makeHighWaterMarkToken(
-                highWaterMark, _pipeline->getContext()->changeStreamTokenVersion);
+                highWaterMark, _pipeline->getContext()->getChangeStreamTokenVersion());
             _postBatchResumeToken = token.toDocument().toBson();
             _latestOplogTimestamp = highWaterMark;
             _setSpeculativeReadTimestamp();
@@ -185,9 +218,8 @@ void PlanExecutorPipeline::_performChangeStreamsAccounting(const boost::optional
 
 void PlanExecutorPipeline::_validateChangeStreamsResumeToken(const Document& event) const {
     // Confirm that the document _id field matches the original resume token in the sort key field.
-    auto eventBSON = event.toBson();
     auto resumeToken = event.metadata().getSortKey();
-    auto idField = eventBSON.getObjectField("_id");
+    auto idField = event.getField("_id");
     invariant(!resumeToken.missing());
     uassert(ErrorCodes::ChangeStreamFatalError,
             str::stream() << "Encountered an event whose _id field, which contains the resume "
@@ -196,9 +228,9 @@ void PlanExecutorPipeline::_validateChangeStreamsResumeToken(const Document& eve
                              "transformations that retain the unmodified _id field are allowed. "
                              "Expected: "
                           << BSON("_id" << resumeToken) << " but found: "
-                          << (eventBSON["_id"] ? BSON("_id" << eventBSON["_id"]) : BSONObj()),
-            (resumeToken.getType() == BSONType::Object) &&
-                idField.binaryEqual(resumeToken.getDocument().toBson()));
+                          << (idField.missing() ? BSONObj() : BSON("_id" << idField)),
+            resumeToken.getType() == BSONType::Object &&
+                ValueComparator::kInstance.evaluate(idField == resumeToken));
 }
 
 void PlanExecutorPipeline::_performResumableOplogScanAccounting() {
@@ -212,9 +244,18 @@ void PlanExecutorPipeline::_performResumableOplogScanAccounting() {
     _setSpeculativeReadTimestamp();
 }
 
+void PlanExecutorPipeline::_performResumableNaturalOrderScanAccounting() {
+    tassert(7979200,
+            "expected _resumableScanType == kNaturalOrderScan",
+            ResumableScanType::kNaturalOrderScan == _resumableScanType);
+
+    // Update value of postBatchResumeToken.
+    _postBatchResumeToken = PipelineD::getPostBatchResumeToken(_pipeline.get());
+}
+
 void PlanExecutorPipeline::_setSpeculativeReadTimestamp() {
     repl::SpeculativeMajorityReadInfo& speculativeMajorityReadInfo =
-        repl::SpeculativeMajorityReadInfo::get(_expCtx->opCtx);
+        repl::SpeculativeMajorityReadInfo::get(_expCtx->getOperationContext());
     if (speculativeMajorityReadInfo.isSpeculativeRead() && !_latestOplogTimestamp.isNull()) {
         speculativeMajorityReadInfo.setSpeculativeReadTimestampForward(_latestOplogTimestamp);
     }
@@ -228,8 +269,8 @@ void PlanExecutorPipeline::_initializeResumableScanState() {
             // _latestOplogTimestamp.
             tassert(5353403,
                     "expected initialPostBatchResumeToken to be not empty",
-                    !_expCtx->initialPostBatchResumeToken.isEmpty());
-            _postBatchResumeToken = _expCtx->initialPostBatchResumeToken.getOwned();
+                    !_expCtx->getInitialPostBatchResumeToken().isEmpty());
+            _postBatchResumeToken = _expCtx->getInitialPostBatchResumeToken().getOwned();
             _latestOplogTimestamp = ResumeToken::parse(_postBatchResumeToken).getData().clusterTime;
             break;
         case ResumableScanType::kOplogScan:
@@ -237,6 +278,7 @@ void PlanExecutorPipeline::_initializeResumableScanState() {
             // batchSize 0, in which case the PBRT of the first batch would be empty.
             _performResumableOplogScanAccounting();
             break;
+        case ResumableScanType::kNaturalOrderScan:
         case ResumableScanType::kNone:
             break;
         default:
@@ -250,6 +292,24 @@ void PlanExecutorPipeline::markAsKilled(Status killStatus) {
     if (_killStatus.isOK()) {
         _killStatus = killStatus;
     }
+}
+
+PlanExecutor::QueryFramework PlanExecutorPipeline::getQueryFramework() const {
+    // If this executor has a $cursor source at the front, use the query framework of that executor
+    // backing the cursor stage in order to determine whether the current pipeline is a hybrid plan.
+    if (auto cursor = dynamic_cast<DocumentSourceCursor*>(_pipeline->peekFront())) {
+        switch (cursor->getQueryFramework()) {
+            case PlanExecutor::QueryFramework::kClassicOnly:
+                return PlanExecutor::QueryFramework::kClassicHybrid;
+            case PlanExecutor::QueryFramework::kSBEOnly:
+                return PlanExecutor::QueryFramework::kSBEHybrid;
+            default:
+                MONGO_UNREACHABLE_TASSERT(6884701);
+        }
+    }
+    // If this executor doesn't have a $cursor source, then return classicOnly as it cannot be a
+    // hybrid plan.
+    return PlanExecutor::QueryFramework::kClassicOnly;
 }
 
 }  // namespace mongo

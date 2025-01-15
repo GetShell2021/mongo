@@ -27,56 +27,94 @@
  *    it in the license file.
  */
 
-#include "mongo/db/storage/sorted_data_interface_test_harness.h"
-
-#include <memory>
+#include <boost/none.hpp>
 
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/sorted_data_interface_test_harness.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
-// Tests findLoc when it hits something.
-void testFindLoc_Hit(bool unique) {
-    const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
-    auto sorted = harnessHelper->newSortedDataInterface(unique,
-                                                        /*partial=*/false,
-                                                        {
-                                                            {key1, loc1},
-                                                            {key2, loc1},
-                                                            {key3, loc1},
-                                                        });
 
-    auto loc = sorted->findLoc(opCtx.get(), makeKeyString(sorted.get(), key2));
+enum class IndexType { kUnique, kNonUnique, kId };
+
+// Tests findLoc when it hits something.
+void testFindLoc_Hit(OperationContext* opCtx,
+                     SortedDataInterfaceHarnessHelper* harnessHelper,
+                     IndexType type) {
+    std::unique_ptr<SortedDataInterface> sorted;
+    if (IndexType::kId == type) {
+        sorted = harnessHelper->newIdIndexSortedDataInterface(opCtx);
+    } else {
+        sorted = harnessHelper->newSortedDataInterface(opCtx,
+                                                       type == IndexType::kUnique,
+                                                       /*partial=*/false);
+    }
+
+    insertToIndex(opCtx,
+                  sorted.get(),
+                  {
+                      {key1, loc1},
+                      {key2, loc1},
+                      {key3, loc1},
+                  },
+                  /* dupsAllowed*/ false);
+
+    auto loc =
+        sorted->findLoc(opCtx, makeKeyStringForSeek(sorted.get(), key2).finishAndGetBuffer());
     ASSERT_EQ(loc, loc1);
 }
-TEST(SortedDataInterface, SeekExact_Hit_Unique) {
-    testFindLoc_Hit(true);
+
+TEST_F(SortedDataInterfaceTest, SeekExact_Hit_Unique) {
+    testFindLoc_Hit(opCtx(), harnessHelper(), IndexType::kUnique);
 }
-TEST(SortedDataInterface, SeekExact_Hit_Standard) {
-    testFindLoc_Hit(false);
+
+TEST_F(SortedDataInterfaceTest, SeekExact_Hit_Standard) {
+    testFindLoc_Hit(opCtx(), harnessHelper(), IndexType::kNonUnique);
+}
+
+TEST_F(SortedDataInterfaceTest, SeekExact_Hit_Id) {
+    testFindLoc_Hit(opCtx(), harnessHelper(), IndexType::kId);
 }
 
 // Tests findLoc when it doesn't hit the query.
-void testFindLoc_Miss(bool unique) {
-    const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto opCtx = harnessHelper->newOperationContext();
-    auto sorted = harnessHelper->newSortedDataInterface(unique,
-                                                        /*partial=*/false,
-                                                        {
-                                                            {key1, loc1},
-                                                            // No key2.
-                                                            {key3, loc1},
-                                                        });
+void testFindLoc_Miss(OperationContext* opCtx,
+                      SortedDataInterfaceHarnessHelper* harnessHelper,
+                      IndexType type) {
+    std::unique_ptr<SortedDataInterface> sorted;
+    if (IndexType::kId == type) {
+        sorted = harnessHelper->newIdIndexSortedDataInterface(opCtx);
+    } else {
+        sorted = harnessHelper->newSortedDataInterface(opCtx,
+                                                       type == IndexType::kUnique,
+                                                       /*partial=*/false);
+    }
 
-    ASSERT_EQ(sorted->findLoc(opCtx.get(), makeKeyString(sorted.get(), key2)), boost::none);
+    insertToIndex(opCtx,
+                  sorted.get(),
+                  {
+                      {key1, loc1},
+                      // No key 2
+                      {key3, loc1},
+                  },
+                  /* dupsAllowed*/ false);
+
+    ASSERT_EQ(sorted->findLoc(opCtx, makeKeyStringForSeek(sorted.get(), key2).finishAndGetBuffer()),
+              boost::none);
 }
-TEST(SortedDataInterface, SeekExact_Miss_Unique) {
-    testFindLoc_Miss(true);
+
+TEST_F(SortedDataInterfaceTest, SeekExact_Miss_Unique) {
+    testFindLoc_Miss(opCtx(), harnessHelper(), IndexType::kUnique);
 }
-TEST(SortedDataInterface, SeekExact_Miss_Standard) {
-    testFindLoc_Miss(false);
+
+TEST_F(SortedDataInterfaceTest, SeekExact_Miss_Standard) {
+    testFindLoc_Miss(opCtx(), harnessHelper(), IndexType::kNonUnique);
 }
+
+TEST_F(SortedDataInterfaceTest, SeekExact_Miss_Id) {
+    testFindLoc_Miss(opCtx(), harnessHelper(), IndexType::kId);
+}
+
 }  // namespace
 }  // namespace mongo

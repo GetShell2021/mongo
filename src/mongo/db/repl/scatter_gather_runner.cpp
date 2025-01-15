@@ -28,16 +28,21 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/scatter_gather_runner.h"
-
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <algorithm>
-#include <functional>
+#include <mutex>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/repl/scatter_gather_algorithm.h"
+#include "mongo/db/repl/scatter_gather_runner.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
 
@@ -48,7 +53,7 @@ namespace mongo {
 namespace repl {
 
 using executor::RemoteCommandRequest;
-using LockGuard = stdx::lock_guard<Latch>;
+using LockGuard = stdx::lock_guard<stdx::mutex>;
 using CallbackHandle = executor::TaskExecutor::CallbackHandle;
 using EventHandle = executor::TaskExecutor::EventHandle;
 using RemoteCommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackArgs;
@@ -76,7 +81,9 @@ StatusWith<EventHandle> ScatterGatherRunner::start() {
     //     RunnerImpl -> Callback in _callbacks -> RunnerImpl
     // We must remove callbacks after using them, to break this cycle.
     std::shared_ptr<RunnerImpl>& impl = _impl;
-    auto cb = [impl](const RemoteCommandCallbackArgs& cbData) { impl->processResponse(cbData); };
+    auto cb = [impl](const RemoteCommandCallbackArgs& cbData) {
+        impl->processResponse(cbData);
+    };
     return _impl->start(cb);
 }
 
@@ -108,7 +115,6 @@ StatusWith<EventHandle> ScatterGatherRunner::RunnerImpl::start(
     std::vector<RemoteCommandRequest> requests = _algorithm->getRequests();
     for (size_t i = 0; i < requests.size(); ++i) {
         LOGV2(21752,
-              "Scheduling remote command request for {context}: {request}",
               "Scheduling remote command request",
               "context"_attr = _logMessage,
               "request"_attr = requests[i].toString());

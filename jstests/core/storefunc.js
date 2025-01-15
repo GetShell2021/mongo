@@ -2,16 +2,16 @@
 //   requires_fcv_61,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
+//   # system.js stored functions only work for collections that live on the db-primary shard so
+//   # we have to make sure it wont be moved anywhere by the balancer
+//   assumes_balancer_off,
 // ]
-
-(function() {
-'use strict';
 
 // Use a private sister database to avoid conflicts with other tests that use system.js
 const testdb = db.getSiblingDB("storefunc");
 let res;
 
-const s = testdb.system.js;
+const s = testdb.getCollection("system.js");
 assert.commandWorked(s.remove({}));
 assert.eq(0, s.countDocuments({}));
 
@@ -42,4 +42,3 @@ assert(s.getIndexKeys()[0]._id, "no _id index");
 assert.commandFailedWithCode(s.renameCollection('system.js_old'),
                              [ErrorCodes.IllegalOperation, ErrorCodes.Unauthorized]);
 assert.commandFailedWithCode(s.renameCollection('old_system_js'), ErrorCodes.IllegalOperation);
-})();

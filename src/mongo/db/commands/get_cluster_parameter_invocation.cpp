@@ -28,21 +28,39 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <map>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/audit.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands/get_cluster_parameter_invocation.h"
-#include "mongo/idl/cluster_server_parameter_gen.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/query_settings/query_settings_manager.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 namespace mongo {
 
 std::pair<std::vector<std::string>, std::vector<BSONObj>>
-GetClusterParameterInvocation::retrieveRequestedParameters(OperationContext* opCtx,
-                                                           const CmdBody& cmdBody) {
+GetClusterParameterInvocation::retrieveRequestedParameters(
+    OperationContext* opCtx,
+    const CmdBody& cmdBody,
+    bool shouldOmitInFTDC,
+    const boost::optional<TenantId>& tenantId,
+    bool excludeClusterParameterTime) {
     ServerParameterSet* clusterParameters = ServerParameterSet::getClusterParameterSet();
     std::vector<std::string> parameterNames;
     std::vector<BSONObj> parameterValues;
@@ -50,55 +68,71 @@ GetClusterParameterInvocation::retrieveRequestedParameters(OperationContext* opC
     audit::logGetClusterParameter(opCtx->getClient(), cmdBody);
 
     // For each parameter, generate a BSON representation of it and retrieve its name.
-    auto makeBSON = [&](ServerParameter* requestedParameter) {
-        // Skip any disabled cluster parameters.
-        if (requestedParameter->isEnabled()) {
-            BSONObjBuilder bob;
-            requestedParameter->append(opCtx, bob, requestedParameter->name());
-            parameterValues.push_back(bob.obj().getOwned());
-            parameterNames.push_back(requestedParameter->name());
+    auto makeBSON = [&](ServerParameter* requestedParameter, bool skipOnError) {
+        if (!requestedParameter->isEnabled()) {
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "Server parameter: '" << requestedParameter->name()
+                                  << "' is disabled",
+                    skipOnError);
+            return;
         }
+
+        // If the command is invoked with shouldOmitInFTDC, then any parameter that has that
+        // flag set should be omitted.
+        if (shouldOmitInFTDC && requestedParameter->isOmittedInFTDC()) {
+            return;
+        }
+
+        // The persistent query settings are stored in a cluster parameter, however, since this is
+        // an implementation detail, we don't want to expose it to our users.
+        if (requestedParameter->name() ==
+            query_settings::QuerySettingsManager::kQuerySettingsClusterParameterName) {
+            uassert(ErrorCodes::NoSuchKey,
+                    str::stream() << "Unknown server parameter: " << requestedParameter->name(),
+                    skipOnError);
+            return;
+        }
+
+        BSONObjBuilder bob;
+        requestedParameter->append(opCtx, &bob, requestedParameter->name(), tenantId);
+        auto paramObj = bob.obj().getOwned();
+        if (excludeClusterParameterTime) {
+            parameterValues.push_back(
+                paramObj.filterFieldsUndotted(BSON("clusterParameterTime" << true), false));
+        } else {
+            parameterValues.push_back(paramObj);
+        }
+        parameterNames.push_back(requestedParameter->name());
     };
 
-    stdx::visit(
-        visit_helper::Overloaded{
-            [&](const std::string& strParameterName) {
-                if (strParameterName == "*"_sd) {
-                    // Retrieve all cluster parameter values.
-                    Map clusterParameterMap = clusterParameters->getMap();
-                    parameterValues.reserve(clusterParameterMap.size());
-                    parameterNames.reserve(clusterParameterMap.size());
-                    for (const auto& param : clusterParameterMap) {
-                        makeBSON(param.second);
-                    }
-                } else {
-                    // Any other string must correspond to a single parameter name. Return
-                    // an error if a disabled cluster parameter is explicitly requested.
-                    ServerParameter* sp = clusterParameters->get(strParameterName);
-                    uassert(ErrorCodes::BadValue,
-                            str::stream() << "Server parameter: '" << strParameterName
-                                          << "' is currently disabled",
-                            sp->isEnabled());
-                    makeBSON(sp);
-                }
-            },
-            [&](const std::vector<std::string>& listParameterNames) {
-                uassert(ErrorCodes::BadValue,
-                        "Must supply at least one cluster server parameter name to "
-                        "getClusterParameter",
-                        listParameterNames.size() > 0);
-                parameterValues.reserve(listParameterNames.size());
-                parameterNames.reserve(listParameterNames.size());
-                for (const auto& requestedParameterName : listParameterNames) {
-                    ServerParameter* sp = clusterParameters->get(requestedParameterName);
-                    uassert(ErrorCodes::BadValue,
-                            str::stream() << "Server parameter: '" << requestedParameterName
-                                          << "' is currently disabled'",
-                            sp->isEnabled());
-                    makeBSON(sp);
-                }
-            }},
-        cmdBody);
+    visit(OverloadedVisitor{[&](const std::string& strParameterName) {
+                                if (strParameterName == "*"_sd) {
+                                    // Retrieve all cluster parameter values.
+                                    const Map& clusterParameterMap = clusterParameters->getMap();
+                                    parameterValues.reserve(clusterParameterMap.size());
+                                    parameterNames.reserve(clusterParameterMap.size());
+                                    for (const auto& param : clusterParameterMap) {
+                                        makeBSON(param.second.get(), true);
+                                    }
+                                } else {
+                                    // Any other string must correspond to a single parameter name.
+                                    // Return an error if a disabled cluster parameter is explicitly
+                                    // requested.
+                                    makeBSON(clusterParameters->get(strParameterName), false);
+                                }
+                            },
+                            [&](const std::vector<std::string>& listParameterNames) {
+                                uassert(ErrorCodes::BadValue,
+                                        "Must supply at least one cluster server parameter name to "
+                                        "getClusterParameter",
+                                        listParameterNames.size() > 0);
+                                parameterValues.reserve(listParameterNames.size());
+                                parameterNames.reserve(listParameterNames.size());
+                                for (const auto& requestedParameterName : listParameterNames) {
+                                    makeBSON(clusterParameters->get(requestedParameterName), false);
+                                }
+                            }},
+          cmdBody);
 
     return {std::move(parameterNames), std::move(parameterValues)};
 }
@@ -106,86 +140,22 @@ GetClusterParameterInvocation::retrieveRequestedParameters(OperationContext* opC
 GetClusterParameterInvocation::Reply GetClusterParameterInvocation::getCachedParameters(
     OperationContext* opCtx, const GetClusterParameter& request) {
     const CmdBody& cmdBody = request.getCommandParameter();
+    bool shouldOmitInFTDC = request.getOmitInFTDC();
 
-    auto [parameterNames, parameterValues] = retrieveRequestedParameters(opCtx, cmdBody);
+    auto* repl = repl::ReplicationCoordinator::get(opCtx);
+    bool isStandalone = repl && !repl->getSettings().isReplSet() &&
+        serverGlobalParams.clusterRole.has(ClusterRole::None);
+
+    auto [parameterNames, parameterValues] = retrieveRequestedParameters(
+        opCtx, cmdBody, shouldOmitInFTDC, request.getDbName().tenantId(), isStandalone);
 
     LOGV2_DEBUG(6226100,
                 2,
                 "Retrieved parameter values for cluster server parameters",
-                "parameterNames"_attr = parameterNames);
+                "parameterNames"_attr = parameterNames,
+                "tenantId"_attr = request.getDbName().tenantId());
 
     return Reply(parameterValues);
-}
-
-GetClusterParameterInvocation::Reply GetClusterParameterInvocation::getDurableParameters(
-    OperationContext* opCtx, const GetClusterParameter& request) {
-    auto configServers = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-
-    // Create the query document such that all documents in config.clusterParmeters with _id
-    // in the requested list of ServerParameters are returned.
-    const CmdBody& cmdBody = request.getCommandParameter();
-    ServerParameterSet* clusterParameters = ServerParameterSet::getClusterParameterSet();
-
-    BSONObjBuilder queryDocBuilder;
-    BSONObjBuilder inObjBuilder = queryDocBuilder.subobjStart("_id"_sd);
-    BSONArrayBuilder parameterNameBuilder = inObjBuilder.subarrayStart("$in"_sd);
-
-    auto [requestedParameterNames, parameterValues] = retrieveRequestedParameters(opCtx, cmdBody);
-
-    for (const auto& parameterValue : parameterValues) {
-        parameterNameBuilder.append(parameterValue["_id"_sd].String());
-    }
-
-    parameterNameBuilder.doneFast();
-    inObjBuilder.doneFast();
-
-    // Perform the majority read on the config server primary.
-    BSONObj query = queryDocBuilder.obj();
-    LOGV2_DEBUG(6226101, 2, "Querying config servers for cluster parameters", "query"_attr = query);
-    auto findResponse = uassertStatusOK(
-        configServers->exhaustiveFindOnConfig(opCtx,
-                                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                              repl::ReadConcernLevel::kMajorityReadConcern,
-                                              NamespaceString::kClusterParametersNamespace,
-                                              query,
-                                              BSONObj(),
-                                              boost::none));
-
-    // Any parameters that are not included in the response don't have a cluster parameter
-    // document yet, which means they still are using the default value.
-    std::vector<BSONObj> retrievedParameters = std::move(findResponse.docs);
-    if (retrievedParameters.size() < requestedParameterNames.size()) {
-        std::vector<std::string> onDiskParameterNames;
-        onDiskParameterNames.reserve(retrievedParameters.size());
-        std::transform(
-            retrievedParameters.begin(),
-            retrievedParameters.end(),
-            std::back_inserter(onDiskParameterNames),
-            [&](const auto& onDiskParameter) { return onDiskParameter["_id"_sd].String(); });
-
-        // Sort and find the set difference of the requested parameters and the parameters
-        // returned.
-        std::vector<std::string> defaultParameterNames;
-
-        defaultParameterNames.reserve(requestedParameterNames.size() - onDiskParameterNames.size());
-
-        std::sort(onDiskParameterNames.begin(), onDiskParameterNames.end());
-        std::sort(requestedParameterNames.begin(), requestedParameterNames.end());
-        std::set_difference(requestedParameterNames.begin(),
-                            requestedParameterNames.end(),
-                            onDiskParameterNames.begin(),
-                            onDiskParameterNames.end(),
-                            std::back_inserter(defaultParameterNames));
-
-        for (const auto& defaultParameterName : defaultParameterNames) {
-            auto defaultParameter = clusterParameters->get(defaultParameterName);
-            BSONObjBuilder bob;
-            defaultParameter->append(opCtx, bob, defaultParameterName);
-            retrievedParameters.push_back(bob.obj());
-        }
-    }
-
-    return Reply(retrievedParameters);
 }
 
 }  // namespace mongo

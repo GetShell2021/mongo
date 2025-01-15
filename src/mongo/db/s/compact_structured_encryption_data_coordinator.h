@@ -29,14 +29,30 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <memory>
+#include <set>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/crypto/fle_stats_gen.h"
+#include "mongo/db/commands/fle2_compact.h"
 #include "mongo/db/commands/fle2_compact_gen.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/query/write_ops/write_ops.h"
 #include "mongo/db/s/compact_structured_encryption_data_coordinator_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -63,7 +79,7 @@ public:
         return *_response;
     }
 
-    void checkIfOptionsConflict(const BSONObj& doc) const final {}
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const final {}
 
 private:
     StringData serializePhase(const Phase& phase) const override {
@@ -73,10 +89,30 @@ private:
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept final;
 
+    std::set<NamespaceString> _getAdditionalLocksToAcquire(OperationContext* opCtx) override;
+
 private:
+    // The response to the compact command
     boost::optional<CompactStructuredEncryptionDataCommandReply> _response;
+
+    // Whether to skip the compaction operation during the compact phase
     bool _skipCompact{false};
+
+    // The UUID of the temporary collection that the ECOC was renamed to
     boost::optional<UUID> _ecocRenameUuid;
+
+    // Contains the set of _id values of documents that must be deleted from the ESC
+    // during the compact phase. This is populated during the rename phase.
+    // It is by design that this is not persisted to disk between phases, as this should
+    // be emptied (and hence no ESC deletions must happen) if the coordinator were resumed
+    // from disk during the compact phase.
+    FLECompactESCDeleteSet _escDeleteSet;
+
+    // Stats for the ESC
+    ECStats _escStats;
+
+    // Stats for the ECOC
+    ECOCStats _ecocStats;
 };
 
 }  // namespace mongo

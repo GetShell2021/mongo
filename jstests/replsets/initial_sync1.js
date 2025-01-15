@@ -15,7 +15,9 @@
  * This test assumes a 'newlyAdded' removal.
  */
 
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconnect} from "jstests/replsets/rslib.js";
+
 var basename = "jstests_initsync1";
 
 print("1. Bring up set");
@@ -53,8 +55,13 @@ admin_s1.runCommand({replSetFreeze: 999999});
 print("6. Bring up #3");
 var hostname = getHostName();
 
-var secondary2 =
-    MongoRunner.runMongod(Object.merge({replSet: basename, oplogSize: 2}, x509_options2));
+var secondary2 = MongoRunner.runMongod(Object.merge({
+    replSet: basename,
+    oplogSize: 2,
+    // Preserve the initial sync state to validate an assertion.
+    setParameter: {"failpoint.skipClearInitialSyncState": tojson({mode: 'alwaysOn'})}
+},
+                                                    x509_options2));
 
 var local_s2 = secondary2.getDB("local");
 var admin_s2 = secondary2.getDB("admin");
@@ -90,7 +97,7 @@ replTest.stop(secondary1);
 
 print("8. Eventually the new node should become a secondary");
 print("if initial sync has started, this will cause it to fail and sleep for 5 minutes");
-replTest.waitForState(secondary2, ReplSetTest.State.SECONDARY, 60 * 1000);
+replTest.awaitSecondaryNodes(60 * 1000, [secondary2]);
 
 print("9. Bring the secondary back up");
 replTest.start(secondary1, {}, true);

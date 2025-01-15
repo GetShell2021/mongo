@@ -70,27 +70,39 @@ public:
      */
     virtual const NamespaceString& getNS() const = 0;
 
-    virtual bool isShardedTimeSeriesBucketsNamespace() const = 0;
+    virtual bool isTrackedTimeSeriesBucketsNamespace() const = 0;
 
     /**
      * Returns a ShardEndpoint for a single document write or throws ShardKeyNotFound if 'doc' is
      * malformed with respect to the shard key pattern of the collection.
+     * If 'chunkRanges' is not null, populates it with ChunkRanges that would be targeted by the
+     * insert.
      */
     virtual ShardEndpoint targetInsert(OperationContext* opCtx, const BSONObj& doc) const = 0;
 
     /**
      * Returns a vector of ShardEndpoints for a potentially multi-shard update or throws
      * ShardKeyNotFound if 'updateOp' misses a shard key, but the type of update requires it.
+     * If 'chunkRanges' is not null, populates it with ChunkRanges that would be targeted by the
+     * update.
      */
-    virtual std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
-                                                    const BatchItemRef& itemRef) const = 0;
+    virtual std::vector<ShardEndpoint> targetUpdate(
+        OperationContext* opCtx,
+        const BatchItemRef& itemRef,
+        bool* useTwoPhaseWriteProtocol = nullptr,
+        bool* isNonTargetedWriteWithoutShardKeyWithExactId = nullptr) const = 0;
 
     /**
      * Returns a vector of ShardEndpoints for a potentially multi-shard delete or throws
      * ShardKeyNotFound if 'deleteOp' misses a shard key, but the type of delete requires it.
+     * If 'chunkRanges' is not null, populates it with ChunkRanges that would be targeted by the
+     * delete.
      */
-    virtual std::vector<ShardEndpoint> targetDelete(OperationContext* opCtx,
-                                                    const BatchItemRef& itemRef) const = 0;
+    virtual std::vector<ShardEndpoint> targetDelete(
+        OperationContext* opCtx,
+        const BatchItemRef& itemRef,
+        bool* useTwoPhaseWriteProtocol = nullptr,
+        bool* isNonTargetedWriteWithoutShardKeyWithExactId = nullptr) const = 0;
 
     /**
      * Returns a vector of ShardEndpoints for all shards.
@@ -109,11 +121,10 @@ public:
      *
      * Any stale responses noted here will be taken into account on the next refresh.
      *
-     * If stale responses are is noted, we must not have noted that we cannot target.
+     * If stale responses are noted, we must not have noted that we cannot target.
      */
-    virtual void noteStaleShardResponse(OperationContext* opCtx,
-                                        const ShardEndpoint& endpoint,
-                                        const StaleConfigInfo& staleInfo) = 0;
+    virtual void noteStaleCollVersionResponse(OperationContext* opCtx,
+                                              const StaleConfigInfo& staleInfo) = 0;
 
     /**
      * Informs the targeter of stale db routing version responses for this db from an endpoint,
@@ -121,11 +132,22 @@ public:
      *
      * Any stale responses noted here will be taken into account on the next refresh.
      *
-     * If stale responses are is noted, we must not have noted that we cannot target.
+     * If stale responses are noted, we must not have noted that we cannot target.
      */
-    virtual void noteStaleDbResponse(OperationContext* optCtx,
-                                     const ShardEndpoint& endpoint,
-                                     const StaleDbRoutingVersion& staleInfo) = 0;
+    virtual void noteStaleDbVersionResponse(OperationContext* optCtx,
+                                            const StaleDbRoutingVersion& staleInfo) = 0;
+
+    virtual bool hasStaleShardResponse() = 0;
+
+    /**
+     * Informs the targeter of CannotImplicitlyCreateCollection responses for this collection from
+     * an endpoint, with further information available in the returned createInfo.
+     *
+     * Any cannotImplicitlyCreateCollection errors noted here will be taken into account on the next
+     * create.
+     */
+    virtual void noteCannotImplicitlyCreateCollectionResponse(
+        OperationContext* optCtx, const CannotImplicitlyCreateCollectionInfo& createInfo) = 0;
 
     /**
      * Refreshes the targeting metadata for the namespace if needed, based on previously-noted
@@ -142,9 +164,31 @@ public:
     virtual bool refreshIfNeeded(OperationContext* opCtx) = 0;
 
     /**
-     * Returns the number of shards that own one or more chunks for the targeted collection.
+     * Creates a collection if there were previously noted cannotImplicitlyCreateCollection
+     * failures.
+     *
+     * After this function is called, the targeter should be in a state such that the noted
+     * cannotImplicitlyCreateCollection responses are not seen again.
+     *
+     * Returns if the collection was created.
+     *
+     * NOTE: This function may block for shared resources or network calls.
      */
-    virtual int getNShardsOwningChunks() const = 0;
+    virtual bool createCollectionIfNeeded(OperationContext* opCtx) = 0;
+
+    /**
+     * Returns the number of shards that own one or more chunks for the targeted collection.
+     *
+     * To be only used for logging/metrics which do not need to be always correct. The returned
+     * value may be incorrect when this targeter is at point-in-time (it will reflect the 'latest'
+     * number of shards, rather than the one at the point-in-time).
+     */
+    virtual int getAproxNShardsOwningChunks() const = 0;
+
+    /**
+     * Returns whether the targeted collection is sharded or not
+     */
+    virtual bool isTargetedCollectionSharded() const = 0;
 };
 
 }  // namespace mongo

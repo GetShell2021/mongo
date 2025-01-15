@@ -27,19 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_internal_apply_oplog_update.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -108,7 +114,7 @@ TEST_F(DocumentSourceInternalApplyOplogUpdateTest, ShouldRejectMalformedSpecs) {
     ASSERT_THROWS_CODE(
         DocumentSourceInternalApplyOplogUpdate::createFromBson(spec.firstElement(), getExpCtx()),
         DBException,
-        40414);
+        ErrorCodes::IDLFailedToParse);
 
     spec =
         fromjson(R"({$_internalApplyOplogUpdate: {foo: {"$v": NumberInt(2), diff: {u: {b: 3}}}}})");
@@ -216,28 +222,26 @@ TEST_F(DocumentSourceInternalApplyOplogUpdateTest, ShouldErrorOnInvalidDiffs) {
         stage->setSource(mock.get());
         ASSERT_THROWS_CODE(stage->getNext(), DBException, 4770507);
     }
+}
 
-    {
-        auto spec = BSON("$_internalApplyOplogUpdate"
-                         << BSON("oplogUpdate" << BSON("$v" << 2 << "diff"
-                                                            << BSON("u" << BSON("b\0c"_sd << 3)))));
-        auto stage = DocumentSourceInternalApplyOplogUpdate::createFromBson(spec.firstElement(),
-                                                                            getExpCtx());
-        auto mock = DocumentSourceMock::createForTest({Document{{"a", 0}}}, getExpCtx());
-        stage->setSource(mock.get());
-        ASSERT_THROWS_CODE(stage->getNext(), DBException, 4728000);
-    }
-
-    {
-        auto spec = BSON(
-            "$_internalApplyOplogUpdate" << BSON(
-                "oplogUpdate" << BSON("$v" << 2 << "diff" << BSON("sb\0c"_sd << BSON("d" << 5)))));
-        auto stage = DocumentSourceInternalApplyOplogUpdate::createFromBson(spec.firstElement(),
-                                                                            getExpCtx());
-        auto mock = DocumentSourceMock::createForTest({Document{{"a", 0}}}, getExpCtx());
-        stage->setSource(mock.get());
-        ASSERT_THROWS_CODE(stage->getNext(), DBException, 4770505);
-    }
+TEST_F(DocumentSourceInternalApplyOplogUpdateTest, RedactsCorrectly) {
+    auto spec = fromjson(R"({
+        $_internalApplyOplogUpdate: {
+            oplogUpdate: {
+                $v: 2,
+                diff: { sa: [] }
+            }
+        }
+    })");
+    auto docSource =
+        DocumentSourceInternalApplyOplogUpdate::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$_internalApplyOplogUpdate": {
+                "oplogUpdate":"?object"
+            }
+        })",
+        redact(*docSource));
 }
 
 }  // namespace

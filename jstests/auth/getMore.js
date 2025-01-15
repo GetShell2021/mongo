@@ -1,16 +1,12 @@
 // Tests that a user can only run a getMore on a cursor that they created.
 // @tags: [requires_sharding]
-(function() {
-"use strict";
-
 // Multiple users cannot be authenticated on one connection within a session.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 TestData.disableImplicitSessions = true;
 
 function runTest(conn) {
     const adminDB = conn.getDB("admin");
-    const hello = adminDB.runCommand("hello");
-    assert.commandWorked(hello);
-    const isMongos = (hello.msg === "isdbgrid");
 
     // Create the admin user.
     assert.commandWorked(adminDB.runCommand({createUser: "admin", pwd: "admin", roles: ["root"]}));
@@ -261,7 +257,6 @@ MongoRunner.stopMongod(conn);
 
 // Run the test on a sharded cluster.
 const cluster = new ShardingTest(
-    {shards: 1, mongos: 1, keyFile: "jstests/libs/key1", other: {shardOptions: {auth: ""}}});
+    {shards: 1, mongos: 1, keyFile: "jstests/libs/key1", other: {rsOptions: {auth: ""}}});
 runTest(cluster);
 cluster.stop();
-}());

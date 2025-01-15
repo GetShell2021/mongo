@@ -29,11 +29,21 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <utility>
+#include <variant>
+
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/window_function/partition_iterator.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
 #include "mongo/db/pipeline/window_function/window_function_exec.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/memory_usage_tracker.h"
 
 namespace mongo {
 
@@ -57,24 +67,24 @@ public:
                                    boost::intrusive_ptr<Expression> input,
                                    boost::intrusive_ptr<AccumulatorState> function,
                                    WindowBounds::Bound<int> upperDocumentBound,
-                                   MemoryUsageTracker::PerFunctionMemoryTracker* memTracker)
+                                   MemoryUsageTracker::Impl* memTracker)
         : WindowFunctionExec(PartitionAccessor(iter, PartitionAccessor::Policy::kDefaultSequential),
                              memTracker),
           _input(std::move(input)),
           _function(std::move(function)),
           _upperDocumentBound(upperDocumentBound){};
 
-    Value getNext() final {
+    Value getNext(boost::optional<Document> current = boost::none) final {
         if (!_initialized) {
             initialize();
-        } else if (!stdx::holds_alternative<WindowBounds::Unbounded>(_upperDocumentBound)) {
+        } else if (!holds_alternative<WindowBounds::Unbounded>(_upperDocumentBound)) {
             // Right-unbounded windows will accumulate all values on the first pass during
             // initialization.
             auto upperIndex = [&]() {
-                if (stdx::holds_alternative<WindowBounds::Current>(_upperDocumentBound))
+                if (holds_alternative<WindowBounds::Current>(_upperDocumentBound))
                     return 0;
                 else
-                    return stdx::get<int>(_upperDocumentBound);
+                    return get<int>(_upperDocumentBound);
             }();
 
             if (auto doc = (this->_iter)[upperIndex]) {
@@ -108,13 +118,12 @@ private:
 
     void initialize() {
         auto needMore = [&](int index) {
-            return stdx::visit(
-                visit_helper::Overloaded{
-                    [&](const WindowBounds::Unbounded&) { return true; },
-                    [&](const WindowBounds::Current&) { return index == 0; },
-                    [&](const int& n) { return index <= n; },
-                },
-                _upperDocumentBound);
+            return visit(OverloadedVisitor{
+                             [&](const WindowBounds::Unbounded&) { return true; },
+                             [&](const WindowBounds::Current&) { return index == 0; },
+                             [&](const int& n) { return index <= n; },
+                         },
+                         _upperDocumentBound);
         };
 
         _initialized = true;

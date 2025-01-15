@@ -1,11 +1,9 @@
 // Tests changing the zones on a shard at runtime results in a correct distribution of chunks across
 // the cluster
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
-load("jstests/sharding/libs/find_chunks_util.js");
-
-const st = new ShardingTest({shards: 3, mongos: 1, other: {chunkSize: 1, enableAutoSplit: false}});
+const st = new ShardingTest({shards: 3, mongos: 1, other: {chunkSize: 1}});
 const dbName = 'test';
 const collName = 'foo';
 const ns = dbName + '.' + collName;
@@ -39,7 +37,10 @@ function assertBalanceCompleteAndStable(checkFunc, stepName) {
 
     assert.soon(checkFunc, 'Balance at step ' + stepName + ' did not happen', 3 * 60 * 1000, 2000);
 
-    st.waitForBalancer(true, 60000);
+    // When running with CSRS stepdowns, the balancer round might take longer to complete
+    const balancerRoundTimeout = TestData.runningWithConfigStepdowns ? 3 * 60 * 1000 : 60 * 1000;
+    st.awaitBalancerRound(balancerRoundTimeout);
+
     st.printShardingStatus(true);
     assert(checkFunc());
 
@@ -85,9 +86,9 @@ assertBalanceCompleteAndStable(function() {
 }, 'chunks to zones a and b');
 
 // Tag the entire collection to shard0 and wait for everything to move to that shard
-st.removeTagRange(ns, {_id: -100}, {_id: 100}, 'a');
-st.removeTagRange(ns, {_id: MinKey}, {_id: -100}, 'b');
-st.removeTagRange(ns, {_id: 100}, {_id: MaxKey}, 'b');
+st.removeTagRange(ns, {_id: -100}, {_id: 100});
+st.removeTagRange(ns, {_id: MinKey}, {_id: -100});
+st.removeTagRange(ns, {_id: 100}, {_id: MaxKey});
 
 st.removeShardTag(st.shard1.shardName, 'a');
 st.removeShardTag(st.shard2.shardName, 'b');
@@ -96,15 +97,14 @@ st.addTagRange(ns, {_id: MinKey}, {_id: MaxKey}, 'a');
 assertBalanceCompleteAndStable(function() {
     var counts = st.chunkCounts(collName);
     printjson(counts);
-    return counts[st.shard0.shardName] == 11 && counts[st.shard1.shardName] == 0 &&
-        counts[st.shard2.shardName] == 0;
+    // All chunks must have been moved to shard 0, none left on shard 1 and 2
+    return counts[st.shard1.shardName] == 0 && counts[st.shard2.shardName] == 0;
 }, 'all chunks to zone a');
 
 // Remove all zones and ensure collection is correctly redistributed
 st.removeShardTag(st.shard0.shardName, 'a');
-st.removeTagRange(ns, {_id: MinKey}, {_id: MaxKey}, 'a');
+st.removeTagRange(ns, {_id: MinKey}, {_id: MaxKey});
 
 assertBalanceCompleteAndStable(checkClusterEvenlyBalanced, 'final');
 
 st.stop();
-})();

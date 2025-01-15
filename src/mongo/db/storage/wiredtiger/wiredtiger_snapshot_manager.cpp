@@ -28,15 +28,20 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <wiredtiger.h>
 
-#include "mongo/db/storage/wiredtiger/wiredtiger_snapshot_manager.h"
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/server_options.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_snapshot_manager.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
@@ -47,14 +52,14 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeMajorityReadTransactionStarted);
 }
 
 void WiredTigerSnapshotManager::setCommittedSnapshot(const Timestamp& timestamp) {
-    stdx::lock_guard<Latch> lock(_committedSnapshotMutex);
+    stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
 
     invariant(!_committedSnapshot || *_committedSnapshot <= timestamp);
     _committedSnapshot = timestamp;
 }
 
 void WiredTigerSnapshotManager::setLastApplied(const Timestamp& timestamp) {
-    stdx::lock_guard<Latch> lock(_lastAppliedMutex);
+    stdx::lock_guard<stdx::mutex> lock(_lastAppliedMutex);
     if (timestamp.isNull())
         _lastApplied = boost::none;
     else
@@ -62,35 +67,32 @@ void WiredTigerSnapshotManager::setLastApplied(const Timestamp& timestamp) {
 }
 
 boost::optional<Timestamp> WiredTigerSnapshotManager::getLastApplied() {
-    stdx::lock_guard<Latch> lock(_lastAppliedMutex);
+    stdx::lock_guard<stdx::mutex> lock(_lastAppliedMutex);
     return _lastApplied;
 }
 
 void WiredTigerSnapshotManager::clearCommittedSnapshot() {
-    stdx::lock_guard<Latch> lock(_committedSnapshotMutex);
+    stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
     _committedSnapshot = boost::none;
 }
 
 boost::optional<Timestamp> WiredTigerSnapshotManager::getMinSnapshotForNextCommittedRead() const {
-    if (!serverGlobalParams.enableMajorityReadConcern) {
-        return boost::none;
-    }
-
-    stdx::lock_guard<Latch> lock(_committedSnapshotMutex);
+    stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
     return _committedSnapshot;
 }
 
 Timestamp WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
-    WT_SESSION* session,
+    WiredTigerSession* session,
     PrepareConflictBehavior prepareConflictBehavior,
-    RoundUpPreparedTimestamps roundUpPreparedTimestamps) const {
+    bool roundUpPreparedTimestamps,
+    RecoveryUnit::UntimestampedWriteAssertionLevel untimestampedWriteAssertion) const {
 
     auto committedSnapshot = [this]() {
-        stdx::lock_guard<Latch> lock(_committedSnapshotMutex);
+        stdx::lock_guard<stdx::mutex> lock(_committedSnapshotMutex);
         uassert(ErrorCodes::ReadConcernMajorityNotAvailableYet,
                 "Committed view disappeared while running operation",
                 _committedSnapshot);
-        return _committedSnapshot.get();
+        return _committedSnapshot.value();
     }();
 
     if (MONGO_unlikely(hangBeforeMajorityReadTransactionStarted.shouldFail())) {
@@ -99,8 +101,11 @@ Timestamp WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
 
     // We need to round up our read timestamp in case the oldest timestamp has advanced past the
     // committedSnapshot we just read.
-    WiredTigerBeginTxnBlock txnOpen(
-        session, prepareConflictBehavior, roundUpPreparedTimestamps, RoundUpReadTimestamp::kRound);
+    WiredTigerBeginTxnBlock txnOpen(session,
+                                    prepareConflictBehavior,
+                                    roundUpPreparedTimestamps,
+                                    RoundUpReadTimestamp::kRound,
+                                    untimestampedWriteAssertion);
     auto status = txnOpen.setReadSnapshot(committedSnapshot);
     fassert(30635, status);
 

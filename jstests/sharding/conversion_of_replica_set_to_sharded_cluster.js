@@ -1,17 +1,28 @@
-/*
+/**
  * Tests that during an upgrade from a replica set to a sharded cluster the CRUD and DDL command
  * works. This implies testing those commands on a replica set directly when it is in a sharded
  * cluster.
  * @tags: [
+ *   multiversion_incompatible,
  *   requires_persistence,
- *   multiversion_incompatible
+ *   # TODO (SERVER-97257): Re-enable this test.
+ *   # Test doesn't start enough mongods to have num_mongos routers
+ *   embedded_router_incompatible,
+ *   requires_scripting
  * ]
  */
 
-(function() {
-'use strict';
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {waitForAllMembers} from "jstests/replsets/rslib.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
 
-load('jstests/replsets/rslib.js');
+// TODO: SERVER-80318 Convert test to connect to the shard port or delete completely if no longer
+// relevant.
+if (jsTestOptions().useAutoBootstrapProcedure) {
+    quit();
+}
 
 // TODO SERVER-50144 Remove this and allow orphan checking.
 // This test calls removeShard which can leave docs in config.rangeDeletions in state "pending",
@@ -259,16 +270,7 @@ let assertAddShardSucceeded = function(res, shardName) {
                "newly added shard " + res.shardAdded + " not found in config.shards");
 };
 
-var removeShardWithName = function(st, shardName) {
-    var res = st.s.adminCommand({removeShard: shardName});
-    assert.commandWorked(res);
-    assert.eq('started', res.state);
-    assert.soon(function() {
-        res = st.s.adminCommand({removeShard: shardName});
-        assert.commandWorked(res);
-        return ('completed' === res.state);
-    }, "removeShard never completed for shard " + shardName);
-};
+let removeShardWithName = removeShard;
 
 let checkCRUDCommands = function(testDB) {
     for (let command in CRUDCommands) {
@@ -294,7 +296,7 @@ let checkDDLCommands = function(testDB) {
 jsTest.log("Creating replica set.");
 let rst0 = new ReplSetTest({name: 'rs0', nodes: 2});
 rst0.startSet();
-rst0.initiate();
+rst0.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 waitForAllMembers(rst0.getPrimary().getDB(dbName));
 
 let coll = rst0.getPrimary().getDB(dbName).getCollection(collName);
@@ -315,7 +317,7 @@ checkCRUDCommands(rst0.getPrimary().getDB(dbName));
 checkDDLCommands(rst0.getPrimary().getDB(DDLDbName));
 
 let st = new ShardingTest({
-    shards: 0,
+    shards: TestData.configShard ? 1 : 0,
     mongos: 1,
 });
 
@@ -324,22 +326,26 @@ rst0.restart(0, {shardsvr: ''});
 rst0.restart(1, {shardsvr: ''});
 rst0.awaitReplication();
 
-checkCRUDCommands(rst0.getPrimary().getDB(dbName));
-checkDDLCommands(rst0.getPrimary().getDB(DDLDbName));
+// TODO SERVER-82316: currently we don't have full compatibility for direct connections.
+if (!FeatureFlagUtil.isPresentAndEnabled(rst0.getPrimary(),
+                                         "TrackUnshardedCollectionsUponCreation")) {
+    checkCRUDCommands(rst0.getPrimary().getDB(dbName));
+    checkDDLCommands(rst0.getPrimary().getDB(DDLDbName));
 
-jsTest.log("Third test, using the rs connection directly.");
-let addShardRes = st.s.adminCommand({addShard: rst0.getURL(), name: rst0.name});
-assertAddShardSucceeded(addShardRes, rst0.name);
+    jsTest.log("Third test, using the rs connection directly.");
+    let addShardRes = st.s.adminCommand({addShard: rst0.getURL(), name: rst0.name});
+    assertAddShardSucceeded(addShardRes, rst0.name);
 
-checkCRUDCommands(rst0.getPrimary().getDB(dbName));
-checkDDLCommands(rst0.getPrimary().getDB(DDLDbName));
+    checkCRUDCommands(rst0.getPrimary().getDB(dbName));
+    checkDDLCommands(rst0.getPrimary().getDB(DDLDbName));
 
-jsTest.log("Fourth test, using the router.");
-checkCRUDCommands(st.s0.getDB(dbName));
-checkDDLCommands(st.s0.getDB(DDLDbName));
+    jsTest.log("Fourth test, using the router.");
+    checkCRUDCommands(st.s0.getDB(dbName));
+    checkDDLCommands(st.s0.getDB(DDLDbName));
+}
 
 // Cleaning up.
-rst0.stopSet();
-
+jsTest.log("Finished test, stopping sharding test");
 st.stop();
-})();
+jsTest.log("Finished test, stopping replica set");
+rst0.stopSet();

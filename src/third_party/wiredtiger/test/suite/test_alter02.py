@@ -47,7 +47,6 @@ class test_alter02(TieredConfigMixin, wttest.WiredTigerTestCase):
 
     types = [
         ('file', dict(uri='file:', use_cg=False, use_index=False)),
-        ('lsm', dict(uri='lsm:', use_cg=False, use_index=False)),
         ('table-cg', dict(uri='table:', use_cg=True, use_index=False)),
         ('table-index', dict(uri='table:', use_cg=False, use_index=True)),
         ('table-simple', dict(uri='table:', use_cg=False, use_index=False)),
@@ -74,7 +73,7 @@ class test_alter02(TieredConfigMixin, wttest.WiredTigerTestCase):
         return None
     def ConnectionOpen(self):
         self.home = '.'
-        
+
         tiered_config = self.conn_config()
         tiered_config += self.extensionsConfig()
         # In case the open starts additional threads, flush first to avoid confusion.
@@ -106,8 +105,7 @@ class test_alter02(TieredConfigMixin, wttest.WiredTigerTestCase):
             if ret != 0:
                 break
             key = cursor.get_key()
-            check_meta = ((key.find("lsm:") != -1 or key.find("file:") != -1) \
-                and key.find(self.name) != -1)
+            check_meta = key.find("file:") != -1 and key.find(self.name) != -1
             if check_meta:
                 value = cursor[key]
                 found = True
@@ -138,9 +136,9 @@ class test_alter02(TieredConfigMixin, wttest.WiredTigerTestCase):
 
     # Alter: Change the log setting after creation
     def test_alter02_log(self):
-        if self.is_tiered_scenario() and (self.uri == 'lsm:' or self.uri == 'file:'):
-            self.skipTest('Tiered storage does not support LSM or file URIs.')
-        
+        if self.is_tiered_scenario() and (self.uri == 'file:'):
+            self.skipTest('Tiered storage does not support file URIs.')
+
         uri = self.uri + self.name
         create_params = 'key_format=i,value_format=S,'
         complex_params = ''
@@ -243,6 +241,3 @@ class test_alter02(TieredConfigMixin, wttest.WiredTigerTestCase):
         if self.conncreate or (self.connreopen and self.reopen):
             self.pr("EXPECTED KEYS 2: " + str(expected_keys))
             self.verify_logrecs(expected_keys)
-
-if __name__ == '__main__':
-    wttest.run()

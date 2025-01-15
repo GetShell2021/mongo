@@ -9,12 +9,14 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/libs/sync_source.js");
-load('jstests/replsets/rslib.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    DataCenter,
+    delayMessagesBetweenDataCenters,
+    forceSyncSource
+} from "jstests/replsets/libs/sync_source.js";
+import {setLogVerbosity} from "jstests/replsets/rslib.js";
 
 const name = jsTestName();
 const rst = new ReplSetTest({
@@ -36,7 +38,7 @@ const rst = new ReplSetTest({
 });
 
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const primary = rst.getPrimary();
 const centralSecondary = rst.getSecondaries()[0];
@@ -105,7 +107,13 @@ assert.soon(() => {
     const syncSourcePingTime = replSetGetStatus.members[0].pingMs;
     const receivedSyncSourceHb = (syncSourcePingTime > 60);
 
-    return (receivedCentralHb && receivedSyncSourceHb);
+    // Wait for enough heartbeat's from the desired sync source so that our understanding of the
+    // ping time to that node is at least 'changeSyncSourceThresholdMillis' less than the ping time
+    // to our current sync source.
+    const centralSecondaryPingTime = replSetGetStatus.members[1].pingMs;
+    const exceedsChangeSyncSourceThreshold = (syncSourcePingTime - centralSecondaryPingTime > 5);
+
+    return (receivedCentralHb && receivedSyncSourceHb && exceedsChangeSyncSourceThreshold);
 });
 
 const replSetGetStatus = assert.commandWorked(testNode.adminCommand({replSetGetStatus: 1}));
@@ -122,4 +130,3 @@ assert.eq(numSyncSourceChanges + 1,
           serverStatus.syncSource.numSyncSourceChangesDueToSignificantlyCloserNode);
 
 rst.stopSet();
-})();

@@ -28,11 +28,30 @@
  */
 #pragma once
 
+#include <boost/smart_ptr.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/static_immortal.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -127,8 +146,7 @@ private:
 template <typename BodyCallable, typename ConditionCallable, typename Delay>
 class [[nodiscard]] AsyncTryUntilWithDelay {
 public:
-    explicit AsyncTryUntilWithDelay(
-        BodyCallable && body, ConditionCallable && condition, Delay delay)
+    explicit AsyncTryUntilWithDelay(BodyCallable&& body, ConditionCallable&& condition, Delay delay)
         : _body(std::move(body)), _condition(std::move(condition)), _delay(delay) {}
 
     /**
@@ -140,13 +158,19 @@ public:
      * The returned ExecutorFuture contains the last result returned by the loop body. If the last
      * iteration of the loop body threw an exception or otherwise returned an error status, the
      * returned ExecutorFuture will contain that error.
+     *
+     * SleepableExecutor must be a shared_ptr to an OutOfLineExecutor that also provides a function:
+     * `ExecutorFuture<void> sleepFor(Milliseconds duration, const CancellationToken& token)`
+     * that readies the returned future when the given duration has elapsed or token cancelled.
      */
-    auto on(std::shared_ptr<executor::TaskExecutor> executor, CancellationToken cancelToken)&& {
-        auto loop = std::make_shared<TryUntilLoopWithDelay>(std::move(executor),
-                                                            std::move(_body),
-                                                            std::move(_condition),
-                                                            std::move(_delay),
-                                                            std::move(cancelToken));
+    template <typename SleepableExecutor>
+    auto on(SleepableExecutor executor, CancellationToken cancelToken) && {
+        auto loop =
+            std::make_shared<TryUntilLoopWithDelay<SleepableExecutor>>(std::move(executor),
+                                                                       std::move(_body),
+                                                                       std::move(_condition),
+                                                                       std::move(_delay),
+                                                                       std::move(cancelToken));
         // Launch the recursive chain using the helper class.
         return loop->run();
     }
@@ -156,8 +180,11 @@ private:
      * Helper class to perform the actual looping logic with a recursive member function run().
      * Mostly needed to clean up lambda captures and make the looping logic more readable.
      */
-    struct TryUntilLoopWithDelay : public std::enable_shared_from_this<TryUntilLoopWithDelay> {
-        TryUntilLoopWithDelay(std::shared_ptr<executor::TaskExecutor> executor,
+    template <typename SleepableExecutor>
+    class TryUntilLoopWithDelay
+        : public std::enable_shared_from_this<TryUntilLoopWithDelay<SleepableExecutor>> {
+    public:
+        TryUntilLoopWithDelay(SleepableExecutor executor,
                               BodyCallable executeLoopBody,
                               ConditionCallable shouldStopIteration,
                               Delay delay,
@@ -190,7 +217,7 @@ private:
             return std::move(future).thenRunOn(executor);
         }
 
-
+    private:
         /**
          * Helper function that schedules an asynchronous task. This task executes the loop body and
          * either terminates the loop by emplacing the resultPromise, or makes a recursive call to
@@ -248,7 +275,7 @@ private:
             });
         }
 
-        std::shared_ptr<executor::TaskExecutor> executor;
+        SleepableExecutor executor;
         BodyCallable executeLoopBody;
         ConditionCallable shouldStopIteration;
         Delay delay;
@@ -269,7 +296,7 @@ private:
 template <typename BodyCallable, typename ConditionCallable>
 class [[nodiscard]] AsyncTryUntil {
 public:
-    explicit AsyncTryUntil(BodyCallable && body, ConditionCallable && condition)
+    explicit AsyncTryUntil(BodyCallable&& body, ConditionCallable&& condition)
         : _body(std::move(body)), _condition(std::move(condition)) {}
 
     /**
@@ -277,7 +304,7 @@ public:
      * loop body.
      */
     template <typename DurationType>
-    auto withDelayBetweenIterations(DurationType delay)&& {
+    auto withDelayBetweenIterations(DurationType delay) && {
         return AsyncTryUntilWithDelay(
             std::move(_body), std::move(_condition), ConstDelay<DurationType>(std::move(delay)));
     }
@@ -287,7 +314,7 @@ public:
      * executing the loop body.
      */
     template <typename BackoffType>
-    auto withBackoffBetweenIterations(BackoffType backoff)&& {
+    auto withBackoffBetweenIterations(BackoffType backoff) && {
         return AsyncTryUntilWithDelay(
             std::move(_body), std::move(_condition), BackoffDelay<BackoffType>(std::move(backoff)));
     }
@@ -302,7 +329,7 @@ public:
      * iteration of the loop body threw an exception or otherwise returned an error status, the
      * returned ExecutorFuture will contain that error.
      */
-    auto on(ExecutorPtr executor, CancellationToken cancelToken)&& {
+    auto on(ExecutorPtr executor, CancellationToken cancelToken) && {
         auto loop = std::make_shared<TryUntilLoop>(
             std::move(executor), std::move(_body), std::move(_condition), std::move(cancelToken));
         // Launch the recursive chain using the helper class.
@@ -340,7 +367,8 @@ private:
      * Helper class to perform the actual looping logic with a recursive member function run().
      * Mostly needed to clean up lambda captures and make the looping logic more readable.
      */
-    struct TryUntilLoop : public std::enable_shared_from_this<TryUntilLoop> {
+    class TryUntilLoop : public std::enable_shared_from_this<TryUntilLoop> {
+    public:
         TryUntilLoop(ExecutorPtr executor,
                      BodyCallable executeLoopBody,
                      ConditionCallable shouldStopIteration,
@@ -372,6 +400,7 @@ private:
             return std::move(future).thenRunOn(executor);
         }
 
+    private:
         /**
          * Helper function that schedules an asynchronous task. This task executes the loop body and
          * either terminates the loop by emplacing the resultPromise, or makes a recursive call to
@@ -457,22 +486,24 @@ std::vector<T> variadicArgsToVector(U&&... elems) {
  * Example usage to send a request until a successful status is returned:
  *    ExecutorFuture<Response> response =
  *           AsyncTry([] { return sendRequest(); })
- *          .until([](StatusWith<Response> swResponse) { return swResponse.isOK(); })
+ *          .until([](const StatusWith<Response>& swResponse) { return swResponse.isOK(); })
  *          .withDelayBetweenIterations(Milliseconds(100)) // This call is optional.
  *          .on(executor);
  *
- * Note that the AsyncTry() call passes on the return value of its input lambda (the *body*) to the
- * condition lambda of Until, even if the body returns an error or throws - in which case the
- * StatusWith<T> will contain an error status. The delay inserted by WithDelayBetweenIterations
- * takes place after evaluating the condition and before executing the loop body an extra time.
+ * The constructor for `AsyncTry` accepts a callable that is invoked as part of running every loop
+ * iteration. The `until` predicate peeks at the result of running this callable to decide if the
+ * loop can be terminated. The predicate must accept a `StatusWith<T>`, where `T` is the return
+ * type for the callable, and should accept this argument as a const reference. This allows
+ * avoiding unnecessary copies and supporting move-only types. Optionally, a delay can be added
+ * after each iteration of the loop through invoking `withDelayBetweenIterations`.
  */
 template <typename Callable>
 class [[nodiscard]] AsyncTry {
 public:
-    explicit AsyncTry(Callable && callable) : _body(std::move(callable)) {}
+    explicit AsyncTry(Callable&& callable) : _body(std::move(callable)) {}
 
     template <typename Condition>
-    auto until(Condition && condition)&& {
+    auto until(Condition&& condition) && {
         return future_util_details::AsyncTryUntil(std::move(_body), std::move(condition));
     }
 
@@ -485,11 +516,11 @@ public:
  * error as soon as any input future is set with an error. The resulting vector contains the results
  * of all of the input futures in the same order in which they were provided.
  */
-TEMPLATE(typename FutureLike,
-         typename Value = typename FutureLike::value_type,
-         typename ResultVector = std::vector<Value>)
-REQUIRES(!std::is_void_v<Value> && future_util_details::isFutureOrExecutorFuture<FutureLike>)
-SemiFuture<ResultVector> whenAllSucceed(std::vector<FutureLike>&& futures) {
+template <typename FutureLike,
+          typename Value = typename FutureLike::value_type,
+          typename ResultVector = std::vector<Value>>
+requires(!std::is_void_v<Value> && future_util_details::isFutureOrExecutorFuture<FutureLike>)
+    SemiFuture<ResultVector> whenAllSucceed(std::vector<FutureLike>&& futures) {
     invariant(futures.size() > 0, future_util_details::kWhenAllSucceedEmptyInputInvariantMsg);
 
     // A structure used to share state between the input futures.
@@ -549,9 +580,9 @@ SemiFuture<ResultVector> whenAllSucceed(std::vector<FutureLike>&& futures) {
  * Variant of whenAllSucceed for void input futures. The only behavior difference is that it returns
  * SemiFuture<void> instead of SemiFuture<std::vector<T>>.
  */
-TEMPLATE(typename FutureLike, typename Value = typename FutureLike::value_type)
-REQUIRES(std::is_void_v<Value>&& future_util_details::isFutureOrExecutorFuture<FutureLike>)
-SemiFuture<void> whenAllSucceed(std::vector<FutureLike>&& futures) {
+template <typename FutureLike, typename Value = typename FutureLike::value_type>
+requires(std::is_void_v<Value>&& future_util_details::isFutureOrExecutorFuture<FutureLike>)
+    SemiFuture<void> whenAllSucceed(std::vector<FutureLike>&& futures) {
     invariant(futures.size() > 0, future_util_details::kWhenAllSucceedEmptyInputInvariantMsg);
 
     // A structure used to share state between the input futures.
@@ -704,11 +735,11 @@ SemiFuture<Result> whenAny(std::vector<FutureT>&& futures) {
  * we peel off the first element of each input list in order to assist the compiler in type
  * inference and to prevent 0 length lists from compiling.
  */
-TEMPLATE(typename... FuturePack,
-         typename FutureLike = std::common_type_t<FuturePack...>,
-         typename Value = typename FutureLike::value_type,
-         typename ResultVector = std::vector<Value>)
-REQUIRES(future_util_details::isFutureOrExecutorFuture<FutureLike>)
+template <typename... FuturePack,
+          typename FutureLike = std::common_type_t<FuturePack...>,
+          typename Value = typename FutureLike::value_type,
+          typename ResultVector = std::vector<Value>>
+requires future_util_details::isFutureOrExecutorFuture<FutureLike>
 auto whenAllSucceed(FuturePack&&... futures) {
     return whenAllSucceed(
         future_util_details::variadicArgsToVector(std::forward<FuturePack>(futures)...));
@@ -813,7 +844,7 @@ public:
      * running the launcher.
      */
     template <typename Launcher>
-        auto thenWithState(Launcher && launcher) && noexcept {
+    auto thenWithState(Launcher&& launcher) && noexcept {
         using namespace future_details;
         using ReturnType = FutureFor<NormalizedCallResult<Launcher, State*>>;
 
@@ -838,7 +869,7 @@ public:
      * If an exception would be emitted, it is instead stored in the AsyncState.
      */
     template <typename... Args>
-    static auto make(Args && ... args) noexcept {
+    static auto make(Args&&... args) noexcept {
         try {
             auto ptr = std::make_unique<State>(std::forward<Args>(args)...);
             return AsyncState(std::move(ptr));

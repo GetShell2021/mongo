@@ -12,7 +12,7 @@ test_type_size("uintmax_t" u_intmax_size)
 test_type_size("unsigned long long" u_long_long_size)
 set(default_uintmax_def " ")
 if(${u_intmax_size} STREQUAL "")
-    if(${unsigned long long} STREQUAL "")
+    if(${u_long_long_size} STREQUAL "")
         set(default_uintmax_def "typedef unsigned long uintmax_t\\;")
     else()
         set(default_uintmax_def "typedef unsigned long long uintmax_t\\;")
@@ -147,13 +147,6 @@ config_func(
 )
 
 config_func(
-    HAVE_FTRUNCATE
-    "Function ftruncate exists."
-    FUNC "ftruncate"
-    FILES "unistd.h;sys/types.h"
-)
-
-config_func(
     HAVE_GETTIMEOFDAY
     "Function gettimeofday exists."
     FUNC "gettimeofday"
@@ -243,6 +236,19 @@ config_lib(
 )
 
 config_lib(
+    HAVE_LIBCXX
+    "stdc++ library exists."
+    LIB "stdc++"
+)
+
+config_lib(
+    HAVE_LIBACCEL_CONFIG
+    "accel-config library exists."
+    LIB "accel-config"
+)
+
+
+config_lib(
     HAVE_LIBLZ4
     "lz4 library exists."
     LIB "lz4"
@@ -271,17 +277,17 @@ config_lib(
 )
 
 config_lib(
+    HAVE_LIBQPL
+    "qpl library exists."
+    LIB "qpl"
+    HEADER "qpl/qpl.h"
+)
+
+config_lib(
     HAVE_LIBSODIUM
     "sodium library exists."
     LIB "sodium"
     HEADER "sodium.h"
-)
-
-config_lib(
-    HAVE_LIBTCMALLOC
-    "tcmalloc library exists."
-    LIB "tcmalloc"
-    HEADER "gperftools/tcmalloc.h"
 )
 
 config_compile(

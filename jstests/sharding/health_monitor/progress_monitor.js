@@ -1,10 +1,14 @@
-/*
- *  @tags: [multiversion_incompatible]
+/**
+ * @tags: [
+ *   multiversion_incompatible,
+ *   # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *   embedded_router_incompatible,
+ * ]
  */
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 const PROGRESS_TIMEOUT_SECONDS = 5;
 const monitoringIntervalMs = 500;
-(function() {
-'use strict';
 
 const params = {
     setParameter: {
@@ -17,7 +21,6 @@ const params = {
             tojson({values: [{type: "test", interval: NumberInt(monitoringIntervalMs)}]}),
         progressMonitor:
             tojson({interval: PROGRESS_TIMEOUT_SECONDS * 1000, deadline: PROGRESS_TIMEOUT_SECONDS}),
-        featureFlagHealthMonitoring: true
     }
 };
 let st = new ShardingTest({
@@ -62,4 +65,3 @@ assert.soon(() => {
 // Don't validate exit codes, since a mongos will exit on its own with a non-zero exit code.
 
 st.stop({skipValidatingExitCode: true});
-})();

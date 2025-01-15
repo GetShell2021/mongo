@@ -4,10 +4,8 @@
  * @tags: [requires_fcv_60]
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/write_concern_util.js");  // For 'shardCollectionWithChunks'
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {shardCollectionWithChunks} from "jstests/libs/write_concern_util.js";
 
 const validateErrorResponse = function(
     res, db, collectionUUID, expectedCollection, actualCollection) {
@@ -31,6 +29,8 @@ const st = new ShardingTest({
 
 const testDB = st.s.getDB(jsTestName());
 assert.commandWorked(testDB.dropDatabase());
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'shardedCollection', primaryShard: st.shard0.shardName}));
 const shardedCollection = testDB["shardedCollection"];
 // Set up sharded collection. Put 5 documents on each shard, with keys {x: 0...9}.
 shardCollectionWithChunks(st, shardedCollection, 10 /* numDocs */);
@@ -40,12 +40,11 @@ assert.commandWorked(sameShardColl.insert({x: 1, y: 1}));
 
 const otherDB = testDB.getSiblingDB("otherDB");
 assert.commandWorked(otherDB.dropDatabase());
+// Make sure that the primary shard is different for the shardedCollection and the otherShardColl.
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'otherShardColl', primaryShard: st.shard1.shardName}));
 const otherShardColl = otherDB["otherShardColl"];
 assert.commandWorked(otherShardColl.insert({x: 1, y: 1}));
-
-// Make sure that the primary shard is different for the shardedCollection and the otherShardColl.
-st.ensurePrimaryShard(testDB.getName(), st.shard0.shardName);
-st.ensurePrimaryShard(otherDB.getName(), st.shard1.shardName);
 
 const otherShardUUID = getUUID(otherDB, otherShardColl.getName());
 const shardedUUID = getUUID(testDB, shardedCollection.getName());
@@ -92,4 +91,3 @@ testCommand("aggregate", {aggregate: "", pipeline: [{$collStats: {latencyStats: 
 testCommand("aggregate", {aggregate: "", pipeline: [{$indexStats: {}}], cursor: {}});
 
 st.stop();
-})();

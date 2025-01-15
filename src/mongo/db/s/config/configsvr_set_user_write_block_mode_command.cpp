@@ -28,17 +28,30 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/config/configsvr_coordinator.h"
+#include "mongo/db/s/config/configsvr_coordinator_gen.h"
 #include "mongo/db/s/config/configsvr_coordinator_service.h"
-#include "mongo/db/s/config/set_user_write_block_mode_coordinator.h"
-#include "mongo/db/server_feature_flags_gen.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
+#include "mongo/db/s/config/set_user_write_block_mode_coordinator_document_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -58,20 +71,13 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName << " can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
             const auto startBlocking = request().getGlobal();
 
             const auto coordinatorCompletionFuture = [&]() -> SharedSemiFuture<void> {
-                // TODO SERVER-65010 Remove FCV guard once 6.0 has branched out
-                FixedFCVRegion fixedFcvRegion(opCtx);
-                uassert(ErrorCodes::IllegalOperation,
-                        "featureFlagUserWriteBlocking not enabled",
-                        gFeatureFlagUserWriteBlocking.isEnabled(
-                            serverGlobalParams.featureCompatibility));
-
                 SetUserWriteBlockModeCoordinatorDocument coordinatorDoc{startBlocking};
                 coordinatorDoc.setConfigsvrCoordinatorMetadata(
                     {ConfigsvrCoordinatorTypeEnum::kSetUserWriteBlockMode});
@@ -99,8 +105,9 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
 
@@ -116,7 +123,8 @@ public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
-} configsvrSetUserWriteBlockModeCmd;
+};
+MONGO_REGISTER_COMMAND(ConfigsvrSetUserWriteBlockModeCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

@@ -30,14 +30,17 @@
 #include "mongo/platform/decimal128.h"
 
 #include <array>
+#include <cfloat>
 #include <cmath>
 #include <fmt/format.h>
+#include <limits>
 #include <memory>
 #include <string>
-#include <utility>
 
-#include "mongo/config.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -74,41 +77,41 @@ TEST(Decimal128Test, TestConstructor) {
         TEST_CTOR_COMMON_(vn, HIGH64, LOW64)      \
     }
 
-    TEST_CTOR(int8_t{0}, posHigh, 0);  // +0E+0
-    TEST_CTOR(Lim<int8_t>::lowest(), negHigh, uint64_t{1} << 7);
-    TEST_CTOR(Lim<int8_t>::max(), posHigh, (uint64_t{1} << 7) - 1);
-    TEST_CTOR(int8_t{5}, posHigh, 0x5);
+    TEST_CTOR(int8_t{0}, posHigh, 0);                                // NOLINT
+    TEST_CTOR(Lim<int8_t>::lowest(), negHigh, uint64_t{1} << 7);     // NOLINT
+    TEST_CTOR(Lim<int8_t>::max(), posHigh, (uint64_t{1} << 7) - 1);  // NOLINT
+    TEST_CTOR(int8_t{5}, posHigh, 0x5);                              // NOLINT
 
-    TEST_CTOR(uint8_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<uint8_t>::max(), posHigh, (uint64_t{1} << 8) - 1);
-    TEST_CTOR(uint8_t{5}, posHigh, 0x5);
+    TEST_CTOR(uint8_t{0}, posHigh, 0);                                // NOLINT
+    TEST_CTOR(Lim<uint8_t>::max(), posHigh, (uint64_t{1} << 8) - 1);  // NOLINT
+    TEST_CTOR(uint8_t{5}, posHigh, 0x5);                              // NOLINT
 
-    TEST_CTOR(int16_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<int16_t>::lowest(), negHigh, uint64_t{1} << 15);
-    TEST_CTOR(Lim<int16_t>::max(), posHigh, (uint64_t{1} << 15) - 1);
-    TEST_CTOR(int16_t{5}, posHigh, 0x5);
+    TEST_CTOR(int16_t{0}, posHigh, 0);                                 // NOLINT
+    TEST_CTOR(Lim<int16_t>::lowest(), negHigh, uint64_t{1} << 15);     // NOLINT
+    TEST_CTOR(Lim<int16_t>::max(), posHigh, (uint64_t{1} << 15) - 1);  // NOLINT
+    TEST_CTOR(int16_t{5}, posHigh, 0x5);                               // NOLINT
 
-    TEST_CTOR(uint16_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<uint16_t>::max(), posHigh, (uint64_t{1} << 16) - 1);
-    TEST_CTOR(uint16_t{5}, posHigh, 0x5);
+    TEST_CTOR(uint16_t{0}, posHigh, 0);                                 // NOLINT
+    TEST_CTOR(Lim<uint16_t>::max(), posHigh, (uint64_t{1} << 16) - 1);  // NOLINT
+    TEST_CTOR(uint16_t{5}, posHigh, 0x5);                               // NOLINT
 
-    TEST_CTOR(int32_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<int32_t>::lowest(), negHigh, uint64_t{1} << 31);
-    TEST_CTOR(Lim<int32_t>::max(), posHigh, (uint64_t{1} << 31) - 1);
-    TEST_CTOR(int32_t{5}, posHigh, 0x5);
+    TEST_CTOR(int32_t{0}, posHigh, 0);                                 // NOLINT
+    TEST_CTOR(Lim<int32_t>::lowest(), negHigh, uint64_t{1} << 31);     // NOLINT
+    TEST_CTOR(Lim<int32_t>::max(), posHigh, (uint64_t{1} << 31) - 1);  // NOLINT
+    TEST_CTOR(int32_t{5}, posHigh, 0x5);                               // NOLINT
 
-    TEST_CTOR(uint32_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<uint32_t>::max(), posHigh, (uint64_t{1} << 32) - 1);
-    TEST_CTOR(uint32_t{5}, posHigh, 0x5);
+    TEST_CTOR(uint32_t{0}, posHigh, 0);                                 // NOLINT
+    TEST_CTOR(Lim<uint32_t>::max(), posHigh, (uint64_t{1} << 32) - 1);  // NOLINT
+    TEST_CTOR(uint32_t{5}, posHigh, 0x5);                               // NOLINT
 
-    TEST_CTOR(int64_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<int64_t>::lowest(), negHigh, uint64_t{1} << 63);
-    TEST_CTOR(Lim<int64_t>::max(), posHigh, (uint64_t{1} << 63) - 1);
-    TEST_CTOR(int64_t{5}, posHigh, 0x5);
+    TEST_CTOR(int64_t{0}, posHigh, 0);                                 // NOLINT
+    TEST_CTOR(Lim<int64_t>::lowest(), negHigh, uint64_t{1} << 63);     // NOLINT
+    TEST_CTOR(Lim<int64_t>::max(), posHigh, (uint64_t{1} << 63) - 1);  // NOLINT
+    TEST_CTOR(int64_t{5}, posHigh, 0x5);                               // NOLINT
 
-    TEST_CTOR(uint64_t{0}, posHigh, 0);
-    TEST_CTOR(Lim<uint64_t>::max(), posHigh, Lim<uint64_t>::max());
-    TEST_CTOR(uint64_t{5}, posHigh, 0x5);
+    TEST_CTOR(uint64_t{0}, posHigh, 0);                              // NOLINT
+    TEST_CTOR(Lim<uint64_t>::max(), posHigh, Lim<uint64_t>::max());  // NOLINT
+    TEST_CTOR(uint64_t{5}, posHigh, 0x5);                            // NOLINT
 
 #undef TEST_CTOR_COMMON_
 #undef TEST_CTOR
@@ -292,6 +295,14 @@ TEST(Decimal128Test, TestStringConstructorNaN) {
     uint64_t lowBytes = 0x0000000000000000;
     ASSERT_EQUALS(val.high64, highBytes);
     ASSERT_EQUALS(val.low64, lowBytes);
+}
+
+TEST(Decimal128Test, TestStringConstructorInvalidCases) {
+    for (auto in : {"", "-", "+", ".", "e", "1e", "1e-", "1e+", ".e", ".e-", ".e+"}) {
+        uint32_t flags = 0;
+        Decimal128{in, &flags};
+        ASSERT(Decimal128::hasFlag(flags, Decimal128::SignalingFlag::kInvalid)) << "in=" << in;
+    }
 }
 
 TEST(Decimal128Test, TestLiteral) {
@@ -1229,7 +1240,9 @@ void assertRoundingTestCase(const Decimal128& actual,
 }
 
 TEST(Decimal128Test, TestDecimal128RoundingFractionalValues) {
-    auto d = [](auto x) { return Decimal128{x}; };
+    auto d = [](auto x) {
+        return Decimal128{x};
+    };
 
     // 'pBig' is the largest positive integer value where Decimal128 can represent pBig + 0.1
     // without losing precision.

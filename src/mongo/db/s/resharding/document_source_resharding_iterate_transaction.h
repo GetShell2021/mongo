@@ -29,7 +29,31 @@
 
 #pragma once
 
+#include <memory>
+#include <set>
+#include <stack>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/session/logical_session_id.h"
 
 namespace mongo {
 
@@ -66,7 +90,7 @@ public:
 
     DocumentSource::GetModPathsReturn getModifiedPaths() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 
@@ -74,9 +98,15 @@ public:
         return boost::none;
     }
 
-    const char* getSourceName() const {
+    const char* getSourceName() const override {
         return DocumentSourceReshardingIterateTransaction::kStageName.rawData();
     }
+
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kReshardingIterateTransaction;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
 protected:
     DocumentSource::GetNextResult doGetNext() override;

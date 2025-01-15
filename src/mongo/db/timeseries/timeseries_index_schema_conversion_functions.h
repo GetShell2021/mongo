@@ -29,9 +29,15 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <list>
+
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/timeseries/timeseries_options.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
 
 /**
  * Namespace for helper functions converting index spec schema between time-series collection and
@@ -50,6 +56,19 @@ StatusWith<BSONObj> createBucketsIndexSpecFromTimeseriesIndexSpec(
 
 StatusWith<BSONObj> createBucketsShardKeySpecFromTimeseriesShardKeySpec(
     const TimeseriesOptions& timeseriesOptions, const BSONObj& timeseriesIndexSpecBSON);
+
+boost::optional<BSONObj> createTimeseriesIndexFromBucketsIndexSpec(
+    const TimeseriesOptions& timeseriesOptions, const BSONObj& bucketsIndexSpecBSON);
+
+/**
+ * Maps a bucket collection shard key to a bucket collection index backing the shard key using the
+ * information provided in 'timeseriesOptions'.
+ *
+ * Returns boost::none if the specified 'bucketShardKeySpecBSON' is invalid for the time-series
+ * collection.
+ */
+boost::optional<BSONObj> createBucketsShardKeyIndexFromBucketsShardKeySpec(
+    const TimeseriesOptions& timeseriesOptions, const BSONObj& bucketShardKeySpecBSON);
 
 /**
  * Returns a time-series collection index spec equivalent to the given 'bucketsIndex' using the
@@ -97,5 +116,13 @@ bool doesBucketsIndexIncludeMeasurement(OperationContext* opCtx,
  * or it can be {} which means no hint is given.
  */
 bool isHintIndexKey(const BSONObj& obj);
+
+/**
+ * Returns an index hint which we can use for query based reopening, if a suitable index exists for
+ * the collection.
+ */
+boost::optional<BSONObj> getIndexSupportingReopeningQuery(OperationContext* opCtx,
+                                                          const IndexCatalog* indexCatalog,
+                                                          const TimeseriesOptions& tsOptions);
 
 }  // namespace mongo::timeseries

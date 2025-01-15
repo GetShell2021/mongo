@@ -28,17 +28,26 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <cstddef>
+#include <random>
+#include <vector>
 
-#include "mongo/bson/bson_depth.h"
-#include "mongo/bson/json.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/update/document_diff_calculator.h"
 #include "mongo/db/update/document_diff_test_helpers.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/platform/random.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -141,15 +150,13 @@ void runTest(TestOptions* options) {
         std::vector<BSONObj> diffs;
         diffs.reserve(options->documents.size() - 1);
         for (size_t i = 1; i < options->documents.size(); ++i) {
-            const auto diffOutput = computeDiff(preDoc,
-                                                options->documents[i],
-                                                update_oplog_entry::kSizeOfDeltaOplogEntryMetadata,
-                                                nullptr);
+            const auto diffOutput = computeOplogDiff(
+                preDoc, options->documents[i], update_oplog_entry::kSizeOfDeltaOplogEntryMetadata);
 
             ASSERT(diffOutput);
-            diffs.push_back(diffOutput->diff);
+            diffs.push_back(*diffOutput);
             const auto postObj = applyDiffTestHelper(
-                preDoc, diffOutput->diff, options->mustCheckExistenceForInsertOperations);
+                preDoc, *diffOutput, options->mustCheckExistenceForInsertOperations);
             ASSERT_BSONOBJ_BINARY_EQ(options->documents[i], postObj);
 
             if (options->mustCheckExistenceForInsertOperations) {
@@ -157,7 +164,7 @@ void runTest(TestOptions* options) {
                 ASSERT_BSONOBJ_BINARY_EQ(
                     postObj,
                     applyDiffTestHelper(
-                        postObj, diffOutput->diff, options->mustCheckExistenceForInsertOperations));
+                        postObj, *diffOutput, options->mustCheckExistenceForInsertOperations));
             }
 
             preDoc = options->documents[i];

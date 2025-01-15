@@ -1,4 +1,5 @@
 """Script to generate & upload 'buildId -> debug symbols URL' mappings to symbolizer service."""
+
 import argparse
 import json
 import logging
@@ -10,7 +11,7 @@ import subprocess
 import sys
 import time
 from json import JSONDecoder
-from typing import Optional, Tuple, Generator, Dict, List, NamedTuple
+from typing import Dict, Generator, List, NamedTuple, Optional
 
 import requests
 
@@ -18,9 +19,12 @@ import requests
 sys.path.append(str(pathlib.Path(os.path.join(os.getcwd(), __file__)).parent.parent))
 
 # pylint: disable=wrong-import-position
-from buildscripts.util.oauth import get_client_cred_oauth_credentials, Configs
-from buildscripts.resmokelib.setup_multiversion.setup_multiversion import SetupMultiversion, download
 from buildscripts.build_system_options import PathOptions
+from buildscripts.resmokelib.setup_multiversion.setup_multiversion import (
+    SetupMultiversion,
+    download,
+)
+from buildscripts.util.oauth import Configs, get_client_cred_oauth_credentials
 
 BUILD_INFO_RE = re.compile(r"Build Info: ({(\n.*)*})")
 MONGOD = "mongod"
@@ -38,8 +42,9 @@ class CmdClient:
         :return: Command output.
         """
 
-        out = subprocess.run(args, close_fds=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             check=False)
+        out = subprocess.run(
+            args, close_fds=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False
+        )
         return out.stdout.strip().decode()
 
 
@@ -70,8 +75,9 @@ class BinVersionOutput(NamedTuple):
 class CmdOutputExtractor:
     """Data extractor from command output."""
 
-    def __init__(self, cmd_client: Optional[CmdClient] = None,
-                 json_decoder: Optional[JSONDecoder] = None) -> None:
+    def __init__(
+        self, cmd_client: Optional[CmdClient] = None, json_decoder: Optional[JSONDecoder] = None
+    ) -> None:
         """
         Initialize.
 
@@ -114,10 +120,10 @@ class CmdOutputExtractor:
         build_id = None
         for line in out.splitlines():
             line = line.strip()
-            if line.startswith('Build ID'):
+            if line.startswith("Build ID"):
                 if build_id is not None:
                     raise ValueError("Found multiple Build ID values.")
-                build_id = line.split(': ')[1]
+                build_id = line.split(": ")[1]
         return build_id
 
     def _get_mongodb_version(self, out: str) -> Optional[str]:
@@ -140,8 +146,13 @@ class CmdOutputExtractor:
 class DownloadOptions(object):
     """A class to collect download option configurations."""
 
-    def __init__(self, download_binaries=False, download_symbols=False, download_artifacts=False,
-                 download_python_venv=False):
+    def __init__(
+        self,
+        download_binaries=False,
+        download_symbols=False,
+        download_artifacts=False,
+        download_python_venv=False,
+    ):
         """Initialize instance."""
 
         self.download_binaries = download_binaries
@@ -153,24 +164,34 @@ class DownloadOptions(object):
 class Mapper:
     """A class to to basically all of the work."""
 
-    # pylint: disable=too-many-instance-attributes
     # This amount of attributes are necessary.
 
-    default_web_service_base_url: str = "https://symbolizer-service.server-tig.prod.corp.mongodb.com"
-    default_cache_dir = os.path.join(os.getcwd(), 'build', 'symbols_cache')
-    selected_binaries = ('mongos.debug', 'mongod.debug', 'mongo.debug')
+    default_web_service_base_url: str = (
+        "https://symbolizer-service.server-tig.prod.corp.mongodb.com"
+    )
+    default_cache_dir = os.path.join(os.getcwd(), "build", "symbols_cache")
+    selected_binaries = ("mongos", "mongod", "mongo")
     default_client_credentials_scope = "servertig-symbolizer-fullaccess"
     default_client_credentials_user_name = "client-user"
-    default_creds_file_path = os.path.join(os.getcwd(), '.symbolizer_credentials.json')
+    default_creds_file_path = os.path.join(os.getcwd(), ".symbolizer_credentials.json")
 
-    def __init__(self, evg_version: str, evg_variant: str, client_id: str, client_secret: str,
-                 cache_dir: str = None, web_service_base_url: str = None,
-                 logger: logging.Logger = None):
+    def __init__(
+        self,
+        evg_version: str,
+        evg_variant: str,
+        is_san_variant: bool,
+        client_id: str,
+        client_secret: str,
+        cache_dir: str = None,
+        web_service_base_url: str = None,
+        logger: logging.Logger = None,
+    ):
         """
         Initialize instance.
 
         :param evg_version: Evergreen version ID.
         :param evg_variant: Evergreen build variant name.
+        :param is_san_variant: Whether build variant is sanitizer build.
         :param client_id: Client id for Okta Oauth.
         :param client_secret: Secret key for Okta Oauth.
         :param cache_dir: Full path to cache directory as a string.
@@ -179,12 +200,13 @@ class Mapper:
         """
         self.evg_version = evg_version
         self.evg_variant = evg_variant
+        self.is_san_variant = is_san_variant
         self.cache_dir = cache_dir or self.default_cache_dir
         self.web_service_base_url = web_service_base_url or self.default_web_service_base_url
 
         if not logger:
             logging.basicConfig()
-            logger = logging.getLogger('symbolizer')
+            logger = logging.getLogger("symbolizer")
             logger.setLevel(logging.INFO)
         self.logger = logger
 
@@ -192,12 +214,15 @@ class Mapper:
 
         self.multiversion_setup = SetupMultiversion(
             DownloadOptions(download_symbols=True, download_binaries=True),
-            variant=self.evg_variant, ignore_failed_push=True)
+            variant=self.evg_variant,
+            ignore_failed_push=True,
+        )
         self.debug_symbols_url = None
         self.url = None
         self.configs = Configs(
             client_credentials_scope=self.default_client_credentials_scope,
-            client_credentials_user_name=self.default_client_credentials_user_name)
+            client_credentials_user_name=self.default_client_credentials_user_name,
+        )
         self.client_id = client_id
         self.client_secret = client_secret
         self.path_options = PathOptions()
@@ -221,17 +246,21 @@ class Mapper:
                     self.http_client.headers.update({"Authorization": f"Bearer {access_token}"})
                     return
 
-        credentials = get_client_cred_oauth_credentials(self.client_id, self.client_secret,
-                                                        configs=self.configs)
+        credentials = get_client_cred_oauth_credentials(
+            self.client_id, self.client_secret, configs=self.configs
+        )
         self.http_client.headers.update({"Authorization": f"Bearer {credentials.access_token}"})
 
         # write credentials to local file for further usage
         with open(self.default_creds_file_path, "w") as cfile:
             cfile.write(
-                json.dumps({
-                    "access_token": credentials.access_token,
-                    "expire_time": time.time() + credentials.expires_in
-                }))
+                json.dumps(
+                    {
+                        "access_token": credentials.access_token,
+                        "expire_time": time.time() + credentials.expires_in,
+                    }
+                )
+            )
 
     def __enter__(self):
         """Return instance when used as a context manager."""
@@ -257,22 +286,28 @@ class Mapper:
         :param url: download URL
         :return: full name for local file
         """
-        return url.split('/')[-1]
+        return url.split("/")[-1]
 
     def setup_urls(self):
         """Set up URLs using multiversion."""
 
         urlinfo = self.multiversion_setup.get_urls(self.evg_version, self.evg_variant)
 
-        download_symbols_url = urlinfo.urls.get("mongo-debugsymbols.tgz", None)
         binaries_url = urlinfo.urls.get("Binaries", "")
+        if self.is_san_variant:
+            # Sanitizer builds are not stripped and contain debug symbols
+            download_symbols_url = binaries_url
+        else:
+            download_symbols_url = urlinfo.urls.get("mongo-debugsymbols.tgz") or urlinfo.urls.get(
+                "mongo-debugsymbols.zip"
+            )
 
         if not download_symbols_url:
-            download_symbols_url = urlinfo.urls.get("mongo-debugsymbols.zip", None)
-
-        if not download_symbols_url:
-            self.logger.error("Couldn't find URL for debug symbols. Version: %s, URLs dict: %s",
-                              self.evg_version, urlinfo.urls)
+            self.logger.error(
+                "Couldn't find URL for debug symbols. Version: %s, URLs dict: %s",
+                self.evg_version,
+                urlinfo.urls,
+            )
             raise ValueError(f"Debug symbols URL not found. URLs dict: {urlinfo.urls}")
 
         self.debug_symbols_url = download_symbols_url
@@ -285,7 +320,7 @@ class Mapper:
         :param path: full path of file
         :return: full path of directory of unpacked file
         """
-        foldername = path.replace('.tgz', '', 1).split('/')[-1]
+        foldername = path.replace(".tgz", "", 1).split("/")[-1]
         out_dir = os.path.join(self.cache_dir, foldername)
 
         if not os.path.exists(out_dir):
@@ -320,101 +355,107 @@ class Mapper:
 
         extractor = CmdOutputExtractor()
 
-        debug_symbols_path = self.download(self.debug_symbols_url)
-        debug_symbols_unpacked_path = self.unpack(debug_symbols_path)
-
         binaries_path = self.download(self.url)
         binaries_unpacked_path = self.unpack(binaries_path)
 
-        # we need to analyze two directories: main binary folder inside debug-symbols and
+        # we need to analyze two directories: main binary folder and
         # shared libraries folder inside binaries.
         # main binary folder holds main binaries, like mongos, mongod, mongo ...
         # shared libraries folder holds shared libraries, tons of them.
         # some build variants do not contain shared libraries.
 
-        debug_symbols_unpacked_path = os.path.join(debug_symbols_unpacked_path, 'dist-test')
-        binaries_unpacked_path = os.path.join(binaries_unpacked_path, 'dist-test')
+        binaries_unpacked_path = os.path.join(binaries_unpacked_path, "dist-test")
 
-        self.logger.info("INSIDE unpacked debug-symbols/dist-test: %s",
-                         os.listdir(debug_symbols_unpacked_path))
-        self.logger.info("INSIDE unpacked binaries/dist-test: %s",
-                         os.listdir(binaries_unpacked_path))
+        self.logger.info(
+            "INSIDE unpacked binaries/dist-test: %s", os.listdir(binaries_unpacked_path)
+        )
 
-        mongod_bin = os.path.join(binaries_unpacked_path, self.path_options.main_binary_folder_name,
-                                  MONGOD)
+        mongod_bin = os.path.join(
+            binaries_unpacked_path, self.path_options.main_binary_folder_name, MONGOD
+        )
         bin_version_output = extractor.get_bin_version(mongod_bin)
 
         if bin_version_output.mongodb_version is None:
-            self.logger.error("mongodb version could not be extracted. \n`%s --version` output: %s",
-                              mongod_bin, bin_version_output.cmd_output)
+            self.logger.error(
+                "mongodb version could not be extracted. \n`%s --version` output: %s",
+                mongod_bin,
+                bin_version_output.cmd_output,
+            )
             return
         else:
             self.logger.info("Extracted mongodb version: %s", bin_version_output.mongodb_version)
 
         # start with main binary folder
         for binary in self.selected_binaries:
-            full_bin_path = os.path.join(debug_symbols_unpacked_path,
-                                         self.path_options.main_binary_folder_name, binary)
+            full_bin_path = os.path.join(
+                binaries_unpacked_path, self.path_options.main_binary_folder_name, binary
+            )
 
             if not os.path.exists(full_bin_path):
                 self.logger.error("Could not find binary at %s", full_bin_path)
-                return
+                continue
 
             build_id_output = extractor.get_build_id(full_bin_path)
 
             if not build_id_output.build_id:
-                self.logger.error("Build ID couldn't be extracted. \nReadELF output %s",
-                                  build_id_output.cmd_output)
-                return
+                self.logger.error(
+                    "Build ID couldn't be extracted. \nReadELF output %s",
+                    build_id_output.cmd_output,
+                )
+                continue
             else:
                 self.logger.info("Extracted build ID: %s", build_id_output.build_id)
 
             yield {
-                'url': self.url,
-                'debug_symbols_url': self.debug_symbols_url,
-                'build_id': build_id_output.build_id,
-                'file_name': binary,
-                'version': bin_version_output.mongodb_version,
+                "url": self.url,
+                "debug_symbols_url": self.debug_symbols_url,
+                "build_id": build_id_output.build_id,
+                "file_name": binary,
+                "version": bin_version_output.mongodb_version,
             }
 
         # move to shared libraries folder.
         # it contains all shared library binary files,
         # we run readelf on each of them.
-        lib_folder_path = os.path.join(binaries_unpacked_path,
-                                       self.path_options.shared_library_folder_name)
+        lib_folder_path = os.path.join(
+            binaries_unpacked_path, self.path_options.shared_library_folder_name
+        )
 
         if not os.path.exists(lib_folder_path):
             # sometimes we don't get lib folder, which means there is no shared libraries for current build variant.
-            self.logger.info("'%s' folder does not exist.",
-                             self.path_options.shared_library_folder_name)
+            self.logger.info(
+                "'%s' folder does not exist.", self.path_options.shared_library_folder_name
+            )
             sofiles = []
         else:
             sofiles = os.listdir(lib_folder_path)
-            self.logger.info("'%s' folder: %s", self.path_options.shared_library_folder_name,
-                             sofiles)
+            self.logger.info(
+                "'%s' folder: %s", self.path_options.shared_library_folder_name, sofiles
+            )
 
         for sofile in sofiles:
             sofile_path = os.path.join(lib_folder_path, sofile)
 
             if not os.path.exists(sofile_path):
                 self.logger.error("Could not find binary at %s", sofile_path)
-                return
+                continue
 
             build_id_output = extractor.get_build_id(sofile_path)
 
             if not build_id_output.build_id:
-                self.logger.error("Build ID couldn't be extracted. \nReadELF out %s",
-                                  build_id_output.cmd_output)
-                return
+                self.logger.error(
+                    "Build ID couldn't be extracted. \nReadELF out %s", build_id_output.cmd_output
+                )
+                continue
             else:
                 self.logger.info("Extracted build ID: %s", build_id_output.build_id)
 
             yield {
-                'url': self.url,
-                'debug_symbols_url': self.debug_symbols_url,
-                'build_id': build_id_output.build_id,
-                'file_name': sofile,
-                'version': bin_version_output.mongodb_version,
+                "url": self.url,
+                "debug_symbols_url": self.debug_symbols_url,
+                "build_id": build_id_output.build_id,
+                "file_name": sofile,
+                "version": bin_version_output.mongodb_version,
             }
 
     def run(self):
@@ -427,12 +468,18 @@ class Mapper:
 
         # mappings is a generator, we iterate over to generate mappings on the go
         for mapping in mappings:
-            response = self.http_client.post('/'.join((self.web_service_base_url, 'add')),
-                                             json=mapping)
+            self.logger.info("Creating mapping %s", mapping)
+            response = self.http_client.post(
+                "/".join((self.web_service_base_url, "add")), json=mapping
+            )
             if response.status_code != 200:
                 self.logger.error(
                     "Could not store mapping, web service returned status code %s from URL %s. "
-                    "Response: %s", response.status_code, response.url, response.text)
+                    "Response: %s",
+                    response.status_code,
+                    response.url,
+                    response.text,
+                )
 
 
 def make_argument_parser(parser=None, **kwargs):
@@ -441,20 +488,26 @@ def make_argument_parser(parser=None, **kwargs):
     if parser is None:
         parser = argparse.ArgumentParser(**kwargs)
 
-    parser.add_argument('--version')
-    parser.add_argument('--client-id')
-    parser.add_argument('--client-secret')
-    parser.add_argument('--variant')
-    parser.add_argument('--web-service-base-url', default="")
+    parser.add_argument("--version")
+    parser.add_argument("--client-id")
+    parser.add_argument("--client-secret")
+    parser.add_argument("--variant")
+    parser.add_argument("--is-san-variant", action="store_true")
+    parser.add_argument("--web-service-base-url", default="")
     return parser
 
 
 def main(options):
     """Execute mapper here. Main entry point."""
 
-    mapper = Mapper(evg_version=options.version, evg_variant=options.variant,
-                    client_id=options.client_id, client_secret=options.client_secret,
-                    web_service_base_url=options.web_service_base_url)
+    mapper = Mapper(
+        evg_version=options.version,
+        evg_variant=options.variant,
+        is_san_variant=options.is_san_variant,
+        client_id=options.client_id,
+        client_secret=options.client_secret,
+        web_service_base_url=options.web_service_base_url,
+    )
 
     # when used as a context manager, mapper instance automatically cleans files/folders after finishing its job.
     # in other cases, mapper.cleanup() method should be called manually.
@@ -462,6 +515,6 @@ def main(options):
         mapper.run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     mapper_options = make_argument_parser(description=__doc__).parse_args()
     main(mapper_options)

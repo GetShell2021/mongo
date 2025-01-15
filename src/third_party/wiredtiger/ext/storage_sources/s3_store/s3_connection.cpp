@@ -33,6 +33,7 @@
 #include <aws/s3-crt/model/GetObjectRequest.h>
 #include <aws/s3-crt/model/HeadObjectRequest.h>
 #include <aws/s3-crt/model/HeadBucketRequest.h>
+#include <aws/core/utils/stream/PreallocatedStreamBuf.h>
 
 #include <fstream>
 #include <iostream>
@@ -66,10 +67,11 @@ S3Connection::S3Connection(const Aws::S3Crt::ClientConfiguration &config,
         throw std::invalid_argument(_bucketName + " : Unable to access bucket.");
 }
 
-// Builds a list of object names, with prefix matching, from an S3 bucket into a vector. The
-// batchSize parameter specifies the maximum number of objects returned in each AWS response, up
-// to 1000. Return an errno value given an HTTP response code if the aws request does not
-// succeed.
+/*
+ * Builds a list of object names, with prefix matching, from an S3 bucket into a vector. The
+ * batchSize parameter specifies the maximum number of objects returned in each AWS response, up to
+ * 1000. Return an errno value given an HTTP response code if the aws request does not succeed.
+ */
 int
 S3Connection::ListObjects(const std::string &prefix, std::vector<std::string> &objects,
   uint32_t batchSize, bool listSingle) const
@@ -160,20 +162,27 @@ S3Connection::DeleteObject(const std::string &objectKey) const
     return (-1);
 }
 
-// Retrieves an object from S3. The object is downloaded to disk at the specified location.
+// Read a given range of bytes from an object in the S3 bucket. The bytes are copied into a
+// user provided buffer.
 int
-S3Connection::GetObject(const std::string &objectKey, const std::string &path) const
+S3Connection::ReadObjectWithRange(
+  const std::string &objectKey, size_t offset, size_t len, void *buf) const
 {
     Aws::S3Crt::Model::GetObjectRequest request;
     request.SetBucket(_bucketName);
     request.SetKey(_objectPrefix + objectKey);
+    std::string range = "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + len - 1);
+    request.SetRange(range);
 
-    // The S3 Object should be downloaded to disk rather than into an in-memory buffer. Use a custom
-    // response stream factory to specify how the response should be downloaded.
-    request.SetResponseStreamFactory([=]() {
-        return (Aws::New<Aws::FStream>(
-          s3AllocationTag, path, std::ios_base::out | std::ios_base::binary));
-    });
+    /*
+     * The requested S3 object's range should be extracted into the given buffer. We create an
+     * IOstream using the given buffer, so that the object can be downloaded directly into the
+     * buffer without making unnecessary intermediate copies.
+     */
+    Aws::Utils::Stream::PreallocatedStreamBuf streambuf(
+      reinterpret_cast<unsigned char *>(buf), len);
+    request.SetResponseStreamFactory(
+      [&streambuf]() { return (Aws::New<Aws::IOStream>("", &streambuf)); });
 
     Aws::S3Crt::Model::GetObjectOutcome outcome = _s3CrtClient.GetObject(request);
 
@@ -202,9 +211,11 @@ S3Connection::ObjectExists(const std::string &objectKey, bool &exists, size_t &o
     request.SetKey(_objectPrefix + objectKey);
     Aws::S3Crt::Model::HeadObjectOutcome outcome = _s3CrtClient.HeadObject(request);
 
-    // If an object with the given key does not exist the HEAD request will return a 404.
-    // Do not fail in this case as it is an expected response. Otherwise return an errno value
-    // for any other HTTP response code.
+    /*
+     * If an object with the given key does not exist the HEAD request will return a 404. Do not
+     * fail in this case as it is an expected response. Otherwise return an errno value for any
+     * other HTTP response code.
+     */
     if (outcome.IsSuccess()) {
         exists = true;
         objectSize = outcome.GetResult().GetContentLength();
@@ -230,9 +241,11 @@ S3Connection::BucketExists(bool &exists) const
     request.WithBucket(_bucketName);
     Aws::S3Crt::Model::HeadBucketOutcome outcome = _s3CrtClient.HeadBucket(request);
 
-    // If an object with the given key does not exist the HEAD request will return a 404.
-    // Do not fail in this case as it is an expected response. Otherwise return an errno value
-    // for any other HTTP response code.
+    /*
+     * If an object with the given key does not exist the HEAD request will return a 404. Do not
+     * fail in this case as it is an expected response. Otherwise return an errno value for any
+     * other HTTP response code.
+     */
     if (outcome.IsSuccess()) {
         exists = true;
         return (0);

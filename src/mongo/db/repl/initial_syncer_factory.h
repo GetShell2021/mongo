@@ -30,12 +30,16 @@
 #pragma once
 
 #include <functional>
+#include <memory>
+#include <string>
 #include <vector>
 
+#include "mongo/base/status_with.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/initial_syncer_interface.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/string_map.h"
 
@@ -67,7 +71,7 @@ public:
     using CreateInitialSyncerFunction = std::function<std::shared_ptr<InitialSyncerInterface>(
         InitialSyncerInterface::Options opts,
         std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
-        ThreadPool* writerPool,
+        ThreadPool* workerPool,
         StorageInterface* storage,
         ReplicationProcess* replicationProcess,
         const InitialSyncerInterface::OnCompletionFn& onCompletion)>;
@@ -82,7 +86,7 @@ public:
         const std::string& initialSyncMethod,
         InitialSyncerInterface::Options opts,
         std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
-        ThreadPool* writerPool,
+        ThreadPool* workerPool,
         StorageInterface* storage,
         ReplicationProcess* replicationProcess,
         const InitialSyncerInterface::OnCompletionFn& onCompletion);

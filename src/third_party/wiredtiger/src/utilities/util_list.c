@@ -21,8 +21,8 @@ usage(void)
 {
     static const char *options[] = {"-c",
       "display checkpoints in human-readable format (by default checkpoints are not displayed)",
-      "-v", "display the complete schema table (by default only a subset is displayed)", NULL,
-      NULL};
+      "-v", "display the complete schema table (by default only a subset is displayed)", "-?",
+      "show this message", NULL, NULL};
 
     util_usage("list [-cv] [uri]", "options:", options);
     return (1);
@@ -42,7 +42,7 @@ util_list(WT_SESSION *session, int argc, char *argv[])
 
     cflag = vflag = false;
     uri = NULL;
-    while ((ch = __wt_getopt(progname, argc, argv, "cv")) != EOF)
+    while ((ch = __wt_getopt(progname, argc, argv, "cv?")) != EOF)
         switch (ch) {
         case 'c':
             cflag = true;
@@ -51,6 +51,8 @@ util_list(WT_SESSION *session, int argc, char *argv[])
             vflag = true;
             break;
         case '?':
+            usage();
+            return (0);
         default:
             return (usage());
         }
@@ -70,7 +72,7 @@ util_list(WT_SESSION *session, int argc, char *argv[])
 
     ret = list_print(session, uri, cflag, vflag);
 
-    free(uri);
+    util_free(uri);
     return (ret);
 }
 
@@ -116,7 +118,7 @@ err:
             ret = tret;
     }
 
-    free(config);
+    util_free(config);
     return (ret);
 }
 

@@ -29,11 +29,10 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
-
-    InternalFleEqStruct:
+    InternalFleEqStructV2:
         description: "Struct for $_internalFleEq"
         strict: true
         fields:
@@ -41,17 +40,20 @@ structs:
             description: "Expression"
             type: IDLAnyType
             cpp_name: field
-          edc:
-            description: "EDCDerivedFromDataToken"
-            type: bindata_encrypt
-            cpp_name: edcDerivedToken
           server:
-            description: "ServerDataEncryptionLevel1Token"
+            description: "ServerZerosEncryptionToken"
             type: bindata_encrypt
-            cpp_name: serverEncryptionToken
-          counter:
-            description: "Queryable Encryption max counter"
-            type: long
-            cpp_name: maxCounter
+            cpp_name: serverZerosEncryptionToken
 
-
+    InternalFleBetweenStructV2:
+        description: "Struct for $_internalFleBetween"
+        strict: true
+        fields:
+          field:
+            description: "Expression"
+            type: IDLAnyType
+            cpp_name: field
+          server:
+            description: "ServerZerosEncryptionTokens"
+            type: array<bindata_encrypt>
+            cpp_name: serverZerosEncryptionTokens

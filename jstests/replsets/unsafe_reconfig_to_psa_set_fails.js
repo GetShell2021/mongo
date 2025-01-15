@@ -12,9 +12,11 @@
  * The second reconfig should then increase its priority to the desired level.
  */
 
-(function() {
-"use strict";
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    assertVoteCount,
+    waitForNewlyAddedRemovalForNodeToBeCommitted
+} from "jstests/replsets/rslib.js";
 
 {
     jsTestLog("Testing reconfig from PA set to PSA set fails");
@@ -23,7 +25,7 @@ load("jstests/replsets/rslib.js");
         nodes: [{}, {rsConfig: {arbiterOnly: true}}],
     });
     rst.startSet();
-    rst.initiateWithHighElectionTimeout();
+    rst.initiate();
 
     const primary = rst.getPrimary();
     assertVoteCount(primary, {
@@ -70,7 +72,7 @@ load("jstests/replsets/rslib.js");
         nodes: [{}, {rsConfig: {votes: 0, priority: 0}}, {rsConfig: {arbiterOnly: true}}],
     });
     rst.startSet();
-    rst.initiateWithHighElectionTimeout();
+    rst.initiate();
 
     const primary = rst.getPrimary();
     assertVoteCount(primary, {
@@ -114,7 +116,7 @@ load("jstests/replsets/rslib.js");
         nodes: [{}, {rsConfig: {arbiterOnly: true}}],
     });
     rst.startSet();
-    rst.initiateWithHighElectionTimeout();
+    rst.initiate();
 
     const primary = rst.getPrimary();
     assertVoteCount(primary, {
@@ -164,4 +166,3 @@ load("jstests/replsets/rslib.js");
 
     rst.stopSet();
 }
-})();

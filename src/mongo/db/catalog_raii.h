@@ -29,16 +29,75 @@
 
 #pragma once
 
-#include "mongo/base/string_data.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/db/views/view.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
+namespace auto_get_collection {
+enum class ViewMode { kViewsPermitted, kViewsForbidden };
+
+template <typename T>
+struct OptionsBase {
+    T viewMode(ViewMode viewMode) {
+        _viewMode = viewMode;
+        return std::move(*static_cast<T*>(this));
+    }
+
+    T deadline(Date_t deadline) {
+        _deadline = std::move(deadline);
+        return std::move(*static_cast<T*>(this));
+    }
+
+    T expectedUUID(boost::optional<UUID> expectedUUID) {
+        _expectedUUID = expectedUUID;
+        return std::move(*static_cast<T*>(this));
+    }
+
+    T globalLockSkipOptions(boost::optional<Lock::GlobalLockSkipOptions> globalLockSkipOptions) {
+        _globalLockSkipOptions = globalLockSkipOptions;
+        return std::move(*static_cast<T*>(this));
+    }
+
+    ViewMode _viewMode = ViewMode::kViewsForbidden;
+    Date_t _deadline = Date_t::max();
+    boost::optional<UUID> _expectedUUID;
+    boost::optional<Lock::GlobalLockSkipOptions> _globalLockSkipOptions;
+};
+
+struct Options : OptionsBase<Options> {};
+struct OptionsWithSecondaryCollections : OptionsBase<OptionsWithSecondaryCollections> {
+    OptionsWithSecondaryCollections secondaryNssOrUUIDs(
+        std::vector<NamespaceStringOrUUID>::const_iterator secondaryNssOrUUIDsBegin,
+        std::vector<NamespaceStringOrUUID>::const_iterator secondaryNssOrUUIDsEnd) {
+        _secondaryNssOrUUIDsBegin = secondaryNssOrUUIDsBegin;
+        _secondaryNssOrUUIDsEnd = secondaryNssOrUUIDsEnd;
+        return std::move(*this);
+    }
+
+    std::vector<NamespaceStringOrUUID>::const_iterator _secondaryNssOrUUIDsBegin;
+    std::vector<NamespaceStringOrUUID>::const_iterator _secondaryNssOrUUIDsEnd;
+};
+}  // namespace auto_get_collection
 
 /**
  * RAII-style class, which acquires a lock on the specified database in the requested mode and
@@ -55,13 +114,52 @@ class AutoGetDb {
     AutoGetDb(const AutoGetDb&) = delete;
     AutoGetDb& operator=(const AutoGetDb&) = delete;
 
-public:
     AutoGetDb(OperationContext* opCtx,
-              StringData dbName,
+              const DatabaseName& dbName,
+              LockMode mode,
+              boost::optional<LockMode> tenantLockMode,
+              Date_t deadline,
+              Lock::DBLockSkipOptions options);
+
+public:
+    /**
+     * Acquires a lock on the specified database 'dbName' in the requested 'mode'.
+     *
+     * If the database belongs to a tenant, then acquires a tenant lock before the database lock.
+     * For 'mode' MODE_IS or MODE_S acquires tenant lock in intent-shared (IS) mode, otherwise,
+     * acquires a tenant lock in intent-exclusive (IX) mode.
+     */
+    AutoGetDb(OperationContext* opCtx,
+              const DatabaseName& dbName,
               LockMode mode,
               Date_t deadline = Date_t::max());
 
+    /**
+     * Acquires a lock on the specified database 'dbName' in the requested 'mode'.
+     *
+     * If the database belongs to a tenant, then acquires a tenant lock before the database lock.
+     * For 'mode' MODE_IS or MODE_S acquires tenant lock in intent-shared (IS) mode, otherwise,
+     * acquires a tenant lock in intent-exclusive (IX) mode. A different, stronger tenant lock mode
+     * to acquire can be specified with 'tenantLockMode' parameter. Passing boost::none for the
+     * tenant lock mode does not skip the tenant lock, but indicates that the tenant lock in default
+     * mode should be acquired.
+     */
+    AutoGetDb(OperationContext* opCtx,
+              const DatabaseName& dbName,
+              LockMode mode,
+              boost::optional<LockMode> tenantLockMode,
+              Date_t deadline = Date_t::max());
+
     AutoGetDb(AutoGetDb&&) = default;
+
+    static bool canSkipRSTLLock(const NamespaceStringOrUUID& nsOrUUID);
+    static bool canSkipFlowControlTicket(const NamespaceStringOrUUID& nsOrUUID);
+
+    static AutoGetDb createForAutoGetCollection(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& nsOrUUID,
+        LockMode modeColl,
+        const auto_get_collection::OptionsWithSecondaryCollections& options);
 
     /**
      * Returns the database, or nullptr if it didn't exist.
@@ -75,8 +173,14 @@ public:
      */
     Database* ensureDbExists(OperationContext* opCtx);
 
+    /**
+     * Returns the database reference, after attempting to refresh it if it was null. Does not
+     * create the database, so after this call the referece might still be null.
+     */
+    Database* refreshDbReferenceIfNull(OperationContext* opCtx);
+
 private:
-    std::string _dbName;
+    DatabaseName _dbName;
 
     // Special note! The primary DBLock must destruct last (be declared first) so that the global
     // and RSTL locks are not released until all the secondary DBLocks (without global and RSTL)
@@ -90,7 +194,26 @@ private:
     std::vector<Lock::DBLock> _secondaryDbLocks;
 };
 
-enum class AutoGetCollectionViewMode { kViewsPermitted, kViewsForbidden };
+/**
+ * Light wrapper around Lock::CollectionLock which allows acquiring the lock based on UUID rather
+ * than namespace.
+ *
+ * The lock manager manages resources based on namespace and does not have a concept of UUIDs, so
+ * there must be some additional concurrency checks around resolving the UUID to a namespace and
+ * then subsequently acquiring the lock.
+ */
+class CollectionNamespaceOrUUIDLock {
+public:
+    CollectionNamespaceOrUUIDLock(OperationContext* opCtx,
+                                  const NamespaceStringOrUUID& nsOrUUID,
+                                  LockMode mode,
+                                  Date_t deadline = Date_t::max());
+
+    CollectionNamespaceOrUUIDLock(CollectionNamespaceOrUUIDLock&& other) = default;
+
+private:
+    Lock::CollectionLock _lock;
+};
 
 /**
  * RAII-style class, which acquires global, database, and collection locks according to the chart
@@ -113,6 +236,8 @@ class AutoGetCollection {
     AutoGetCollection& operator=(const AutoGetCollection&) = delete;
 
 public:
+    using Options = auto_get_collection::OptionsWithSecondaryCollections;
+
     /**
      * Collection locks are also acquired for any 'secondaryNssOrUUIDs' namespaces provided.
      * Collection locks are acquired in ascending ResourceId(RESOURCE_COLLECTION, nss) order to
@@ -123,13 +248,24 @@ public:
      * 'nsOrUUID' to be duplicated in 'secondaryNssOrUUIDs', or 'secondaryNssOrUUIDs' to contain
      * duplicates.
      */
-    AutoGetCollection(
-        OperationContext* opCtx,
-        const NamespaceStringOrUUID& nsOrUUID,
-        LockMode modeColl,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max(),
-        const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs = {});
+    AutoGetCollection(OperationContext* opCtx,
+                      const NamespaceStringOrUUID& nsOrUUID,
+                      LockMode modeColl,
+                      const Options& options = {});
+
+    /**
+     * Special constructor when this class is instantiated from AutoGetCollectionForRead. Used to
+     * indicate that the intent is to perform reads only. We cannot use the LockMode to determine
+     * this as multi-document transactions use MODE_IX for reads.
+     */
+    struct ForReadTag {};
+    AutoGetCollection(OperationContext* opCtx,
+                      const NamespaceStringOrUUID& nsOrUUID,
+                      LockMode modeColl,
+                      const Options& options,
+                      ForReadTag read);
+
+    AutoGetCollection(AutoGetCollection&&) = default;
 
     explicit operator bool() const {
         return static_cast<bool>(getCollection());
@@ -150,14 +286,14 @@ public:
      * Returns the database, or nullptr if it didn't exist.
      */
     Database* getDb() const {
-        return _autoDb->getDb();
+        return _autoDb.getDb();
     }
 
     /**
      * Returns the database, creating it if it does not exist.
      */
     Database* ensureDbExists(OperationContext* opCtx) {
-        return _autoDb->ensureDbExists(opCtx);
+        return _autoDb.ensureDbExists(opCtx);
     }
 
     /**
@@ -193,12 +329,17 @@ public:
     Collection* getWritableCollection(OperationContext* opCtx);
 
 protected:
+    AutoGetCollection(OperationContext* opCtx,
+                      const NamespaceStringOrUUID& nsOrUUID,
+                      LockMode modeColl,
+                      const Options& options,
+                      bool verifyWriteEligible);
     // Ordering matters, the _collLocks should destruct before the _autoGetDb releases the
     // rstl/global/database locks.
-    boost::optional<AutoGetDb> _autoDb;
-    std::vector<Lock::CollectionLock> _collLocks;
+    AutoGetDb _autoDb;
+    std::vector<CollectionNamespaceOrUUIDLock> _collLocks;
 
-    CollectionPtr _coll = nullptr;
+    CollectionPtr _coll;
     std::shared_ptr<const ViewDefinition> _view;
 
     // If the object was instantiated with a UUID, contains the resolved namespace, otherwise it is
@@ -209,128 +350,8 @@ protected:
     Collection* _writableColl = nullptr;
 };
 
-/**
- * RAII-style class that acquires the global MODE_IS lock. This class should only be used for reads.
- *
- * NOTE: Throws NamespaceNotFound if the collection UUID cannot be resolved to a nss.
- *
- * The collection references returned by this class will no longer be safe to retain after this
- * object goes out of scope. This object ensures the continued existence of a Collection reference,
- * if the collection exists when this object is instantiated.
- *
- * NOTE: this class is not safe to instantiate outside of AutoGetCollectionForReadLockFree. For
- * example, it does not perform database or collection level shard version checks; nor does it
- * establish a consistent storage snapshot with which to read.
- */
-class AutoGetCollectionLockFree {
-    AutoGetCollectionLockFree(const AutoGetCollectionLockFree&) = delete;
-    AutoGetCollectionLockFree& operator=(const AutoGetCollectionLockFree&) = delete;
-
-public:
-    /**
-     * Function used to customize restore after yield behavior
-     */
-    using RestoreFromYieldFn =
-        std::function<void(std::shared_ptr<const Collection>&, OperationContext*, UUID)>;
-
-    /**
-     * Used by AutoGetCollectionForReadLockFree where it provides implementation for restore after
-     * yield.
-     */
-    AutoGetCollectionLockFree(
-        OperationContext* opCtx,
-        const NamespaceStringOrUUID& nsOrUUID,
-        RestoreFromYieldFn restoreFromYield,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max());
-
-    explicit operator bool() const {
-        // Use the CollectionPtr because it is updated if it yields whereas _collection is not until
-        // restore.
-        return static_cast<bool>(_collectionPtr);
-    }
-
-    /**
-     * AutoGetCollectionLockFree can be used as a Collection pointer with the -> operator.
-     */
-    const Collection* operator->() const {
-        return getCollection().get();
-    }
-
-    const CollectionPtr& operator*() const {
-        return getCollection();
-    }
-
-    /**
-     * Returns nullptr if the collection didn't exist.
-     *
-     * Deprecated in favor of the new ->(), *() and bool() accessors above!
-     */
-    const CollectionPtr& getCollection() const {
-        return _collectionPtr;
-    }
-
-    /**
-     * Returns nullptr if the view didn't exist.
-     */
-    const ViewDefinition* getView() const {
-        return _view.get();
-    }
-
-    /**
-     * Returns the resolved namespace of the collection or view.
-     */
-    const NamespaceString& getNss() const {
-        return _resolvedNss;
-    }
-
-private:
-    // Indicate that we are lock-free on code paths that can run either lock-free or locked for
-    // different kinds of operations. Note: this class member is currently declared first so that it
-    // destructs last, as a safety measure, but not because it is currently depended upon behavior.
-    boost::optional<LockFreeReadsBlock> _lockFreeReadsBlock;
-
-    Lock::GlobalLock _globalLock;
-
-    // If the object was instantiated with a UUID, contains the resolved namespace, otherwise it is
-    // the same as the input namespace string
-    NamespaceString _resolvedNss;
-
-    // The Collection shared_ptr will keep the Collection instance alive even if it is removed from
-    // the CollectionCatalog while this lock-free operation runs.
-    std::shared_ptr<const Collection> _collection;
-
-    // The CollectionPtr is the access point to the Collection instance for callers.
-    CollectionPtr _collectionPtr;
-
-    std::shared_ptr<const ViewDefinition> _view;
-};
-
-/**
- * This is a nested lock helper. If a higher level operation is running a lock-free read, then this
- * helper will follow suite and instantiate a AutoGetCollectionLockFree. Otherwise, it will
- * instantiate a regular AutoGetCollection helper.
- */
-class AutoGetCollectionMaybeLockFree {
-    AutoGetCollectionMaybeLockFree(const AutoGetCollectionMaybeLockFree&) = delete;
-    AutoGetCollectionMaybeLockFree& operator=(const AutoGetCollectionMaybeLockFree&) = delete;
-
-public:
-    /**
-     * Decides whether to instantiate a lock-free or locked helper based on whether a lock-free
-     * operation is set on the opCtx.
-     */
-    AutoGetCollectionMaybeLockFree(
-        OperationContext* opCtx,
-        const NamespaceStringOrUUID& nsOrUUID,
-        LockMode modeColl,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max());
-
-private:
-    boost::optional<AutoGetCollection> _autoGet;
-    boost::optional<AutoGetCollectionLockFree> _autoGetLockFree;
-};
+class CollectionAcquisition;
+class ScopedLocalCatalogWriteFence;
 
 /**
  * RAII-style class to handle the lifetime of writable Collections.
@@ -338,11 +359,45 @@ private:
  * AutoGetCollection. This class can serve as an adaptor to unify different methods of acquiring a
  * writable collection.
  *
- * It is safe to re-use an instance for multiple WriteUnitOfWorks or to destroy it before the active
- * WriteUnitOfWork finishes.
+ * It is safe to re-use an instance for multiple WriteUnitOfWorks. It is not safe to destroy it
+ * before the active WriteUnitOfWork finishes.
  */
 class CollectionWriter final {
 public:
+    // This constructor indicates to the shard role subsystem that the subsequent code enters into
+    // local DDL land and that the content of the local collection should not be trusted until it
+    // goes out of scope.
+    //
+    // On destruction, if `getWritableCollection` been called during the object lifetime, the
+    // `acquisition` will be advanced to reflect the local catalog changes. It is important that
+    // when this destructor is called, the WUOW under which the catalog changes have been performed
+    // has already been commited or rollbacked. If it hasn't and the WUOW later rollbacks, the
+    // acquisition is left in an invalid state and must not be used.
+    //
+    // Example usage pattern:
+    // writeConflictRetry {
+    //     auto coll = acquireCollection(...);
+    //     CollectionWriter collectionWriter(opCtx, &coll);
+    //     WriteUnitOfWork wuow();
+    //     collectionWriter.getWritableCollection().xxxx();
+    //     wouw.commit();
+    // }
+    //
+    // Example usage pattern when the acquisition is held higher up by the caller:
+    // auto coll = acquireCollection(...);
+    // ...
+    // writeConflictRetry {
+    //     // It is important that ~CollectionWriter will be executed after the ~WriteUnitOfWork
+    //     // commits or rollbacks.
+    //     CollectionWriter collectionWriter(opCtx, &coll);
+    //     WriteUnitOfWork wuow();
+    //     collectionWriter.getWritableCollection().xxxx();
+    //     wouw.commit();
+    // }
+    //
+    // TODO (SERVER-73766): Only this constructor should remain in use
+    CollectionWriter(OperationContext* opCtx, CollectionAcquisition* acquisition);
+
     // Gets the collection from the catalog for the provided uuid
     CollectionWriter(OperationContext* opCtx, const UUID& uuid);
     // Gets the collection from the catalog for the provided namespace string
@@ -383,6 +438,11 @@ public:
     Collection* getWritableCollection(OperationContext* opCtx);
 
 private:
+    // This group of values is only operated on for code paths that go through the
+    // `CollectionAcquisition` constructor.
+    CollectionAcquisition* _acquisition = nullptr;
+    std::unique_ptr<ScopedLocalCatalogWriteFence> _fence;
+
     // If this class is instantiated with the constructors that take UUID or nss we need somewhere
     // to store the CollectionPtr used. But if it is instantiated with an AutoGetCollection then the
     // lifetime of the object is managed there. To unify the two code paths we have a pointer that
@@ -424,29 +484,45 @@ private:
 };
 
 /**
- * RAII-style class to acquire proper locks using special oplog locking rules for oplog accesses.
+ * RAII-style class to acquire the oplog with weaker consistency rules.
+ *
+ * IMPORTANT: this acquisition is optimized for fast-path access and is suitable for efficiently
+ * reading from or writing to the oplog table. This acquisition can return a stale view of the
+ * oplog metadata if interleaving with a DDL operation like an oplog resize. For consistent
+ * lookups and support for yield and restore, use a conventional acquisition API like
+ * mongo::acquireCollection.
  *
  * Only the global lock is acquired:
  * | OplogAccessMode | Global Lock |
  * +-----------------+-------------|
  * | kRead           | MODE_IS     |
  * | kWrite          | MODE_IX     |
+ * | kLogOp          | -           |
  *
  * kLogOp is a special mode for replication operation logging and it behaves similar to kWrite. The
  * difference between kWrite and kLogOp is that kLogOp invariants that global IX lock is already
  * held. It is the caller's responsibility to ensure the global lock already held is still valid
  * within the lifetime of this object.
  *
- * Any acquired locks may be released when this object goes out of scope, therefore the oplog
+ * The catalog resources are released when this object goes out of scope, therefore the oplog
  * collection reference returned by this class should not be retained.
  */
 enum class OplogAccessMode { kRead, kWrite, kLogOp };
-class AutoGetOplog {
-    AutoGetOplog(const AutoGetOplog&) = delete;
-    AutoGetOplog& operator=(const AutoGetOplog&) = delete;
+
+struct AutoGetOplogFastPathOptions {
+    bool skipRSTLLock = false;
+};
+
+class AutoGetOplogFastPath {
+    AutoGetOplogFastPath(const AutoGetOplogFastPath&) = delete;
+    AutoGetOplogFastPath& operator=(const AutoGetOplogFastPath&) = delete;
 
 public:
-    AutoGetOplog(OperationContext* opCtx, OplogAccessMode mode, Date_t deadline = Date_t::max());
+    AutoGetOplogFastPath(
+        OperationContext* opCtx,
+        OplogAccessMode mode,
+        Date_t deadline = Date_t::max(),
+        const AutoGetOplogFastPathOptions& options = AutoGetOplogFastPathOptions());
 
     /**
      * Return a pointer to the per-service-context LocalOplogInfo.
@@ -459,31 +535,35 @@ public:
      * Returns a pointer to the oplog collection or nullptr if the oplog collection didn't exist.
      */
     const CollectionPtr& getCollection() const {
-        return *_oplog;
+        return _oplog;
     }
 
 private:
-    ShouldNotConflictWithSecondaryBatchApplicationBlock
-        _shouldNotConflictWithSecondaryBatchApplicationBlock;
     boost::optional<Lock::GlobalLock> _globalLock;
     LocalOplogInfo* _oplogInfo;
-    const CollectionPtr* _oplog;
+    CollectionPtr _oplog;
+
+    // Retain the CollectionCatalog snapshot since this fast-path acquisition skips acquiring the
+    // oplog collection lock.
+    std::shared_ptr<const CollectionCatalog> _stashedCatalog;
 };
 
 /**
  * A RAII-style class to acquire lock to a particular tenant's change collection.
  *
  * A change collection can be accessed in the following modes:
- *   kWrite - This mode assumes that the global IX lock is already held before writing to the change
- *            collection.
+ *   kWriteInOplogContext - assumes that the tenant IX lock has been pre-acquired. The user can
+ *                          perform reads and writes to the change collection.
+ *   kWrite - behaves the same as 'AutoGetCollection::AutoGetCollection()' with lock mode MODE_IX.
+ *   kRead - behaves the same as 'AutoGetCollection::AutoGetCollection()' with lock mode MODE_IS.
  */
 class AutoGetChangeCollection {
 public:
-    enum class AccessMode { kWrite };
+    enum class AccessMode { kWriteInOplogContext, kWrite, kRead };
 
     AutoGetChangeCollection(OperationContext* opCtx,
                             AccessMode mode,
-                            boost::optional<TenantId> tenantId,
+                            const TenantId& tenantId,
                             Date_t deadline = Date_t::max());
 
     AutoGetChangeCollection(const AutoGetChangeCollection&) = delete;
@@ -494,7 +574,10 @@ public:
     explicit operator bool() const;
 
 private:
+    // Used when the 'kWrite' or 'kRead' access mode is used.
     boost::optional<AutoGetCollection> _coll;
+    // Used when the 'kWriteInOplogContext' access mode is used.
+    CollectionPtr _changeCollection;
 };
 
 }  // namespace mongo

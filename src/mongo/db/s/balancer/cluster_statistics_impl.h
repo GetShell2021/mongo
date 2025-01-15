@@ -29,7 +29,12 @@
 
 #pragma once
 
-#include "mongo/db/s/balancer/balancer_random.h"
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/s/balancer/cluster_statistics.h"
 
 namespace mongo {
@@ -41,20 +46,9 @@ namespace mongo {
  */
 class ClusterStatisticsImpl final : public ClusterStatistics {
 public:
-    ClusterStatisticsImpl(BalancerRandomSource& random);
-    ~ClusterStatisticsImpl();
+    ~ClusterStatisticsImpl() override;
 
     StatusWith<std::vector<ShardStatistics>> getStats(OperationContext* opCtx) override;
-
-    StatusWith<std::vector<ShardStatistics>> getCollStats(OperationContext* opCtx,
-                                                          NamespaceString const& ns) override;
-
-private:
-    StatusWith<std::vector<ShardStatistics>> _getStats(OperationContext* opCtx,
-                                                       boost::optional<NamespaceString> ns);
-
-    // Source of randomness when metadata needs to be randomized.
-    BalancerRandomSource& _random;
 };
 
 }  // namespace mongo

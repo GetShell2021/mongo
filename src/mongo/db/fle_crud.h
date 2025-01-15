@@ -29,27 +29,44 @@
 
 #pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
+#include <boost/optional/optional.hpp>
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <utility>
+#include <vector>
 
-#include "boost/smart_ptr/intrusive_ptr.hpp"
-
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
+#include "mongo/crypto/encryption_fields_gen.h"
 #include "mongo/crypto/fle_crypto.h"
+#include "mongo/crypto/fle_crypto_types.h"
 #include "mongo/crypto/fle_field_schema_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/ops/write_ops_gen.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/count_command_gen.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/transaction_api.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/transaction/transaction_api.h"
+#include "mongo/executor/inline_executor.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
+#include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 
 namespace mongo {
+class OperationContext;
 
 /**
  * FLE Result enum
@@ -159,6 +176,13 @@ processFLEFindAndModifyExplainMongos(
 /**
  * Process a findAndModify request from a replica set.
  */
+StatusWith<std::pair<write_ops::FindAndModifyCommandReply, OpMsgRequest>>
+processFLEFindAndModifyHelper(OperationContext* opCtx,
+                              const write_ops::FindAndModifyCommandRequest& findAndModifyRequest);
+
+/**
+ * Process a findAndModify request from a replica set.
+ */
 write_ops::FindAndModifyCommandReply processFLEFindAndModify(
     OperationContext* opCtx, const write_ops::FindAndModifyCommandRequest& findAndModifyRequest);
 
@@ -186,14 +210,14 @@ void processFLEFindD(OperationContext* opCtx,
  */
 void processFLECountS(OperationContext* opCtx,
                       const NamespaceString& nss,
-                      CountCommandRequest* countCommand);
+                      CountCommandRequest& countCommand);
 
 /**
  * Process a find command from a replica set.
  */
 void processFLECountD(OperationContext* opCtx,
                       const NamespaceString& nss,
-                      CountCommandRequest* countCommand);
+                      CountCommandRequest& countCommand);
 
 /**
  * Process a pipeline from mongos.
@@ -214,55 +238,19 @@ std::unique_ptr<Pipeline, PipelineDeleter> processFLEPipelineD(
     std::unique_ptr<Pipeline, PipelineDeleter> toRewrite);
 
 /**
- * Helper function to determine if an IDL object with encryption information should be rewritten.
- */
-template <typename T>
-bool shouldDoFLERewrite(const std::unique_ptr<T>& cmd) {
-    // TODO (SERVER-65077): Remove FCV check once 6.0 is released
-    return (!serverGlobalParams.featureCompatibility.isVersionInitialized() ||
-            gFeatureFlagFLE2.isEnabled(serverGlobalParams.featureCompatibility)) &&
-        cmd->getEncryptionInformation();
-}
-
-template <typename T>
-bool shouldDoFLERewrite(const T& cmd) {
-    // TODO (SERVER-65077): Remove FCV check once 6.0 is released
-    return (!serverGlobalParams.featureCompatibility.isVersionInitialized() ||
-            gFeatureFlagFLE2.isEnabled(serverGlobalParams.featureCompatibility)) &&
-        cmd.getEncryptionInformation();
-}
-
-/**
  * Abstraction layer for FLE
  */
-class FLEQueryInterface {
+class FLEQueryInterface : public FLETagQueryInterface {
 public:
-    virtual ~FLEQueryInterface();
-
-    /**
-     * Retrieve a single document by _id == BSONElement from nss.
-     *
-     * Returns an empty BSONObj if no document is found.
-     * Expected to throw an error if it detects more then one documents.
-     */
-    virtual BSONObj getById(const NamespaceString& nss, BSONElement element) = 0;
-
-    /**
-     * Count the documents in the collection.
-     *
-     * Throws if the collection is not found.
-     */
-    virtual uint64_t countDocuments(const NamespaceString& nss) = 0;
-
     /**
      * Insert a document into the given collection.
      *
      * If translateDuplicateKey == true and the insert returns DuplicateKey, returns
      * FLEStateCollectionContention instead.
      */
-    virtual StatusWith<write_ops::InsertCommandReply> insertDocument(
+    virtual StatusWith<write_ops::InsertCommandReply> insertDocuments(
         const NamespaceString& nss,
-        BSONObj obj,
+        std::vector<BSONObj> objs,
         StmtId* pStmtId,
         bool translateDuplicateKey,
         bool bypassDocumentValidation = false) = 0;
@@ -277,6 +265,11 @@ public:
         const NamespaceString& nss,
         const EncryptionInformation& ei,
         const write_ops::DeleteCommandRequest& deleteRequest) = 0;
+
+    virtual write_ops::DeleteCommandReply deleteDocument(
+        const NamespaceString& nss,
+        int32_t stmtId,
+        write_ops::DeleteCommandRequest& deleteRequest) = 0;
 
     /**
      * Update a single document with the given query and update operators.
@@ -315,24 +308,29 @@ public:
      */
     virtual std::vector<BSONObj> findDocuments(const NamespaceString& nss, BSONObj filter) = 0;
 };
+
 /**
  * Implementation of the FLE Query interface that exposes the DB operations needed for FLE 2
  * server-side work.
  */
 class FLEQueryInterfaceImpl : public FLEQueryInterface {
 public:
-    FLEQueryInterfaceImpl(const txn_api::TransactionClient& txnClient,
-                          ServiceContext* serviceContext)
-        : _txnClient(txnClient), _serviceContext(serviceContext) {}
+    FLEQueryInterfaceImpl(const txn_api::TransactionClient& txnClient, Service* service)
+        : _txnClient(txnClient), _service(service) {}
 
     BSONObj getById(const NamespaceString& nss, BSONElement element) final;
 
     uint64_t countDocuments(const NamespaceString& nss) final;
 
-    StatusWith<write_ops::InsertCommandReply> insertDocument(
+    std::vector<std::vector<FLEEdgeCountInfo>> getTags(
         const NamespaceString& nss,
-        BSONObj obj,
-        int32_t* pStmtId,
+        const std::vector<std::vector<FLEEdgePrfBlock>>& escDerivedFromDataTokenAndCounter,
+        FLETagQueryInterface::TagQueryType type) final;
+
+    StatusWith<write_ops::InsertCommandReply> insertDocuments(
+        const NamespaceString& nss,
+        std::vector<BSONObj> objs,
+        StmtId* pStmtId,
         bool translateDuplicateKey,
         bool bypassDocumentValidation = false) final;
 
@@ -340,6 +338,11 @@ public:
         const NamespaceString& nss,
         const EncryptionInformation& ei,
         const write_ops::DeleteCommandRequest& deleteRequest) final;
+
+    write_ops::DeleteCommandReply deleteDocument(
+        const NamespaceString& nss,
+        int32_t stmtId,
+        write_ops::DeleteCommandRequest& deleteRequest) final;
 
     std::pair<write_ops::UpdateCommandReply, BSONObj> updateWithPreimage(
         const NamespaceString& nss,
@@ -359,33 +362,61 @@ public:
 
 private:
     const txn_api::TransactionClient& _txnClient;
-    ServiceContext* _serviceContext;
+    Service* _service;
+    std::shared_ptr<executor::InlineExecutor::SleepableExecutor> _executor;
 };
 
 /**
- * Implementation of FLEStateCollectionReader for txn_api::TransactionClient
- *
- * Document count is cached since we only need it once per esc or ecc collection.
+ * FLEStateCollectionReader using an FLEQueryInterface.
  */
-class TxnCollectionReader : public FLEStateCollectionReader {
+class FLEStateCollectionQueryInterfaceReader : public FLEStateCollectionReader {
 public:
-    TxnCollectionReader(uint64_t count, FLEQueryInterface* queryImpl, const NamespaceString& nss)
-        : _count(count), _queryImpl(queryImpl), _nss(nss) {}
+    FLEStateCollectionQueryInterfaceReader(FLEQueryInterface* iface, const NamespaceString& nss)
+        : _query(iface), _nss(nss) {}
 
     uint64_t getDocumentCount() const override {
-        return _count;
+        return _query->countDocuments(_nss);
     }
 
     BSONObj getById(PrfBlock block) const override {
-        auto doc = BSON("v" << BSONBinData(block.data(), block.size(), BinDataGeneral));
-        BSONElement element = doc.firstElement();
-        return _queryImpl->getById(_nss, element);
+        BSONObjBuilder bob;
+        bob.appendBinData("_id"_sd, block.size(), BinDataType::BinDataGeneral, block.data());
+        auto docs = _query->findDocuments(_nss, bob.obj());
+        _stats.setRead(_stats.getRead() + 1);
+        if (docs.empty()) {
+            return {};
+        }
+        return std::move(docs[0]);
+    }
+
+    ECStats getStats() const override {
+        return _stats;
     }
 
 private:
-    uint64_t _count;
-    FLEQueryInterface* _queryImpl;
+    FLEQueryInterface* _query;
     NamespaceString _nss;
+    mutable ECStats _stats;
+};
+
+/**
+ * FLETagQueryInterface that does not use transaction_api.h to retrieve tags.
+ */
+class FLETagNoTXNQuery : public FLETagQueryInterface {
+public:
+    FLETagNoTXNQuery(OperationContext* opCtx);
+
+    BSONObj getById(const NamespaceString& nss, BSONElement element) final;
+
+    uint64_t countDocuments(const NamespaceString& nss) final;
+
+    std::vector<std::vector<FLEEdgeCountInfo>> getTags(
+        const NamespaceString& nss,
+        const std::vector<std::vector<FLEEdgePrfBlock>>& escDerivedFromDataTokenAndCounter,
+        FLETagQueryInterface::TagQueryType type) final;
+
+private:
+    OperationContext* _opCtx;
 };
 
 /**
@@ -412,7 +443,7 @@ StatusWith<write_ops::InsertCommandReply> processInsert(
     const NamespaceString& edcNss,
     std::vector<EDCServerPayloadInfo>& serverPayload,
     const EncryptedFieldConfig& efc,
-    int32_t stmtId,
+    int32_t* stmtId,
     BSONObj document,
     bool bypassDocumentValidation = false);
 
@@ -494,4 +525,17 @@ processFindAndModifyRequest<write_ops::FindAndModifyCommandRequest>(
 write_ops::UpdateCommandReply processUpdate(OperationContext* opCtx,
                                             const write_ops::UpdateCommandRequest& updateRequest,
                                             GetTxnCallback getTxns);
+
+void validateInsertUpdatePayloads(const std::vector<EncryptedField>& fields,
+                                  const std::vector<EDCServerPayloadInfo>& payload);
+
+/**
+ * Get the tags from local storage.
+ */
+std::vector<std::vector<FLEEdgeCountInfo>> getTagsFromStorage(
+    OperationContext* opCtx,
+    const NamespaceStringOrUUID& nsOrUUID,
+    const std::vector<std::vector<FLEEdgePrfBlock>>& escDerivedFromDataTokens,
+    FLETagQueryInterface::TagQueryType type);
+
 }  // namespace mongo

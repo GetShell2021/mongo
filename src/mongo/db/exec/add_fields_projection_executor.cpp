@@ -27,13 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <iterator>
 
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/add_fields_projection_executor.h"
-
-#include <algorithm>
-
 #include "mongo/db/matcher/expression_algo.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo::projection_executor {
 namespace {
@@ -93,7 +98,7 @@ private:
     const BSONObj& _rawObj;
 
     // Tracks which paths we've seen to ensure no two paths conflict with each other.
-    std::set<std::string, PathPrefixComparator> _seenPaths;
+    OrderedPathSet _seenPaths;
 };
 
 void ProjectionSpecValidator::uassertValid(const BSONObj& spec) {
@@ -142,15 +147,9 @@ void ProjectionSpecValidator::parseElement(const BSONElement& elem, const FieldP
 
 void ProjectionSpecValidator::parseNestedObject(const BSONObj& thisLevelSpec,
                                                 const FieldPath& prefix) {
-    if (thisLevelSpec.isEmpty()) {
-        uasserted(
-            40180,
-            str::stream() << "an empty object is not a valid value. Found empty object at path "
-                          << prefix.fullPath());
-    }
     for (auto&& elem : thisLevelSpec) {
         auto fieldName = elem.fieldNameStringData();
-        if (fieldName[0] == '$') {
+        if (fieldName.starts_with('$')) {
             // This object is an expression specification like {$add: [...]}. It will be parsed
             // into an Expression later, but for now, just track that the prefix has been
             // specified and skip it.
@@ -239,7 +238,9 @@ bool AddFieldsProjectionExecutor::parseObjectAsExpression(
     const VariablesParseState& variablesParseState) {
     if (objSpec.firstElementFieldName()[0] == '$') {
         // This is an expression like {$add: [...]}. We already verified that it has only one field.
-        invariant(objSpec.nFields() == 1);
+        tassert(7241737,
+                "expression in Projection Executor should only have one field",
+                objSpec.nFields() == 1);
         _root->addExpressionForPath(
             pathToObject, Expression::parseExpression(_expCtx.get(), objSpec, variablesParseState));
         return true;
@@ -250,12 +251,18 @@ bool AddFieldsProjectionExecutor::parseObjectAsExpression(
 void AddFieldsProjectionExecutor::parseSubObject(const BSONObj& subObj,
                                                  const VariablesParseState& variablesParseState,
                                                  const FieldPath& pathToObj) {
+    bool elemInSubObj = false;
     for (auto&& elem : subObj) {
+        elemInSubObj = true;
         auto fieldName = elem.fieldNameStringData();
-        invariant(fieldName[0] != '$');
+        tassert(7241738,
+                "the field name in the Projection Executor cannot be an operator",
+                fieldName[0] != '$');
         // Dotted paths in a sub-object have already been detected and disallowed by the function
         // ProjectionSpecValidator::validate().
-        invariant(fieldName.find('.') == std::string::npos);
+        tassert(7241739,
+                "dotted paths in Projection Executor are not allowed",
+                fieldName.find('.') == std::string::npos);
 
         auto currentPath = pathToObj.concat(fieldName);
         if (elem.type() == BSONType::Object) {
@@ -269,6 +276,11 @@ void AddFieldsProjectionExecutor::parseSubObject(const BSONObj& subObj,
             _root->addExpressionForPath(
                 currentPath, Expression::parseOperand(_expCtx.get(), elem, variablesParseState));
         }
+    }
+
+    if (!elemInSubObj) {
+        _root->addExpressionForPath(
+            pathToObj, Expression::parseObject(_expCtx.get(), subObj, variablesParseState));
     }
 }
 }  // namespace mongo::projection_executor

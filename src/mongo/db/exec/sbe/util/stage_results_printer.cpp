@@ -28,7 +28,15 @@
  */
 
 #include "mongo/db/exec/sbe/util/stage_results_printer.h"
-#include "mongo/platform/basic.h"
+
+#include <cstddef>
+
+#include <absl/container/inlined_vector.h>
+
+#include "mongo/db/exec/plan_stats_visitor.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
+#include "mongo/db/query/tree_walker.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo::sbe {
 
@@ -58,7 +66,7 @@ void StageResultsPrinter<T>::printStageResults(CompileCtx* ctx,
                                                const SlotNames& slotNames,
                                                PlanStage* stage) {
     std::vector<value::SlotAccessor*> accessors;
-    for (auto slot : slotNames) {
+    for (const auto& slot : slotNames) {
         accessors.push_back(stage->getAccessor(*ctx, slot.first));
     }
 
@@ -92,7 +100,7 @@ template <typename T>
 void StageResultsPrinter<T>::printSlotNames(const SlotNames& slotNames) {
     _stream << "[";
     bool first = true;
-    for (auto slot : slotNames) {
+    for (const auto& slot : slotNames) {
         if (!first) {
             _stream << ", ";
         } else {
@@ -114,7 +122,7 @@ struct PlanStatsSpecificStatsPrinter : PlanStatsVisitorBase<true> {
     // To avoid overloaded-virtual warnings.
     using PlanStatsConstVisitor::visit;
 
-    void visit(tree_walker::MaybeConstPtr<true, sbe::HashLookupStats> stats) override final {
+    void visit(tree_walker::MaybeConstPtr<true, sbe::HashLookupStats> stats) final {
         _stream << "dsk:" << stats->usedDisk << "\n";
         _stream << "htRecs:" << stats->spilledHtRecords << "\n";
         _stream << "htIndices:" << stats->spilledHtBytesOverAllRecords << "\n";

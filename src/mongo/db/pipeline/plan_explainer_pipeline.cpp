@@ -27,31 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <list>
+#include <memory>
 
-#include "mongo/db/pipeline/plan_explainer_pipeline.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
-#include "mongo/db/pipeline/document_source_facet.h"
-#include "mongo/db/pipeline/document_source_lookup.h"
-#include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/document_source_union_with.h"
-#include "mongo/db/pipeline/plan_executor_pipeline.h"
-#include "mongo/db/query/explain.h"
+#include "mongo/db/pipeline/plan_explainer_pipeline.h"
 #include "mongo/db/query/plan_summary_stats_visitor.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
-/**
- * Templatized method to get plan summary stats from document source and aggregate it to 'statsOut'.
- */
-template <typename DocSourceType, typename DocSourceStatType>
-void collectPlanSummaryStats(const DocSourceType& source, PlanSummaryStats* statsOut) {
-    auto specificStats = source.getSpecificStats();
-    invariant(specificStats);
-    auto visitor = PlanSummaryStatsVisitor(*statsOut);
-    specificStats->acceptVisitor(&visitor);
-}
-
 const PlanExplainer::ExplainVersion& PlanExplainerPipeline::getVersion() const {
     static const ExplainVersion kExplainVersion = "1";
 
@@ -74,31 +62,21 @@ std::string PlanExplainerPipeline::getPlanSummary() const {
 void PlanExplainerPipeline::getSummaryStats(PlanSummaryStats* statsOut) const {
     invariant(statsOut);
 
-    if (auto docSourceCursor =
-            dynamic_cast<DocumentSourceCursor*>(_pipeline->getSources().front().get())) {
+    auto source_it = _pipeline->getSources().begin();
+    if (auto docSourceCursor = dynamic_cast<DocumentSourceCursor*>(source_it->get())) {
         *statsOut = docSourceCursor->getPlanSummaryStats();
-    }
+        ++source_it;
+    };
 
-    for (auto&& source : _pipeline->getSources()) {
+    PlanSummaryStatsVisitor visitor(*statsOut);
+    std::for_each(source_it, _pipeline->getSources().end(), [&](const auto& source) {
         statsOut->usedDisk = statsOut->usedDisk || source->usedDisk();
-
-        if (dynamic_cast<DocumentSourceSort*>(source.get())) {
-            statsOut->hasSortStage = true;
-        } else if (auto docSourceLookUp = dynamic_cast<DocumentSourceLookUp*>(source.get())) {
-            collectPlanSummaryStats<DocumentSourceLookUp, DocumentSourceLookupStats>(
-                *docSourceLookUp, statsOut);
-        } else if (auto docSourceUnionWith = dynamic_cast<DocumentSourceUnionWith*>(source.get())) {
-            collectPlanSummaryStats<DocumentSourceUnionWith, UnionWithStats>(*docSourceUnionWith,
-                                                                             statsOut);
-        } else if (auto docSourceFacet = dynamic_cast<DocumentSourceFacet*>(source.get())) {
-            collectPlanSummaryStats<DocumentSourceFacet, DocumentSourceFacetStats>(*docSourceFacet,
-                                                                                   statsOut);
+        if (auto specificStats = source->getSpecificStats()) {
+            specificStats->acceptVisitor(&visitor);
         }
-    }
+    });
 
-    if (_nReturned) {
-        statsOut->nReturned = _nReturned;
-    }
+    statsOut->nReturned = _nReturned;
 }
 
 PlanExplainer::PlanStatsDetails PlanExplainerPipeline::getWinningPlanStats(
@@ -116,11 +94,5 @@ std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerPipeline::getRejectedP
     ExplainOptions::Verbosity verbosity) const {
     // Multi-planning is not supported for aggregation pipelines.
     return {};
-}
-
-std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerPipeline::getCachedPlanStats(
-    const plan_cache_debug_info::DebugInfo&, ExplainOptions::Verbosity) const {
-    // Pipelines are not cached, so we should never try to rebuild the stats from a cached entry.
-    MONGO_UNREACHABLE;
 }
 }  // namespace mongo

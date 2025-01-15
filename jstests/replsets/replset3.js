@@ -1,5 +1,6 @@
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var doTest = function(signal) {
-    "use strict";
     // Test replica set step down
 
     // Replica set testing API
@@ -12,7 +13,7 @@ var doTest = function(signal) {
 
     // Call initiate() to send the replSetInitiate command
     // This will wait for initiation
-    replTest.initiate();
+    replTest.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
     // Get primary node
     var primary = replTest.getPrimary();

@@ -29,21 +29,33 @@
 
 #pragma once
 
-#include "mongo/db/internal_session_pool.h"
+#include <boost/optional/optional.hpp>
+#include <memory>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/s/config/configsvr_coordinator.h"
+#include "mongo/db/s/config/configsvr_coordinator_gen.h"
 #include "mongo/db/s/config/set_cluster_parameter_coordinator_document_gen.h"
+#include "mongo/db/session/internal_session_pool.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
-class SetClusterParameterCoordinator : public ConfigsvrCoordinator {
+class SetClusterParameterCoordinator
+    : public ConfigsvrCoordinatorImpl<SetClusterParameterCoordinatorDocument,
+                                      SetClusterParameterCoordinatorPhaseEnum> {
 public:
     using StateDoc = SetClusterParameterCoordinatorDocument;
     using Phase = SetClusterParameterCoordinatorPhaseEnum;
 
     explicit SetClusterParameterCoordinator(const BSONObj& stateDoc)
-        : ConfigsvrCoordinator(stateDoc),
-          _doc(StateDoc::parse(IDLParserErrorContext("SetClusterParameterCoordinatorDocument"),
-                               stateDoc)) {}
+        : ConfigsvrCoordinatorImpl(stateDoc) {}
 
     bool hasSameOptions(const BSONObj& participantDoc) const override;
 
@@ -51,9 +63,16 @@ public:
         MongoProcessInterface::CurrentOpConnectionsMode connMode,
         MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
 
-private:
-    StateDoc _doc;
+    /**
+     * Returns 'true' if the coordinator instance has detected an unexpected concurrent update
+     * operation.
+     */
+    bool detectedConcurrentUpdate() const {
+        return _detectedConcurrentUpdate;
+    }
 
+private:
+    friend class SetClusterParameterCoordinatorTest;
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
@@ -63,9 +82,10 @@ private:
     void _commit(OperationContext* opCtx);
 
     /*
-     * Checks if the cluster parameter was already set to the provided value.
+     * Returns the persisted cluster parameter value. Returns boost::none if the parameter has not
+     * been set.
      */
-    bool _isClusterParameterSetAtTimestamp(OperationContext* opCtx);
+    boost::optional<BSONObj> _getPersistedClusterParameter(OperationContext* opCtx) const;
 
     /*
      * Sends setClusterParameter to every shard in the cluster with the appropiate session.
@@ -77,24 +97,25 @@ private:
 
     const ConfigsvrCoordinatorMetadata& metadata() const override;
 
-    template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
-        return [=] {
-            const auto& currPhase = _doc.getPhase();
-
-            if (currPhase > newPhase) {
-                // Do not execute this phase if we already reached a subsequent one.
-                return;
-            }
-            if (currPhase < newPhase) {
-                // Persist the new phase if this is the first time we are executing it.
-                _enterPhase(newPhase);
-            }
-            return func();
-        };
+    StringData serializePhase(const Phase& phase) const override {
+        return SetClusterParameterCoordinatorPhase_serializer(phase);
     }
 
-    void _enterPhase(Phase newPhase);
+    /*
+     * Returns true if 'previousTime' does not match the value of "clusterParameterTime" field of
+     * the cluster-wide parameter document 'currentClusterParameterValue'.
+     */
+    static bool _isPersistedStateConflictingWithPreviousTime(
+        const boost::optional<LogicalTime>& previousTime,
+        const boost::optional<BSONObj>& currentClusterParameterValue);
+
+    /* Returns true if the cluster-wide parameter value given as variable 'parameter' is equal to
+     * the cluster-wide parameter value given as the persisted parameter document
+     * 'persistedParameter'.
+     */
+    static bool _parameterValuesEqual(const BSONObj& parameter, const BSONObj& persistedParameter);
+
+    bool _detectedConcurrentUpdate = false;
 };
 
 }  // namespace mongo

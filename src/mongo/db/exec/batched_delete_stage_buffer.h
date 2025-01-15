@@ -29,6 +29,11 @@
 
 #pragma once
 
+#include <cstddef>
+#include <set>
+#include <vector>
+
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 
 namespace mongo {
@@ -41,11 +46,11 @@ class BatchedDeleteStageBuffer {
 public:
     BatchedDeleteStageBuffer(WorkingSet* ws);
 
-    size_t size() {
+    size_t size() const {
         return _buffer.size();
     }
 
-    bool empty() {
+    bool empty() const {
         return _buffer.empty();
     }
 
@@ -54,7 +59,7 @@ public:
     /**
      * Returns the WorkingSetID associated with the staged document at 'bufferOffset'.
      */
-    WorkingSetID at(size_t bufferOffset) {
+    WorkingSetID at(size_t bufferOffset) const {
         return _buffer.at(bufferOffset);
     }
 

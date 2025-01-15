@@ -3,12 +3,8 @@
  * and profiler. This test also verifies that for a sharded collection, the 'comment' fields gets
  * passed on from mongos to the respective shards.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fixture_helpers.js");  // For FixtureHelpers.
-load("jstests/libs/profiler.js");         // For profilerHas*OrThrow helper functions.
-load("jstests/libs/logv2_helpers.js");
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test runs manual getMores using different connections, which will not inherit the
 // implicit session of the cursor establishing command.
@@ -21,8 +17,8 @@ const unshardedColl = testDB.unsharded;
 const shard0DB = st.shard0.getDB(jsTestName());
 const shard1DB = st.shard1.getDB(jsTestName());
 
-assert.commandWorked(st.s0.adminCommand({enableSharding: testDB.getName()}));
-st.ensurePrimaryShard(testDB.getName(), st.shard0.shardName);
+assert.commandWorked(
+    st.s0.adminCommand({enableSharding: testDB.getName(), primaryShard: st.shard0.shardName}));
 
 // Shard shardedColl on {x:1}, split it at {x:0}, and move chunk {x:1} to shard1.
 st.shardColl(shardedColl, {x: 1}, {x: 0}, {x: 1});
@@ -38,7 +34,7 @@ assert.commandWorked(testDB.adminCommand({profile: 0, slowms: -1}));
 
 /**
  * Verifies that there are 'expectedNumOccurrences' log lines contains every element of
- * 'inputArray'.
+ * 'inputArray'; log lines including references to StaleConfig errors are ignored.
  */
 function verifyLogContains(connections, inputArray, expectedNumOccurrences) {
     let numOccurrences = 0;
@@ -47,7 +43,7 @@ function verifyLogContains(connections, inputArray, expectedNumOccurrences) {
         for (let logMsg of logs) {
             let numMatches = 0;
             for (let input of inputArray) {
-                numMatches += logMsg.includes(input) ? 1 : 0;
+                numMatches += (logMsg.includes(input) && !logMsg.includes('StaleConfig')) ? 1 : 0;
             }
             numOccurrences += ((numMatches == inputArray.length) ? 1 : 0);
         }
@@ -153,7 +149,8 @@ function runCommentParamTest({
     if (!Array.isArray(expectedProfilerEntriesList)) {
         expectedProfilerEntriesList = [expectedProfilerEntriesList];
     }
-    const profileFilter = {"command.comment": commentObj};
+
+    const profileFilter = {"command.comment": commentObj, "errName": {$ne: "StaleConfig"}};
     const foundProfilerEntriesCount = shard0DB.system.profile.find(profileFilter).itcount() +
         shard1DB.system.profile.find(profileFilter).itcount();
     assert(expectedProfilerEntriesList.includes(foundProfilerEntriesCount),
@@ -168,19 +165,12 @@ function runCommentParamTest({
     // current operation.
     if (commentObj["uuid"]) {
         // Verify that a field with 'comment' exists in the same line as the command.
-        let expectStrings = [
-            ", comment: ",
-            checkLog.formatAsLogLine(commentObj),
-            'appName: "MongoDB Shell" command: ' + ((cmdName === "getMore") ? cmdName : "")
+        const expectStrings = [
+            ',"comment":',
+            checkLog.formatAsJsonLogLine(commentObj),
+            '"appName":"MongoDB Shell",',
+            '"command":{' + ((cmdName === "getMore") ? '"' + cmdName + '"' : "")
         ];
-        if (isJsonLog(testDB.getMongo())) {
-            expectStrings = [
-                ',"comment":',
-                checkLog.formatAsJsonLogLine(commentObj),
-                '"appName":"MongoDB Shell","command":{' +
-                    ((cmdName === "getMore") ? '"' + cmdName + '"' : "")
-            ];
-        }
 
         verifyLogContains(
             [testDB, shard0DB, shard1DB],
@@ -532,7 +522,7 @@ runCommentParamTest({
 //
 
 // For aggregate command with a $unionWith stage, where a sharded collection unions with a sharded
-// collection, each shard recieves an aggregate operation for the outer pipeline (with the stages
+// collection, each shard receives an aggregate operation for the outer pipeline (with the stages
 // prior to the $unionWith stage) and the inner pipeline. Each aggregate operation is followed up by
 // a getMore to exhaust the cursor. So there should be 8 profiler entries which has the 'comment'
 // field. In addition there is an aggregate operation which does merge cursors.
@@ -551,7 +541,7 @@ runCommentParamTest({
 });
 
 // For aggregate command with a $unionWith stage, where a sharded collection unions with an
-// unsharded collection, each shard recieves an aggregate & getMore operation (with the stages prior
+// unsharded collection, each shard receives an aggregate & getMore operation (with the stages prior
 // to the $unionWith stage) for the outer pipeline and 1 aggregate operation for the inner pipeline
 // on unsharded collection. So there should be 5 profiler entries which has the 'comment' field. In
 // addition there is an aggregate operation which does merge cursors.
@@ -572,7 +562,7 @@ runCommentParamTest({
 });
 
 // For aggregate command with a $unionWith stage, where an unsharded collection unions with a
-// sharded collection, each shard recieves an aggregate & getMore operation for the inner pipeline.
+// sharded collection, each shard receives an aggregate & getMore operation for the inner pipeline.
 // So there should be 4 profiler entries which has the 'comment' field. In addition there is an
 // aggregate operation which does merge cursors.
 runCommentParamTest({
@@ -629,4 +619,3 @@ runCommentParamTest({
 });
 
 st.stop();
-})();

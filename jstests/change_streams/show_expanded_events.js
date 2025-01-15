@@ -2,32 +2,26 @@
  * Tests the behavior of change streams in the presence of 'showExpandedEvents' flag.
  *
  * @tags: [
- *   requires_fcv_61,
  *   # The test assumes certain ordering of the events. The chunk migrations on a sharded collection
  *   # could break the test.
  *   assumes_unsharded_collection,
- *   featureFlagChangeStreamsFurtherEnrichedEvents,
+ *   # TODO (SERVER-89668): Remove tag. Currently incompatible due to change
+ *   # change events containing the recordIdsReplicated:true option, which
+ *   # this test dislikes.
+ *   exclude_when_record_ids_replicated
  * ]
  */
-(function() {
-"use strict";
-
-load('jstests/libs/collection_drop_recreate.js');  // For 'assertDropAndRecreateCollection' and
-                                                   // 'assertDropCollection'.
-load('jstests/libs/change_stream_util.js');        // For 'ChangeStreamTest' and
-                                                   // 'assertChangeStreamEventEq'.
+import {
+    assertCreateCollection,
+    assertDropAndRecreateCollection,
+    assertDropCollection,
+} from "jstests/libs/collection_drop_recreate.js";
+import {
+    assertChangeStreamEventEq,
+    ChangeStreamTest
+} from "jstests/libs/query/change_stream_util.js";
 
 const testDB = db.getSiblingDB(jsTestName());
-
-if (!isChangeStreamsVisibilityEnabled(testDB)) {
-    assert.commandFailedWithCode(testDB.runCommand({
-        aggregate: 1,
-        pipeline: [{$changeStream: {showExpandedEvents: true}}],
-        cursor: {},
-    }),
-                                 6188501);
-    return;
-}
 
 // Assert that the flag is not allowed with 'apiStrict'.
 assert.commandFailedWithCode(testDB.runCommand({
@@ -162,7 +156,8 @@ assertCreateCollection(testDB, renamedCollName);
 assertNextChangeEvent({
     ns: renamedNs,
     operationType: 'create',
-    operationDescription: {idIndex: {v: 2, key: {_id: 1}, name: "_id_"}}
+    operationDescription: {idIndex: {v: 2, key: {_id: 1}, name: "_id_"}},
+    nsType: "collection",
 
 });
 assertChangeEvent(() => assert.commandWorked(coll.renameCollection(renamedCollName, true)), {
@@ -188,4 +183,3 @@ assertChangeEvent(
     },
     false /* checkUuid */
 );
-}());

@@ -29,10 +29,14 @@
 
 #pragma once
 
+#include <memory>
 #include <queue>
 
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 
@@ -52,7 +56,7 @@ public:
 
     StageState doWork(WorkingSetID* out) final;
 
-    bool isEOF() final;
+    bool isEOF() const final;
 
     StageType stageType() const final {
         return STAGE_QUEUED_DATA;

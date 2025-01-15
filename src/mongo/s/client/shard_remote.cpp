@@ -31,27 +31,51 @@
 #include "mongo/s/client/shard_remote.h"
 
 #include <algorithm>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <cstdint>
 #include <string>
+#include <utility>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/client/fetcher.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/client/remote_command_targeter.h"
-#include "mongo/client/replica_set_monitor.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_gen.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/vector_clock.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_options.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/tracking_metadata.h"
-#include "mongo/s/client/shard_remote_gen.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/str.h"
-#include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -61,7 +85,6 @@ namespace mongo {
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 using executor::TaskExecutor;
-using rpc::TrackingMetadata;
 using RemoteCommandCallbackArgs = TaskExecutor::RemoteCommandCallbackArgs;
 
 namespace {
@@ -102,61 +125,13 @@ ShardRemote::ShardRemote(const ShardId& id,
 ShardRemote::~ShardRemote() = default;
 
 bool ShardRemote::isRetriableError(ErrorCodes::Error code, RetryPolicy options) {
-    if (gInternalProhibitShardOperationRetry.loadRelaxed()) {
-        return false;
-    }
-
-    switch (options) {
-        case RetryPolicy::kNoRetry: {
-            return false;
-        } break;
-
-        case RetryPolicy::kIdempotent: {
-            return isMongosRetriableError(code);
-        } break;
-
-        case RetryPolicy::kIdempotentOrCursorInvalidated: {
-            return isRetriableError(code, Shard::RetryPolicy::kIdempotent) ||
-                ErrorCodes::isCursorInvalidatedError(code);
-        } break;
-
-        case RetryPolicy::kNotIdempotent: {
-            return ErrorCodes::isNotPrimaryError(code);
-        } break;
-    }
-
-    MONGO_UNREACHABLE;
+    return remoteIsRetriableError(code, options);
 }
 
 // Any error code changes should possibly also be made to Shard::shouldErrorBePropagated!
 void ShardRemote::updateReplSetMonitor(const HostAndPort& remoteHost,
                                        const Status& remoteCommandStatus) {
-    if (remoteCommandStatus.isOK())
-        return;
-
-    if (ErrorCodes::isNotPrimaryError(remoteCommandStatus.code())) {
-        _targeter->markHostNotPrimary(remoteHost, remoteCommandStatus);
-    } else if (ErrorCodes::isNetworkError(remoteCommandStatus.code())) {
-        _targeter->markHostUnreachable(remoteHost, remoteCommandStatus);
-    } else if (remoteCommandStatus == ErrorCodes::NetworkInterfaceExceededTimeLimit) {
-        _targeter->markHostUnreachable(remoteHost, remoteCommandStatus);
-    } else if (ErrorCodes::isShutdownError(remoteCommandStatus.code())) {
-        _targeter->markHostShuttingDown(remoteHost, remoteCommandStatus);
-    }
-}
-
-void ShardRemote::updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) {
-    stdx::lock_guard<Latch> lk(_lastCommittedOpTimeMutex);
-
-    // A secondary may return a lastCommittedOpTime less than the latest seen so far.
-    if (lastCommittedOpTime > _lastCommittedOpTime) {
-        _lastCommittedOpTime = lastCommittedOpTime;
-    }
-}
-
-LogicalTime ShardRemote::getLastCommittedOpTime() const {
-    stdx::lock_guard<Latch> lk(_lastCommittedOpTimeMutex);
-    return _lastCommittedOpTime;
+    _targeter->updateHostWithStatus(remoteHost, remoteCommandStatus);
 }
 
 std::string ShardRemote::toString() const {
@@ -166,24 +141,6 @@ std::string ShardRemote::toString() const {
 BSONObj ShardRemote::_appendMetadataForCommand(OperationContext* opCtx,
                                                const ReadPreferenceSetting& readPref) {
     BSONObjBuilder builder;
-    if (shouldLog(logv2::LogComponent::kTracking,
-                  logv2::LogSeverity::Debug(1))) {  // avoid performance overhead if not logging
-        if (!TrackingMetadata::get(opCtx).getIsLogged()) {
-            if (!TrackingMetadata::get(opCtx).getOperId()) {
-                TrackingMetadata::get(opCtx).initWithOperName("NotSet");
-            }
-            LOGV2_DEBUG_OPTIONS(20164,
-                                1,
-                                logv2::LogOptions{logv2::LogComponent::kTracking},
-                                "{trackingMetadata}",
-                                "trackingMetadata"_attr = TrackingMetadata::get(opCtx));
-            TrackingMetadata::get(opCtx).setIsLogged(true);
-        }
-
-        TrackingMetadata metadata = TrackingMetadata::get(opCtx).constructChildMetadata();
-        metadata.writeToMetadata(&builder);
-    }
-
     readPref.toContainingBSON(&builder);
 
     if (isConfig())
@@ -194,13 +151,10 @@ BSONObj ShardRemote::_appendMetadataForCommand(OperationContext* opCtx,
 
 StatusWith<Shard::CommandResponse> ShardRemote::_runCommand(OperationContext* opCtx,
                                                             const ReadPreferenceSetting& readPref,
-                                                            StringData dbName,
+                                                            const DatabaseName& dbName,
                                                             Milliseconds maxTimeMSOverride,
                                                             const BSONObj& cmdObj) {
-    RemoteCommandResponse response =
-        Status(ErrorCodes::InternalError,
-               str::stream() << "Failed to run remote command request cmd: " << cmdObj);
-
+    boost::optional<RemoteCommandResponse> response;
     auto asyncStatus = _scheduleCommand(
         opCtx,
         readPref,
@@ -230,20 +184,21 @@ StatusWith<Shard::CommandResponse> ShardRemote::_runCommand(OperationContext* op
         return e.toStatus();
     }
 
-    const auto& host = asyncHandle.hostTargetted;
-    updateReplSetMonitor(host, response.status);
+    // After wait returns successfully, the callback in _scheduleCommand is guaranteed to have run
+    // and set the response.
+    invariant(response);
 
-    if (!response.status.isOK()) {
-        if (ErrorCodes::isExceededTimeLimitError(response.status.code())) {
-            LOGV2(22739,
-                  "Operation timed out {error}",
-                  "Operation timed out",
-                  "error"_attr = redact(response.status));
+    const auto& host = asyncHandle.hostTargetted;
+    updateReplSetMonitor(host, response->status);
+
+    if (!response->status.isOK()) {
+        if (ErrorCodes::isExceededTimeLimitError(response->status.code())) {
+            LOGV2(22739, "Operation timed out", "error"_attr = redact(response->status));
         }
-        return response.status;
+        return response->status;
     }
 
-    auto result = response.data.getOwned();
+    auto result = response->data.getOwned();
     auto commandStatus = getStatusFromCommandResult(result);
     auto writeConcernStatus = getWriteConcernStatusFromCommandResult(result);
 
@@ -259,7 +214,7 @@ StatusWith<Shard::CommandResponse> ShardRemote::_runCommand(OperationContext* op
 StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
-    StringData dbName,
+    const DatabaseName& dbName,
     Milliseconds maxTimeMSOverride,
     const BSONObj& cmdObj) {
     const auto host = _targeter->findHost(opCtx, readPref);
@@ -312,13 +267,19 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
         getMoreBob->append("collection", data.nss.coll());
     };
 
-    const Milliseconds requestTimeout =
-        std::min(opCtx->getRemainingMaxTimeMillis(), maxTimeMSOverride);
+    const Milliseconds requestTimeout = [&] {
+        auto minMaxTimeMS = std::min(opCtx->getRemainingMaxTimeMillis(), maxTimeMSOverride);
+        if (minMaxTimeMS < Milliseconds::max()) {
+            return minMaxTimeMS;
+        }
+        // The Fetcher expects kNoTimeout when there is no maxTimeMS instead of Milliseconds::max().
+        return RemoteCommandRequest::kNoTimeout;
+    }();
 
     auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     Fetcher fetcher(executor.get(),
                     host.getValue(),
-                    dbName.toString(),
+                    dbName,
                     cmdObj,
                     fetcherCallback,
                     _appendMetadataForCommand(opCtx, readPref),
@@ -333,10 +294,7 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
     Status joinStatus = fetcher.join(opCtx);
     if (!joinStatus.isOK()) {
         if (ErrorCodes::isExceededTimeLimitError(joinStatus.code())) {
-            LOGV2(6195000,
-                  "Operation timed out {error}",
-                  "Operation timed out",
-                  "error"_attr = joinStatus);
+            LOGV2(6195000, "Operation timed out", "error"_attr = joinStatus);
         }
 
         return joinStatus;
@@ -346,8 +304,7 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
 
     if (!status.isOK()) {
         if (ErrorCodes::isExceededTimeLimitError(status.code())) {
-            LOGV2(
-                22740, "Operation timed out {error}", "Operation timed out", "error"_attr = status);
+            LOGV2(22740, "Operation timed out", "error"_attr = status);
         }
         return status;
     }
@@ -355,6 +312,18 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
     return response;
 }
 
+Milliseconds getExhaustiveFindOnConfigMaxTimeMS(OperationContext* opCtx,
+                                                const NamespaceString& nss) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+        // Don't use a timeout on the config server to guarantee it can always refresh.
+        return Milliseconds::max();
+    }
+
+    return std::min(opCtx->getRemainingMaxTimeMillis(),
+                    nss == NamespaceString::kConfigsvrChunksNamespace
+                        ? Milliseconds(gFindChunksOnConfigTimeoutMS.load())
+                        : Milliseconds(defaultConfigCommandTimeoutMS.load()));
+}
 
 StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     OperationContext* opCtx,
@@ -379,20 +348,12 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
         return readPrefToReturn;
     }();
 
-    BSONObj readConcernObj = [&] {
-        invariant(readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern);
-        repl::OpTime configOpTime{configTime.asTimestamp(),
-                                  mongo::repl::OpTime::kUninitializedTerm};
-        repl::ReadConcernArgs readConcern{configOpTime, readConcernLevel};
-        BSONObjBuilder bob;
-        readConcern.appendInfo(&bob);
-        return bob.done().getObjectField(repl::ReadConcernArgs::kReadConcernFieldName).getOwned();
-    }();
 
-    const Milliseconds maxTimeMS =
-        std::min(opCtx->getRemainingMaxTimeMillis(),
-                 nss == ChunkType::ConfigNS ? Milliseconds(gFindChunksOnConfigTimeoutMS.load())
-                                            : kDefaultConfigCommandTimeout);
+    invariant(readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern ||
+              readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern);
+    repl::ReadConcernArgs readConcern{configTime /* afterClusterTime */, readConcernLevel};
+
+    const Milliseconds maxTimeMS = getExhaustiveFindOnConfigMaxTimeMS(opCtx, nss);
 
     BSONObjBuilder findCmdBuilder;
 
@@ -400,7 +361,7 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
         FindCommandRequest findCommand(nss);
         findCommand.setFilter(query.getOwned());
         findCommand.setSort(sort.getOwned());
-        findCommand.setReadConcern(readConcernObj.getOwned());
+        findCommand.setReadConcern(readConcern);
         findCommand.setLimit(limit ? static_cast<boost::optional<std::int64_t>>(*limit)
                                    : boost::none);
         if (hint) {
@@ -411,16 +372,16 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
             findCommand.setMaxTimeMS(durationCount<Milliseconds>(maxTimeMS));
         }
 
-        findCommand.serialize(BSONObj(), &findCmdBuilder);
+        findCommand.serialize(&findCmdBuilder);
     }
 
     return _runExhaustiveCursorCommand(
-        opCtx, readPrefWithConfigTime, nss.db().toString(), maxTimeMS, findCmdBuilder.done());
+        opCtx, readPrefWithConfigTime, nss.dbName(), maxTimeMS, findCmdBuilder.done());
 }
 
 void ShardRemote::runFireAndForgetCommand(OperationContext* opCtx,
                                           const ReadPreferenceSetting& readPref,
-                                          const std::string& dbName,
+                                          const DatabaseName& dbName,
                                           const BSONObj& cmdObj) {
     _scheduleCommand(opCtx,
                      readPref,
@@ -506,7 +467,7 @@ Status ShardRemote::runAggregation(
     auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     Fetcher fetcher(executor.get(),
                     host,
-                    aggRequest.getNamespace().db().toString(),
+                    aggRequest.getNamespace().dbName(),
                     aggregation_request_helper::serializeToCommandObj(aggRequest),
                     fetcherCallback,
                     readPrefMetadata,
@@ -529,26 +490,32 @@ Status ShardRemote::runAggregation(
 }
 
 
+BatchedCommandResponse ShardRemote::runBatchWriteCommand(OperationContext* opCtx,
+                                                         const Milliseconds maxTimeMS,
+                                                         const BatchedCommandRequest& batchRequest,
+                                                         const WriteConcernOptions& writeConcern,
+                                                         RetryPolicy retryPolicy) {
+    const DatabaseName dbName = batchRequest.getNS().dbName();
+    const BSONObj cmdObj = [&] {
+        BSONObjBuilder cmdObjBuilder;
+        batchRequest.serialize(&cmdObjBuilder);
+        cmdObjBuilder.append(WriteConcernOptions::kWriteConcernField, writeConcern.toBSON());
+        return cmdObjBuilder.obj();
+    }();
+
+    return _submitBatchWriteCommand(opCtx, cmdObj, dbName, maxTimeMS, retryPolicy);
+}
+
+
 StatusWith<ShardRemote::AsyncCmdHandle> ShardRemote::_scheduleCommand(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
-    StringData dbName,
+    const DatabaseName& dbName,
     Milliseconds maxTimeMSOverride,
     const BSONObj& cmdObj,
     const TaskExecutor::RemoteCommandCallbackFn& cb) {
 
-    const auto readPrefWithConfigTime = [&]() -> ReadPreferenceSetting {
-        if (isConfig()) {
-            const auto vcTime = VectorClock::get(opCtx)->getTime();
-            ReadPreferenceSetting readPrefToReturn{readPref};
-            readPrefToReturn.minClusterTime = vcTime.configTime().asTimestamp();
-            return readPrefToReturn;
-        } else {
-            return {readPref};
-        }
-    }();
-
-    const auto swHost = _targeter->findHost(opCtx, readPrefWithConfigTime);
+    const auto swHost = _targeter->findHost(opCtx, readPref);
     if (!swHost.isOK()) {
         return swHost.getStatus();
     }
@@ -561,9 +528,9 @@ StatusWith<ShardRemote::AsyncCmdHandle> ShardRemote::_scheduleCommand(
 
     const RemoteCommandRequest request(
         asyncHandle.hostTargetted,
-        dbName.toString(),
+        dbName,
         appendMaxTimeToCmdObj(requestTimeout, cmdObj),
-        _appendMetadataForCommand(opCtx, readPrefWithConfigTime),
+        _appendMetadataForCommand(opCtx, readPref),
         opCtx,
         requestTimeout < Milliseconds::max() ? requestTimeout : RemoteCommandRequest::kNoTimeout);
 

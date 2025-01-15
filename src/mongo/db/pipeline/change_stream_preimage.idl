@@ -32,9 +32,18 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 server_parameters:
+    disableExpiredPreImagesRemover:
+        description: Disables the expired pre-images remover.
+        set_at: [ startup ]
+        cpp_vartype: bool
+        cpp_varname: gPreImageRemoverDisabled
+        default: false
+        test_only: true
+        redact: false
+
     expiredChangeStreamPreImageRemovalJobSleepSecs:
         description: >-
             Specifies the period within which expired pre-image removal job is running.
@@ -44,14 +53,20 @@ server_parameters:
         validator:
             gte: 1
         default: 10
+        redact: false
 
-    batchedExpiredChangeStreamPreImageRemoval:
+    preImagesCollectionTruncateMarkersMinBytes:
         description: >-
-            Specifies if expired pre-images are removed in batches rather than document-by-document.
-        set_at: [ startup, runtime ]
-        cpp_vartype: AtomicWord<bool>
-        cpp_varname: gBatchedExpiredChangeStreamPreImageRemoval
-        default: true
+            Server parameter that specifies the minimum number of bytes contained in each
+            truncate marker. This is only of use if featureFlagUseUnreplicatedTruncatesForDeletions is
+            enabled
+        set_at: startup
+        cpp_varname: gPreImagesCollectionTruncateMarkersMinBytes
+        cpp_vartype: int32_t
+        default: 33_554_432  # 32 MiB
+        validator:
+            gt: 0
+        redact: false
 
 structs:
     ChangeStreamPreImageId:

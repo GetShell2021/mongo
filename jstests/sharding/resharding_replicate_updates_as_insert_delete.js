@@ -6,12 +6,11 @@
 // ]
 //
 
-(function() {
-'use strict';
-
-load('jstests/libs/discover_topology.js');
-load('jstests/sharding/libs/resharding_test_fixture.js');
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
+import {
+    isUpdateDocumentShardKeyUsingTransactionApiEnabled
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const reshardingTest = new ReshardingTest({numDonors: 2, numRecipients: 2, reshardInPlace: true});
 reshardingTest.setup();
@@ -52,10 +51,18 @@ reshardingTest.withReshardingInBackground(  //
         const tempColl = mongos.getCollection(tempNs);
         assert.soon(() => tempColl.findOne(docToUpdate) !== null);
 
-        assert.commandFailedWithCode(
-            testColl.update({_id: 0, x: 2, s: 2}, {$set: {y: 10}}),
-            ErrorCodes.IllegalOperation,
-            'was able to update value under new shard key as ordinary write');
+        // When the updateDocumentShardKeyUsingTransactionApi feature flag is enabled, ordinary
+        // updates that modify a document's shard key will complete.
+        assert.commandWorked(testColl.insert({_id: 1, x: 2, s: 2, y: 2}));
+        const updateRes = testColl.update({_id: 1, x: 2, s: 2}, {$set: {y: 10}});
+        if (updateDocumentShardKeyUsingTransactionApiEnabled) {
+            assert.commandWorked(updateRes);
+        } else {
+            assert.commandFailedWithCode(
+                updateRes,
+                ErrorCodes.IllegalOperation,
+                'was able to update value under new shard key as ordinary write');
+        }
 
         const session = testColl.getMongo().startSession({retryWrites: true});
         const sessionColl =
@@ -69,8 +76,8 @@ reshardingTest.withReshardingInBackground(  //
         assert.commandFailedWithCode(
             sessionColl.update({_id: 0}, {$set: {y: 10}}),
             31025,
-            'was able to update value under new shard key without specifying the full shard key ' +
-                'in the query');
+            'was able to update value under new shard key without specifying the full shard ' +
+                'key in the query');
 
         let res;
         assert.soon(
@@ -86,7 +93,8 @@ reshardingTest.withReshardingInBackground(  //
                 assert.commandFailedWithCode(res, [
                     ErrorCodes.StaleConfig,
                     ErrorCodes.NoSuchTransaction,
-                    ErrorCodes.ShardCannotRefreshDueToLocksHeld
+                    ErrorCodes.ShardCannotRefreshDueToLocksHeld,
+                    ErrorCodes.WriteConflict,
                 ]);
                 return false;
             },
@@ -118,10 +126,12 @@ reshardingTest.withReshardingInBackground(  //
                 assert.commandFailedWithCode(res, [
                     ErrorCodes.NoSuchTransaction,
                     ErrorCodes.ShardCannotRefreshDueToLocksHeld,
-                    ErrorCodes.NoSuchTransaction
+                    ErrorCodes.NoSuchTransaction,
+                    ErrorCodes.WriteConflict,
                 ]);
             } else {
-                assert.commandFailedWithCode(res, ErrorCodes.NoSuchTransaction);
+                assert.commandFailedWithCode(
+                    res, [ErrorCodes.NoSuchTransaction, ErrorCodes.WriteConflict]);
             }
             session.abortTransaction();
             return false;
@@ -161,4 +171,3 @@ assert.neq(null, txnWriteEntry, 'failed to find oplog entry for transaction');
 assertOplogEntryIsDeleteInsertApplyOps(txnWriteEntry);
 
 reshardingTest.teardown();
-})();

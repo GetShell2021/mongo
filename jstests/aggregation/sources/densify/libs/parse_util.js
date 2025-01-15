@@ -2,7 +2,7 @@
  * Utility for testing the parsing of densify-like commands. I.e. $_internalDensify and $densify.
  */
 
-let parseUtil = (function(db, coll, stageName, options = {}) {
+export let parseUtil = (function(db, coll, stageName, options = {}) {
     function run(stage, extraCommandArgs = options) {
         return coll.runCommand(Object.merge(
             {aggregate: coll.getName(), pipeline: [stage], cursor: {}}, extraCommandArgs));
@@ -39,6 +39,30 @@ let parseUtil = (function(db, coll, stageName, options = {}) {
             }),
             ErrorCodes.TypeMismatch,
             "BSON field '$densify.partitionByFields' is the wrong type 'string', expected type 'array'");
+
+        // 'partitionByFields' contains the field that is being desified.
+        assert.commandFailedWithCode(
+            run({
+                [stageName]:
+                    {field: "a", partitionByFields: ["a"], range: {step: 1.0, bounds: "full"}}
+            }),
+            8993000,
+            "BSON field '$densify.partitionByFields' contains the field that is being densified");
+        assert.commandFailedWithCode(
+            run({
+                [stageName]:
+                    {field: "a.b", partitionByFields: ["a"], range: {step: 1.0, bounds: "full"}}
+            }),
+            9554500,
+            "The field that is being densified contains the BSON field '$densify.partitionByFields'");
+        assert.commandFailedWithCode(
+            run({
+                [stageName]:
+                    {field: "a", partitionByFields: ["a.b"], range: {step: 1.0, bounds: "full"}}
+            }),
+            8993000,
+            "BSON field '$densify.partitionByFields' contains the field that is being densified");
+
         assert.commandFailedWithCode(
             run({
                 [stageName]: {

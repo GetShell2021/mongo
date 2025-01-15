@@ -5,10 +5,14 @@
  *   requires_fcv_60,
  * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-const st = new ShardingTest({shards: 1});
+const st = new ShardingTest({
+    shards: 1,
+    other: {
+        configOptions: {setParameter: {reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000}}
+    }
+});
 const mongos = st.s0;
 const db = mongos.getDB(jsTestName());
 const coll = db['coll'];
@@ -39,8 +43,12 @@ const uuid = function() {
 resetColl(coll);
 
 // The command succeeds when provided with the correct collection UUID.
-assert.commandWorked(mongos.adminCommand(
-    {reshardCollection: coll.getFullName(), key: newKeyDoc, collectionUUID: uuid()}));
+assert.commandWorked(mongos.adminCommand({
+    reshardCollection: coll.getFullName(),
+    key: newKeyDoc,
+    collectionUUID: uuid(),
+    numInitialChunks: 1
+}));
 
 // The command fails when provided with a UUID with no corresponding collection.
 resetColl(coll);
@@ -49,6 +57,7 @@ let res = assert.commandFailedWithCode(mongos.adminCommand({
     reshardCollection: coll.getFullName(),
     key: newKeyDoc,
     collectionUUID: nonexistentUUID,
+    numInitialChunks: 1,
 }),
                                        ErrorCodes.CollectionUUIDMismatch);
 assert.eq(res.db, db.getName());
@@ -63,6 +72,7 @@ res = assert.commandFailedWithCode(mongos.adminCommand({
     reshardCollection: coll2.getFullName(),
     key: newKeyDoc,
     collectionUUID: uuid(),
+    numInitialChunks: 1,
 }),
                                    ErrorCodes.CollectionUUIDMismatch);
 assert.eq(res.db, db.getName());
@@ -79,6 +89,7 @@ res = assert.commandFailedWithCode(mongos.adminCommand({
     reshardCollection: coll3.getFullName(),
     key: newKeyDoc,
     collectionUUID: uuid(),
+    numInitialChunks: 1,
 }),
                                    ErrorCodes.CollectionUUIDMismatch);
 assert.eq(res.db, otherDB.getName());
@@ -93,6 +104,7 @@ res = assert.commandFailedWithCode(mongos.adminCommand({
     reshardCollection: coll2.getFullName(),
     key: newKeyDoc,
     collectionUUID: uuid(),
+    numInitialChunks: 1,
 }),
                                    ErrorCodes.CollectionUUIDMismatch);
 assert.eq(res.db, db.getName());
@@ -108,6 +120,7 @@ res = assert.commandFailedWithCode(mongos.adminCommand({
     reshardCollection: view.getFullName(),
     key: newKeyDoc,
     collectionUUID: uuid(),
+    numInitialChunks: 1,
 }),
                                    ErrorCodes.CollectionUUIDMismatch);
 assert.eq(res.db, db.getName());
@@ -116,4 +129,3 @@ assert.eq(res.expectedCollection, view.getName());
 assert.eq(res.actualCollection, coll.getName());
 
 st.stop();
-})();

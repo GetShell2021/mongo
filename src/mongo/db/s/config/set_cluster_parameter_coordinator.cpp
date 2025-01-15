@@ -28,23 +28,51 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <tuple>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/s/config/set_cluster_parameter_coordinator.h"
-
-#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/commands/cluster_server_parameter_cmds_gen.h"
 #include "mongo/db/commands/set_cluster_parameter_invocation.h"
-#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/wait_for_majority_service.h"
+#include "mongo/db/s/config/set_cluster_parameter_coordinator.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_util.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/db/vector_clock.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/future_impl.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -55,82 +83,122 @@ namespace {
 const WriteConcernOptions kMajorityWriteConcern{WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 WriteConcernOptions::kNoTimeout};
+
+/*
+ * Returns the "clusterParameterTime" attribute value in 'parameterDoc'.
+ */
+Timestamp parseClusterParameterTime(const BSONObj& parameterDoc) {
+    BSONElement clusterParameterTimeElem = parameterDoc.getField(
+        SetClusterParameterCoordinatorDocument::kClusterParameterTimeFieldName);
+    dassert(!clusterParameterTimeElem.eoo() && !clusterParameterTimeElem.isNull());
+    return clusterParameterTimeElem.timestamp();
 }
 
+const int kNumberOfSystemFieldsInParameterDocument = 2;
+}  // namespace
+
 bool SetClusterParameterCoordinator::hasSameOptions(const BSONObj& otherDocBSON) const {
-    const auto otherDoc = StateDoc::parse(
-        IDLParserErrorContext("SetClusterParameterCoordinatorDocument"), otherDocBSON);
-    return SimpleBSONObjComparator::kInstance.evaluate(_doc.getParameter() ==
-                                                       otherDoc.getParameter());
+    const auto otherDoc =
+        StateDoc::parse(IDLParserContext("SetClusterParameterCoordinatorDocument"), otherDocBSON);
+
+    return _evalStateDocumentThreadSafe([&](const StateDoc& doc) -> bool {
+        return SimpleBSONObjComparator::kInstance.evaluate(doc.getParameter() ==
+                                                           otherDoc.getParameter()) &&
+            doc.getTenantId() == otherDoc.getTenantId();
+    });
 }
 
 boost::optional<BSONObj> SetClusterParameterCoordinator::reportForCurrentOp(
     MongoProcessInterface::CurrentOpConnectionsMode connMode,
     MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept {
-    BSONObjBuilder cmdBob;
-    cmdBob.appendElements(_doc.getParameter());
 
     BSONObjBuilder bob;
-    bob.append("type", "op");
-    bob.append("desc", "SetClusterParameterCoordinator");
-    bob.append("op", "command");
-    bob.append("currentPhase", _doc.getPhase());
-    bob.append("command", cmdBob.obj());
-    bob.append("active", true);
+
+    _evalStateDocumentThreadSafe([&](const StateDoc& doc) {
+        BSONObjBuilder cmdBob;
+        cmdBob.appendElements(_doc.getParameter());
+
+        bob.append("type", "op");
+        bob.append("desc", "SetClusterParameterCoordinator");
+        bob.append("op", "command");
+        auto tenantId = _doc.getTenantId();
+        if (tenantId.is_initialized()) {
+            bob.append("tenantId", tenantId->toString());
+        }
+        bob.append("currentPhase", _doc.getPhase());
+        bob.append("command", cmdBob.obj());
+        bob.append("active", true);
+    });
+
     return bob.obj();
 }
 
-void SetClusterParameterCoordinator::_enterPhase(Phase newPhase) {
-    StateDoc newDoc(_doc);
-    newDoc.setPhase(newPhase);
-
-    LOGV2_DEBUG(6343101,
-                2,
-                "SetClusterParameterCoordinator phase transition",
-                "newPhase"_attr = SetClusterParameterCoordinatorPhase_serializer(newDoc.getPhase()),
-                "oldPhase"_attr = SetClusterParameterCoordinatorPhase_serializer(_doc.getPhase()));
-
-    auto opCtx = cc().makeOperationContext();
-
-    if (_doc.getPhase() == Phase::kUnset) {
-        PersistentTaskStore<StateDoc> store(NamespaceString::kConfigsvrCoordinatorsNamespace);
-        try {
-            store.add(opCtx.get(), newDoc, WriteConcerns::kMajorityWriteConcernNoTimeout);
-        } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
-            // A series of step-up and step-down events can cause a node to try and insert the
-            // document when it has already been persisted locally, but we must still wait for
-            // majority commit.
-            const auto replCoord = repl::ReplicationCoordinator::get(opCtx.get());
-            const auto lastLocalOpTime = replCoord->getMyLastAppliedOpTime();
-            WaitForMajorityService::get(opCtx->getServiceContext())
-                .waitUntilMajority(lastLocalOpTime, opCtx.get()->getCancellationToken())
-                .get(opCtx.get());
-        }
-    } else {
-        _updateStateDocument(opCtx.get(), newDoc);
+bool SetClusterParameterCoordinator::_parameterValuesEqual(const BSONObj& parameter,
+                                                           const BSONObj& persistedParameter) {
+    // Check if the number of fields in 'parameter' match the number of fields in the persisted
+    // cluster-wide parameter document while ignoring "_id" and "clusterParameterTime" fields.
+    if (persistedParameter.nFields() !=
+        parameter.nFields() + kNumberOfSystemFieldsInParameterDocument) {
+        return false;
     }
-
-    _doc = std::move(newDoc);
+    for (auto&& element : parameter) {
+        if (!element.binaryEqualValues(
+                persistedParameter.getField(element.fieldNameStringData()))) {
+            return false;
+        }
+    }
+    return true;
 }
 
-bool SetClusterParameterCoordinator::_isClusterParameterSetAtTimestamp(OperationContext* opCtx) {
-    auto parameterElem = _doc.getParameter().firstElement();
-    auto parameterName = parameterElem.fieldName();
-    auto parameter = _doc.getParameter()[parameterName].Obj();
-    auto configsvrParameters =
-        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            repl::ReadConcernLevel::kMajorityReadConcern,
-            NamespaceString::kClusterParametersNamespace,
-            BSON("_id" << parameterName << "clusterParameterTime"
-                       << *_doc.getClusterParameterTime()),
-            BSONObj(),
-            boost::none));
+bool SetClusterParameterCoordinator::_isPersistedStateConflictingWithPreviousTime(
+    const boost::optional<LogicalTime>& previousTime,
+    const boost::optional<BSONObj>& currentClusterParameterValue) {
+    // If optimistic locking is not used, there is no update conflict.
+    if (!previousTime) {
+        return false;
+    }
+
+    // "previousTime" is provided, thus check whether the cluster parameter value was modified (by a
+    // concurrent update) since 'previousTime' by comparing "clusterParameterTime" stored on disk
+    // with 'previousTime'. The 'previousTime' equal to 'LogicalTime::kUninitialized' denotes a
+    // special case when the cluster parameter value is still unset. In such a case, we expect that
+    // 'currentClusterParameterValue' does not have a value.
+    if (*previousTime == LogicalTime::kUninitialized) {
+        return currentClusterParameterValue.has_value();
+    }
+    if (!currentClusterParameterValue) {
+        return true;
+    }
+    return parseClusterParameterTime(*currentClusterParameterValue) != previousTime->asTimestamp();
+}
+
+boost::optional<BSONObj> SetClusterParameterCoordinator::_getPersistedClusterParameter(
+    OperationContext* opCtx) const {
+    auto parameterName = _doc.getParameter().firstElement().fieldName();
+    const auto& configShard = ShardingCatalogManager::get(opCtx)->localConfigShard();
+    auto configsvrParameters = uassertStatusOK(configShard->exhaustiveFindOnConfig(
+        opCtx,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+        repl::ReadConcernLevel::kMajorityReadConcern,
+        NamespaceString::makeClusterParametersNSS(_doc.getTenantId()),
+        BSON("_id" << parameterName),
+        BSONObj(),
+        boost::none));
 
     dassert(configsvrParameters.docs.size() <= 1);
 
-    return !configsvrParameters.docs.empty();
+    if (configsvrParameters.docs.empty()) {
+        return boost::none;
+    }
+
+    BSONObj& parameterDoc = configsvrParameters.docs.front();
+    LOGV2_DEBUG(9469100,
+                1,
+                "loaded cluster parameter",
+                "coordinatorState"_attr = _doc.toBSON(),
+                "document"_attr = parameterDoc,
+                "parameterName"_attr = parameterName);
+    return boost::optional<BSONObj>(parameterDoc.getOwned());
 }
 
 void SetClusterParameterCoordinator::_sendSetClusterParameterToAllShards(
@@ -139,31 +207,43 @@ void SetClusterParameterCoordinator::_sendSetClusterParameterToAllShards(
     std::shared_ptr<executor::ScopedTaskExecutor> executor) {
     auto shards = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
 
+    // In case the config server acts as a config shard, there is no need to send the update because
+    // it will be handled in the _commit phase.
+    shards.erase(std::remove(shards.begin(), shards.end(), ShardId::kConfigServerId), shards.end());
+
     LOGV2_DEBUG(6387001, 1, "Sending setClusterParameter to shards:", "shards"_attr = shards);
 
     ShardsvrSetClusterParameter request(_doc.getParameter());
-    request.setDbName(NamespaceString::kAdminDb);
+    request.setDbName(DatabaseNameUtil::deserialize(_doc.getTenantId(),
+                                                    DatabaseName::kAdmin.db(omitTenant),
+                                                    SerializationContext::stateDefault()));
     request.setClusterParameterTime(*_doc.getClusterParameterTime());
+    generic_argument_util::setOperationSessionInfo(request, session);
+    generic_argument_util::setMajorityWriteConcern(request);
+
     sharding_util::sendCommandToShards(
-        opCtx,
-        NamespaceString::kAdminDb,
-        CommandHelpers::appendMajorityWriteConcern(request.toBSON(session.toBSON())),
-        shards,
-        **executor);
+        opCtx, DatabaseName::kAdmin, request.toBSON(), shards, **executor);
 }
 
 void SetClusterParameterCoordinator::_commit(OperationContext* opCtx) {
     LOGV2_DEBUG(6387002, 1, "Updating configsvr cluster parameter");
 
     SetClusterParameter setClusterParameterRequest(_doc.getParameter());
-    setClusterParameterRequest.setDbName(NamespaceString::kAdminDb);
+    setClusterParameterRequest.setDbName(
+        DatabaseNameUtil::deserialize(_doc.getTenantId(),
+                                      DatabaseName::kAdmin.db(omitTenant),
+                                      SerializationContext::stateDefault()));
     std::unique_ptr<ServerParameterService> parameterService =
         std::make_unique<ClusterParameterService>();
     DBDirectClient client(opCtx);
     ClusterParameterDBClientService dbService(client);
     SetClusterParameterInvocation invocation{std::move(parameterService), dbService};
-    invocation.invoke(
-        opCtx, setClusterParameterRequest, _doc.getClusterParameterTime(), kMajorityWriteConcern);
+    invocation.invoke(opCtx,
+                      setClusterParameterRequest,
+                      _doc.getClusterParameterTime(),
+                      boost::none /* previousTime */,
+                      kMajorityWriteConcern,
+                      true /* skipValidation */);
 }
 
 const ConfigsvrCoordinatorMetadata& SetClusterParameterCoordinator::metadata() const {
@@ -185,28 +265,57 @@ ExecutorFuture<void> SetClusterParameterCoordinator::_runImpl(
                 // Select a clusterParameter time.
                 auto vt = VectorClock::get(opCtx)->getTime();
                 auto clusterParameterTime = vt.clusterTime();
-                _doc.setClusterParameterTime(clusterParameterTime.asTimestamp());
+
+                _updateStateDocumentWith(opCtx, [&](StateDoc& doc) {
+                    doc.setClusterParameterTime(clusterParameterTime.asTimestamp());
+                });
             }
         })
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kSetClusterParameter, [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
 
-                ShardingLogging::get(opCtx)->logChange(
-                    opCtx,
-                    "setClusterParameter.start",
-                    NamespaceString::kClusterParametersNamespace.toString(),
-                    _doc.getParameter(),
-                    kMajorityWriteConcern);
+                // Get cluster parameter value stored on disk.
+                const auto persistedClusterParameter = _getPersistedClusterParameter(opCtx);
 
-                // If the parameter was already set on the config server, there is
-                // nothing else to do.
-                if (_isClusterParameterSetAtTimestamp(opCtx)) {
+                // If the parameter is already set on the config server, do a no-op.
+                if (persistedClusterParameter) {
+                    bool isClusterTimeEqual =
+                        parseClusterParameterTime(*persistedClusterParameter) ==
+                        *_doc.getClusterParameterTime();
+                    if (isClusterTimeEqual)
+                        return;
+
+                    bool isParameterValueEqual = _parameterValuesEqual(
+                        _doc.getParameter().firstElement().Obj(), *persistedClusterParameter);
+                    if (isParameterValueEqual)
+                        return;
+                }
+
+                // If the cluster parameter value was modified since 'previousTime', do not proceed
+                // with updating server cluster parameter.
+                if (_isPersistedStateConflictingWithPreviousTime(_doc.getPreviousTime(),
+                                                                 persistedClusterParameter)) {
+                    _detectedConcurrentUpdate = true;
+                    LOGV2_DEBUG(7880300,
+                                1,
+                                "encountered unexpected 'clusterParameterTime'",
+                                "previousTime"_attr = _doc.getPreviousTime()->asTimestamp());
+
                     return;
                 }
 
-                _doc = _updateSession(opCtx, _doc);
+                auto catalogManager = ShardingCatalogManager::get(opCtx);
+                ShardingLogging::get(opCtx)->logChange(opCtx,
+                                                       "setClusterParameter.start",
+                                                       NamespaceString::kClusterParametersNamespace,
+                                                       _doc.getParameter(),
+                                                       kMajorityWriteConcern,
+                                                       catalogManager->localConfigShard(),
+                                                       catalogManager->localCatalogClient());
+
+                _updateSession(opCtx);
                 const auto session = _getCurrentSession();
 
                 {
@@ -215,19 +324,20 @@ ExecutorFuture<void> SetClusterParameterCoordinator::_runImpl(
                     // persisted the cluster parameter on the configsvr so that new
                     // shards that get added will see the new cluster parameter.
                     Lock::SharedLock stableTopologyRegion =
-                        ShardingCatalogManager::get(opCtx)->enterStableTopologyRegion(opCtx);
+                        catalogManager->enterStableTopologyRegion(opCtx);
 
                     _sendSetClusterParameterToAllShards(opCtx, session, executor);
 
                     _commit(opCtx);
                 }
 
-                ShardingLogging::get(opCtx)->logChange(
-                    opCtx,
-                    "setClusterParameter.end",
-                    NamespaceString::kClusterParametersNamespace.toString(),
-                    _doc.getParameter(),
-                    kMajorityWriteConcern);
+                ShardingLogging::get(opCtx)->logChange(opCtx,
+                                                       "setClusterParameter.end",
+                                                       NamespaceString::kClusterParametersNamespace,
+                                                       _doc.getParameter(),
+                                                       kMajorityWriteConcern,
+                                                       catalogManager->localConfigShard(),
+                                                       catalogManager->localCatalogClient());
             }));
 }
 

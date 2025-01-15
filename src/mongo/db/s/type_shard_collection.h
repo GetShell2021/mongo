@@ -29,7 +29,17 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/s/type_shard_collection_gen.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -52,27 +62,25 @@ public:
     using ShardCollectionTypeBase::kUuidFieldName;
 
     // Make getters and setters accessible.
-    using ShardCollectionTypeBase::getAllowAutoSplit;
     using ShardCollectionTypeBase::getDefaultCollation;
     using ShardCollectionTypeBase::getEnterCriticalSectionCounter;
     using ShardCollectionTypeBase::getEpoch;
     using ShardCollectionTypeBase::getKeyPattern;
-    using ShardCollectionTypeBase::getMaxChunkSizeBytes;
     using ShardCollectionTypeBase::getNss;
     using ShardCollectionTypeBase::getRefreshing;
     using ShardCollectionTypeBase::getReshardingFields;
     using ShardCollectionTypeBase::getTimeseriesFields;
     using ShardCollectionTypeBase::getTimestamp;
     using ShardCollectionTypeBase::getUnique;
+    using ShardCollectionTypeBase::getUnsplittable;
     using ShardCollectionTypeBase::getUuid;
-    using ShardCollectionTypeBase::setAllowAutoSplit;
     using ShardCollectionTypeBase::setDefaultCollation;
     using ShardCollectionTypeBase::setEnterCriticalSectionCounter;
     using ShardCollectionTypeBase::setKeyPattern;
-    using ShardCollectionTypeBase::setMaxChunkSizeBytes;
     using ShardCollectionTypeBase::setRefreshing;
     using ShardCollectionTypeBase::setReshardingFields;
     using ShardCollectionTypeBase::setTimeseriesFields;
+    using ShardCollectionTypeBase::setUnsplittable;
 
     ShardCollectionType(NamespaceString nss,
                         OID epoch,
@@ -94,7 +102,7 @@ public:
     }
     void setAllowMigrations(bool allowMigrations);
 
-    boost::optional<ChunkVersion> getLastRefreshedCollectionVersion() const;
+    boost::optional<ChunkVersion> getLastRefreshedCollectionPlacementVersion() const;
 };
 
 }  // namespace mongo

@@ -1,7 +1,5 @@
-load('jstests/libs/sessions_collection.js');
-
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {validateSessionsCollection} from "jstests/libs/sessions_collection.js";
 
 // This test makes assertions about the number of sessions, which are not compatible with
 // implicit sessions.
@@ -17,7 +15,7 @@ var replTest = new ReplSetTest({
 });
 var nodes = replTest.startSet();
 
-replTest.initiate();
+replTest.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 var primary = replTest.getPrimary();
 var primaryAdmin = primary.getDB("admin");
 
@@ -109,6 +107,7 @@ let timeoutMinutes = res.localLogicalSessionTimeoutMinutes;
 
     validateSessionsCollection(primary, true, false, timeoutMinutes);
 
+    replTest.awaitReplication();
     assert.commandFailedWithCode(secondaryAdmin.runCommand({refreshLogicalSessionCacheNow: 1}),
                                  [ErrorCodes.IndexNotFound]);
 
@@ -154,4 +153,3 @@ secondary = replTest.getSecondary();
 }
 
 replTest.stopSet();
-})();

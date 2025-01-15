@@ -5,26 +5,25 @@
  * bumps the collection version.
  *
  * @tags: [
- *   does_not_support_stepdowns,
+ *    does_not_support_stepdowns,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
  * ]
  */
-(function() {
-'use strict';
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {ShardVersioningUtil} from "jstests/sharding/libs/shard_versioning_util.js";
 
-load("jstests/libs/feature_flag_util.js");
-load('jstests/libs/fail_point_util.js');
-load('jstests/libs/parallel_shell_helpers.js');
-load("jstests/sharding/libs/find_chunks_util.js");
-load("jstests/sharding/libs/shard_versioning_util.js");
-
-const st = new ShardingTest({shards: 2, other: {chunkSize: 1, enableAutoSplit: false}});
+const st = new ShardingTest({shards: 2, other: {chunkSize: 1}});
 const configDB = st.s.getDB("config");
 
 // Resets database dbName and enables sharding and establishes shard0 as primary, test case agnostic
 function setUpDatabaseAndEnableSharding(dbName) {
     assert.commandWorked(st.s.getDB(dbName).dropDatabase());
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
     return dbName;
 }
@@ -38,6 +37,8 @@ function setUpDatabaseAndEnableSharding(dbName) {
     const collName = "foo";
     const ns = dbName + "." + collName;
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
+    // Do a read via mongoS to force the filtering information to be known on the shard.
+    assert.eq(st.s.getDB(dbName).getCollection(collName).countDocuments({}), 0);
 
     ShardVersioningUtil.assertCollectionVersionEquals(st.shard0, ns, Timestamp(1, 0));
 
@@ -180,20 +181,9 @@ function testAllowMigrationsFalseDisablesBalancer(allowMigrations, collBSetNoBal
     }));
 
     st.startBalancer();
-    assert.soon(() => {
-        st.awaitBalancerRound();
-        const shard0Chunks =
-            findChunksUtil
-                .findChunksByNs(configDB, collA.getFullName(), {shard: st.shard0.shardName})
-                .itcount();
-        const shard1Chunks =
-            findChunksUtil
-                .findChunksByNs(configDB, collA.getFullName(), {shard: st.shard1.shardName})
-                .itcount();
-        jsTestLog(`shard0 chunks ${shard0Chunks}, shard1 chunks ${shard1Chunks}`);
-        return shard0Chunks == 2 && shard1Chunks == 2;
-    }, `Balancer failed to balance ${collA.getFullName()}`, 1000 * 60 * 10);
+    st.awaitBalance(collAName, dbName, 10 * 60000 /* 10min timeout */);
     st.stopBalancer();
+    st.verifyCollectionIsBalanced(collA);
 
     const collABalanceStatus =
         assert.commandWorked(st.s.adminCommand({balancerCollectionStatus: collA.getFullName()}));
@@ -216,4 +206,3 @@ testAllowMigrationsFalseDisablesBalancer(false /* allowMigrations */, {noBalance
 testAllowMigrationsFalseDisablesBalancer(false /* allowMigrations */, {noBalance: true});
 
 st.stop();
-})();

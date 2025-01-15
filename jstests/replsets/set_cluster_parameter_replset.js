@@ -7,10 +7,12 @@
  *   requires_persistence,
  *  ]
  */
-(function() {
-'use strict';
-
-load('jstests/libs/cluster_server_parameter_utils.js');
+import {
+    runGetClusterParameterNode,
+    runGetClusterParameterReplicaSet,
+    runSetClusterParameter,
+} from "jstests/libs/cluster_server_parameter_utils.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Checks that up-to-date cluster parameters are transferred over to newly-added replica set nodes
 // as part of initial sync.
@@ -28,6 +30,7 @@ function checkClusterParameterInitialSync(rst) {
     runSetClusterParameter(rst.getPrimary(), newStrParameter);
 
     // Check that the new values are visible on the majority of the nodes.
+    rst.awaitReplication();
     runGetClusterParameterReplicaSet(rst,
                                      ["testIntClusterParameter", "testStrClusterParameter"],
                                      [newIntParameter, newStrParameter]);
@@ -36,13 +39,13 @@ function checkClusterParameterInitialSync(rst) {
     // with all data fully replicated to it.
     const newNode = rst.add({});
     rst.reInitiate();
-    rst.waitForState(newNode, ReplSetTest.State.SECONDARY);
+    rst.awaitSecondaryNodes(null, [newNode]);
     rst.awaitReplication();
 
     // Check that the new node has the latest cluster parameter values.
-    runGetClusterParameterNode(newNode,
-                               ["testIntClusterParameter", "testStrClusterParameter"],
-                               [newIntParameter, newStrParameter]);
+    assert(runGetClusterParameterNode(newNode,
+                                      ["testIntClusterParameter", "testStrClusterParameter"],
+                                      [newIntParameter, newStrParameter]));
 
     // Check that setClusterParameter properly works with the reconfigured replica set.
     newIntParameter.intData = 30;
@@ -72,6 +75,7 @@ function checkClusterParameterRestart(rst) {
     runSetClusterParameter(rst.getPrimary(), newStrParameter);
 
     // Check that the new values are visible on the majority of the nodes.
+    rst.awaitReplication();
     runGetClusterParameterReplicaSet(rst,
                                      ["testIntClusterParameter", "testStrClusterParameter"],
                                      [newIntParameter, newStrParameter]);
@@ -91,10 +95,9 @@ const rst = new ReplSetTest({
     nodes: 2,
 });
 rst.startSet();
-rst.initiate();
+rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 checkClusterParameterInitialSync(rst);
 checkClusterParameterRestart(rst);
 
 rst.stopSet();
-})();

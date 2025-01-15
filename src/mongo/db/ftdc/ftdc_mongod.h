@@ -29,10 +29,14 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
 
 namespace mongo {
 
@@ -40,7 +44,7 @@ namespace mongo {
  * Start Full Time Data Capture
  * Starts 1 thread.
  */
-void startMongoDFTDC();
+void startMongoDFTDC(ServiceContext* serviceContext);
 
 /**
  * Stop Full Time Data Capture
@@ -50,6 +54,7 @@ void stopMongoDFTDC();
 /**
  * Validation callback for setParameter
  */
-Status validateCollectionStatsNamespaces(std::vector<std::string> value);
+Status validateCollectionStatsNamespaces(std::vector<std::string> value,
+                                         const boost::optional<TenantId>& tenantId);
 
 }  // namespace mongo

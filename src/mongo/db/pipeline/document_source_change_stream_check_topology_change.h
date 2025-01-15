@@ -29,8 +29,22 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <set>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -45,7 +59,8 @@ namespace mongo {
  * that previously may not have held any data for the collection being watched, and they contain the
  * information necessary for the mongoS to include the new shard in the merged change stream.
  */
-class DocumentSourceChangeStreamCheckTopologyChange final : public DocumentSource {
+class DocumentSourceChangeStreamCheckTopologyChange final
+    : public DocumentSourceInternalChangeStreamStage {
 public:
     static constexpr StringData kStageName = "$_internalChangeStreamCheckTopologyChange"_sd;
 
@@ -67,12 +82,14 @@ public:
         return boost::none;
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value doSerialize(const SerializationOptions& opts = SerializationOptions{}) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
 private:
     DocumentSourceChangeStreamCheckTopologyChange(
         const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : DocumentSource(kStageName, expCtx) {}
+        : DocumentSourceInternalChangeStreamStage(kStageName, expCtx) {}
 
     GetNextResult doGetNext() final;
 };

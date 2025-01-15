@@ -27,14 +27,16 @@
  *    it in the license file.
  */
 
+#include <mutex>
+#include <new>
 #include <queue>
 #include <utility>
 #include <vector>
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/static_immortal.h"
 
 namespace mongo {
@@ -104,7 +106,7 @@ private:
         }
     }
 
-    mutable stdx::mutex _mutex;  // NOLINT
+    mutable stdx::mutex _mutex;
     Date_t _now = ClockSourceMock::kInitialNow;
     AlarmQueue _alarms;
 };

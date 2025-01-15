@@ -29,23 +29,60 @@
 
 #include "mongo/db/pipeline/change_stream_rewrite_helpers.h"
 
+#include <absl/container/flat_hash_map.h>
+#include <boost/algorithm/string/replace.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <cstddef>
+#include <fmt/format.h>
+#include <functional>
+#include <map>
+#include <ostream>
+#include <utility>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_expr.h"
+#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/expression_path.h"
+#include "mongo/db/matcher/expression_tree.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
-#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace change_stream_rewrite {
 using MatchExpressionRewrite =
     std::function<std::unique_ptr<MatchExpression>(const boost::intrusive_ptr<ExpressionContext>&,
                                                    const PathMatchExpression*,
-                                                   bool /* allowInexact */)>;
+                                                   bool /* allowInexact */,
+                                                   std::vector<BSONObj>&)>;
 
 using AggExpressionRewrite =
     std::function<boost::intrusive_ptr<Expression>(const boost::intrusive_ptr<ExpressionContext>&,
                                                    const ExpressionFieldPath*,
-                                                   bool /* allowInexact */)>;
+                                                   bool /* allowInexact */,
+                                                   std::vector<BSONObj>&)>;
 
 namespace {
 /**
@@ -54,8 +91,8 @@ namespace {
 std::unique_ptr<PathMatchExpression> cloneWithSubstitution(
     const PathMatchExpression* predicate, const StringMap<std::string>& renameList) {
     auto clonedPred = std::unique_ptr<PathMatchExpression>(
-        static_cast<PathMatchExpression*>(predicate->shallowClone().release()));
-    clonedPred->applyRename(renameList);
+        static_cast<PathMatchExpression*>(predicate->clone().release()));
+    tassert(7585302, "Failed to rename", clonedPred->applyRename(renameList));
     return clonedPred;
 }
 boost::intrusive_ptr<ExpressionFieldPath> cloneWithSubstitution(
@@ -86,7 +123,8 @@ std::unique_ptr<MatchExpression> resolvePredicateOnNonExistentField(
 std::unique_ptr<MatchExpression> matchRewriteOperationType(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const PathMatchExpression* predicate,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
     // We should only ever see predicates on the 'operationType' field.
     tassert(5554200, "Unexpected empty path", !predicate->path().empty());
     tassert(5554201,
@@ -114,6 +152,8 @@ std::unique_ptr<MatchExpression> matchRewriteOperationType(
           {"$or"_sd,
            std::vector<Value>{Value({{"o.createIndexes"_sd, kExistsTrue}}),
                               Value({{"o.commitIndexBuild"_sd, kExistsTrue}})}}}},
+        {"startIndexBuild", {{"op", "c"_sd}, {"o.startIndexBuild"_sd, kExistsTrue}}},
+        {"abortIndexBuild", {{"op", "c"_sd}, {"o.abortIndexBuild"_sd, kExistsTrue}}},
         {"dropIndexes", {{"op", "c"_sd}, {"o.dropIndexes"_sd, kExistsTrue}}},
         {"modify", {{"op", "c"_sd}, {"o.collMod"_sd, kExistsTrue}}},
         {"rename", {{"op", "c"_sd}, {"o.renameCollection"_sd, kExistsTrue}}},
@@ -128,8 +168,8 @@ std::unique_ptr<MatchExpression> matchRewriteOperationType(
         if (BSONType::String != opType.type() || !kOpTypeRewriteMap.count(opType.str())) {
             return std::make_unique<AlwaysFalseMatchExpression>();
         }
-        return MatchExpressionParser::parseAndNormalize(kOpTypeRewriteMap.at(opType.str()).toBson(),
-                                                        expCtx);
+        return MatchExpressionParser::parseAndNormalize(
+            backingBsonObjs.emplace_back(kOpTypeRewriteMap.at(opType.str()).toBson()), expCtx);
     };
 
     switch (predicate->matchType()) {
@@ -178,7 +218,8 @@ std::unique_ptr<MatchExpression> matchRewriteOperationType(
 boost::intrusive_ptr<Expression> exprRewriteOperationType(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const ExpressionFieldPath* expr,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>&) {
     auto fieldPath = expr->getFieldPathWithoutCurrentPrefix();
     tassert(5920000,
             str::stream() << "Unexpected field path" << fieldPath.fullPathWithPrefix(),
@@ -221,11 +262,15 @@ boost::intrusive_ptr<Expression> exprRewriteOperationType(
     opCases.push_back(
         fromjson("{case: {$ne: ['$o.commitIndexBuild', '$$REMOVE']}, then: 'createIndexes'}"));
     opCases.push_back(
+        fromjson("{case: {$ne: ['$o.startIndexBuild', '$$REMOVE']}, then: 'startIndexBuild'}"));
+    opCases.push_back(
+        fromjson("{case: {$ne: ['$o.abortIndexBuild', '$$REMOVE']}, then: 'abortIndexBuild'}"));
+    opCases.push_back(
         fromjson("{case: {$ne: ['$o.dropIndexes', '$$REMOVE']}, then: 'dropIndexes'}"));
     opCases.push_back(fromjson("{case: {$ne: ['$o.collMod', '$$REMOVE']}, then: 'modify'}"));
 
     // The default case, if nothing matches.
-    auto defaultCase = ExpressionConstant::create(expCtx.get(), Value())->serialize(false);
+    auto defaultCase = ExpressionConstant::create(expCtx.get(), Value())->serialize();
 
     // Build the final expression object...
     BSONObjBuilder exprBuilder;
@@ -248,21 +293,12 @@ boost::intrusive_ptr<Expression> exprRewriteOperationType(
 std::unique_ptr<MatchExpression> matchRewriteDocumentKey(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const PathMatchExpression* predicate,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
     tassert(5554600, "Unexpected empty predicate path", predicate->fieldRef()->numParts() > 0);
     tassert(5554601,
             str::stream() << "Unexpected predicate path: " << predicate->path(),
             predicate->fieldRef()->getPart(0) == DocumentSourceChangeStream::kDocumentKeyField);
-
-    // Check if the predicate's path starts with "documentKey._id". If so, then we can always
-    // perform an exact rewrite. If not, because of the complexities of the 'op' == 'i' case, it's
-    // impractical to try to generate a rewritten predicate that matches exactly.
-    bool pathStartsWithDKId =
-        (predicate->fieldRef()->numParts() >= 2 &&
-         predicate->fieldRef()->getPart(1) == DocumentSourceChangeStream::kIdField);
-    if (!pathStartsWithDKId && !allowInexact) {
-        return nullptr;
-    }
 
     // Helper to generate a filter on the 'op' field for the specified type. This filter will also
     // include a copy of 'predicate' with the path renamed to apply to the oplog.
@@ -282,88 +318,15 @@ std::unique_ptr<MatchExpression> matchRewriteDocumentKey(
     // we evaluate the predicate against a non-existent field to see whether it matches.
     if (predicate->matchesSingleElement({})) {
         auto nonCRUDCase = MatchExpressionParser::parseAndNormalize(
-            fromjson("{$nor: [{op: 'i'}, {op: 'u'}, {op: 'd'}]}"), expCtx);
+            backingBsonObjs.emplace_back(fromjson("{$nor: [{op: 'i'}, {op: 'u'}, {op: 'd'}]}")),
+            expCtx);
         rewrittenPredicate->add(std::move(nonCRUDCase));
     }
 
-    // Handle update, replace and delete. The predicate path can simply be renamed.
+    // Handle update, replace, delete and insert. The predicate path can simply be renamed.
     rewrittenPredicate->add(generateFilterForOp("u"_sd, {{"documentKey", "o2"}}));
     rewrittenPredicate->add(generateFilterForOp("d"_sd, {{"documentKey", "o"}}));
-
-    // If the path is a subfield of 'documentKey', inserts can also be handled by renaming, as long
-    // as the path starts with _id or the predicate does not match a missing field.
-    if (predicate->fieldRef()->numParts() > 1) {
-        // If the predicate matches against a missing field and is on a field which exists in the
-        // full document but not the documentKey, then applying that predicate to the 'o' field in
-        // the oplog will discard entries that would have matched the eventual change stream event.
-        if (pathStartsWithDKId || !predicate->matchesSingleElement({})) {
-            rewrittenPredicate->add(generateFilterForOp("i"_sd, {{"documentKey", "o"}}));
-        } else {
-            // We can't rewrite the predicate, so we have to match all {op: "i"} events.
-            rewrittenPredicate->add(
-                std::make_unique<EqualityMatchExpression>("op"_sd, Value("i"_sd)));
-        }
-        return rewrittenPredicate;
-    }
-
-    // Otherwise, we must handle the {op: "i"} case where the predicate is on the full 'documentKey'
-    // field. Create an $and filter for the insert case, and seed it with {op: "i"}. If we are
-    // unable to rewrite the predicate below, this filter will simply return all insert events.
-    auto insertCase = std::make_unique<AndMatchExpression>();
-    insertCase->add(std::make_unique<EqualityMatchExpression>("op"_sd, Value("i"_sd)));
-
-    // Helper to convert an equality match against 'documentKey' into a match against each subfield.
-    auto makeInsertDocKeyFilterForOperand =
-        [&](BSONElement rhs) -> std::unique_ptr<MatchExpression> {
-        // We're comparing against the full 'documentKey' field, which is an object that has an
-        // '_id' subfield and possibly other subfields. If 'rhs' is not an object or if 'rhs'
-        // doesn't have an '_id' subfield, it will never match.
-        if (rhs.type() != BSONType::Object ||
-            !rhs.embeddedObject()[DocumentSourceChangeStream::kIdField]) {
-            return std::make_unique<AlwaysFalseMatchExpression>();
-        }
-        // Iterate over 'rhs' and add an equality match on each subfield into the $and. Each
-        // fieldname is prefixed with "o." so that it applies to the document embedded in the oplog.
-        auto andExpr = std::make_unique<AndMatchExpression>();
-        for (auto&& subfield : rhs.embeddedObject()) {
-            andExpr->add(MatchExpressionParser::parseAndNormalize(
-                BSON((str::stream() << "o." << subfield.fieldNameStringData()) << subfield),
-                expCtx));
-        }
-        return andExpr;
-    };
-
-    // There are only a limited set of predicates that we can feasibly rewrite here.
-    switch (predicate->matchType()) {
-        case MatchExpression::INTERNAL_EXPR_EQ:
-        case MatchExpression::EQ: {
-            auto cme = static_cast<const ComparisonMatchExpressionBase*>(predicate);
-            insertCase->add(makeInsertDocKeyFilterForOperand(cme->getData()));
-            break;
-        }
-        case MatchExpression::MATCH_IN: {
-            // Convert the $in into an $or with one branch for each operand. We don't need to
-            // account for regex operands, since these will never match.
-            auto ime = static_cast<const InMatchExpression*>(predicate);
-            auto orExpr = std::make_unique<OrMatchExpression>();
-            for (auto& equality : ime->getEqualities()) {
-                orExpr->add(makeInsertDocKeyFilterForOperand(equality));
-            }
-            insertCase->add(std::move(orExpr));
-            break;
-        }
-        case MatchExpression::EXISTS:
-            // An $exists predicate will match every insert, since every insert has a documentKey.
-            // Leave the filter as {op: "i"} and fall through to the default 'break' case.
-        default:
-            // For all other predicates, we give up and just allow all insert oplog entries to pass
-            // through.
-            break;
-    }
-
-    // Regardless of whether we were able to fully rewrite the {op: "i"} case or not, add the
-    // 'insertCase' to produce the final rewritten documentKey predicate.
-    rewrittenPredicate->add(std::move(insertCase));
+    rewrittenPredicate->add(generateFilterForOp("i"_sd, {{"documentKey", "o2"}}));
 
     return rewrittenPredicate;
 }
@@ -375,47 +338,32 @@ std::unique_ptr<MatchExpression> matchRewriteDocumentKey(
 boost::intrusive_ptr<Expression> exprRewriteDocumentKey(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const ExpressionFieldPath* expr,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>&) {
     auto fieldPath = expr->getFieldPathWithoutCurrentPrefix();
     tassert(5942300,
             str::stream() << "Unexpected field path" << fieldPath.fullPathWithPrefix(),
             fieldPath.getFieldName(0) == DocumentSourceChangeStream::kDocumentKeyField);
 
-    // If the field path refers to the full "documentKey" field (and not a subfield thereof), we
-    // don't attempt to generate a rewritten expression.
-    if (fieldPath.getPathLength() == 1) {
-        return nullptr;
-    }
-
-    // Check if the field path starts with "documentKey._id". If so, then we can always perform an
-    // exact rewrite. If not, because of the complexities of the 'op' == 'i' case, it's impractical
-    // to try to generate a rewritten expression that matches exactly.
-    bool pathStartsWithDKId = (fieldPath.getPathLength() >= 2 &&
-                               fieldPath.getFieldName(1) == DocumentSourceChangeStream::kIdField);
-    if (!pathStartsWithDKId && !allowInexact) {
-        return nullptr;
-    }
-
     // We intend to build a $switch statement which returns the correct change stream operationType
     // based on the contents of the oplog event. Start by enumerating the different opType cases.
     std::vector<BSONObj> opCases;
 
-    // Cases for 'insert' and 'delete'.
-    auto insertAndDeletePath = cloneWithSubstitution(expr, {{"documentKey", "o"}})
-                                   ->getFieldPathWithoutCurrentPrefix()
-                                   .fullPathWithPrefix();
-    opCases.push_back(
-        fromjson("{case: {$in: ['$op', ['i', 'd']]}, then: '" + insertAndDeletePath + "'}"));
+    // Case for 'delete'.
+    auto deletePath = cloneWithSubstitution(expr, {{"documentKey", "o"}})
+                          ->getFieldPathWithoutCurrentPrefix()
+                          .fullPathWithPrefix();
+    opCases.push_back(fromjson("{case: {$eq: ['$op', 'd']}, then: '" + deletePath + "'}"));
 
-    // Cases for 'update' and 'replace'.
-    auto updateAndReplacePath = cloneWithSubstitution(expr, {{"documentKey", "o2"}})
-                                    ->getFieldPathWithoutCurrentPrefix()
-                                    .fullPathWithPrefix();
+    // Cases for 'insert', 'update' and 'replace'.
+    auto insertUpdateAndReplacePath = cloneWithSubstitution(expr, {{"documentKey", "o2"}})
+                                          ->getFieldPathWithoutCurrentPrefix()
+                                          .fullPathWithPrefix();
     opCases.push_back(
-        fromjson("{case: {$eq: ['$op', 'u']}, then: '" + updateAndReplacePath + "'}"));
+        fromjson("{case: {$in: ['$op', ['i', 'u']]}, then: '" + insertUpdateAndReplacePath + "'}"));
 
     // The default case, if nothing matches.
-    auto defaultCase = ExpressionConstant::create(expCtx.get(), Value())->serialize(false);
+    auto defaultCase = ExpressionConstant::create(expCtx.get(), Value())->serialize();
 
     // Build the expression BSON object.
     BSONObjBuilder exprBuilder;
@@ -438,7 +386,8 @@ boost::intrusive_ptr<Expression> exprRewriteDocumentKey(
 std::unique_ptr<MatchExpression> matchRewriteFullDocument(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const PathMatchExpression* predicate,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
     tassert(5851400, "Unexpected empty predicate path", predicate->fieldRef()->numParts() > 0);
     tassert(5851401,
             str::stream() << "Unexpected predicate path: " << predicate->path(),
@@ -478,7 +427,9 @@ std::unique_ptr<MatchExpression> matchRewriteFullDocument(
     auto insertOrReplaceCase = std::make_unique<AndMatchExpression>();
 
     auto insertOrReplaceOpFilter = MatchExpressionParser::parseAndNormalize(
-        fromjson("{$or: [{op: 'i'}, {op: 'u', 'o._id': {$exists: true}}]}"), expCtx);
+        backingBsonObjs.emplace_back(
+            fromjson("{$or: [{op: 'i'}, {op: 'u', 'o._id': {$exists: true}}]}")),
+        expCtx);
     insertOrReplaceCase->add(std::move(insertOrReplaceOpFilter));
 
     auto predForInsertOrReplace = cloneWithSubstitution(predicate, {{"fullDocument", "o"}});
@@ -493,7 +444,8 @@ std::unique_ptr<MatchExpression> matchRewriteFullDocument(
         rewrittenPredicate->add(std::move(deleteCase));
 
         auto nonCRUDCase = MatchExpressionParser::parseAndNormalize(
-            fromjson("{$nor: [{op: 'i'}, {op: 'u'}, {op: 'd'}]}"), expCtx);
+            backingBsonObjs.emplace_back(fromjson("{$nor: [{op: 'i'}, {op: 'u'}, {op: 'd'}]}")),
+            expCtx);
         rewrittenPredicate->add(std::move(nonCRUDCase));
     }
 
@@ -507,7 +459,8 @@ std::unique_ptr<MatchExpression> matchRewriteFullDocument(
 std::unique_ptr<MatchExpression> matchRewriteUpdateDescription(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const PathMatchExpression* predicate,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
     tassert(5554500, "Unexpected empty predicate path", predicate->fieldRef()->numParts() > 0);
     tassert(5554501,
             str::stream() << "Unexpected predicate path: " << predicate->path(),
@@ -530,8 +483,8 @@ std::unique_ptr<MatchExpression> matchRewriteUpdateDescription(
                 return std::make_unique<AlwaysTrueMatchExpression>();
             }
             // We check whether this is a ComparisonMatchExpression to ensure that the predicate is
-            // type-bracketed, which means that it will *only* match missing, null, or undefined.
-            // None of these fields will ever be null or undefined in the change stream event.
+            // type-bracketed, which means that it will *only* match missing or null. None of these
+            // fields will ever be null or undefined in the change stream event.
             if (ComparisonMatchExpression::isComparisonMatchExpression(predicate) &&
                 predicate->matchesSingleElement({})) {
                 return std::make_unique<AlwaysFalseMatchExpression>();
@@ -621,9 +574,10 @@ std::unique_ptr<MatchExpression> matchRewriteUpdateDescription(
                 // not need to check whether the predicate matches a missing field in this case.
                 static const std::vector<std::string> oplogFields = {"o.diff.d", "o.$unset"};
                 auto rewrittenEquality = std::make_unique<OrMatchExpression>();
+                using namespace fmt::literals;
                 for (auto&& oplogField : oplogFields) {
-                    rewrittenEquality->add(
-                        std::make_unique<ExistsMatchExpression>(oplogField + "." + fieldName));
+                    rewrittenEquality->add(std::make_unique<ExistsMatchExpression>(
+                        StringData("{}.{}"_format(oplogField, fieldName))));
                 }
                 return rewrittenEquality;
             };
@@ -694,7 +648,9 @@ std::unique_ptr<MatchExpression> matchRewriteUpdateDescription(
     // events, so we evaluate the predicate against a non-existent field to see whether it matches.
     if (predicate->matchesSingleElement({})) {
         auto nonUpdateCase = MatchExpressionParser::parseAndNormalize(
-            fromjson("{$or: [{op: {$ne: 'u'}}, {op: 'u', 'o._id': {$exists: true}}]}"), expCtx);
+            backingBsonObjs.emplace_back(
+                fromjson("{$or: [{op: {$ne: 'u'}}, {op: 'u', 'o._id': {$exists: true}}]}")),
+            expCtx);
         finalPredicate = std::make_unique<OrMatchExpression>(std::move(finalPredicate), nullptr);
         finalPredicate->add(std::move(nonUpdateCase));
     }
@@ -888,9 +844,12 @@ std::unique_ptr<MatchExpression> matchRewriteGenericNamespace(
                 }();
 
                 // Convert the MatchExpression $regex into a $regexMatch on the corresponding field.
+                // Backslashes must be escaped to ensure they retain their special behavior.
+                const auto regex =
+                    boost::replace_all_copy(std::string(nsElem.regex()), R"(\)", R"(\\)");
                 const std::string exprRegexMatch = str::stream()
-                    << "{$regexMatch: {input: " << exprDbOrCollName << ", regex: '"
-                    << nsElem.regex() << "', options: '" << nsElem.regexFlags() << "'}}";
+                    << "{$regexMatch: {input: " << exprDbOrCollName << ", regex: '" << regex
+                    << "', options: '" << nsElem.regexFlags() << "'}}";
 
                 // Finally, wrap the regex in a $let which defines the '$$oplogField' variable.
                 const std::string exprRewrittenPredicate = str::stream()
@@ -970,7 +929,8 @@ std::unique_ptr<MatchExpression> matchRewriteGenericNamespace(
 std::unique_ptr<MatchExpression> matchRewriteNs(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const PathMatchExpression* predicate,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
     // We should only ever see predicates on the 'ns' field.
     tassert(5554101, "Unexpected empty path", !predicate->path().empty());
     tassert(5554102,
@@ -999,8 +959,8 @@ std::unique_ptr<MatchExpression> matchRewriteNs(
 
     // Create the final namespace filter for CRUD operations, i.e. {op: {$ne: 'c'}}.
     auto crudNsFilter = std::make_unique<AndMatchExpression>();
-    crudNsFilter->add(
-        MatchExpressionParser::parseAndNormalize(fromjson("{op: {$ne: 'c'}}"), expCtx));
+    crudNsFilter->add(MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(fromjson("{op: {$ne: 'c'}}")), expCtx));
     crudNsFilter->add(std::move(crudNsRewrite));
 
     //
@@ -1041,6 +1001,20 @@ std::unique_ptr<MatchExpression> matchRewriteNs(
     tassert(6339401, "Unexpected rewrite failure", commitIndexBuildNsRewrite);
     cmdCases->add(std::move(commitIndexBuildNsRewrite));
 
+    // The 'startIndexBuild' event is rewritten to the cmdNs in 'ns' and the collection name in
+    // 'o.startIndexBuild'.
+    auto startIndexBuildNsRewrite = matchRewriteGenericNamespace(
+        expCtx, predicate, "ns"_sd, true /* nsFieldIsCmdNs */, "o.startIndexBuild"_sd);
+    tassert(9315300, "Unexpected rewrite failure", startIndexBuildNsRewrite);
+    cmdCases->add(std::move(startIndexBuildNsRewrite));
+
+    // The 'abortIndexBuild' event is rewritten to the cmdNs in 'ns' and the collection name in
+    // 'o.abortIndexBuild'.
+    auto abortIndexBuildNsRewrite = matchRewriteGenericNamespace(
+        expCtx, predicate, "ns"_sd, true /* nsFieldIsCmdNs */, "o.abortIndexBuild"_sd);
+    tassert(9315400, "Unexpected rewrite failure", abortIndexBuildNsRewrite);
+    cmdCases->add(std::move(abortIndexBuildNsRewrite));
+
     // The 'dropIndexes' event is rewritten to the cmdNs in 'ns' and the collection name in
     // 'o.dropIndexes'.
     auto dropIndexesNsRewrite = matchRewriteGenericNamespace(
@@ -1061,12 +1035,14 @@ std::unique_ptr<MatchExpression> matchRewriteNs(
         matchRewriteGenericNamespace(expCtx, predicate, "ns"_sd, true /* nsFieldIsCmdNs */);
     tassert(5554105, "Unexpected rewrite failure", dropDbNsRewrite);
     auto andDropDbNsRewrite = std::make_unique<AndMatchExpression>(std::move(dropDbNsRewrite));
-    andDropDbNsRewrite->add(std::make_unique<EqualityMatchExpression>("o.dropDatabase", Value(1)));
+    andDropDbNsRewrite->add(
+        std::make_unique<EqualityMatchExpression>("o.dropDatabase"_sd, Value(1)));
     cmdCases->add(std::move(andDropDbNsRewrite));
 
     // Create the final namespace filter for {op: 'c'} operations.
     auto cmdNsFilter = std::make_unique<AndMatchExpression>();
-    cmdNsFilter->add(MatchExpressionParser::parseAndNormalize(fromjson("{op: 'c'}"), expCtx));
+    cmdNsFilter->add(MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(fromjson("{op: 'c'}")), expCtx));
     cmdNsFilter->add(std::move(cmdCases));
 
     //
@@ -1088,7 +1064,8 @@ std::unique_ptr<MatchExpression> matchRewriteNs(
 boost::intrusive_ptr<Expression> exprRewriteNs(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const ExpressionFieldPath* expr,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
     auto fieldPath = expr->getFieldPathWithoutCurrentPrefix();
 
     // This function should only be called on the 'ns' field.
@@ -1150,11 +1127,15 @@ boost::intrusive_ptr<Expression> exprRewriteNs(
     collCases.push_back(fromjson(
         "{case: {$ne: ['$o.commitIndexBuild', '$$REMOVE']}, then: '$o.commitIndexBuild'}"));
     collCases.push_back(
+        fromjson("{case: {$ne: ['$o.startIndexBuild', '$$REMOVE']}, then: '$o.startIndexBuild'}"));
+    collCases.push_back(
+        fromjson("{case: {$ne: ['$o.abortIndexBuild', '$$REMOVE']}, then: '$o.abortIndexBuild'}"));
+    collCases.push_back(
         fromjson("{case: {$ne: ['$o.dropIndexes', '$$REMOVE']}, then: '$o.dropIndexes'}"));
     collCases.push_back(fromjson("{case: {$ne: ['$o.collMod', '$$REMOVE']}, then: '$o.collMod'}"));
 
     // The default case, if nothing matches.
-    auto defaultCase = ExpressionConstant::create(expCtx.get(), Value())->serialize(false);
+    auto defaultCase = ExpressionConstant::create(expCtx.get(), Value())->serialize();
 
     // Build the collection expression object...
     BSONObjBuilder collExprBuilder;
@@ -1188,7 +1169,8 @@ boost::intrusive_ptr<Expression> exprRewriteNs(
 std::unique_ptr<MatchExpression> matchRewriteTo(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const PathMatchExpression* predicate,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
     // We should only ever see predicates on the 'to' field.
     tassert(5554400, "Unexpected empty path", !predicate->path().empty());
     tassert(5554401,
@@ -1196,8 +1178,9 @@ std::unique_ptr<MatchExpression> matchRewriteTo(
             predicate->fieldRef()->getPart(0) == DocumentSourceChangeStream::kRenameTargetNssField);
 
     if (auto rewriteTo = matchRewriteGenericNamespace(expCtx, predicate, "o.to"_sd)) {
-        auto andRewriteTo = std::make_unique<AndMatchExpression>(
-            MatchExpressionParser::parseAndNormalize(fromjson("{op: 'c'}"), expCtx));
+        auto andRewriteTo =
+            std::make_unique<AndMatchExpression>(MatchExpressionParser::parseAndNormalize(
+                backingBsonObjs.emplace_back(fromjson("{op: 'c'}")), expCtx));
         andRewriteTo->add(std::move(rewriteTo));
         return andRewriteTo;
     }
@@ -1211,7 +1194,8 @@ std::unique_ptr<MatchExpression> matchRewriteTo(
 boost::intrusive_ptr<Expression> exprRewriteTo(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const ExpressionFieldPath* expr,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
     auto fieldPath = expr->getFieldPathWithoutCurrentPrefix();
 
     // This function should only be called on the 'to' field.
@@ -1256,6 +1240,61 @@ boost::intrusive_ptr<Expression> exprRewriteTo(
         expCtx.get(), fromjson(condRename.str()), expCtx->variablesParseState);
 }
 
+/**
+ * Rewrites filters on 'fullDocumentBeforeChange' in a format that can be applied directly to the
+ * oplog.
+ */
+std::unique_ptr<MatchExpression> matchRewriteFullDocumentBeforeChange(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const PathMatchExpression* predicate,
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
+    tassert(6199800, "Unexpected empty path", !predicate->path().empty());
+    tassert(6199801,
+            str::stream() << "Unexpected predicate path: " << predicate->path(),
+            predicate->fieldRef()->getPart(0) ==
+                DocumentSourceChangeStream::kFullDocumentBeforeChangeField);
+
+    // If this predicate matches a missing value, e.g. {$eq: null}, we cannot rewrite it. Predicates
+    // such as this will match all non-update and non-delete operations, and we do not know whether
+    // the post-image will be available later in the pipeline. We also cannot continue if an exact
+    // rewrite is required. In both cases, return nullptr immediately.
+    if (!allowInexact || predicate->matchesSingleElement({})) {
+        return nullptr;
+    }
+
+    // Only an update or a delete can possibly match a predicate on fullDocumentBeforeChange.
+    auto updatePred = std::make_unique<AndMatchExpression>(MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(fromjson("{op: 'u'}")), expCtx));
+    auto deletePred = std::make_unique<AndMatchExpression>(MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(fromjson("{op: 'd'}")), expCtx));
+
+    // If the predicate is on the _id field, we can apply it to the documentKey in the oplog.
+    /* Example:
+     *   '{'fullDocumentBeforeChange._id': {$lt: 3}}' gets rewritten to
+     *                           {$or:[
+     *                              {$and: [
+     *                                  {op: {$eq: 'd'}},
+     *                                  {'o._id': {$lt: 3}}
+     *                              ]},
+     *                              {$and: [
+     *                                  {op: {$eq: 'u'}},
+     *                                  {'o2._id': {$lt: 3}}
+     *                              ]}
+     *                           ]}
+     */
+    if (predicate->fieldRef()->numParts() > 1 && predicate->fieldRef()->getPart(1) == "_id") {
+        updatePred->add(cloneWithSubstitution(predicate, {{"fullDocumentBeforeChange", "o2"}}));
+        deletePred->add(cloneWithSubstitution(predicate, {{"fullDocumentBeforeChange", "o"}}));
+    }
+
+    // Wrap the update and delete predicates in an $or, and return the completed rewrite.
+    auto finalPred = std::make_unique<OrMatchExpression>(std::move(updatePred), nullptr);
+    finalPred->add(std::move(deletePred));
+
+    return finalPred;
+}
+
 // Map of fields names for which a simple rename is sufficient when rewriting.
 StringMap<std::string> renameRegistry = {
     {"clusterTime", "ts"}, {"lsid", "lsid"}, {"txnNumber", "txnNumber"}};
@@ -1265,6 +1304,7 @@ StringMap<MatchExpressionRewrite> matchRewriteRegistry = {
     {"operationType", matchRewriteOperationType},
     {"documentKey", matchRewriteDocumentKey},
     {"fullDocument", matchRewriteFullDocument},
+    {"fullDocumentBeforeChange", matchRewriteFullDocumentBeforeChange},
     {"updateDescription", matchRewriteUpdateDescription},
     {"ns", matchRewriteNs},
     {"to", matchRewriteTo}};
@@ -1288,7 +1328,8 @@ boost::intrusive_ptr<Expression> rewriteAggExpressionTree(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     boost::intrusive_ptr<Expression> expr,
     const std::set<std::string>& fields,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
     tassert(5920001, "Expression required for rewriteAggExpressionTree", expr);
 
     if (auto andExpr = dynamic_cast<ExpressionAnd*>(expr.get())) {
@@ -1297,8 +1338,8 @@ boost::intrusive_ptr<Expression> rewriteAggExpressionTree(
         while (childIt != children.end()) {
             // If inexact rewrites are permitted and any children of an $and cannot be rewritten, we
             // can omit those children without expanding the set of rejected documents.
-            if (auto rewrittenPred =
-                    rewriteAggExpressionTree(expCtx, *childIt, fields, allowInexact)) {
+            if (auto rewrittenPred = rewriteAggExpressionTree(
+                    expCtx, *childIt, fields, allowInexact, backingBsonObjs)) {
                 *childIt = rewrittenPred;
                 ++childIt;
             } else if (allowInexact) {
@@ -1314,8 +1355,8 @@ boost::intrusive_ptr<Expression> rewriteAggExpressionTree(
             // Dropping any children of an $or would expand the set of documents rejected by the
             // filter. There is no valid rewrite of a $or if we cannot rewrite all of its children.
             // It is, however, valid for children of an $or to be inexact.
-            if (auto rewrittenPred =
-                    rewriteAggExpressionTree(expCtx, *childIt, fields, allowInexact)) {
+            if (auto rewrittenPred = rewriteAggExpressionTree(
+                    expCtx, *childIt, fields, allowInexact, backingBsonObjs)) {
                 *childIt = rewrittenPred;
             } else {
                 return nullptr;
@@ -1335,7 +1376,7 @@ boost::intrusive_ptr<Expression> rewriteAggExpressionTree(
             auto childIt = norChildren.begin();
             while (childIt != norChildren.end()) {
                 if (auto rewrittenPred = rewriteAggExpressionTree(
-                        expCtx, *childIt, fields, false /* allowInexact */)) {
+                        expCtx, *childIt, fields, false /* allowInexact */, backingBsonObjs)) {
                     *childIt = rewrittenPred;
                     ++childIt;
                 } else if (allowInexact) {
@@ -1347,8 +1388,8 @@ boost::intrusive_ptr<Expression> rewriteAggExpressionTree(
             return notExpr;
         }
 
-        if (auto rewrittenPred =
-                rewriteAggExpressionTree(expCtx, notChild, fields, false /* allowInexact */)) {
+        if (auto rewrittenPred = rewriteAggExpressionTree(
+                expCtx, notChild, fields, false /* allowInexact */, backingBsonObjs)) {
             notChild = rewrittenPred;
             return notExpr;
         }
@@ -1382,7 +1423,7 @@ boost::intrusive_ptr<Expression> rewriteAggExpressionTree(
 
         // Other paths have custom rewrite logic.
         if (exprRewriteRegistry.contains(firstPath)) {
-            return exprRewriteRegistry[firstPath](expCtx, fieldExpr, allowInexact);
+            return exprRewriteRegistry[firstPath](expCtx, fieldExpr, allowInexact, backingBsonObjs);
         }
 
         // Others cannot be rewritten at all.
@@ -1407,7 +1448,7 @@ boost::intrusive_ptr<Expression> rewriteAggExpressionTree(
                 // Some expressions have null children, which we leave in place.
                 continue;
             } else if (auto rewrittenPred = rewriteAggExpressionTree(
-                           expCtx, *childIt, fields, false /* allowInexact */)) {
+                           expCtx, *childIt, fields, false /* allowInexact */, backingBsonObjs)) {
                 *childIt = rewrittenPred;
             } else {
                 return nullptr;
@@ -1433,7 +1474,8 @@ std::unique_ptr<MatchExpression> rewriteMatchExpressionTree(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const MatchExpression* root,
     const std::set<std::string>& fields,
-    bool allowInexact) {
+    bool allowInexact,
+    std::vector<BSONObj>& backingBsonObjs) {
     tassert(5687200, "MatchExpression required for rewriteMatchExpressionTree", root);
 
     switch (root->matchType()) {
@@ -1444,7 +1486,7 @@ std::unique_ptr<MatchExpression> rewriteMatchExpressionTree(
                 // rewritten, we can omit those children without expanding the set of rejected
                 // documents.
                 if (auto rewrittenPred = rewriteMatchExpressionTree(
-                        expCtx, root->getChild(i), fields, allowInexact)) {
+                        expCtx, root->getChild(i), fields, allowInexact, backingBsonObjs)) {
                     rewrittenAnd->add(std::move(rewrittenPred));
                 } else if (!allowInexact) {
                     return nullptr;
@@ -1459,7 +1501,7 @@ std::unique_ptr<MatchExpression> rewriteMatchExpressionTree(
                 // filter. There is no valid rewrite of a $or if we cannot rewrite all of its
                 // children. It is, however, valid for children of an $or to be inexact.
                 if (auto rewrittenPred = rewriteMatchExpressionTree(
-                        expCtx, root->getChild(i), fields, allowInexact)) {
+                        expCtx, root->getChild(i), fields, allowInexact, backingBsonObjs)) {
                     rewrittenOr->add(std::move(rewrittenPred));
                 } else {
                     return nullptr;
@@ -1474,8 +1516,11 @@ std::unique_ptr<MatchExpression> rewriteMatchExpressionTree(
             // documents, then {$nor: [P]} will incorrectly reject a _superset_ of documents.
             auto rewrittenNor = std::make_unique<NorMatchExpression>();
             for (size_t i = 0; i < root->numChildren(); ++i) {
-                if (auto rewrittenPred = rewriteMatchExpressionTree(
-                        expCtx, root->getChild(i), fields, false /* allowInexact */)) {
+                if (auto rewrittenPred = rewriteMatchExpressionTree(expCtx,
+                                                                    root->getChild(i),
+                                                                    fields,
+                                                                    false /* allowInexact */,
+                                                                    backingBsonObjs)) {
                     rewrittenNor->add(std::move(rewrittenPred));
                 } else if (!allowInexact) {
                     return nullptr;
@@ -1487,7 +1532,7 @@ std::unique_ptr<MatchExpression> rewriteMatchExpressionTree(
             // Note that children of a $not _cannot_ be inexact. If predicate P rejects a _subset_
             // of documents, then {$not: P} will incorrectly reject a _superset_ of documents.
             if (auto rewrittenPred = rewriteMatchExpressionTree(
-                    expCtx, root->getChild(0), fields, false /* allowInexact */)) {
+                    expCtx, root->getChild(0), fields, false /* allowInexact */, backingBsonObjs)) {
                 return std::make_unique<NotMatchExpression>(std::move(rewrittenPred));
             }
             return nullptr;
@@ -1495,20 +1540,25 @@ std::unique_ptr<MatchExpression> rewriteMatchExpressionTree(
         case MatchExpression::EXPRESSION: {
             // Agg expressions are rewritten in-place, so we must clone the expression tree.
             auto origExprVal =
-                static_cast<const ExprMatchExpression*>(root)->getExpression()->serialize(false);
+                static_cast<const ExprMatchExpression*>(root)->getExpression()->serialize(
+                    SerializationOptions{});
             auto clonedExpr = Expression::parseOperand(
                 expCtx.get(), BSON("" << origExprVal).firstElement(), expCtx->variablesParseState);
 
             // Attempt to rewrite the aggregation expression and return a new ExprMatchExpression.
-            if (auto rewrittenExpr =
-                    rewriteAggExpressionTree(expCtx, clonedExpr, fields, allowInexact)) {
+            if (auto rewrittenExpr = rewriteAggExpressionTree(
+                    expCtx, clonedExpr, fields, allowInexact, backingBsonObjs)) {
                 return std::make_unique<ExprMatchExpression>(rewrittenExpr, expCtx);
             }
             return nullptr;
         }
         default: {
             if (auto pathME = dynamic_cast<const PathMatchExpression*>(root)) {
-                tassert(5687201, "Unexpected empty path", !pathME->path().empty());
+                // Only attempt to rewrite non-empty paths.
+                if (pathME->path().empty()) {
+                    return nullptr;
+                }
+
                 auto firstPath = pathME->fieldRef()->getPart(0).toString();
 
                 // Only attempt to rewrite paths that begin with one of the caller-requested fields.
@@ -1523,7 +1573,8 @@ std::unique_ptr<MatchExpression> rewriteMatchExpressionTree(
 
                 // Other paths have custom rewrite logic.
                 if (matchRewriteRegistry.contains(firstPath)) {
-                    return matchRewriteRegistry[firstPath](expCtx, pathME, allowInexact);
+                    return matchRewriteRegistry[firstPath](
+                        expCtx, pathME, allowInexact, backingBsonObjs);
                 }
 
                 // Others cannot be rewritten at all.
@@ -1539,6 +1590,7 @@ std::unique_ptr<MatchExpression> rewriteMatchExpressionTree(
 std::unique_ptr<MatchExpression> rewriteFilterForFields(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const MatchExpression* userMatch,
+    std::vector<BSONObj>& backingBsonObjs,
     std::set<std::string> includeFields,
     std::set<std::string> excludeFields) {
     // If we get null in, we return null immediately.
@@ -1565,7 +1617,8 @@ std::unique_ptr<MatchExpression> rewriteFilterForFields(
     }
 
     // Attempt to rewrite the tree. Predicates on unknown or unrequested fields will be discarded.
-    return rewriteMatchExpressionTree(expCtx, userMatch, includeFields, true /* allowInexact */);
+    return rewriteMatchExpressionTree(
+        expCtx, userMatch, includeFields, true /* allowInexact */, backingBsonObjs);
 }
 }  // namespace change_stream_rewrite
 }  // namespace mongo

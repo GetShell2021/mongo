@@ -81,11 +81,12 @@ class test_checkpoint09(wttest.WiredTigerTestCase):
         evict_cursor = s.open_cursor(uri, None, "debug=(release_evict)")
         for i in range(1, nrows + 1):
             evict_cursor.set_key(ds.key(i))
-            self.assertEquals(evict_cursor.search(), 0)
+            self.assertEqual(evict_cursor.search(), 0)
             evict_cursor.reset()
         s.rollback_transaction()
         evict_cursor.close()
 
+    @wttest.prevent(["timestamp"])  # prevent the use of hooks that manage timestamps
     def test_checkpoint09(self):
         uri = 'table:ckpt09'
         nrows = 1000
@@ -139,6 +140,3 @@ class test_checkpoint09(wttest.WiredTigerTestCase):
         self.assertEqual(val, nrows + nrows/10 + nrows/100)
 
         self.session.close()
-
-if __name__ == '__main__':
-    wttest.run()

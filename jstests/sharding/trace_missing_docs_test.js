@@ -1,15 +1,9 @@
 // Tests tracing where a document was inserted
-load('jstests/libs/trace_missing_docs.js');
-
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {traceMissingDoc} from "jstests/libs/trace_missing_docs.js";
 
 var testDocMissing = function(useReplicaSet) {
-    var options = {
-        rs: useReplicaSet,
-        shardOptions: {oplogSize: 10},
-        rsOptions: {nodes: 1, oplogSize: 10}
-    };
+    var options = {rs: useReplicaSet, rsOptions: {nodes: 1, oplogSize: 10}};
 
     var st = new ShardingTest({shards: 2, mongos: 1, other: options});
 
@@ -17,8 +11,8 @@ var testDocMissing = function(useReplicaSet) {
     var coll = mongos.getCollection("foo.bar");
     var admin = mongos.getDB("admin");
 
-    assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
-    st.ensurePrimaryShard(coll.getDB() + "", st.shard0.shardName);
+    assert.commandWorked(
+        admin.runCommand({enableSharding: coll.getDB() + "", primaryShard: st.shard0.shardName}));
 
     coll.createIndex({sk: 1});
     assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {sk: 1}}));
@@ -43,4 +37,3 @@ var testDocMissing = function(useReplicaSet) {
 };
 
 testDocMissing(true);
-})();

@@ -29,24 +29,27 @@
 
 #pragma once
 
-/**
- * Test suite generator headers.
- */
+#include <boost/optional/optional.hpp>
+#include <memory>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/inline_auto_update.h"
+#include "mongo/unittest/test_info.h"
 #include "mongo/unittest/unittest.h"
 
-using namespace mongo;
-using namespace mongo::unittest;
-using std::shared_ptr;
-
 namespace mongo {
-
-class BSONObj;
-class OperationContext;
-class Status;
-class StringData;
-
 namespace dbtests {
 
 /**
@@ -80,7 +83,8 @@ public:
     }
 
     CollectionPtr getCollection() const {
-        return CollectionCatalog::get(_opCtx)->lookupCollectionByNamespace(_opCtx, _nss);
+        return CollectionPtr(
+            CollectionCatalog::get(_opCtx)->lookupCollectionByNamespace(_opCtx, _nss));
     }
 
 private:

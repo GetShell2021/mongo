@@ -14,11 +14,13 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {
+    kSnapshotErrors,
+    setFailCommandOnShards,
+    unsetFailCommandOnEachShard
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -42,6 +44,7 @@ function runTest(st, numShardsToError, errorCode, isSharded) {
         ]) {
             const commandName = commandTestCase.name;
             const commandBody = commandTestCase.command;
+            const failCommandOptions = {namespace: ns, errorCode, failCommands: [commandName]};
 
             jsTestLog(`Test ${commandName},` +
                       ` readConcern ${tojson(readConcern)},` +
@@ -61,7 +64,7 @@ function runTest(st, numShardsToError, errorCode, isSharded) {
 
             if (readConcern.hasOwnProperty("atClusterTime")) {
                 // Single error.
-                setFailCommandOnShards(st, {times: 1}, [commandName], errorCode, numShardsToError);
+                setFailCommandOnShards(st, {times: 1}, failCommandOptions, numShardsToError);
                 const res =
                     assert.commandFailedWithCode(db.runCommand(snapshotCommandBody), errorCode);
                 // No error labels for non-transaction error.
@@ -69,17 +72,17 @@ function runTest(st, numShardsToError, errorCode, isSharded) {
                 unsetFailCommandOnEachShard(st, numShardsToError);
             } else {
                 // Single error.
-                setFailCommandOnShards(st, {times: 1}, [commandName], errorCode, numShardsToError);
+                setFailCommandOnShards(st, {times: 1}, failCommandOptions, numShardsToError);
                 assert.commandWorked(db.runCommand(snapshotCommandBody));
                 unsetFailCommandOnEachShard(st, numShardsToError);
 
                 // Retry on multiple errors.
-                setFailCommandOnShards(st, {times: 3}, [commandName], errorCode, numShardsToError);
+                setFailCommandOnShards(st, {times: 3}, failCommandOptions, numShardsToError);
                 assert.commandWorked(db.runCommand(snapshotCommandBody));
                 unsetFailCommandOnEachShard(st, numShardsToError);
 
                 // Exhaust retry attempts.
-                setFailCommandOnShards(st, "alwaysOn", [commandName], errorCode, numShardsToError);
+                setFailCommandOnShards(st, "alwaysOn", failCommandOptions, numShardsToError);
                 const res =
                     assert.commandFailedWithCode(db.runCommand(snapshotCommandBody), errorCode);
                 // No error labels for non-transaction error.
@@ -95,7 +98,7 @@ const st = new ShardingTest({
     mongos: 1,
     config: 1,
     other: {
-        shardOptions:
+        rsOptions:
             {setParameter: {minSnapshotHistoryWindowInSeconds: kMinSnapshotHistoryWindowInSeconds}}
     }
 });
@@ -103,18 +106,17 @@ const st = new ShardingTest({
 jsTestLog("Unsharded snapshot read");
 
 assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
+assert.commandWorked(
     st.s.getDB(dbName)[collName].insert({_id: 5}, {writeConcern: {w: "majority"}}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 
 for (let errorCode of kSnapshotErrors) {
     runTest(st, 1, errorCode, false /* isSharded */);
 }
 
-// Enable sharding and set up 2 chunks, [minKey, 10), [10, maxKey), each with
+// Shard collection and set up 2 chunks, [minKey, 10), [10, maxKey), each with
 // one document
 // (includes the document already inserted).
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 10}}));
@@ -150,4 +152,3 @@ for (let errorCode of kSnapshotErrors) {
 }
 
 st.stop();
-})();

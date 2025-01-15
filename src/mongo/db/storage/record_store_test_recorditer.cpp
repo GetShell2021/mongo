@@ -27,61 +27,58 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <initializer_list>
+#include <memory>
+#include <ostream>
+#include <string>
 
-#include "mongo/db/storage/record_store_test_harness.h"
-
-#include <algorithm>
-
-#include "mongo/bson/util/builder.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/record_data.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/record_store_test_harness.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
-
-using std::string;
-using std::stringstream;
-using std::unique_ptr;
 
 // Insert multiple records and iterate through them in the forward direction.
 // When curr() or getNext() is called on an iterator positioned at EOF,
 // the iterator returns RecordId() and stays at EOF.
 TEST(RecordStoreTestHarness, IterateOverMultipleRecords) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(0, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(0, rs->numRecords());
 
     const int nToInsert = 10;
     RecordId locs[nToInsert];
     std::string datas[nToInsert];
     for (int i = 0; i < nToInsert; i++) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
         {
-            stringstream ss;
+            std::stringstream ss;
             ss << "record " << i;
-            string data = ss.str();
+            std::string data = ss.str();
 
-            WriteUnitOfWork uow(opCtx.get());
+            StorageWriteTransaction txn(ru);
             StatusWith<RecordId> res =
                 rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             locs[i] = res.getValue();
             datas[i] = data;
-            uow.commit();
+            txn.commit();
         }
     }
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(nToInsert, rs->numRecords());
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -101,37 +98,32 @@ TEST(RecordStoreTestHarness, IterateOverMultipleRecords) {
 // the iterator returns RecordId() and stays at EOF.
 TEST(RecordStoreTestHarness, IterateOverMultipleRecordsReversed) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(0, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(0, rs->numRecords());
 
     const int nToInsert = 10;
     RecordId locs[nToInsert];
     std::string datas[nToInsert];
     for (int i = 0; i < nToInsert; i++) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
         {
-            stringstream ss;
+            std::stringstream ss;
             ss << "record " << i;
-            string data = ss.str();
+            std::string data = ss.str();
 
-            WriteUnitOfWork uow(opCtx.get());
+            StorageWriteTransaction txn(ru);
             StatusWith<RecordId> res =
                 rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             locs[i] = res.getValue();
             datas[i] = data;
-            uow.commit();
+            txn.commit();
         }
     }
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(nToInsert, rs->numRecords());
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -151,37 +143,32 @@ TEST(RecordStoreTestHarness, IterateOverMultipleRecordsReversed) {
 // starting at an interior position.
 TEST(RecordStoreTestHarness, IterateStartFromMiddle) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(0, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(0, rs->numRecords());
 
     const int nToInsert = 10;
     RecordId locs[nToInsert];
     std::string datas[nToInsert];
     for (int i = 0; i < nToInsert; i++) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
         {
-            stringstream ss;
+            std::stringstream ss;
             ss << "record " << i;
-            string data = ss.str();
+            std::string data = ss.str();
 
-            WriteUnitOfWork uow(opCtx.get());
+            StorageWriteTransaction txn(ru);
             StatusWith<RecordId> res =
                 rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             locs[i] = res.getValue();
             datas[i] = data;
-            uow.commit();
+            txn.commit();
         }
     }
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(nToInsert, rs->numRecords());
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -202,37 +189,32 @@ TEST(RecordStoreTestHarness, IterateStartFromMiddle) {
 // starting at an interior position.
 TEST(RecordStoreTestHarness, IterateStartFromMiddleReversed) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(0, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(0, rs->numRecords());
 
     const int nToInsert = 10;
     RecordId locs[nToInsert];
     std::string datas[nToInsert];
     for (int i = 0; i < nToInsert; i++) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
         {
-            stringstream ss;
+            std::stringstream ss;
             ss << "record " << i;
-            string data = ss.str();
+            std::string data = ss.str();
 
-            WriteUnitOfWork uow(opCtx.get());
+            StorageWriteTransaction txn(ru);
             StatusWith<RecordId> res =
                 rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             locs[i] = res.getValue();
             datas[i] = data;
-            uow.commit();
+            txn.commit();
         }
     }
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(nToInsert, rs->numRecords());
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -254,40 +236,36 @@ TEST(RecordStoreTestHarness, IterateStartFromMiddleReversed) {
 // that the iterator remains EOF.
 TEST(RecordStoreTestHarness, RecordIteratorEOF) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(0, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(0, rs->numRecords());
 
     const int nToInsert = 10;
     RecordId locs[nToInsert];
     std::string datas[nToInsert];
     for (int i = 0; i < nToInsert; i++) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
         {
             StringBuilder sb;
             sb << "record " << i;
-            string data = sb.str();
+            std::string data = sb.str();
 
-            WriteUnitOfWork uow(opCtx.get());
+            StorageWriteTransaction txn(ru);
             StatusWith<RecordId> res =
                 rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             locs[i] = res.getValue();
             datas[i] = data;
-            uow.commit();
+            txn.commit();
         }
     }
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(nToInsert, rs->numRecords());
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
 
         // Get a forward iterator starting at the beginning of the record store.
         auto cursor = rs->getCursor(opCtx.get());
@@ -306,13 +284,13 @@ TEST(RecordStoreTestHarness, RecordIteratorEOF) {
 
         StringBuilder sb;
         sb << "record " << nToInsert + 1;
-        string data = sb.str();
+        std::string data = sb.str();
 
-        WriteUnitOfWork uow(opCtx.get());
+        StorageWriteTransaction txn(ru);
         StatusWith<RecordId> res =
             rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
         ASSERT_OK(res.getStatus());
-        uow.commit();
+        txn.commit();
 
         ASSERT(cursor->restore());
 
@@ -325,37 +303,32 @@ TEST(RecordStoreTestHarness, RecordIteratorEOF) {
 // Test calling save and restore after each call to next
 TEST(RecordStoreTestHarness, RecordIteratorSaveRestore) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(0, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(0, rs->numRecords());
 
     const int nToInsert = 10;
     RecordId locs[nToInsert];
     std::string datas[nToInsert];
     for (int i = 0; i < nToInsert; i++) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
         {
             StringBuilder sb;
             sb << "record " << i;
-            string data = sb.str();
+            std::string data = sb.str();
 
-            WriteUnitOfWork uow(opCtx.get());
+            StorageWriteTransaction txn(ru);
             StatusWith<RecordId> res =
                 rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             locs[i] = res.getValue();
             datas[i] = data;
-            uow.commit();
+            txn.commit();
         }
     }
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(nToInsert, rs->numRecords());
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -387,9 +360,10 @@ TEST(RecordStoreTestHarness, RecordIteratorSaveRestore) {
 // that next() returns the second record.
 TEST(RecordStoreTestHarness, SeekAfterEofAndContinue) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
     ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
 
     const int nToInsert = 2;
     RecordId locs[nToInsert];
@@ -397,15 +371,15 @@ TEST(RecordStoreTestHarness, SeekAfterEofAndContinue) {
     for (int i = 0; i < nToInsert; i++) {
         StringBuilder sb;
         sb << "record " << i;
-        string data = sb.str();
+        std::string data = sb.str();
 
-        WriteUnitOfWork uow(opCtx.get());
+        StorageWriteTransaction txn(ru);
         StatusWith<RecordId> res =
             rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
         ASSERT_OK(res.getStatus());
         locs[i] = res.getValue();
         datas[i] = data;
-        uow.commit();
+        txn.commit();
     }
 
 
@@ -443,6 +417,7 @@ TEST(RecordStoreTestHarness, SeekExactForMissingRecordReturnsNone) {
     const auto harnessHelper{newRecordStoreHarnessHelper()};
     auto recordStore = harnessHelper->newRecordStore();
     ServiceContext::UniqueOperationContext opCtx{harnessHelper->newOperationContext()};
+    auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
 
     // Insert three records and remember their record ids.
     const int nToInsert = 3;
@@ -450,21 +425,21 @@ TEST(RecordStoreTestHarness, SeekExactForMissingRecordReturnsNone) {
     for (int i = 0; i < nToInsert; ++i) {
         StringBuilder sb;
         sb << "record " << i;
-        string data = sb.str();
+        std::string data = sb.str();
 
-        WriteUnitOfWork uow{opCtx.get()};
+        StorageWriteTransaction txn(ru);
         auto res =
             recordStore->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp{});
         ASSERT_OK(res.getStatus());
         recordIds[i] = res.getValue();
-        uow.commit();
+        txn.commit();
     }
 
     // Delete the second record.
     {
-        WriteUnitOfWork uow{opCtx.get()};
+        StorageWriteTransaction txn(ru);
         recordStore->deleteRecord(opCtx.get(), recordIds[1]);
-        uow.commit();
+        txn.commit();
     }
 
     // Seeking to the second record should now return boost::none, for both forward and reverse

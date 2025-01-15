@@ -27,18 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <functional>
+#include <array>
+#include <fmt/format.h>
 #include <list>
+#include <map>
+#include <ostream>
 #include <string>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include <absl/container/node_hash_map.h>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/logv2/log.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/unittest/assert_that.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/matcher.h"
+#include "mongo/unittest/stringify.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -224,6 +235,11 @@ TEST(AssertThat, Demo) {
     ASSERT_THAT(myVec, ElementsAre(Eq(111), AllOf(Lt(1000), Gt(0)), Any()));
     ASSERT_THAT(myList, ElementsAre(Eq(111), AllOf(Lt(1000), Gt(0)), Any()));
 
+    // Map
+    std::map<int, int> myMap{{101, 201}, {102, 202}};
+    ASSERT_THAT(
+        myMap, ElementsAre(TupleElementsAre(Eq(101), Eq(201)), TupleElementsAre(Eq(102), Eq(202))));
+
     // Structs/Tuples
     struct {
         int i;
@@ -245,18 +261,35 @@ TEST(AssertThat, Demo) {
     ASSERT_THAT(obj, Not(BSONObjHas(BSONElementIs(Eq("x"), Any(), Any()))));
 }
 
+TEST(StringifyForAssert, PrintableTypes) {
+    ASSERT_EQ(stringify::invoke(3.14), "3.14");
+    ASSERT_EQ(stringify::invoke(std::string{"pi"}), "pi");
+    ASSERT_EQ(stringify::invoke(std::pair<std::string, double>{"pi", 3.14}), "(pi, 3.14)");
+    ASSERT_EQ(stringify::invoke(std::tuple<int, int>{1, 2}), "(1, 2)");
+    ASSERT_EQ(stringify::invoke(std::tuple<>{}), "()");
+    ASSERT_EQ(stringify::invoke(std::vector<int>{1, 2, 3}), "[1, 2, 3]");
+    ASSERT_EQ(stringify::invoke(std::list<int>{1, 2, 3}), "[1, 2, 3]");
+    ASSERT_EQ(stringify::invoke(std::map<int, std::string>{{1, "a"}, {2, "b"}}),
+              "[(1, a), (2, b)]");
+    ASSERT_THAT(
+        stringify::invoke(std::unordered_map<int, std::string>{{1, "a"}, {2, "b"}}),  // NOLINT
+        AnyOf(Eq("[(1, a), (2, b)]"), Eq("[(2, b), (1, a)]")));
+    ASSERT_THAT(stringify::invoke(stdx::unordered_map<int, std::string>{{1, "a"}, {2, "b"}}),
+                AnyOf(Eq("[(1, a), (2, b)]"), Eq("[(2, b), (1, a)]")));
+    ASSERT_EQ(stringify::invoke(std::array{1, 2, 3, 4}), "[1, 2, 3, 4]")
+        << "std::array is both a sequence and a tuple. Should prefer sequence notation";
+}
+
 TEST(AssertThat, UnprintableValues) {
     struct Unprintable {
         int i;
     } v{123};
-    std::string lastResort = detail::lastResortFormat(typeid(v), &v, sizeof(v));
+    std::string lastResort = stringify::lastResortFormat(typeid(v), &v, sizeof(v));
     // Test that the lastResortFormat function is used for unprintable values.
-    using detail::stringifyForAssert;  // Augment ADL with the "detail" NS.
-    ASSERT_EQ(stringifyForAssert(v), lastResort);
+    ASSERT_EQ(stringify::invoke(v), lastResort);
     // Test that a typical matcher like Eq uses it.
     ASSERT_STRING_CONTAINS(Eq(v).describe(), lastResort);
 }
-
 
 }  // namespace
 }  // namespace mongo::unittest::match

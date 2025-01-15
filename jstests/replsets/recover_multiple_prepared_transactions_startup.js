@@ -5,9 +5,8 @@
  * @tags: [requires_persistence, uses_transactions, uses_prepare_transaction]
  */
 
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 1});
 replTest.startSet();
@@ -154,7 +153,7 @@ jsTestLog("Aborting the second transaction");
 assert.commandWorked(sessionDB2.adminCommand(
     {abortTransaction: 1, txnNumber: NumberLong(txnNumber2), autocommit: false}));
 
-jsTestLog("Attempting to run another transction");
+jsTestLog("Attempting to run another transaction");
 
 // Make sure that we can run another conflicting transaction after recovery without any
 // problems.
@@ -165,4 +164,3 @@ assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp)
 assert.eq(testDB[collName].findOne({_id: 1}), {_id: 1, a: 3});
 
 replTest.stopSet();
-}());

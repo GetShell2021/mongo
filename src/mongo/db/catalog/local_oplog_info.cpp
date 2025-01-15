@@ -30,13 +30,27 @@
 
 #include "mongo/db/catalog/local_oplog_info.h"
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <mutex>
+#include <utility>
+
+#include "mongo/db/curop.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/timer.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCatalog
 
@@ -63,20 +77,19 @@ LocalOplogInfo* LocalOplogInfo::get(OperationContext* opCtx) {
     return get(opCtx->getServiceContext());
 }
 
-const CollectionPtr& LocalOplogInfo::getCollection() const {
-    return _oplog;
+RecordStore* LocalOplogInfo::getRecordStore() const {
+    return _rs;
 }
 
-void LocalOplogInfo::setCollection(const CollectionPtr& oplog) {
-    _oplog = CollectionPtr(oplog.get(), CollectionPtr::NoYieldTag{});
+void LocalOplogInfo::setRecordStore(RecordStore* rs) {
+    _rs = rs;
 }
 
-void LocalOplogInfo::resetCollection() {
-    _oplog.reset();
+void LocalOplogInfo::resetRecordStore() {
+    _rs = nullptr;
 }
 
 void LocalOplogInfo::setNewTimestamp(ServiceContext* service, const Timestamp& newTime) {
-    stdx::lock_guard<Latch> lk(_newOpMutex);
     VectorClockMutable::get(service)->tickClusterTimeTo(LogicalTime(newTime));
 }
 
@@ -85,7 +98,7 @@ std::vector<OplogSlot> LocalOplogInfo::getNextOpTimes(OperationContext* opCtx, s
     long long term = repl::OpTime::kUninitializedTerm;
 
     // Fetch term out of the newOpMutex.
-    if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet) {
+    if (replCoord->getSettings().isReplSet()) {
         // Current term. If we're not a replset of pv=1, it remains kOldProtocolVersionTerm.
         term = replCoord->getTerm();
     }
@@ -99,20 +112,40 @@ std::vector<OplogSlot> LocalOplogInfo::getNextOpTimes(OperationContext* opCtx, s
         }
     });
 
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+
+    const bool isFirstOpTime = !shard_role_details::getRecoveryUnit(opCtx)->isTimestamped();
+
     // Allow the storage engine to start the transaction outside the critical section.
-    opCtx->recoveryUnit()->preallocateSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->preallocateSnapshot();
     {
-        stdx::lock_guard<Latch> lk(_newOpMutex);
+        stdx::lock_guard<stdx::mutex> lk(_newOpMutex);
 
         ts = VectorClockMutable::get(opCtx)->tickClusterTime(count).asTimestamp();
         const bool orderedCommit = false;
 
-        // The local oplog collection pointer must already be established by this point.
+        // The local oplog record store pointer must already be established by this point.
         // We can't establish it here because that would require locking the local database, which
         // would be a lock order violation.
-        invariant(_oplog);
-        fassert(28560, _oplog->getRecordStore()->oplogDiskLocRegister(opCtx, ts, orderedCommit));
+        invariant(_rs);
+        fassert(28560, storageEngine->oplogDiskLocRegister(opCtx, _rs, ts, orderedCommit));
     }
+
+    const auto prevAssertOnLockAttempt =
+        shard_role_details::getLocker(opCtx)->getAssertOnLockAttempt();
+    const auto prevRuBlockingAllowed =
+        shard_role_details::getRecoveryUnit(opCtx)->getBlockingAllowed();
+    if (isFirstOpTime) {
+        // This transaction has begun holding a resource in the form of an oplog slot. Committed
+        // transactions that get a later oplog slot will be unable to replicate until this resource
+        // is released (in the form of this transaction committing or aborting). We choose to fail
+        // the operation if it blocks on a lock or a storage engine operation, like a prepared
+        // update. Both scenarios could stall the system and stop replication.
+        shard_role_details::getLocker(opCtx)->setAssertOnLockAttempt(true);
+        shard_role_details::getRecoveryUnit(opCtx)->setBlockingAllowed(false);
+    }
+
+    Timer oplogSlotDurationTimer;
     std::vector<OplogSlot> oplogSlots(count);
     for (std::size_t i = 0; i < count; i++) {
         oplogSlots[i] = {Timestamp(ts.asULL() + i), term};
@@ -121,8 +154,39 @@ std::vector<OplogSlot> LocalOplogInfo::getNextOpTimes(OperationContext* opCtx, s
     // If we abort a transaction that has reserved an optime, we should make sure to update the
     // stable timestamp if necessary, since this oplog hole may have been holding back the stable
     // timestamp.
-    opCtx->recoveryUnit()->onRollback(
-        [replCoord]() { replCoord->attemptToAdvanceStableTimestamp(); });
+    shard_role_details::getRecoveryUnit(opCtx)->onRollback([replCoord,
+                                                            oplogSlotDurationTimer,
+                                                            isFirstOpTime,
+                                                            prevAssertOnLockAttempt,
+                                                            prevRuBlockingAllowed](
+                                                               OperationContext* opCtx) {
+        replCoord->attemptToAdvanceStableTimestamp();
+        // Sum the oplog slot durations. An operation may participate in multiple transactions.
+        CurOp::get(opCtx)->debug().totalOplogSlotDurationMicros +=
+            Microseconds(oplogSlotDurationTimer.elapsed());
+
+        // Only reset these properties when the first slot is released.
+        if (isFirstOpTime) {
+            shard_role_details::getLocker(opCtx)->setAssertOnLockAttempt(prevAssertOnLockAttempt);
+            shard_role_details::getRecoveryUnit(opCtx)->setBlockingAllowed(prevRuBlockingAllowed);
+        }
+    });
+
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+        [oplogSlotDurationTimer, isFirstOpTime, prevAssertOnLockAttempt, prevRuBlockingAllowed](
+            OperationContext* opCtx, boost::optional<Timestamp>) {
+            // Sum the oplog slot durations. An operation may participate in multiple transactions.
+            CurOp::get(opCtx)->debug().totalOplogSlotDurationMicros +=
+                Microseconds(oplogSlotDurationTimer.elapsed());
+
+            // Only reset these properties when the first slot is released.
+            if (isFirstOpTime) {
+                shard_role_details::getLocker(opCtx)->setAssertOnLockAttempt(
+                    prevAssertOnLockAttempt);
+                shard_role_details::getRecoveryUnit(opCtx)->setBlockingAllowed(
+                    prevRuBlockingAllowed);
+            }
+        });
 
     return oplogSlots;
 }

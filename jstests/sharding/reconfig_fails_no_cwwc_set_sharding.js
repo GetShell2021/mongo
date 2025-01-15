@@ -2,14 +2,21 @@
  * Test that a reconfig for a shard that would change the implicit default write concern to w:1
  * fails if CWWC is not set.
  *
- * @tags: [requires_majority_read_concern, requires_persistence, requires_fcv_51]
+ * @tags: [
+ *   requires_majority_read_concern,
+ *   requires_persistence,
+ *   requires_fcv_51,
+ * ]
  */
 
-(function() {
-'use strict';
+// Adds a shard near the end of the test that won't have metadata for the sessions collection during
+// test shutdown. This is only a problem with a config shard because otherwise there are no shards
+// so the sessions collection can't be created.
+TestData.skipCheckShardFilteringMetadata = TestData.configShard;
 
-load("jstests/replsets/rslib.js");  // For reconfig, isConfigCommitted and
-                                    // safeReconfigShouldFail.
+import {reconfig, safeReconfigShouldFail, isConfigCommitted} from "jstests/replsets/rslib.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const configurationIncompatibleMsg =
     "config that would change the implicit default write concern on the shard to {w: 1}.";
@@ -58,10 +65,10 @@ let logPrefix = "While the shard is not part of a sharded cluster: ";
 let shardServer = new ReplSetTest(
     {name: "shardServer", nodes: 1, nodeOptions: {shardsvr: ""}, useHostName: true});
 shardServer.startSet();
-shardServer.initiateWithHighElectionTimeout();
+shardServer.initiate();
 
 jsTestLog(logPrefix + "Adding an arbiter node that will change IDWC to (w:1) should succeed.");
-let arbiter = shardServer.add();
+let arbiter = shardServer.add({shardsvr: ""});
 testReconfig(shardServer,
              addNodeConfig(shardServer, 1 /* nodeId */, arbiter /* conn */, true /* arbiter */),
              true /* shouldSucceed */);
@@ -78,9 +85,17 @@ logPrefix = "While the shard is part of a sharded cluster: ";
 shardServer = new ReplSetTest(
     {name: "shardServer", nodes: 1, nodeOptions: {shardsvr: ""}, useHostName: true});
 shardServer.startSet();
-shardServer.initiateWithHighElectionTimeout();
+shardServer.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
-const st = new ShardingTest({shards: 0, mongos: 1});
+const st = new ShardingTest({
+    shards: TestData.configShard ? 1 : 0,
+    mongos: 1,
+    // By default, our test infrastructure sets the election timeout to a very high value (24
+    // hours). For this test, we need a shorter election timeout because it relies on nodes running
+    // an election when they do not detect an active primary. Therefore, we are setting the
+    // electionTimeoutMillis to its default value.
+    initiateWithDefaultElectionTimeout: true
+});
 var admin = st.getDB('admin');
 
 jsTestLog("Adding the shard to the cluster should succeed.");
@@ -88,13 +103,15 @@ assert.commandWorked(admin.runCommand({addshard: shardServer.getURL()}));
 
 jsTestLog(logPrefix +
           "Adding an non-arbiter node that will keep IDWC set to (w: 'Majority') should succeed.");
-testReconfig(
-    shardServer,
-    addNodeConfig(shardServer, 1 /* nodeId */, shardServer.add() /* conn */, false /* arbiter */),
-    true /* shouldSucceed */);
+testReconfig(shardServer,
+             addNodeConfig(shardServer,
+                           1 /* nodeId */,
+                           shardServer.add({shardsvr: ""}) /* conn */,
+                           false /* arbiter */),
+             true /* shouldSucceed */);
 
 jsTestLog(logPrefix + "Adding an arbiter node that will change IDWC to (w:1) should fail.");
-arbiter = shardServer.add();
+arbiter = shardServer.add({shardsvr: ""});
 testReconfig(shardServer,
              addNodeConfig(shardServer, 2 /* nodeId */, arbiter /* conn */, true /* arbiter */),
              false /* shouldSucceed */,
@@ -135,7 +152,7 @@ testReconfig(shardServer,
 
 jsTestLog("Restarting the config servers.");
 logPrefix = "While the config server is reachable: ";
-for (var i = 0; i < st.configRS.nodes.length; i++) {
+for (let i = 0; i < st.configRS.nodes.length; i++) {
     st.restartConfigServer(i, undefined, undefined, true /* wait */);
 }
 st.configRS.awaitNodesAgreeOnPrimary();
@@ -143,7 +160,7 @@ print("Sleeping for 60 seconds to let the other shards restart their ReplicaSetM
 sleep(60000);
 
 jsTestLog(logPrefix + "Adding an arbiter node will change IDWC to (w:1) should succeed.");
-arbiter = shardServer.add();
+arbiter = shardServer.add({shardsvr: ""});
 testReconfig(shardServer,
              addNodeConfig(shardServer, 2 /* nodeId */, arbiter /* conn */, true /* arbiter */),
              true /* shouldSucceed */);
@@ -153,4 +170,3 @@ st.stop();
 
 jsTestLog("Stopping the shard.");
 shardServer.stopSet();
-})();

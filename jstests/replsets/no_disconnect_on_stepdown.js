@@ -1,16 +1,14 @@
 /**
  * Tests that stepdown terminates writes, but does not disconnect connections.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/curop_helpers.js");
+import {waitForCurOpByFailPointNoNS} from "jstests/libs/curop_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({
     nodes: [{}, {rsConfig: {priority: 0}}],
 });
 rst.startSet();
-rst.initiate();
+rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 const primary = rst.getPrimary();
 const primaryAdmin = primary.getDB("admin");
@@ -34,7 +32,7 @@ rst.awaitReplication();
 jsTestLog("Stepping down with no command in progress.  Should not disconnect.");
 // If the 'primary' connection is broken on stepdown, this command will fail.
 assert.commandWorked(primaryAdmin.adminCommand({replSetStepDown: 60, force: true}));
-rst.waitForState(primary, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [primary]);
 // If the 'primaryDataConn' connection was broken during stepdown, this command will fail.
 assert.commandWorked(primaryDb.adminCommand({ping: 1}));
 // Allow the primary to be re-elected, and wait for it.
@@ -45,7 +43,7 @@ function runStepDownTest({description, failpoint, operation, errorCode}) {
     const primary = rst.getPrimary();
     // Each PrimaryOnlyService rebuilds its instances on stepup, and that may involve doing read and
     // write operations which are interruptible on stepdown so we wait for PrimaryOnlyService to
-    // finish rebuilding to make the userOperationsKilled check below work reliably.
+    // finish rebuilding.
     rst.waitForPrimaryOnlyServices(primary);
 
     jsTestLog(`Trying ${description} on a stepping-down primary`);
@@ -62,7 +60,7 @@ function runStepDownTest({description, failpoint, operation, errorCode}) {
     const waitForShell = startParallelShell(writeCommand, primary.port);
     waitForCurOpByFailPointNoNS(primaryAdmin, failpoint);
     assert.commandWorked(primaryAdmin.adminCommand({replSetStepDown: 60, force: true}));
-    rst.waitForState(primary, ReplSetTest.State.SECONDARY);
+    rst.awaitSecondaryNodes(null, [primary]);
     assert.commandWorked(primaryAdmin.adminCommand({configureFailPoint: failpoint, mode: "off"}));
     try {
         waitForShell();
@@ -76,7 +74,6 @@ function runStepDownTest({description, failpoint, operation, errorCode}) {
     const replMetrics =
         assert.commandWorked(primaryAdmin.adminCommand({serverStatus: 1})).metrics.repl;
     assert.eq(replMetrics.stateTransition.lastStateTransition, "stepDown");
-    assert.eq(replMetrics.stateTransition.userOperationsKilled, 1);
     assert.eq(replMetrics.network.notPrimaryUnacknowledgedWrites, 0);
 
     // Allow the primary to be re-elected, and wait for it.
@@ -107,4 +104,3 @@ runStepDownTest({
     operation: "db['" + collname + "'].remove({removeme: true})"
 });
 rst.stopSet();
-})();

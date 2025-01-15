@@ -47,18 +47,18 @@ public:
      * invoke the related acknowledge() method on the defragmentation policy once the result is
      * available (this will allow to update the progress of the algorithm).
      */
-    virtual boost::optional<DefragmentationAction> getNextStreamingAction(
+    virtual boost::optional<BalancerStreamAction> getNextStreamingAction(
         OperationContext* opCtx) = 0;
 
     /**
      * Updates the internal status of the policy by notifying the result of an action previously
      * retrieved through getNextStreamingAction().
-     * The types of action and response are expected to match - or an stdx::bad_variant_access
+     * The types of action and response are expected to match - or an std::bad_variant_access
      * error will be thrown.
      */
     virtual void applyActionResult(OperationContext* opCtx,
-                                   const DefragmentationAction& action,
-                                   const DefragmentationActionResponse& result) = 0;
+                                   const BalancerStreamAction& action,
+                                   const BalancerStreamActionResponse& result) = 0;
 };
 
 }  // namespace mongo

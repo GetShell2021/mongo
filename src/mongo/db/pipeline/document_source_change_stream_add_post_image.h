@@ -29,8 +29,28 @@
 
 #pragma once
 
+#include <set>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -38,7 +58,8 @@ namespace mongo {
  * Part of the change stream API machinery used to look up the post-image of a document. Uses the
  * "documentKey" field of the input to look up the new version of the document.
  */
-class DocumentSourceChangeStreamAddPostImage final : public DocumentSource {
+class DocumentSourceChangeStreamAddPostImage final
+    : public DocumentSourceInternalChangeStreamStage {
 public:
     static constexpr StringData kStageName = "$_internalChangeStreamAddPostImage"_sd;
     static constexpr StringData kFullDocumentFieldName =
@@ -93,7 +114,7 @@ public:
         return boost::none;
     }
 
-    DepsTracker::State getDependencies(DepsTracker* deps) const {
+    DepsTracker::State getDependencies(DepsTracker* deps) const override {
         // The namespace is not technically needed yet, but we will if there is more than one
         // collection involved.
         deps->fields.insert(DocumentSourceChangeStream::kNamespaceField.toString());
@@ -114,7 +135,9 @@ public:
         return DepsTracker::State::SEE_NEXT;
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
+    Value doSerialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     const char* getSourceName() const final {
         return kStageName.rawData();
@@ -123,7 +146,8 @@ public:
 private:
     DocumentSourceChangeStreamAddPostImage(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                            const FullDocumentModeEnum fullDocumentMode)
-        : DocumentSource(kStageName, expCtx), _fullDocumentMode(fullDocumentMode) {
+        : DocumentSourceInternalChangeStreamStage(kStageName, expCtx),
+          _fullDocumentMode(fullDocumentMode) {
         tassert(5842300,
                 "the 'fullDocument' field cannot be 'default'",
                 _fullDocumentMode != FullDocumentModeEnum::kDefault);

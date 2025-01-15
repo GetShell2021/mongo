@@ -29,11 +29,17 @@
 
 #include "mongo/db/update/pattern_cmp.h"
 
-#include "mongo/db/bson/dotted_path_support.h"
+#include <cstddef>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/exec/mutable_bson/const_element.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace pattern_cmp {
@@ -112,12 +118,12 @@ bool PatternValueCmp::operator()(const Value& lhs, const Value& rhs) const {
         return (descending ? ValueComparator(collator).getLessThan()(rhs, lhs)
                            : ValueComparator(collator).getLessThan()(lhs, rhs));
     } else {
-        BSONObj lhsObj = lhs.isObject() ? lhs.getDocument().toBson() : lhs.wrap("");
-        BSONObj rhsObj = rhs.isObject() ? rhs.getDocument().toBson() : rhs.wrap("");
-
-        BSONObj lhsKey = dps::extractElementsBasedOnTemplate(lhsObj, sortPattern, true);
-        BSONObj rhsKey = dps::extractElementsBasedOnTemplate(rhsObj, sortPattern, true);
-
+        BSONObj lhsKey = lhs.isObject()
+            ? dps::extractElementsBasedOnTemplate(lhs.getDocument().toBson(), sortPattern, true)
+            : dps::extractNullForAllFieldsBasedOnTemplate(sortPattern);
+        BSONObj rhsKey = rhs.isObject()
+            ? dps::extractElementsBasedOnTemplate(rhs.getDocument().toBson(), sortPattern, true)
+            : dps::extractNullForAllFieldsBasedOnTemplate(sortPattern);
         return lhsKey.woCompare(rhsKey, sortPattern, false, collator) < 0;
     }
 }

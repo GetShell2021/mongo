@@ -4,24 +4,33 @@
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
+import {
+    withAbortAndRetryOnTransientTxnError
+} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    checkWriteConcernTimedOut,
+    restartServerReplication,
+    stopServerReplication
+} from "jstests/libs/write_concern_util.js";
 
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/rslib.js");
+// This test requires running transactions directly against the shard.
+TestData.replicaSetEndpointIncompatible = true;
 
 const dbName = "test";
 const collName = "transient_txn_error_labels_with_write_concern";
 
 // We are testing coordinateCommitTransaction, which requires the nodes to be started with
 // --shardsvr.
-const st = new ShardingTest(
-    {config: 1, mongos: 1, shards: {rs0: {nodes: [{}, {rsConfig: {priority: 0}}]}}});
+const st = new ShardingTest({
+    config: TestData.configShard ? undefined : 1,
+    mongos: 1,
+    shards: {rs0: {nodes: [{}, {rsConfig: {priority: 0}}]}}
+});
 const rst = st.rs0;
 
 const primary = rst.getPrimary();
-const secondary = rst.getSecondary();
 assert.eq(primary, rst.nodes[0]);
 const testDB = primary.getDB(dbName);
 
@@ -41,9 +50,12 @@ let session = primary.startSession(sessionOptions);
 let sessionDb = session.getDatabase(dbName);
 let sessionColl = sessionDb.getCollection(collName);
 stopServerReplication(rst.getSecondaries());
-session.startTransaction({writeConcern: writeConcernMajority});
-assert.commandWorked(sessionColl.insert({_id: "write-with-write-concern"}));
-let res = session.commitTransaction_forTesting();
+let res;
+withAbortAndRetryOnTransientTxnError(session, () => {
+    session.startTransaction({writeConcern: writeConcernMajority});
+    assert.commandWorked(sessionColl.insert({_id: "write-with-write-concern"}));
+    res = session.commitTransaction_forTesting();
+});
 checkWriteConcernTimedOut(res);
 assert(!res.hasOwnProperty("code"));
 assert(!res.hasOwnProperty("errorLabels"));
@@ -112,4 +124,3 @@ runNoSuchTransactionTests({coordinateCommitTransaction: 1, participants: []},
 session.endSession();
 
 st.stop();
-}());

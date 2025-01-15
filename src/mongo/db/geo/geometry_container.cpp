@@ -30,9 +30,37 @@
 
 #include "mongo/db/geo/geometry_container.h"
 
+#include <cstddef>
+#include <s1angle.h>
+#include <s2.h>
+#include <s2cap.h>
+#include <s2cell.h>
+#include <s2cellid.h>
+#include <s2latlng.h>
+#include <s2latlngrect.h>
+#include <s2polygon.h>
+#include <s2polyline.h>
+#include <s2region.h>
+#include <s2regionunion.h>
+#include <util/math/vector3-inl.h>
+#include <util/math/vector3.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <set>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement_comparator_interface.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/geo/big_polygon.h"
 #include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/geoparser.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
@@ -98,13 +126,13 @@ bool GeometryContainer::hasR2Region() const {
 class GeometryContainer::R2BoxRegion : public R2Region {
 public:
     R2BoxRegion(const GeometryContainer* geometry);
-    virtual ~R2BoxRegion();
+    ~R2BoxRegion() override;
 
-    Box getR2Bounds() const;
+    Box getR2Bounds() const override;
 
-    bool fastContains(const Box& other) const;
+    bool fastContains(const Box& other) const override;
 
-    bool fastDisjoint(const Box& other) const;
+    bool fastDisjoint(const Box& other) const override;
 
 private:
     static Box buildBounds(const GeometryContainer& geometry);
@@ -165,7 +193,7 @@ static Point toLngLatPoint(const S2Point& s2Point) {
 
 static void lineR2Bounds(const S2Polyline& flatLine, Box* flatBounds) {
     int numVertices = flatLine.num_vertices();
-    verify(flatLine.num_vertices() > 0);
+    MONGO_verify(flatLine.num_vertices() > 0);
 
     flatBounds->init(toLngLatPoint(flatLine.vertex(0)), toLngLatPoint(flatLine.vertex(0)));
 
@@ -180,7 +208,7 @@ static void circleR2Bounds(const Circle& circle, Box* flatBounds) {
 }
 
 static void multiPointR2Bounds(const vector<S2Point>& points, Box* flatBounds) {
-    verify(!points.empty());
+    MONGO_verify(!points.empty());
 
     flatBounds->init(toLngLatPoint(points.front()), toLngLatPoint(points.front()));
 
@@ -217,15 +245,15 @@ Box GeometryContainer::R2BoxRegion::buildBounds(const GeometryContainer& geometr
     } else if (geometry._multiPoint && FLAT == geometry._multiPoint->crs) {
         multiPointR2Bounds(geometry._multiPoint->points, &bounds);
     } else if (geometry._multiLine && FLAT == geometry._multiLine->crs) {
-        verify(false);
+        MONGO_verify(false);
     } else if (geometry._multiPolygon && FLAT == geometry._multiPolygon->crs) {
-        verify(false);
+        MONGO_verify(false);
     } else if (geometry._geometryCollection) {
-        verify(false);
+        MONGO_verify(false);
     } else if (geometry.hasS2Region()) {
         // For now, just support spherical cap for $centerSphere and GeoJSON points
-        verify((geometry._cap && FLAT != geometry._cap->crs) ||
-               (geometry._point && FLAT != geometry._point->crs));
+        MONGO_verify((geometry._cap && FLAT != geometry._cap->crs) ||
+                     (geometry._point && FLAT != geometry._point->crs));
         s2RegionR2Bounds(geometry.getS2Region(), &bounds);
     }
 
@@ -291,7 +319,7 @@ bool GeometryContainer::contains(const GeometryContainer& otherContainer) const 
     }
 
     if (nullptr != _box) {
-        verify(FLAT == _box->crs);
+        MONGO_verify(FLAT == _box->crs);
         if (nullptr == otherContainer._point) {
             return false;
         }
@@ -319,7 +347,9 @@ bool GeometryContainer::contains(const GeometryContainer& otherContainer) const 
     }
 
     if (nullptr != otherContainer._polygon) {
-        invariant(nullptr != otherContainer._polygon->s2Polygon);
+        tassert(7323500,
+                "Checking if geometry contains big polygon is not supported",
+                nullptr != otherContainer._polygon->s2Polygon);
         return contains(*otherContainer._polygon->s2Polygon);
     }
 

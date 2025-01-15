@@ -29,7 +29,25 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <string>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/type_collection_gen.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -81,19 +99,21 @@ public:
     static constexpr auto kEpochFieldName = kPre22CompatibleEpochFieldName;
 
     using CollectionTypeBase::kAllowMigrationsFieldName;
-    using CollectionTypeBase::kChunksAlreadySplitForDowngradeFieldName;
     using CollectionTypeBase::kDefaultCollationFieldName;
     using CollectionTypeBase::kDefragmentationPhaseFieldName;
     using CollectionTypeBase::kDefragmentCollectionFieldName;
+    using CollectionTypeBase::kEnableAutoMergeFieldName;
+    using CollectionTypeBase::kIndexVersionFieldName;
     using CollectionTypeBase::kKeyPatternFieldName;
     using CollectionTypeBase::kMaxChunkSizeBytesFieldName;
-    using CollectionTypeBase::kNoAutoSplitFieldName;
+    using CollectionTypeBase::kNoBalanceFieldName;
     using CollectionTypeBase::kNssFieldName;
     using CollectionTypeBase::kPermitMigrationsFieldName;
     using CollectionTypeBase::kReshardingFieldsFieldName;
     using CollectionTypeBase::kTimeseriesFieldsFieldName;
     using CollectionTypeBase::kTimestampFieldName;
     using CollectionTypeBase::kUniqueFieldName;
+    using CollectionTypeBase::kUnsplittableFieldName;
     using CollectionTypeBase::kUpdatedAtFieldName;
     using CollectionTypeBase::kUuidFieldName;
 
@@ -106,6 +126,7 @@ public:
     using CollectionTypeBase::getTimeseriesFields;
     using CollectionTypeBase::getTimestamp;
     using CollectionTypeBase::getUnique;
+    using CollectionTypeBase::getUnsplittable;
     using CollectionTypeBase::getUpdatedAt;
     using CollectionTypeBase::getUuid;
     using CollectionTypeBase::setDefragmentationPhase;
@@ -116,6 +137,7 @@ public:
     using CollectionTypeBase::setTimeseriesFields;
     using CollectionTypeBase::setTimestamp;
     using CollectionTypeBase::setUnique;
+    using CollectionTypeBase::setUnsplittable;
     using CollectionTypeBase::setUpdatedAt;
     using CollectionTypeBase::setUuid;
     using CollectionTypeBase::toBSON;
@@ -144,16 +166,13 @@ public:
     BSONObj getDefaultCollation() const {
         return CollectionTypeBase::getDefaultCollation().get_value_or(BSONObj());
     }
-    void setDefaultCollation(const BSONObj& defaultCollation);
 
     void setMaxChunkSizeBytes(int64_t value);
 
+    void setDefaultCollation(const BSONObj& defaultCollation);
+
     bool getDefragmentCollection() const {
         return CollectionTypeBase::getDefragmentCollection().get_value_or(false);
-    }
-
-    bool getAllowAutoSplit() const {
-        return !getNoAutoSplit().get_value_or(false);
     }
 
     bool getAllowBalance() const {
@@ -169,6 +188,20 @@ public:
             CollectionTypeBase::setAllowMigrations(boost::none);
         else
             CollectionTypeBase::setAllowMigrations(false);
+    }
+
+    boost::optional<CollectionIndexes> getIndexVersion() const {
+        return CollectionTypeBase::getIndexVersion()
+            ? CollectionIndexes(getUuid(), *CollectionTypeBase::getIndexVersion())
+            : boost::optional<CollectionIndexes>(boost::none);
+    }
+
+    void setIndexVersion(CollectionIndexes indexVersion) {
+        tassert(7000500,
+                str::stream() << "Cannot set collection indexes to " << indexVersion
+                              << " since collection uuid is " << getUuid(),
+                indexVersion.uuid() == getUuid());
+        CollectionTypeBase::setIndexVersion(indexVersion.indexVersion());
     }
 
     // TODO SERVER-61033: remove after permitMigrations have been merge with allowMigrations.

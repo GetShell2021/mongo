@@ -24,7 +24,6 @@ import SCons
 
 
 def _update_builder(env, builder):
-
     old_scanner = builder.target_scanner
     old_path_function = old_scanner.path_function
 
@@ -34,8 +33,9 @@ def _update_builder(env, builder):
         if origin is not None:
             origin_results = old_scanner(origin, env, path)
             for origin_result in origin_results:
-                origin_result_debug_files = getattr(origin_result.attributes,
-                                                    "separate_debug_files", None)
+                origin_result_debug_files = getattr(
+                    origin_result.attributes, "separate_debug_files", None
+                )
                 if origin_result_debug_files is not None:
                     results.extend(origin_result_debug_files)
         return results
@@ -57,27 +57,31 @@ def _update_builder(env, builder):
     # setup from the etc/scons/xcode_*.vars files, which would be a
     # win as well.
     if env.TargetOSIs("darwin"):
-        base_action.list.extend([
-            SCons.Action.Action(
-                "$DSYMUTIL -num-threads 1 $TARGET -o ${TARGET}.dSYM",
-                "$DSYMUTILCOMSTR",
-            ),
-            SCons.Action.Action(
-                "$STRIP -S ${TARGET}",
-                "$DEBUGSTRIPCOMSTR",
-            ),
-        ])
+        base_action.list.extend(
+            [
+                SCons.Action.Action(
+                    "$DSYMUTIL -num-threads 1 $TARGET -o ${TARGET}$SEPDBG_SUFFIX",
+                    "$DSYMUTILCOMSTR",
+                ),
+                SCons.Action.Action(
+                    "$STRIP -S ${TARGET}",
+                    "$DEBUGSTRIPCOMSTR",
+                ),
+            ]
+        )
     elif env.TargetOSIs("posix"):
-        base_action.list.extend([
-            SCons.Action.Action(
-                "$OBJCOPY --only-keep-debug $TARGET ${TARGET}.debug",
-                "$OBJCOPY_ONLY_KEEP_DEBUG_COMSTR",
-            ),
-            SCons.Action.Action(
-                "$OBJCOPY --strip-debug --add-gnu-debuglink ${TARGET}.debug ${TARGET}",
-                "$DEBUGSTRIPCOMSTR",
-            ),
-        ])
+        base_action.list.extend(
+            [
+                SCons.Action.Action(
+                    "$OBJCOPY --only-keep-debug $TARGET ${TARGET}$SEPDBG_SUFFIX",
+                    "$OBJCOPY_ONLY_KEEP_DEBUG_COMSTR",
+                ),
+                SCons.Action.Action(
+                    "$OBJCOPY --strip-debug --add-gnu-debuglink ${TARGET}$SEPDBG_SUFFIX ${TARGET}",
+                    "$DEBUGSTRIPCOMSTR",
+                ),
+            ]
+        )
     else:
         pass
 
@@ -86,10 +90,8 @@ def _update_builder(env, builder):
     base_emitter = builder.emitter
 
     def new_emitter(target, source, env):
-
         debug_files = []
         if env.TargetOSIs("darwin"):
-
             # There isn't a lot of great documentation about the structure of dSYM bundles.
             # For general bundles, see:
             #
@@ -105,20 +107,26 @@ def _update_builder(env, builder):
 
             plist_file = env.File("Contents/Info.plist", directory=dsym_dir)
             setattr(plist_file.attributes, "aib_effective_suffix", ".dSYM")
-            setattr(plist_file.attributes, "aib_additional_directory",
-                    "{}/Contents".format(dsym_dir_name))
+            setattr(
+                plist_file.attributes,
+                "aib_additional_directory",
+                "{}/Contents".format(dsym_dir_name),
+            )
 
             dwarf_dir = env.Dir("Contents/Resources/DWARF", directory=dsym_dir)
 
             dwarf_file = env.File(target0.name, directory=dwarf_dir)
             setattr(dwarf_file.attributes, "aib_effective_suffix", ".dSYM")
-            setattr(dwarf_file.attributes, "aib_additional_directory",
-                    "{}/Contents/Resources/DWARF".format(dsym_dir_name))
+            setattr(
+                dwarf_file.attributes,
+                "aib_additional_directory",
+                "{}/Contents/Resources/DWARF".format(dsym_dir_name),
+            )
 
             debug_files.extend([plist_file, dwarf_file])
 
         elif env.TargetOSIs("posix"):
-            debug_file = env.File(str(target[0]) + ".debug")
+            debug_file = env.File(f"{target[0]}$SEPDBG_SUFFIX")
             debug_files.append(debug_file)
         elif env.TargetOSIs("windows"):
             debug_file = env.File(env.subst("${PDB}", target=target))
@@ -153,6 +161,7 @@ def generate(env):
         return
 
     if env.TargetOSIs("darwin"):
+        env["SEPDBG_SUFFIX"] = ".dSYM"
 
         if env.get("DSYMUTIL", None) is None:
             env["DSYMUTIL"] = env.WhereIs("dsymutil")
@@ -167,15 +176,14 @@ def generate(env):
             )
 
     elif env.TargetOSIs("posix"):
+        env["SEPDBG_SUFFIX"] = env.get("SEPDBG_SUFFIX", ".debug")
         if env.get("OBJCOPY", None) is None:
             env["OBJCOPY"] = env.Whereis("objcopy")
 
         if not env.Verbose():
             env.Append(
-                OBJCOPY_ONLY_KEEP_DEBUG_COMSTR=
-                "Generating debug info for $TARGET into ${TARGET}.dSYM",
-                DEBUGSTRIPCOMSTR=
-                "Stripping debug info from ${TARGET} and adding .gnu.debuglink to ${TARGET}.debug",
+                OBJCOPY_ONLY_KEEP_DEBUG_COMSTR="Generating debug info for $TARGET into ${TARGET}${SEPDBG_SUFFIX}",
+                DEBUGSTRIPCOMSTR="Stripping debug info from ${TARGET} and adding .gnu.debuglink to ${TARGET}${SEPDBG_SUFFIX}",
             )
 
     for builder in ["Program", "SharedLibrary", "LoadableModule"]:

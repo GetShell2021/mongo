@@ -80,6 +80,18 @@ structs:
                 description: "The namespace of the collection being resharded."
             minimumOperationDurationMillis:
                 type: long
+            oplogBatchTaskCount:
+                type: long
+                description: >-
+                    "The number of subtasks to divide a single oplog batch into,
+                    so that it may be applied concurrently by multiple threads."
+                optional: true
+            relaxed:
+                type: optionalBool
+                description: >-
+                    "Runs the cloner aggregation without specifying a collection
+                    uuid to avoid errors in a scenario where the collection UUIDs
+                    are inconsistent among shards."
 
     TypeCollectionReshardingFields:
         description: "Resharding-related fields meant to be stored in a config.collections
@@ -111,3 +123,15 @@ structs:
                 type: date
                 description: "Start time of the operation."
                 optional: true
+            provenance:
+                type: Provenance
+                description: "The source operation that called this resharding operation."
+                optional: true
+            implicitlyCreateIndex:
+                type: bool
+                description: "Whether to create an index on the shard key pattern if the shard key
+                              does not already have a support index."
+                default: true
+            performVerification:
+                type: optionalBool
+                description: "Whether to perform data comparison verification."

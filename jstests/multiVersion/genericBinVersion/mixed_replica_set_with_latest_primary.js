@@ -1,10 +1,9 @@
 /**
  * Tests initializing a mixed version replica set through the shell.
  */
+import "jstests/multiVersion/libs/multi_rs.js";
 
-(function() {
-"use strict";
-load('./jstests/multiVersion/libs/multi_rs.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const lastLTSVersion = "last-lts";
 const latestVersion = "latest";
@@ -32,4 +31,3 @@ for (let i = 0; i < rst.nodes.length; i++) {
     assert(MongoRunner.areBinVersionsTheSame(actualVersion, expectedVersion));
 }
 rst.stopSet();
-})();

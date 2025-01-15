@@ -37,22 +37,26 @@
  * process and verifies that the data across two tables match after restart.
  */
 
-#define NUM_RECORDS 100000
+#define NUM_RECORDS (100 * WT_THOUSAND)
 #define TIMEOUT 40
+
+static bool compact_error;
+static uint64_t compact_event;
 
 /* Constants and variables declaration. */
 /*
  * You may want to add "verbose=[compact,compact_progress]" to the connection config string to get
  * better view on what is happening.
  */
-static const char conn_config[] = "create,cache_size=2GB,statistics=(all)";
+static const char conn_config[] =
+  "create,cache_size=2GB,statistics=(all),statistics_log=(json,on_close,wait=1)";
 static const char table_config_row[] =
   "allocation_size=4KB,leaf_page_max=4KB,key_format=Q,value_format=" WT_UNCHECKED_STRING(QS);
 static const char table_config_col[] =
   "allocation_size=4KB,leaf_page_max=4KB,key_format=r,value_format=" WT_UNCHECKED_STRING(QS);
 static char data_str[1024] = "";
 
-static const char ckpt_file_fmt[] = "%s/checkpoint_done";
+static const char ckpt_file[] = "checkpoint_done";
 static const char working_dir_row[] = "WT_TEST.compact-stress-row";
 static const char working_dir_col[] = "WT_TEST.compact-stress-col";
 static const char uri1[] = "table:compact1";
@@ -73,10 +77,38 @@ subtest_error_handler(
     return (0);
 }
 
+/*
+ * handle_general --
+ *     General event handler.
+ */
+static int
+handle_general(WT_EVENT_HANDLER *handler, WT_CONNECTION *conn, WT_SESSION *session,
+  WT_EVENT_TYPE type, void *arg)
+{
+    (void)(handler);
+    (void)(conn);
+    (void)(session);
+    (void)(arg);
+    if (type != WT_EVENT_COMPACT_CHECK)
+        return (0);
+
+    /*
+     * The compact_event variable is cumulative. Return with an interrupt periodically but not too
+     * often. We don't want to change the nature of the test too much.
+     */
+    if (++compact_event % 8 == 0) {
+        printf(" *** Compact check interrupting compact with warning\n");
+        compact_error = true;
+        return (-1);
+    }
+    return (0);
+}
+
 static WT_EVENT_HANDLER event_handler = {
   subtest_error_handler, NULL, /* Message handler */
   NULL,                        /* Progress handler */
-  NULL                         /* Close handler */
+  NULL,                        /* Close handler */
+  handle_general               /* General handler */
 };
 
 static void sig_handler(int) WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
@@ -142,18 +174,17 @@ run_test(bool column_store, bool preserve)
     WT_CONNECTION *conn;
     WT_SESSION *session;
 
-    char ckpt_file[2048], home[1024];
+    char home[1024];
     int status;
     pid_t pid;
     struct sigaction sa;
-    struct stat sb;
 
     testutil_work_dir_from_path(
       home, sizeof(home), column_store ? working_dir_col : working_dir_row);
 
     printf("\n");
     printf("Work directory: %s\n", home);
-    testutil_make_work_dir(home);
+    testutil_recreate_dir(home);
 
     /* Fork a child to create tables and perform operations on them. */
     memset(&sa, 0, sizeof(sa));
@@ -165,7 +196,7 @@ run_test(bool column_store, bool preserve)
 
         workload_compact(home, column_store ? table_config_col : table_config_row);
         /*
-         * We do not expect test to reach here. The child process should have been killed by the
+         * We do not expect the test to reach here. The child process should have been killed by the
          * parent process.
          */
         printf("Child finished processing...\n");
@@ -178,8 +209,7 @@ run_test(bool column_store, bool preserve)
      * time we notice that child process has written a checkpoint. That allows the test to run
      * correctly on really slow machines.
      */
-    testutil_check(__wt_snprintf(ckpt_file, sizeof(ckpt_file), ckpt_file_fmt, home));
-    while (stat(ckpt_file, &sb) != 0)
+    while (!testutil_exists(home, ckpt_file))
         testutil_sleep_wait(1, pid);
 
     /* Sleep for a while. Let the child process do some operations on the tables. */
@@ -205,7 +235,7 @@ run_test(bool column_store, bool preserve)
     conn = NULL;
 
     if (!preserve)
-        testutil_clean_work_dir(home);
+        testutil_remove(home);
 }
 
 /*
@@ -215,13 +245,12 @@ run_test(bool column_store, bool preserve)
 static void
 workload_compact(const char *home, const char *table_config)
 {
-    FILE *fp;
     WT_CONNECTION *conn;
     WT_RAND_STATE rnd;
     WT_SESSION *session;
+    int ret;
 
     bool first_ckpt;
-    char ckpt_file[2048];
     uint32_t i;
     uint64_t key_range_start;
 
@@ -241,9 +270,10 @@ workload_compact(const char *home, const char *table_config)
     populate(session, 0, NUM_RECORDS);
 
     /*
-     * Although we are repeating the steps 40 times, we expect parent process will kill us way
-     * before than that.
+     * Although we are repeating the steps 40 times, we expect the parent process will kill us long
+     * before that number of iterations.
      */
+    compact_event = 0;
     for (i = 0; i < 40; i++) {
 
         printf("Running Loop: %" PRIu32 "\n", i + 1);
@@ -253,9 +283,7 @@ workload_compact(const char *home, const char *table_config)
          * finished and can start its timer.
          */
         if (!first_ckpt) {
-            testutil_check(__wt_snprintf(ckpt_file, sizeof(ckpt_file), ckpt_file_fmt, home));
-            testutil_assert_errno((fp = fopen(ckpt_file, "w")) != NULL);
-            testutil_assert_errno(fclose(fp) == 0);
+            testutil_sentinel(home, ckpt_file);
             first_ckpt = true;
         }
 
@@ -267,9 +295,26 @@ workload_compact(const char *home, const char *table_config)
         remove_records(session, uri1, key_range_start, key_range_start + NUM_RECORDS / 3);
         remove_records(session, uri2, key_range_start, key_range_start + NUM_RECORDS / 3);
 
+        compact_error = false;
         /* Only perform compaction on the first table. */
-        testutil_check(session->compact(session, uri1, NULL));
+        ret = session->compact(session, uri1, NULL);
+        /*
+         * If the handler function returned an error to WiredTiger, make sure an error was returned
+         * back to the caller.
+         */
+        if (compact_error)
+            testutil_assert(ret != 0);
+        else
+            testutil_assert(ret == 0);
 
+        /*
+         * We expect that sometime in the first several iterations at least one of those compact
+         * calls would have called the callback function. It is hard to predict on any given
+         * iteration so check the total once, after a while.
+         */
+        if (i == 5)
+            testutil_assert(compact_event != 0);
+        printf(" - Cumulative compact event callbacks: %" PRIu64 "\n", compact_event);
         log_db_size(session, uri1);
 
         /* If we made progress with compact, verify that compact stats support that. */
@@ -421,7 +466,7 @@ get_file_stats(WT_SESSION *session, const char *uri, uint64_t *file_sz, uint64_t
     WT_CURSOR *cur_stat;
     char *descr, stat_uri[128], *str_val;
 
-    testutil_check(__wt_snprintf(stat_uri, sizeof(stat_uri), "statistics:%s", uri));
+    testutil_snprintf(stat_uri, sizeof(stat_uri), "statistics:%s", uri);
     testutil_check(session->open_cursor(session, stat_uri, NULL, "statistics=(all)", &cur_stat));
 
     /* Get file size. */
@@ -471,7 +516,7 @@ get_compact_progress(WT_SESSION *session, const char *uri, uint64_t *pages_revie
     WT_CURSOR *cur_stat;
     char *descr, *str_val, stat_uri[128];
 
-    testutil_check(__wt_snprintf(stat_uri, sizeof(stat_uri), "statistics:%s", uri));
+    testutil_snprintf(stat_uri, sizeof(stat_uri), "statistics:%s", uri);
     testutil_check(session->open_cursor(session, stat_uri, NULL, "statistics=(all)", &cur_stat));
 
     cur_stat->set_key(cur_stat, WT_STAT_DSRC_BTREE_COMPACT_PAGES_REVIEWED);

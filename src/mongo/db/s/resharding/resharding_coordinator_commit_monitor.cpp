@@ -28,22 +28,46 @@
  */
 
 
-#include <boost/optional.hpp>
+#include "mongo/util/duration.h"
+#include <algorithm>
+#include <boost/smart_ptr.hpp>
 #include <fmt/format.h>
+#include <ratio>
+#include <string>
+#include <tuple>
+#include <utility>
 
-#include "mongo/db/s/resharding/resharding_coordinator_commit_monitor.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/resource_yielder.h"
+#include "mongo/db/s/resharding/resharding_coordinator_commit_monitor.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/request_types/resharding_operation_time_gen.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/future_util.h"
+#include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/testing_proctor.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
@@ -61,8 +85,9 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeQueryingRecipients);
 
 BSONObj makeCommandObj(const NamespaceString& ns) {
     auto command = _shardsvrReshardingOperationTime(ns);
-    command.setDbName("admin");
-    return command.toBSON({});
+    command.setDbName(DatabaseNameUtil::deserialize(
+        ns.tenantId(), DatabaseName::kAdmin.db(omitTenant), SerializationContext::stateDefault()));
+    return command.toBSON();
 }
 
 auto makeRequests(const BSONObj& cmdObj, const std::vector<ShardId>& recipientShards) {
@@ -93,6 +118,7 @@ CoordinatorCommitMonitor::CoordinatorCommitMonitor(
     std::vector<ShardId> recipientShards,
     CoordinatorCommitMonitor::TaskExecutorPtr executor,
     CancellationToken cancelToken,
+    int delayBeforeInitialQueryMillis,
     Milliseconds maxDelayBetweenQueries)
     : _metrics{std::move(metrics)},
       _ns(std::move(ns)),
@@ -100,11 +126,12 @@ CoordinatorCommitMonitor::CoordinatorCommitMonitor(
       _executor(std::move(executor)),
       _cancelToken(std::move(cancelToken)),
       _threshold(Milliseconds(gRemainingReshardingOperationTimeThresholdMillis.load())),
+      _delayBeforeInitialQueryMillis(Milliseconds(delayBeforeInitialQueryMillis)),
       _maxDelayBetweenQueries(maxDelayBetweenQueries) {}
 
 
 SemiFuture<void> CoordinatorCommitMonitor::waitUntilRecipientsAreWithinCommitThreshold() const {
-    return _makeFuture()
+    return _makeFuture(_delayBeforeInitialQueryMillis)
         .onError([](Status status) {
             if (ErrorCodes::isCancellationError(status.code()) ||
                 ErrorCodes::isInterruption(status.code())) {
@@ -136,17 +163,18 @@ CoordinatorCommitMonitor::queryRemainingOperationTimeForRecipients() const {
     LOGV2_DEBUG(5392001,
                 kDiagnosticLogLevel,
                 "Querying recipient shards for the remaining operation time",
-                "namespace"_attr = _ns);
+                logAttrs(_ns));
 
     auto opCtx = CancelableOperationContext(cc().makeOperationContext(), _cancelToken, _executor);
     auto executor = _networkExecutor ? _networkExecutor : _executor;
     AsyncRequestsSender ars(opCtx.get(),
                             executor,
-                            "admin",
+                            DatabaseName::kAdmin,
                             requests,
                             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                             Shard::RetryPolicy::kIdempotent,
-                            nullptr /* resourceYielder */);
+                            nullptr /* resourceYielder */,
+                            {} /* designatedHostMap */);
 
     hangBeforeQueryingRecipients.pauseWhileSet();
 
@@ -158,22 +186,30 @@ CoordinatorCommitMonitor::queryRemainingOperationTimeForRecipients() const {
                 !_cancelToken.isCanceled());
 
         auto response = ars.next();
-        const auto errorContext =
+        auto errorContext =
             "Failed command: {} on {}"_format(cmdObj.toString(), response.shardId.toString());
 
-        const auto shardResponse =
+        auto shardResponse =
             uassertStatusOKWithContext(std::move(response.swResponse), errorContext);
-        const auto status = getStatusFromCommandResult(shardResponse.data);
+        auto status = getStatusFromCommandResult(shardResponse.data);
         uassertStatusOKWithContext(status, errorContext);
 
         const auto remainingTime = extractOperationRemainingTime(shardResponse.data);
-        // A recipient shard does not report the remaining operation time when there is no data
-        // to copy and no oplog entry to apply.
-        if (remainingTime && remainingTime.get() < minRemainingTime) {
-            minRemainingTime = remainingTime.get();
+
+        // If any recipient omits the "remainingMillis" field of the response then
+        // we cannot conclude that it is safe to begin the critical section.
+        // It is possible that the recipient just had a failover and
+        // was not able to restore its metrics before it replied to the
+        // _shardsvrReshardingOperationTime command.
+        if (!remainingTime) {
+            maxRemainingTime = Milliseconds::max();
+            continue;
         }
-        if (remainingTime && remainingTime.get() > maxRemainingTime) {
-            maxRemainingTime = remainingTime.get();
+        if (remainingTime.value() < minRemainingTime) {
+            minRemainingTime = remainingTime.value();
+        }
+        if (remainingTime.value() > maxRemainingTime) {
+            maxRemainingTime = remainingTime.value();
         }
     }
 
@@ -184,47 +220,65 @@ CoordinatorCommitMonitor::queryRemainingOperationTimeForRecipients() const {
     LOGV2_DEBUG(5392002,
                 kDiagnosticLogLevel,
                 "Finished querying recipient shards for the remaining operation time",
-                "namespace"_attr = _ns,
+                logAttrs(_ns),
                 "remainingTime"_attr = maxRemainingTime);
 
     return {minRemainingTime, maxRemainingTime};
 }
 
-ExecutorFuture<void> CoordinatorCommitMonitor::_makeFuture() const {
-    return ExecutorFuture<void>(_executor)
-        .then([this] { return queryRemainingOperationTimeForRecipients(); })
-        .onError([this](Status status) {
-            if (_cancelToken.isCanceled()) {
-                // Do not retry on cancellation errors.
-                iasserted(status);
+ExecutorFuture<void> CoordinatorCommitMonitor::_makeFuture(Milliseconds delayBetweenQueries) const {
+    auto delay = std::make_shared<Milliseconds>(delayBetweenQueries);
+    // We do not use withDelayBetweenIterations option because we want to delay the initial query.
+    return AsyncTry([this, anchor = shared_from_this(), delay] {
+               return _executor->sleepFor(*delay, _cancelToken)
+                   .then([this, anchor = std::move(anchor)] {
+                       return queryRemainingOperationTimeForRecipients();
+                   });
+           })
+        .until([this, anchor = shared_from_this(), delay](
+                   const StatusWith<RemainingOperationTimes> result) -> bool {
+            RemainingOperationTimes remainingTimes;
+            if (!result.isOK()) {
+                if (_cancelToken.isCanceled()) {
+                    // Do not retry on cancellation errors.
+                    iasserted(result.getStatus());
+                }
+                // Absorbs any exception thrown by the query phase, except for cancellation errors,
+                // and retries. The intention is to handle short term issues with querying
+                // recipients (e.g., network hiccups and connection timeouts).
+                LOGV2_WARNING(5392006,
+                              "Encountered an error while querying recipients, will retry shortly",
+                              "error"_attr = result.getStatus());
+                // On error we definitely cannot begin the critical section.  Therefore,
+                // return Milliseconds::max for remainingTimes.max (remainingTimes.max is used
+                // for determining whether the critical section should begin).
+                remainingTimes = RemainingOperationTimes{Milliseconds(-1), Milliseconds::max()};
+            } else {
+                remainingTimes = result.getValue();
             }
 
-            // Absorbs any exception thrown by the query phase, except for cancellation errors, and
-            // retries. The intention is to handle short term issues with querying recipients (e.g.,
-            // network hiccups and connection timeouts).
-            LOGV2_WARNING(5392006,
-                          "Encountered an error while querying recipients, will retry shortly",
-                          "error"_attr = status);
-
-            return RemainingOperationTimes{Milliseconds(0), Milliseconds::max()};
-        })
-        .then([this, anchor = shared_from_this()](RemainingOperationTimes remainingTimes) {
-            _metrics->setCoordinatorHighEstimateRemainingTimeMillis(remainingTimes.max);
-            _metrics->setCoordinatorLowEstimateRemainingTimeMillis(remainingTimes.min);
+            // If remainingTimes.max (or remainingTimes.min) is Milliseconds::max, then use -1 so
+            // that the scale of the y-axis is still useful when looking at FTDC metrics.
+            auto clampIfMax = [](Milliseconds t) {
+                return t != Milliseconds::max() ? t : Milliseconds(-1);
+            };
+            _metrics->setCoordinatorHighEstimateRemainingTimeMillis(clampIfMax(remainingTimes.max));
+            _metrics->setCoordinatorLowEstimateRemainingTimeMillis(clampIfMax(remainingTimes.min));
 
             // Check if all recipient shards are within the commit threshold.
             if (remainingTimes.max <= _threshold)
-                return ExecutorFuture<void>(_executor);
+                return true;
 
             // The following ensures that the monitor would never sleep for more than a predefined
             // maximum delay between querying recipient shards. Thus, it can handle very large,
             // and potentially inaccurate estimates of the remaining operation time.
-            auto sleepTime = std::min(remainingTimes.max - _threshold, _maxDelayBetweenQueries);
-            return _executor->sleepFor(sleepTime, _cancelToken)
-                .then([this, anchor = std::move(anchor)] {
-                    // We are not canceled yet, so schedule new queries against recipient shards.
-                    return _makeFuture();
-                });
+            *delay = std::min(remainingTimes.max - _threshold, _maxDelayBetweenQueries);
+
+            return false;
+        })
+        .on(_executor, _cancelToken)
+        .onCompletion([](StatusWith<CoordinatorCommitMonitor::RemainingOperationTimes> statusWith) {
+            return mongo::Future<void>::makeReady(statusWith.getStatus());
         });
 }
 

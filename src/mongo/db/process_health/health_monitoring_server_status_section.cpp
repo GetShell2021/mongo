@@ -27,10 +27,14 @@
  *    it in the license file.
  */
 
+#include <memory>
+
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/process_health/fault_manager.h"
 #include "mongo/db/service_context.h"
 
@@ -38,7 +42,7 @@ namespace mongo {
 
 class HealthMonitoringServerStatus : public ServerStatusSection {
 public:
-    HealthMonitoringServerStatus() : ServerStatusSection("health") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -62,7 +66,8 @@ public:
 
         return result.obj();
     }
-
-} healthMonitoringServerStatus;
+};
+auto& healthMonitoringServerStatus =
+    *ServerStatusSectionBuilder<HealthMonitoringServerStatus>("health").forRouter();
 
 }  // namespace mongo

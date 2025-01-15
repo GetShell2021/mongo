@@ -30,14 +30,18 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <iosfwd>
+#include <string>
 #include <type_traits>
 #include <utility>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder_fwd.h"
 #include "mongo/platform/compiler.h"
+#include "mongo/unittest/stringify.h"
 #include "mongo/util/assert_util_core.h"
 
 namespace mongo {
@@ -74,7 +78,7 @@ using StatusOrStatusWith = std::conditional_t<std::is_void_v<T>, Status, StatusW
  * }
  */
 template <typename T>
-class MONGO_WARN_UNUSED_RESULT_CLASS StatusWith {
+class [[nodiscard]] StatusWith {
 private:
     MONGO_STATIC_ASSERT_MSG(!isStatusOrStatusWith<T>,
                             "StatusWith<Status> and StatusWith<StatusWith<T>> are banned.");
@@ -152,110 +156,6 @@ public:
     }
 
     /**
-     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
-     * the function to the _t member or forwarding the _status. This is the lvalue overload.
-     */
-    template <typename F>
-    StatusWith<std::invoke_result_t<F&&, T&>> transform(F&& f) & {
-        if (_t)
-            return {std::forward<F>(f)(*_t)};
-        else
-            return {_status};
-    }
-
-    /**
-     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
-     * the function to the _t member or forwarding the _status. This is the const overload.
-     */
-    template <typename F>
-    StatusWith<std::invoke_result_t<F&&, const T&>> transform(F&& f) const& {
-        if (_t)
-            return {std::forward<F>(f)(*_t)};
-        else
-            return {_status};
-    }
-
-    /**
-     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
-     * the function to the _t member or forwarding the _status. This is the rvalue overload.
-     */
-    template <typename F>
-    StatusWith<std::invoke_result_t<F&&, T&&>> transform(F&& f) && {
-        if (_t)
-            return {std::forward<F>(f)(*std::move(_t))};
-        else
-            return {std::move(_status)};
-    }
-
-    /**
-     * For any type U returned by a function f, transform creates a StatusWith<U> by either applying
-     * the function to the _t member or forwarding the _status. This is the const rvalue overload.
-     */
-    template <typename F>
-    StatusWith<std::invoke_result_t<F&&, const T&&>> transform(F&& f) const&& {
-        if (_t)
-            return {std::forward<F>(f)(*std::move(_t))};
-        else
-            return {std::move(_status)};
-    }
-
-    /**
-     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
-     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
-     * _status. andThen performs the same function as transform but for a function f with a return
-     * type of StatusWith. This is the lvalue overload.
-     */
-    template <typename F>
-    StatusWith<typename std::invoke_result_t<F&&, T&>::value_type> andThen(F&& f) & {
-        if (_t)
-            return {std::forward<F>(f)(*_t)};
-        else
-            return {_status};
-    }
-
-    /**
-     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
-     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
-     * _status. andThen performs the same function as transform but for a function f with a return
-     * type of StatusWith. This is the const overload.
-     */
-    template <typename F>
-    StatusWith<typename std::invoke_result_t<F&&, const T&>::value_type> andThen(F&& f) const& {
-        if (_t)
-            return {std::forward<F>(f)(*_t)};
-        else
-            return {_status};
-    }
-
-    /**
-     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
-     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
-     * _status. andThen performs the same function as transform but for a function f with a return
-     * type of StatusWith. This is the rvalue overload.
-     */
-    template <typename F>
-    StatusWith<typename std::invoke_result_t<F&&, T&&>::value_type> andThen(F&& f) && {
-        if (_t)
-            return {std::forward<F>(f)(*std::move(_t))};
-        else
-            return {std::move(_status)};
-    }
-
-    /**
-     * For any type U returned inside a StatusWith<U> by a function f, andThen directly produces a
-     * StatusWith<U> by applying the function to the _t member or creates one by forwarding the
-     * _status. andThen performs the same function as transform but for a function f with a return
-     * type of StatusWith. This is the const rvalue overload.
-     */
-    template <typename F>
-    StatusWith<typename std::invoke_result_t<F&&, const T&&>::value_type> andThen(F&& f) const&& {
-        if (_t)
-            return {std::forward<F>(f)(*std::move(_t))};
-        else
-            return {std::move(_status)};
-    }
-
-    /**
      * This method is a transitional tool, to facilitate transition to compile-time enforced status
      * checking.
      *
@@ -280,6 +180,15 @@ private:
     Status _status;
     boost::optional<T> _t;
 };
+
+template <typename T>
+std::string stringifyForAssert(const StatusWith<T>& sw) {
+    if (sw.isOK()) {
+        return unittest::stringify::invoke(sw.getValue());
+    } else {
+        return unittest::stringify::invoke(sw.getStatus());
+    }
+}
 
 template <typename T>
 auto operator<<(std::ostream& stream, const StatusWith<T>& sw)
@@ -352,22 +261,22 @@ bool operator!=(const Status& status, const StatusWith<T>& sw) {
 //
 
 template <typename T>
-bool operator==(const StatusWith<T>& sw, const ErrorCodes::Error code) {
+bool operator==(const StatusWith<T>& sw, ErrorCodes::Error code) {
     return sw.getStatus() == code;
 }
 
 template <typename T>
-bool operator==(const ErrorCodes::Error code, const StatusWith<T>& sw) {
+bool operator==(ErrorCodes::Error code, const StatusWith<T>& sw) {
     return code == sw.getStatus();
 }
 
 template <typename T>
-bool operator!=(const StatusWith<T>& sw, const ErrorCodes::Error code) {
+bool operator!=(const StatusWith<T>& sw, ErrorCodes::Error code) {
     return !(sw == code);
 }
 
 template <typename T>
-bool operator!=(const ErrorCodes::Error code, const StatusWith<T>& sw) {
+bool operator!=(ErrorCodes::Error code, const StatusWith<T>& sw) {
     return !(code == sw);
 }
 

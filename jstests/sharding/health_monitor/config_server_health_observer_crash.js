@@ -2,22 +2,31 @@
  * Tests that if the primary config server is blackholed from the point of view of mongos,
  * the Config server health checker will eventually crash the server.
  *
- *  @tags: [multiversion_incompatible]
+ *  @tags: [
+ *    multiversion_incompatible,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ *    # TODO (SERVER-94095): Re-enable this test in aubsan and tsan once DEVPROD-10102 is resolved.
+ *    incompatible_aubsan,
+ *    incompatible_tsan,
+ * ]
  */
-(function() {
-'use strict';
-
-load('jstests/replsets/rslib.js');
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
 const kActiveFaultDurationSec = 12;
 
 // Crashed mongos will remain holding its socket as a zombie for some time.
-TestData.failIfUnterminatedProcesses = false;
+TestData.ignoreUnterminatedProcesses = true;
+// Because this test intentionally causes the server to crash, we need to instruct the
+// shell to clean up the core dump that is left behind.
+TestData.cleanUpCoreDumpsFromExpectedCrash = true;
 
 // Checking index consistency involves talking to the primary config server which is blackholed from
 // the mongos in this test.
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 const mongosParams = {
     setParameter: {
@@ -28,7 +37,6 @@ const mongosParams = {
         }),
         healthMonitoringIntervals: tojson({values: [{type: "configServer", interval: 1}]}),
         activeFaultDurationSecs: kActiveFaultDurationSec,
-        featureFlagHealthMonitoring: true
     }
 };
 
@@ -43,6 +51,7 @@ var st = new ShardingTest({
     shards: 1,
     mongos: [mongosParams, {}],
     other: {useBridge: true},
+    config: 3,
 });
 
 assert.commandWorked(st.s0.adminCommand(
@@ -96,6 +105,8 @@ assert.soon(() => {
 
 // Mongos should not crash yet.
 assert.commandWorked(st.s0.adminCommand({"ping": 1}));
+let pidsBefore = _runningMongoChildProcessIds();
+let numPidsBefore = pidsBefore.length;
 
 jsTest.log('Partitioning the final config server replica from the mongos');
 st.config2.discardMessagesFrom(st.s, 1.0);
@@ -117,10 +128,22 @@ assert.soon(() => {
 
 try {
     // Refresh PIDs to force de-registration of the crashed mongos.
-    var pids = _runningMongoChildProcessIds();
-    jsTestLog(`Running processes: ${tojson(pids)}`);
+    assert.soon(
+        () => {
+            var numPidsNow = _runningMongoChildProcessIds().length;
+            return (numPidsBefore - numPidsNow) == 1;
+        },
+        () => {
+            var pids = _runningMongoChildProcessIds();
+            return `Encountered incorrect number of running processes. Expected: 11. Running processes: ${
+                tojson(pids)}`;
+        });
+    var pidsNow = _runningMongoChildProcessIds();
+    pidsBefore = pidsBefore.map((e) => e.toNumber());
+    pidsNow = pidsNow.map((e) => e.toNumber());
+    var difference = pidsBefore.filter((element) => !pidsNow.includes(element));
+    waitProgram(difference[0]);
     st.stop({skipValidatingExitCode: true, skipValidation: true});
 } catch (e) {
     jsTestLog(`Exception during shutdown: ${e}`);
 }
-}());

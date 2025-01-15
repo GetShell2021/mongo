@@ -29,18 +29,34 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
 #include <stack>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/basic_types.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/find_command_gen.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/rpc/message.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
 class AScopedConnection;
 class DBClientBase;
+
 class AggregateCommandRequest;
 
 /**
@@ -55,7 +71,7 @@ class DBClientCursor {
 public:
     static StatusWith<std::unique_ptr<DBClientCursor>> fromAggregationRequest(
         DBClientBase* client,
-        AggregateCommandRequest aggRequest,
+        const AggregateCommandRequest& aggRequest,
         bool secondaryOk,
         bool useExhaust);
 
@@ -87,6 +103,7 @@ public:
     virtual bool more();
 
     bool hasMoreToCome() const {
+        tassert(9279700, "Cursor is not initialized", _isInitialized);
         return _connectionHasPendingReplies;
     }
 
@@ -96,8 +113,10 @@ public:
      * whatever data has been fetched to the client already but then perhaps stop.
      */
     int objsLeftInBatch() const {
-        return _putBack.size() + _batch.objs.size() - _batch.pos;
+        tassert(9279701, "Cursor is not initialized", _isInitialized);
+        return _batch.objs.size() - _batch.pos;
     }
+
     bool moreInCurrentBatch() {
         return objsLeftInBatch() > 0;
     }
@@ -113,13 +132,6 @@ public:
     virtual BSONObj next();
 
     /**
-     * Restores an object previously returned by next() to the cursor.
-     */
-    void putBack(const BSONObj& o) {
-        _putBack.push(o.getOwned());
-    }
-
-    /**
      * Similar to 'next()', but throws an AssertionException on error.
      */
     BSONObj nextSafe();
@@ -127,20 +139,18 @@ public:
     /**
      * Peek ahead at items buffered for future next() calls. Never requests new data from the
      * server.
-     *
-     * WARNING: no support for _putBack yet!
      */
-    void peek(std::vector<BSONObj>&, int atMost);
+    void peek(std::vector<BSONObj>&, int atMost) const;
 
     /**
      * Peeks at first element. If no first element exists, returns an empty object.
      */
-    BSONObj peekFirst();
+    BSONObj peekFirst() const;
 
     /**
      * peek ahead and see if an error occurred, and get the error if so.
      */
-    bool peekError(BSONObj* error = nullptr);
+    bool peekError(BSONObj* error = nullptr) const;
 
     /**
      * Iterates the rest of the cursor and returns the resulting number if items.
@@ -162,12 +172,20 @@ public:
         return _cursorId == 0;
     }
 
+    bool isInitialized() const {
+        return _isInitialized;
+    }
+
     bool tailable() const {
         return _findRequest && _findRequest->getTailable();
     }
 
     bool tailableAwaitData() const {
         return tailable() && _findRequest->getAwaitData();
+    }
+
+    bool isExhaust() const {
+        return _isExhaust;
     }
 
     /**
@@ -185,10 +203,6 @@ public:
 
     std::string originalHost() const {
         return _originalHost;
-    }
-
-    std::string getns() const {
-        return _ns.ns();
     }
 
     const NamespaceString& getNamespaceString() const {
@@ -230,7 +244,7 @@ public:
 
     void setAwaitDataTimeoutMS(Milliseconds timeout) {
         // It only makes sense to set awaitData timeout if the cursor is in tailable awaitData mode.
-        invariant(tailableAwaitData());
+        tassert(9279703, "Cursor is not in tailable awaitData mode", tailableAwaitData());
         _awaitDataTimeout = timeout;
     }
 
@@ -238,7 +252,7 @@ public:
     void setCurrentTermAndLastCommittedOpTime(
         const boost::optional<long long>& term,
         const boost::optional<repl::OpTime>& lastCommittedOpTime) {
-        invariant(tailableAwaitData());
+        tassert(9279704, "Cursor is not in tailable awaitData mode", tailableAwaitData());
         _term = term;
         _lastKnownCommittedOpTime = lastCommittedOpTime;
     }
@@ -294,6 +308,10 @@ private:
     std::string _originalHost;
     NamespaceStringOrUUID _nsOrUuid;
 
+    // In order to fully initialize a DBClientCursor object, one must first call its constructor
+    // and then subsequently call DBClientCursor::init().
+    bool _isInitialized = false;
+
     // 'ns' is initially the NamespaceString passed in, or the dbName if doing a find by UUID.
     // After a successful 'find' command, 'ns' is updated to contain the namespace returned by that
     // command.
@@ -301,7 +319,6 @@ private:
 
     long long _cursorId = 0;
 
-    std::stack<BSONObj> _putBack;
     std::string _scopedHost;
     bool _wasError = false;
     bool _connectionHasPendingReplies = false;

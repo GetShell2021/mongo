@@ -27,33 +27,55 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/client/dbclient_cursor.h"
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/json.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_planner_params.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 /**
  * This file tests db/exec/index_scan.cpp
  */
 
+namespace mongo {
 namespace QueryStageTests {
-
-using std::unique_ptr;
 
 class IndexScanBase {
 public:
@@ -65,7 +87,7 @@ public:
             bob.append("foo", i);
             bob.append("baz", i);
             bob.append("bar", numObj() - i);
-            _client.insert(ns(), bob.obj());
+            _client.insert(nss(), bob.obj());
         }
 
         addIndex(BSON("foo" << 1));
@@ -74,7 +96,7 @@ public:
 
     virtual ~IndexScanBase() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        _client.dropCollection(ns());
+        _client.dropCollection(nss());
     }
 
     void addIndex(const BSONObj& obj) {
@@ -82,23 +104,24 @@ public:
     }
 
     int countResults(const IndexScanParams& params, BSONObj filterObj = BSONObj()) {
-        AutoGetCollectionForReadCommand ctx(&_opCtx, NamespaceString(ns()));
+        AutoGetCollectionForReadCommand ctx(&_opCtx,
+                                            NamespaceString::createNamespaceString_forTest(ns()));
 
         StatusWithMatchExpression statusWithMatcher =
             MatchExpressionParser::parse(filterObj, _expCtx);
-        verify(statusWithMatcher.isOK());
-        unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
+        MONGO_verify(statusWithMatcher.isOK());
+        std::unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
-        unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
-        unique_ptr<IndexScan> ix = std::make_unique<IndexScan>(
-            _expCtx.get(), ctx.getCollection(), params, ws.get(), filterExpr.get());
+        auto ws = std::make_unique<WorkingSet>();
+        auto ix = std::make_unique<IndexScan>(
+            _expCtx.get(), &ctx.getCollection(), params, ws.get(), filterExpr.get());
 
         auto statusWithPlanExecutor =
             plan_executor_factory::make(_expCtx,
                                         std::move(ws),
                                         std::move(ix),
                                         &ctx.getCollection(),
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -114,18 +137,9 @@ public:
         return count;
     }
 
-    void makeGeoData() {
-        dbtests::WriteContextForTests ctx(&_opCtx, ns());
-
-        for (int i = 0; i < numObj(); ++i) {
-            double lat = double(rand()) / RAND_MAX;
-            double lng = double(rand()) / RAND_MAX;
-            _client.insert(ns(), BSON("geo" << BSON_ARRAY(lng << lat)));
-        }
-    }
-
     const IndexDescriptor* getIndex(const BSONObj& obj) {
-        AutoGetCollectionForReadCommand collection(&_opCtx, NamespaceString(ns()));
+        AutoGetCollectionForReadCommand collection(
+            &_opCtx, NamespaceString::createNamespaceString_forTest(ns()));
         std::vector<const IndexDescriptor*> indexes;
         collection->getIndexCatalog()->findIndexesByKeyPattern(
             &_opCtx, obj, IndexCatalog::InclusionPolicy::kReady, &indexes);
@@ -134,7 +148,8 @@ public:
 
     IndexScanParams makeIndexScanParams(OperationContext* opCtx,
                                         const IndexDescriptor* descriptor) {
-        AutoGetCollectionForReadCommand collection(&_opCtx, NamespaceString(ns()));
+        AutoGetCollectionForReadCommand collection(
+            &_opCtx, NamespaceString::createNamespaceString_forTest(ns()));
         IndexScanParams params(opCtx, *collection, descriptor);
         params.bounds.isSimpleRange = true;
         params.bounds.endKey = BSONObj();
@@ -149,13 +164,18 @@ public:
     static const char* ns() {
         return "unittests.IndexScan";
     }
+    static NamespaceString nss() {
+        return NamespaceString::createNamespaceString_forTest(ns());
+    }
 
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
-
     boost::intrusive_ptr<ExpressionContext> _expCtx =
-        new ExpressionContext(&_opCtx, nullptr, NamespaceString(ns()));
+        ExpressionContextBuilder{}
+            .opCtx(&_opCtx)
+            .ns(NamespaceString::createNamespaceString_forTest(ns()))
+            .build();
 
 private:
     DBDirectClient _client;
@@ -163,7 +183,7 @@ private:
 
 class QueryStageIXScanBasic : public IndexScanBase {
 public:
-    virtual ~QueryStageIXScanBasic() {}
+    ~QueryStageIXScanBasic() override {}
 
     void run() {
         // foo <= 20
@@ -177,7 +197,7 @@ public:
 
 class QueryStageIXScanLowerUpper : public IndexScanBase {
 public:
-    virtual ~QueryStageIXScanLowerUpper() {}
+    ~QueryStageIXScanLowerUpper() override {}
 
     void run() {
         // 20 <= foo < 30
@@ -193,7 +213,7 @@ public:
 
 class QueryStageIXScanLowerUpperIncl : public IndexScanBase {
 public:
-    virtual ~QueryStageIXScanLowerUpperIncl() {}
+    ~QueryStageIXScanLowerUpperIncl() override {}
 
     void run() {
         // 20 <= foo <= 30
@@ -207,7 +227,7 @@ public:
 
 class QueryStageIXScanLowerUpperInclFilter : public IndexScanBase {
 public:
-    virtual ~QueryStageIXScanLowerUpperInclFilter() {}
+    ~QueryStageIXScanLowerUpperInclFilter() override {}
 
     void run() {
         // 20 <= foo < 30
@@ -222,7 +242,7 @@ public:
 
 class QueryStageIXScanCantMatch : public IndexScanBase {
 public:
-    virtual ~QueryStageIXScanCantMatch() {}
+    ~QueryStageIXScanCantMatch() override {}
 
     void run() {
         // 20 <= foo < 30
@@ -235,11 +255,11 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query_stage_tests") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageIXScanBasic>();
         add<QueryStageIXScanLowerUpper>();
         add<QueryStageIXScanLowerUpperIncl>();
@@ -248,6 +268,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> queryStageTestsAll;
+unittest::OldStyleSuiteInitializer<All> queryStageTestsAll;
 
 }  // namespace QueryStageTests
+}  // namespace mongo

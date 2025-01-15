@@ -105,7 +105,8 @@ def declare_roles(env, roles, base_role=None, meta_role=None):
     if isinstance(base_role, str):
         if base_role not in role_names:
             raise Exception(
-                "A base_role argument was provided but it does not name a declared role")
+                "A base_role argument was provided but it does not name a declared role"
+            )
     elif isinstance(base_role, DeclaredRole):
         if base_role not in roles:
             raise Exception("A base_role argument was provided but it is not a declared role")
@@ -118,7 +119,8 @@ def declare_roles(env, roles, base_role=None, meta_role=None):
     if isinstance(meta_role, str):
         if meta_role not in role_names:
             raise Exception(
-                "A meta_role argument was provided but it does not name a declared role")
+                "A meta_role argument was provided but it does not name a declared role"
+            )
     elif isinstance(meta_role, DeclaredRole):
         if meta_role not in roles:
             raise Exception("A meta_role argument was provided but it is not a declared role")
@@ -189,7 +191,7 @@ def get_alias_map_entry(env, component, role):
             r_entry.dependencies.add(base_c_entry)
 
         meta_role = env.get(META_ROLE)
-        if (meta_role and role != meta_role and meta_component and component != meta_component):
+        if meta_role and role != meta_role and meta_component and component != meta_component:
             meta_r_entry = get_alias_map_entry(env, component, meta_role)
             meta_c_r_entry = get_alias_map_entry(env, meta_component, meta_role)
             meta_c_r_entry.dependencies.add(meta_r_entry)
@@ -244,18 +246,24 @@ def scan_for_transitive_install(node, env, _path):
         if component_base_entry.files:
             results.update(component_base_entry.files)
 
-    if (base_role and base_component and component != base_component and role != base_role):
+    if base_role and base_component and component != base_component and role != base_role:
         base_base_entry = alias_map[base_component][base_role]
         if base_base_entry.files:
             results.update(base_base_entry.files)
 
-    installed_children = set(grandchild for child in node.children()
-                             for direct_children in child.children()
-                             for grandchild in direct_children.get_executor().get_all_targets()
-                             if direct_children.get_executor() and grandchild.has_builder())
-
+    installed_children = set(
+        grandchild
+        for child in node.children()
+        for direct_children in child.children()
+        for grandchild in direct_children.get_executor().get_all_targets()
+        if direct_children.get_executor() and grandchild.has_builder()
+    )
     for child in installed_children:
         auto_installed_files = get_auto_installed_files(env, child)
+        bazel_child = getattr(child.attributes, "AIB_INSTALL_FROM", child)
+        if str(bazel_child).startswith("bazel-out"):
+            auto_installed_files += get_auto_installed_files(env, bazel_child)
+
         if not auto_installed_files:
             continue
 
@@ -301,8 +309,9 @@ def tag_components(env, target, **kwargs):
         raise Exception("AIB_COMPONENT must be a string and contain no whitespace.")
 
     if component is None:
-        raise Exception("AIB_COMPONENT must be provided; untagged targets: {}".format(
-            [t.path for t in target]))
+        raise Exception(
+            "AIB_COMPONENT must be provided; untagged targets: {}".format([t.path for t in target])
+        )
 
     if role is None:
         raise Exception("AIB_ROLE was not provided.")
@@ -318,8 +327,11 @@ def tag_components(env, target, **kwargs):
     # component or base component. These cause dependency cycles because
     # get_alias_map_entry will do that wiring for us then we will try to
     # map them back on themselves in our loop.
-    if (component != env.get(BASE_COMPONENT) and role != env.get(META_ROLE)
-            and component != env.get(META_COMPONENT)):
+    if (
+        component != env.get(BASE_COMPONENT)
+        and role != env.get(META_ROLE)
+        and component != env.get(META_COMPONENT)
+    ):
         for component in kwargs.get(REVERSE_COMPONENT_DEPENDENCIES, []):
             component_dep = get_alias_map_entry(env, component, role)
             component_dep.dependencies.add(entry)
@@ -333,6 +345,9 @@ def auto_install_task(env, component, role):
     return list(entry.files)
 
 
+bazel_installs = set()
+
+
 def auto_install_pseudobuilder(env, target, source, **kwargs):
     """Auto install pseudo-builder."""
     source = env.Flatten([source])
@@ -341,11 +356,9 @@ def auto_install_pseudobuilder(env, target, source, **kwargs):
 
     installed_files = []
     for s in source:
-
         target_for_source = target
 
         if not target_for_source:
-
             # AIB currently uses file suffixes to do mapping. However, sometimes we need
             # to do the mapping based on a different suffix. This is used for things like
             # dSYM files, where we really just want to describe where .dSYM bundles should
@@ -379,15 +392,19 @@ def auto_install_pseudobuilder(env, target, source, **kwargs):
         # second subst to expand DESTDIR, interpolating
         # `target_for_source` in as $TARGET. Yes, this is confusing.
         target_for_source = env.subst(target_for_source, source=s)
-        target_for_source = env.Dir(env.subst('$DESTDIR/$TARGET', target=target_for_source))
+        target_for_source = env.Dir(env.subst("$DESTDIR/$TARGET", target=target_for_source))
 
         aib_additional_directory = getattr(s.attributes, "aib_additional_directory", None)
         if aib_additional_directory is not None:
             target_for_source = env.Dir(aib_additional_directory, directory=target_for_source)
-
-        new_installed_files = env.Install(target=target_for_source, source=s)
+        aib_new_name = getattr(s.attributes, "aib_new_name", None)
+        if aib_new_name is not None:
+            install_file = env.File(aib_new_name, target_for_source)
+            new_installed_files = env.InstallAs(install_file, s)
+        else:
+            new_installed_files = env.Install(target=target_for_source, source=s)
         setattr(s.attributes, INSTALLED_FILES, new_installed_files)
-
+        setattr(new_installed_files[0].attributes, "AIB_INSTALL_FROM", s)
         installed_files.extend(new_installed_files)
 
     entry.files.update(installed_files)
@@ -418,10 +435,12 @@ def finalize_install_dependencies(env):
                 alias_name = generate_alias_name(env, component, role, task)
                 alias = env.Alias(alias_name, func(env, component, role))
                 if generate_dependent_aliases:
-                    dependent_aliases = env.Flatten([
-                        env.Alias(generate_alias_name(env, d.component, d.role, task))
-                        for d in info.dependencies
-                    ])
+                    dependent_aliases = env.Flatten(
+                        [
+                            env.Alias(generate_alias_name(env, d.component, d.role, task))
+                            for d in info.dependencies
+                        ]
+                    )
                     env.Alias(alias, dependent_aliases)
 
 
@@ -433,6 +452,11 @@ def auto_install_emitter(target, source, env):
             t = env.File(t)
 
         if env.get("AIB_IGNORE", False):
+            continue
+
+        if t.has_builder() and t.get_builder().get_name(env) in set(
+            ["BazelProgram", "BazelSharedLibrary"]
+        ):
             continue
 
         # There is no API for determining if an Entry is operating in
@@ -464,8 +488,11 @@ def add_suffix_mapping(env, suffix, role=None):
     """Map suffix to role"""
     if isinstance(suffix, str):
         if role not in env[ROLE_DECLARATIONS]:
-            raise Exception("target {} is not a known role available roles are {}".format(
-                role, env[ROLE_DECLARATIONS].keys()))
+            raise Exception(
+                "target {} is not a known role available roles are {}".format(
+                    role, env[ROLE_DECLARATIONS].keys()
+                )
+            )
         env[SUFFIX_MAP][env.subst(suffix)] = role
 
     if not isinstance(suffix, dict):
@@ -474,8 +501,11 @@ def add_suffix_mapping(env, suffix, role=None):
     for _, mapping in suffix.items():
         role = mapping.default_role
         if role not in env[ROLE_DECLARATIONS]:
-            raise Exception("target {} is not a known role. Available roles are {}".format(
-                target, env[ROLE_DECLARATIONS].keys()))
+            raise Exception(
+                "target {} is not a known role. Available roles are {}".format(
+                    target, env[ROLE_DECLARATIONS].keys()
+                )
+            )
 
     env[SUFFIX_MAP].update({env.subst(key): value for key, value in suffix.items()})
 
@@ -538,16 +568,16 @@ def list_targets():
             matching_roles = list(filter(target_role.endswith, [f"-{role}" for role in roles]))
             assert len(matching_roles) == 1
 
-            targets.append(target_role[:-len(matching_roles[0])])
+            targets.append(target_role[: -len(matching_roles[0])])
 
         # dedup and sort targets
         targets = sorted(list(set(targets)))
         print(
             "The following are AIB targets. Note that runtime role is implied if not specified. For example, install-mongod"
         )
-        tasks_str = ','.join(tasks)
+        tasks_str = ",".join(tasks)
         print(f"TASK={{{tasks_str}}}")
-        roles_str = ','.join(roles)
+        roles_str = ",".join(roles)
         print(f"ROLE={{{roles_str}}}")
         for target in targets:
             print(f"  TASK-{target}-ROLE")
@@ -564,7 +594,7 @@ def exists(_env):
     return True
 
 
-def generate(env):  # pylint: disable=too-many-statements
+def generate(env):
     """Generate the auto install builders."""
     env["AUTO_INSTALL_ENABLED"] = True
 
@@ -580,9 +610,11 @@ def generate(env):  # pylint: disable=too-many-statements
     env[SUFFIX_MAP] = {}
     env[ALIAS_MAP] = defaultdict(dict)
 
-    env.AppendUnique(AIB_TASKS={
-        "install": auto_install_task,
-    })
+    env.AppendUnique(
+        AIB_TASKS={
+            "install": auto_install_task,
+        }
+    )
 
     env.AddMethod(
         scan_for_transitive_install_pseudobuilder,

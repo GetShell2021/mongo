@@ -27,16 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/fts/fts_query_impl.h"
-
+#include <iosfwd>
 #include <memory>
+#include <utility>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/fts/fts_language.h"
+#include "mongo/db/fts/fts_query_impl.h"
 #include "mongo/db/fts/fts_query_parser.h"
-#include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/fts/fts_tokenizer.h"
-#include "mongo/util/str.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -211,7 +212,7 @@ size_t FTSQueryImpl::getApproximateSize() const {
     auto computeVectorSize = [](const std::vector<std::string>& v) {
         size_t size = 0;
         for (const auto& str : v) {
-            size += sizeof(str) + str.size() + 1;
+            size += sizeof(std::string) + str.size() + 1;
         }
         return size;
     };
@@ -219,7 +220,7 @@ size_t FTSQueryImpl::getApproximateSize() const {
     auto computeSetSize = [](const std::set<std::string>& s) {
         size_t size = 0;
         for (const auto& str : s) {
-            size += sizeof(str) + str.size() + 1;
+            size += sizeof(std::string) + str.size() + 1;
         }
         return size;
     };

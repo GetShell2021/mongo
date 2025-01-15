@@ -27,108 +27,146 @@
  *    it in the license file.
  */
 
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "mongo/platform/basic.h"
+#include <fmt/format.h>
 
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/s/move_primary_coordinator.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/move_primary_coordinator_document_gen.h"
+#include "mongo/db/s/sharding_ddl_coordinator_gen.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/db/s/sharding_ddl_util.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_primary_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-
 namespace mongo {
 namespace {
+using namespace fmt::literals;
 
-class MovePrimaryCommand : public BasicCommand {
+class ShardsvrMovePrimaryCommand final : public TypedCommand<ShardsvrMovePrimaryCommand> {
 public:
-    MovePrimaryCommand() : BasicCommand("_shardsvrMovePrimary") {}
+    using Request = ShardsvrMovePrimary;
 
-    bool skipApiVersionCheck() const override {
-        // Internal command (server to server).
-        return true;
-    }
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
 
-    std::string help() const override {
-        return "should not be calling this directly";
-    }
+        void typedRun(OperationContext* opCtx) {
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
+            CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
+                                                          opCtx->getWriteConcern());
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
+            const auto& dbNss = ns();
+            const auto& toShardId = request().getTo();
 
+            uassert(
+                ErrorCodes::InvalidNamespace,
+                "invalid database {}"_format(dbNss.toStringForErrorMsg()),
+                DatabaseName::isValid(dbNss.dbName(), DatabaseName::DollarInDbNameBehavior::Allow));
+
+            uassert(
+                ErrorCodes::InvalidOptions,
+                "cannot move primary of internal database {}"_format(dbNss.toStringForErrorMsg()),
+                !dbNss.isOnInternalDb());
+
+            sharding_ddl_util::assertDataMovementAllowed();
+
+            ScopeGuard onBlockExit(
+                [&] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbNss.dbName()); });
+
+            const auto coordinatorFuture = [&] {
+                FixedFCVRegion fcvRegion(opCtx);
+
+                auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+                // Ensure that the shard information is up-to-date as possible to catch the case
+                // where a shard with the same name, but with a different host, has been
+                // removed/re-added.
+                shardRegistry->reload(opCtx);
+                const auto toShard = uassertStatusOKWithContext(
+                    shardRegistry->getShard(opCtx, toShardId),
+                    "requested primary shard {} does not exist"_format(toShardId.toString()));
+
+                auto coordinatorDoc = [&] {
+                    MovePrimaryCoordinatorDocument doc;
+                    doc.setShardingDDLCoordinatorMetadata(
+                        {{dbNss, DDLCoordinatorTypeEnum::kMovePrimary}});
+                    doc.setToShardId(toShard->getId());
+                    return doc.toBSON();
+                }();
+
+                const auto coordinator = [&] {
+                    auto service = ShardingDDLCoordinatorService::getService(opCtx);
+                    return checked_pointer_cast<MovePrimaryCoordinator>(
+                        service->getOrCreateInstance(opCtx, std::move(coordinatorDoc)));
+                }();
+
+                return coordinator->getCompletionFuture();
+            }();
+
+            coordinatorFuture.get(opCtx);
+        }
+
+    private:
+        NamespaceString ns() const override {
+            return NamespaceString(request().getCommandParameter());
+        }
+
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
+        }
+    };
+
+private:
     bool adminOnly() const override {
         return true;
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool skipApiVersionCheck() const override {
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
+    AllowedOnSecondary secondaryAllowed(ServiceContext* context) const override {
+        return AllowedOnSecondary::kNever;
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        const auto nsElt = cmdObj.firstElement();
-        uassert(ErrorCodes::InvalidNamespace,
-                "'movePrimary' must be of type String",
-                nsElt.type() == BSONType::String);
-        return nsElt.str();
+    std::string help() const override {
+        return "Internal command. Do not call directly.";
     }
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname_unused,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
-
-        const auto movePrimaryRequest =
-            ShardMovePrimary::parse(IDLParserErrorContext("_shardsvrMovePrimary"), cmdObj);
-        const auto dbname = parseNs("", cmdObj);
-
-        const NamespaceString dbNss(dbname);
-        const auto toShard = movePrimaryRequest.getTo();
-
-        uassert(
-            ErrorCodes::InvalidNamespace,
-            str::stream() << "invalid db name specified: " << dbname,
-            NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
-
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "Can't move primary for " << dbname << " database",
-                !dbNss.isOnInternalDb());
-
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "you have to specify where you want to move it",
-                !toShard.empty());
-
-        CommandHelpers::uassertCommandRunWithMajority(getName(), opCtx->getWriteConcern());
-
-        ON_BLOCK_EXIT(
-            [opCtx, dbNss] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbNss.db()); });
-
-        auto coordinatorDoc = MovePrimaryCoordinatorDocument();
-        coordinatorDoc.setShardingDDLCoordinatorMetadata(
-            {{dbNss, DDLCoordinatorTypeEnum::kMovePrimary}});
-        coordinatorDoc.setToShardId(toShard.toString());
-
-        auto service = ShardingDDLCoordinatorService::getService(opCtx);
-        auto movePrimaryCoordinator = checked_pointer_cast<MovePrimaryCoordinator>(
-            service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
-        movePrimaryCoordinator->getCompletionFuture().get(opCtx);
-        return true;
-    }
-} movePrimaryCmd;
+};
+MONGO_REGISTER_COMMAND(ShardsvrMovePrimaryCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

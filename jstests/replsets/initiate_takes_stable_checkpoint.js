@@ -6,14 +6,10 @@
  *  multiversion_incompatible,
  * ]
  */
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
-(function() {
-"use strict";
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/rslib.js");
-
-const rst = ReplSetTest({
+const rst = new ReplSetTest({
     name: jsTestName(),
     nodes: [
         {
@@ -76,7 +72,7 @@ jsTestLog("Disconnecting old primary");
 node0.disconnect(node1);
 node0.disconnect(node2);
 assert.commandWorked(oldPrimary.adminCommand({replSetStepDown: 10 * 60, force: true}));
-rst.waitForState(rst.nodes[0], ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [rst.nodes[0]]);
 
 jsTestLog("Electing new primary");
 
@@ -111,8 +107,7 @@ assert.soonNoExcept(function() {
     return rbid > lastRBID;
 }, "rbid did not update", ReplSetTest.kDefaultTimeoutMS);
 
-rst.waitForState(rst.nodes[0], ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [rst.nodes[0]]);
 
 jsTestLog("Done with test");
 rst.stopSet();
-})();

@@ -1,9 +1,7 @@
-"use strict";
-
 /**
  * Helper functions that help make assertions on API Version parameters.
  */
-var APIVersionHelpers = (function() {
+export var APIVersionHelpers = (function() {
     /**
      * Asserts that the pipeline fails with the given code when apiStrict is set to true and
      * apiVersion is "1".
@@ -21,8 +19,7 @@ var APIVersionHelpers = (function() {
     }
 
     /**
-     * Asserts that the pipeline succeeds when apiStrict is set to true and
-     * apiVersion is "1".
+     * Asserts that the pipeline succeeds when apiStrict is set to true and apiVersion is "1".
      */
     function assertAggregateSucceedsWithAPIStrict(pipeline, collName, errorCodes) {
         if (errorCodes) {
@@ -45,6 +42,21 @@ var APIVersionHelpers = (function() {
             }),
                                  pipeline);
         }
+    }
+
+    /**
+     * Asserts that the pipeline succeeds with the given code when apiStrict is set to false and
+     * apiVersion is "1".
+     */
+    function assertAggregateSucceedsAPIVersionWithoutAPIStrict(pipeline, collName) {
+        assert.commandWorked(db.runCommand({
+            aggregate: collName,
+            pipeline: pipeline,
+            cursor: {},
+            apiStrict: false,
+            apiVersion: "1"
+        }),
+                             pipeline);
     }
 
     /**
@@ -82,6 +94,8 @@ var APIVersionHelpers = (function() {
     return {
         assertAggregateFailsWithAPIStrict: assertAggregateFailsWithAPIStrict,
         assertAggregateSucceedsWithAPIStrict: assertAggregateSucceedsWithAPIStrict,
+        assertAggregateSucceedsAPIVersionWithoutAPIStrict:
+            assertAggregateSucceedsAPIVersionWithoutAPIStrict,
         assertViewFailsWithAPIStrict: assertViewFailsWithAPIStrict,
         assertViewSucceedsWithAPIStrict: assertViewSucceedsWithAPIStrict,
     };

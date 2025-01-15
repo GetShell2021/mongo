@@ -1,20 +1,7 @@
 // Test that missing values are not returned when the connectFrom value in a $graphLookup is null.
-(function() {
-"use strict";
-
-load("jstests/libs/fixture_helpers.js");      // For isSharded.
-load("jstests/aggregation/extras/utils.js");  // arrayEq
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
 
 var local = db[jsTestName()];
-
-// Do not run the the tests if the foreign collection is implicitly sharded but the flag to
-// allow $lookup/$graphLookup into a sharded collection is disabled.
-const getShardedLookupParam = db.adminCommand({getParameter: 1, featureFlagShardedLookup: 1});
-const isShardedLookupEnabled = getShardedLookupParam.hasOwnProperty("featureFlagShardedLookup") &&
-    getShardedLookupParam.featureFlagShardedLookup.value;
-if (FixtureHelpers.isSharded(local) && !isShardedLookupEnabled) {
-    return;
-}
 
 local.drop();
 
@@ -96,4 +83,3 @@ result = local.aggregate([
 expected =
     [{"_id": 0, "x": 1, "arr": []}, {"_id": 1, "x": 2, "arr": []}, {"_id": 3, "x": 1, "arr": []}];
 assert(arrayEq(expected, result), "Expected:\n" + tojson(expected) + "\nGot:\n" + tojson(result));
-}());

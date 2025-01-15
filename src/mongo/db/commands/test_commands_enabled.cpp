@@ -27,10 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/commands/test_commands_enabled_gen.h"
+#include "mongo/logv2/log_severity.h"
 
 namespace mongo {
 
@@ -39,7 +38,15 @@ bool getTestCommandsEnabled() {
 }
 
 void setTestCommandsEnabled(bool b) {
+    // Enabling test commands suppresses the `LogSeverity::ProdOnly` level as a side effect.
+    logv2::LogSeverity::suppressProdOnly_forTest(b);
     gEnableTestCommands = b;
+}
+
+Status onUpdateTestCommandsEnabled(bool b) {
+    // Enabling test commands suppresses the `LogSeverity::ProdOnly` level as a side effect.
+    logv2::LogSeverity::suppressProdOnly_forTest(b);
+    return Status::OK();
 }
 
 }  // namespace mongo

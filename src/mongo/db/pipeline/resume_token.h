@@ -29,13 +29,20 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <iosfwd>
+#include <string>
+#include <utility>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -62,9 +69,6 @@ struct ResumeTokenData {
         kEventToken = 128,        // Token refers to an actual event in the stream.
     };
 
-    ResumeTokenData(){};
-
-    // TODO SERVER-65257: force all callers to go through this constructor.
     ResumeTokenData(Timestamp clusterTimeIn,
                     int versionIn,
                     size_t txnOpIndexIn,
@@ -78,10 +82,14 @@ struct ResumeTokenData {
                     int versionIn,
                     size_t txnOpIndexIn,
                     const boost::optional<UUID>& uuidIn,
-                    Value eventIdentifierIn)
+                    Value eventIdentifierIn,
+                    FromInvalidate fromInvalidate = FromInvalidate::kNotFromInvalidate,
+                    TokenType tokenType = TokenType::kEventToken)
         : clusterTime(clusterTimeIn),
           version(versionIn),
+          tokenType(tokenType),
           txnOpIndex(txnOpIndexIn),
+          fromInvalidate(fromInvalidate),
           uuid(uuidIn),
           eventIdentifier(std::move(eventIdentifierIn)){};
 
@@ -107,6 +115,17 @@ struct ResumeTokenData {
     // The eventIdentifier can be either be a document key for CRUD operations, or a more
     // descriptive operation details for non-CRUD operations.
     Value eventIdentifier;
+
+    // Index of the current fragment, for oversized events that have been split.
+    boost::optional<size_t> fragmentNum;
+
+    BSONObj toBSON() const;
+
+private:
+    // This private constructor should only ever be used internally or by the ResumeToken class.
+    ResumeTokenData() = default;
+
+    friend class ResumeToken;
 };
 
 std::ostream& operator<<(std::ostream& out, const ResumeTokenData& tokenData);
@@ -162,11 +181,18 @@ public:
      */
     explicit ResumeToken(const ResumeTokenData& resumeValue);
 
-    Document toDocument() const;
+    /**
+     * Convenience method to represent the ResumeToken as a Document.
+     * Provides support for specifying SerializationOptions, as this method is used to service the
+     * toBSON().
+     */
+    Document toDocument(const SerializationOptions& options = {}) const;
 
-    BSONObj toBSON() const {
-        return toDocument().toBson();
-    }
+    /**
+     * Serialization to BSONObj. Provides support for specifying SerializationOptions,
+     * as ResumeToken requires a "query_shape: custom" specification in its IDL uses.
+     */
+    BSONObj toBSON(const SerializationOptions& options = {}) const;
 
     ResumeTokenData getData() const;
 
@@ -184,6 +210,9 @@ public:
     }
 
 private:
+    // Helper function for makeHighWaterMarkToken and isHighWaterMarkToken.
+    static ResumeTokenData makeHighWaterMarkTokenData(Timestamp clusterTime, int version);
+
     explicit ResumeToken(const Document& resumeData);
 
     // This is the hex-encoded string encoding all the pieces of the resume token.

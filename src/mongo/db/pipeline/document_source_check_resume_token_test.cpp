@@ -27,30 +27,68 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
+#include <algorithm>
+#include <cstddef>
+#include <deque>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/crypto/encryption_fields_gen.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_mock.h"
 #include "mongo/db/exec/collection_scan.h"
+#include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream_check_resumability.h"
 #include "mongo/db/pipeline/document_source_change_stream_ensure_resume_token_present.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/db/service_context.h"
+#include "mongo/db/query/record_id_bound.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
-#include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
 using boost::intrusive_ptr;
@@ -62,42 +100,71 @@ static constexpr StringData kTestNs = "test.ns"_sd;
 
 class ChangeStreamOplogCursorMock : public SeekableRecordCursor {
 public:
-    ChangeStreamOplogCursorMock(std::deque<Record>* records) : _records(records) {}
+    ChangeStreamOplogCursorMock(std::list<Record>* records) : _records(records) {}
 
-    virtual ~ChangeStreamOplogCursorMock() {}
+    ~ChangeStreamOplogCursorMock() override {}
 
     boost::optional<Record> next() override {
         if (_records->empty()) {
             return boost::none;
         }
-        auto& next = _records->front();
-        _records->pop_front();
-        return next;
+
+        if (!_initialized) {
+            _initialized = true;
+            _it = _records->cbegin();
+        } else {
+            _it++;
+        }
+
+        if (_it == _records->cend()) {
+            _initialized = false;
+            return boost::none;
+        }
+
+        return *_it;
     }
 
     boost::optional<Record> seekExact(const RecordId& id) override {
-        return Record{};
+        boost::optional<Record> result;
+        result.emplace();
+        return result;
     }
-    boost::optional<Record> seekNear(const RecordId& id) override {
-        return boost::none;
+    boost::optional<Record> seek(const RecordId& start, BoundInclusion boundInclusion) override {
+        invariant(boundInclusion == BoundInclusion::kInclude);
+        for (auto&& it = _records->cbegin(); it != _records->cend(); it++) {
+            if (it->id >= start) {
+                _initialized = true;
+                _it = it;
+                return *it;
+            }
+        }
+        _initialized = false;
+        return {};
     }
+
     void save() override {}
+
+    void saveUnpositioned() override {
+        _initialized = false;
+    }
     bool restore(bool tolerateCappedRepositioning) override {
         return true;
     }
     void detachFromOperationContext() override {}
     void reattachToOperationContext(OperationContext* opCtx) override {}
-    void setSaveStorageCursorOnDetachFromOperationContext(bool) {}
+    void setSaveStorageCursorOnDetachFromOperationContext(bool) override {}
 
 private:
-    std::deque<Record>* _records;
+    bool _initialized = false;
+    std::list<Record>::const_iterator _it;
+    std::list<Record>* _records;
 };
 
 class ChangeStreamOplogCollectionMock : public CollectionMock {
 public:
     ChangeStreamOplogCollectionMock() : CollectionMock(NamespaceString::kRsOplogNamespace) {
-        _recordStore =
-            _devNullEngine.getRecordStore(nullptr, NamespaceString::kRsOplogNamespace, "", {});
+        _recordStore = _devNullEngine.getRecordStore(
+            nullptr, NamespaceString::kRsOplogNamespace, "", {.uuid = UUID::gen()});
     }
 
     void push_back(Document doc) {
@@ -135,8 +202,8 @@ public:
 
 private:
     // We retain the owned record queue here because cursors may be destroyed and recreated.
-    mutable std::deque<Record> _records;
-    std::deque<BSONObj> _data;
+    mutable std::list<Record> _records;
+    std::list<BSONObj> _data;
 
     // These are no-op structures which are required by the CollectionScan.
     std::unique_ptr<RecordStore> _recordStore;
@@ -205,11 +272,7 @@ protected:
         // If this is the first call to doGetNext, we must create the COLLSCAN.
         if (!_collScan) {
             _collScan = std::make_unique<CollectionScan>(
-                pExpCtx.get(), _collectionPtr, _params, &_ws, _filter.get());
-            // The first call to doWork will create the cursor and return NEED_TIME. But it won't
-            // actually scan any of the documents that are present in the mock cursor queue.
-            ASSERT_EQ(_collScan->doWork(nullptr), PlanStage::NEED_TIME);
-            ASSERT_EQ(_getNumDocsTested(), 0);
+                pExpCtx.get(), &_collectionPtr, _params, &_ws, _filter.get());
         }
         while (true) {
             // If the next result is a pause, return it and don't collscan.
@@ -217,18 +280,36 @@ protected:
             if (nextResult.isPaused()) {
                 return nextResult;
             }
+
             // Otherwise, retrieve the document via the CollectionScan stage.
             auto id = WorkingSet::INVALID_ID;
             switch (_collScan->doWork(&id)) {
                 case PlanStage::IS_EOF:
+                    // The CollectionScan can immediately return EOF, in which case document in the
+                    // pipeline should not be returned.
+                    while (nextResult.isAdvanced()) {
+                        nextResult = DocumentSourceMock::doGetNext();
+                    }
                     invariant(nextResult.isEOF());
                     return nextResult;
                 case PlanStage::ADVANCED: {
                     // We need to restore the _id field which was removed when we added this
                     // entry into the oplog. This is like a stripped-down DSCSTransform stage.
                     MutableDocument mutableDoc{_ws.get(id)->doc.value()};
+
+                    // The CollectionScan may immediately start returning our document, which means
+                    // we have to skip forward to get the _id of the correct document at the same
+                    // timestamp.
+                    while (nextResult.isAdvanced() &&
+                           nextResult.getDocument()["ts"].getTimestamp() <
+                               _ws.get(id)->doc.value()["ts"].getTimestamp()) {
+                        nextResult = DocumentSourceMock::doGetNext();
+                    }
+                    ASSERT(nextResult.isAdvanced());
                     mutableDoc["_id"] = nextResult.getDocument()["_id"];
-                    return mutableDoc.freeze();
+                    mutableDoc.metadata().setSortKey(nextResult.getDocument()["_id"], true);
+                    auto frozen = mutableDoc.freeze();
+                    return frozen;
                 }
                 case PlanStage::NEED_TIME:
                     continue;
@@ -268,7 +349,7 @@ protected:
     void addOplogEntryOnTestNS(ResumeTokenData tokenData) {
         _mock->push_back(Document{{"ns", kTestNs},
                                   {"ts", tokenData.clusterTime},
-                                  {"_id", ResumeToken(std::move(tokenData)).toDocument()}});
+                                  {"_id", ResumeToken(tokenData).toDocument()}});
     }
 
     /**
@@ -483,8 +564,12 @@ TEST_F(CheckResumeTokenTest, ShouldFailIfTokenHasWrongNamespace) {
     Timestamp resumeTimestamp(100, 1);
 
     auto resumeTokenUUID = UUID::gen();
-    auto checkResumeToken = createDSEnsureResumeTokenPresent(resumeTimestamp, "1", resumeTokenUUID);
     auto otherUUID = UUID::gen();
+    ASSERT_NE(resumeTokenUUID, otherUUID);
+    if (resumeTokenUUID > otherUUID) {
+        std::swap(resumeTokenUUID, otherUUID);
+    }
+    auto checkResumeToken = createDSEnsureResumeTokenPresent(resumeTimestamp, "1", resumeTokenUUID);
     addOplogEntryOnTestNS(resumeTimestamp, "1", otherUUID);
     ASSERT_THROWS_CODE(
         checkResumeToken->getNext(), AssertionException, ErrorCodes::ChangeStreamFatalError);
@@ -504,7 +589,7 @@ TEST_F(CheckResumeTokenTest, ShouldSucceedWithBinaryCollation) {
 
 TEST_F(CheckResumeTokenTest, UnshardedTokenFailsForShardedResumeOnMongosIfIdDoesNotMatchFirstDoc) {
     Timestamp resumeTimestamp(100, 1);
-    getExpCtx()->inMongos = true;
+    getExpCtx()->setInRouter(true);
 
     auto checkResumeToken =
         createDSEnsureResumeTokenPresent(resumeTimestamp, Document{{"_id"_sd, 1}});
@@ -519,10 +604,10 @@ TEST_F(CheckResumeTokenTest, UnshardedTokenFailsForShardedResumeOnMongosIfIdDoes
 TEST_F(CheckResumeTokenTest, ShardedResumeFailsOnMongosIfTokenHasSubsetOfDocumentKeyFields) {
     // Verify that the relaxed _id check only applies if _id is the sole field present in the
     // client's resume token, even if all the fields that are present match the first doc. We set
-    // 'inMongos' since this is only applicable when DSCSEnsureResumeTokenPresent is running on
+    // 'inRouter' since this is only applicable when DSCSEnsureResumeTokenPresent is running on
     // mongoS.
     Timestamp resumeTimestamp(100, 1);
-    getExpCtx()->inMongos = true;
+    getExpCtx()->setInRouter(true);
 
     auto checkResumeToken =
         createDSEnsureResumeTokenPresent(resumeTimestamp, Document{{"x"_sd, 0}, {"_id"_sd, 1}});
@@ -539,7 +624,7 @@ TEST_F(CheckResumeTokenTest, ShardedResumeFailsOnMongosIfDocumentKeyIsNonObject)
     // cause an invariant when we perform the relaxed eventIdentifier._id check when running in a
     // sharded context.
     Timestamp resumeTimestamp(100, 1);
-    getExpCtx()->inMongos = true;
+    getExpCtx()->setInRouter(true);
 
     auto checkResumeToken = createDSEnsureResumeTokenPresent(resumeTimestamp, boost::none);
 
@@ -555,7 +640,7 @@ TEST_F(CheckResumeTokenTest, ShardedResumeFailsOnMongosIfDocumentKeyOmitsId) {
     // cause an invariant when we perform the relaxed eventIdentifier._id, even when compared
     // against an artificial stream token whose _id is also missing.
     Timestamp resumeTimestamp(100, 1);
-    getExpCtx()->inMongos = true;
+    getExpCtx()->setInRouter(true);
 
     auto checkResumeToken =
         createDSEnsureResumeTokenPresent(resumeTimestamp, Document{{"x"_sd, 0}});
@@ -576,7 +661,7 @@ TEST_F(CheckResumeTokenTest,
     // the current document sorts before the client's resume token, we should continue to examine
     // the next document in the stream.
     Timestamp resumeTimestamp(100, 1);
-    getExpCtx()->inMongos = true;
+    getExpCtx()->setInRouter(true);
 
     // Create an ordered array of 2 UUIDs.
     UUID uuids[2] = {UUID::gen(), UUID::gen()};
@@ -614,7 +699,7 @@ TEST_F(CheckResumeTokenTest,
 TEST_F(CheckResumeTokenTest,
        ShardedResumeFailsOnMongosWithSameClusterTimeIfUUIDsSortAfterResumeToken) {
     Timestamp resumeTimestamp(100, 1);
-    getExpCtx()->inMongos = true;
+    getExpCtx()->setInRouter(true);
 
     // Create an ordered array of 2 UUIDs.
     UUID uuids[2] = {UUID::gen(), UUID::gen()};
@@ -646,16 +731,18 @@ TEST_F(CheckResumeTokenTest, ShouldSwallowInvalidateFromEachShardForStartAfterIn
     UUID uuids[2] = {UUID::gen(), UUID::gen()};
 
     // This behaviour is only relevant when DSEnsureResumeTokenPresent is running on mongoS.
-    getExpCtx()->inMongos = true;
+    getExpCtx()->setInRouter(true);
 
     // Create a resume token representing an 'invalidate' event, and use it to seed the stage. A
     // resume token with {fromInvalidate:true} can only be used with startAfter, to start a new
     // stream after the old stream is invalidated.
-    ResumeTokenData invalidateToken;
-    invalidateToken.clusterTime = resumeTimestamp;
-    invalidateToken.uuid = uuids[0];
-    invalidateToken.fromInvalidate = ResumeTokenData::kFromInvalidate;
-    invalidateToken.eventIdentifier = Value(Document{{"operationType", "drop"_sd}});
+    auto eventIdentifier = Value{Document{{"operationType", "drop"_sd}}};
+    ResumeTokenData invalidateToken{resumeTimestamp,
+                                    ResumeTokenData::kDefaultTokenVersion,
+                                    /* txnOpIndex */ 0,
+                                    uuids[0],
+                                    std::move(eventIdentifier),
+                                    ResumeTokenData::kFromInvalidate};
     auto checkResumeToken = createDSEnsureResumeTokenPresent(invalidateToken);
 
     // Add three documents which each have the invalidate resume token. We expect to see this in the
@@ -683,7 +770,7 @@ TEST_F(CheckResumeTokenTest, ShouldNotSwallowUnrelatedInvalidateForStartAfterInv
     Timestamp resumeTimestamp(100, 1);
 
     // This behaviour is only relevant when DSEnsureResumeTokenPresent is running on mongoS.
-    getExpCtx()->inMongos = true;
+    getExpCtx()->setInRouter(true);
 
     // Create an ordered array of of 2 UUIDs.
     std::vector<UUID> uuids = {UUID::gen(), UUID::gen()};
@@ -692,11 +779,13 @@ TEST_F(CheckResumeTokenTest, ShouldNotSwallowUnrelatedInvalidateForStartAfterInv
     // Create a resume token representing an 'invalidate' event, and use it to seed the stage. A
     // resume token with {fromInvalidate:true} can only be used with startAfter, to start a new
     // stream after the old stream is invalidated.
-    ResumeTokenData invalidateToken;
-    invalidateToken.clusterTime = resumeTimestamp;
-    invalidateToken.uuid = uuids[0];
-    invalidateToken.fromInvalidate = ResumeTokenData::kFromInvalidate;
-    invalidateToken.eventIdentifier = Value(Document{{"operationType", "drop"_sd}});
+    auto eventIdentifier = Value{Document{{"operationType", "drop"_sd}}};
+    ResumeTokenData invalidateToken{resumeTimestamp,
+                                    ResumeTokenData::kDefaultTokenVersion,
+                                    /* txnOpIndex */ 0,
+                                    uuids[0],
+                                    eventIdentifier,
+                                    ResumeTokenData::kFromInvalidate};
     auto checkResumeToken = createDSEnsureResumeTokenPresent(invalidateToken);
 
     // Create a second invalidate token with the same clusterTime but a different UUID.
@@ -911,8 +1000,8 @@ TEST_F(CheckResumabilityTest,
 TEST_F(CheckResumabilityTest, ShouldIgnoreOplogAfterFirstDoc) {
     Timestamp oplogTimestamp(100, 1);
     Timestamp resumeTimestamp(100, 2);
-    Timestamp oplogFutureTimestamp(100, 3);
-    Timestamp docTimestamp(100, 4);
+    Timestamp docTimestamp(100, 3);
+    Timestamp oplogFutureTimestamp(100, 4);
 
     auto dsCheckResumability = createDSCheckResumability(resumeTimestamp);
     addOplogEntryOnOtherNS(oplogTimestamp);

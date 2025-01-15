@@ -30,6 +30,7 @@
 #ifndef UTIL_VERSION_HEADER
 #define UTIL_VERSION_HEADER
 
+#include <iosfwd>
 #include <string>
 #include <vector>
 
@@ -145,14 +146,6 @@ public:
     std::string makeVersionString(StringData binaryName) const;
 
     /**
-     * Appends several fields of build information to the `result`. One of them is
-     * "buildEnvironment", mapped to a subobject containing most of the information associated
-     * with 'buildInfo', above, but with the elements for which inBuildInfo == false
-     * removed.
-     */
-    void appendBuildInfo(BSONObjBuilder* result) const;
-
-    /**
      * Logs the result of 'targetMinOS', above.
      */
     void logTargetMinOS() const;
@@ -183,6 +176,11 @@ std::string mongoShellVersion(const VersionInfoInterface& provider);
  * Returns a pretty string describing the current mongos version.
  */
 std::string mongosVersion(const VersionInfoInterface& provider);
+
+/**
+ * Returns a pretty string describing the current mongocrypt version.
+ */
+std::string mongocryptVersion(const VersionInfoInterface& provider);
 
 /**
  * Returns a pretty string describing the current mongod version.

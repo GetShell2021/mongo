@@ -1,8 +1,8 @@
 /**
  * Test that a new primary that gets elected will properly perform shard initialization.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 1});
 
@@ -21,7 +21,9 @@ replTest.initiate({
         {_id: 1, host: nodes[1]},
         {_id: 2, host: nodes[2], arbiterOnly: true}
     ]
-});
+},
+                  null,
+                  {initiateWithDefaultElectionTimeout: true});
 
 var primaryConn = replTest.getPrimary();
 
@@ -60,4 +62,3 @@ assert.soon(() => shardIdentityDoc.configsvrConnectionString ==
 replTest.stopSet();
 
 st.stop();
-})();

@@ -28,11 +28,27 @@
  */
 #pragma once
 
+#include <absl/container/node_hash_map.h>
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <ostream>
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/process_health/health_monitoring_server_parameters_gen.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/basic.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/synchronized_value.h"
 
 
 namespace mongo {
@@ -117,7 +133,7 @@ public:
 
                 auto x = intensities->_data->getValues();
                 if (x) {
-                    for (auto setting : *x) {
+                    for (const auto& setting : *x) {
                         if (setting.getType() == observerType) {
                             return setting.getIntensity();
                         }
@@ -209,42 +225,10 @@ private:
 
     static Milliseconds _getDefaultObserverInterval(FaultFacetType type);
 
-    template <typename T, typename R>
-    R _getPropertyByType(FaultFacetType type, synchronized_value<T>* data, R defaultValue) const {
-        boost::optional<R> result;
-        switch (type) {
-            case FaultFacetType::kLdap:
-                result = (*data)->getLdap();
-                break;
-            case FaultFacetType::kDns:
-                result = (*data)->getDns();
-                break;
-            case FaultFacetType::kTestObserver:
-                result = (*data)->getTest();
-                break;
-            case FaultFacetType::kConfigServer:
-                result = (*data)->getConfigServer();
-                break;
-            case FaultFacetType::kSystem:
-                result = defaultValue;
-                break;
-            case FaultFacetType::kMock1:
-                result = defaultValue;
-                break;
-            case FaultFacetType::kMock2:
-                result = defaultValue;
-                break;
-            default:
-                MONGO_UNREACHABLE;
-        }
-        return *result;
-    }
-
     bool _periodicChecksDisabledForTests = false;
 
     stdx::unordered_map<FaultFacetType, HealthObserverIntensityEnum> _facetToIntensityMapForTest;
-    mutable Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(5), "FaultManagerConfig::_mutex");
+    mutable stdx::mutex _mutex;
 };
 
 }  // namespace process_health

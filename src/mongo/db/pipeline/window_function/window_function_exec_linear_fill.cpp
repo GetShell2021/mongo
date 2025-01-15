@@ -29,30 +29,43 @@
 
 #include "mongo/db/pipeline/window_function/window_function_exec_linear_fill.h"
 
-namespace {
-mongo::Value interpolate(
-    mongo::Value x1, mongo::Value y1, mongo::Value x2, mongo::Value y2, mongo::Value xCoord) {
-    // Given two known points (x1, y1) and (x2, y2) and a value x that lies between those two
-    // points, we solve (or fill) for y with the following formula: y = y1 + (x - x1) * ((y2 -
-    // y1)/(x2 - x1))
-    return uassertStatusOK(mongo::ExpressionSubtract::apply(y2, y1).andThen([&](auto&& numerator) {
-        return mongo::ExpressionSubtract::apply(x2, x1).andThen([&](auto&& denominator) {
-            return mongo::ExpressionDivide::apply(numerator, denominator)
-                .andThen([&](auto&& quotient) {
-                    return mongo::ExpressionSubtract::apply(xCoord, x1)
-                        .andThen([&](auto&& difference) {
-                            return mongo::ExpressionMultiply::apply(quotient, difference)
-                                .andThen([&](auto&& product) {
-                                    return mongo::ExpressionAdd::apply(y1, product);
-                                });
-                        });
-                });
-        });
-    }));
-}
-}  // namespace
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/exec/expression/evaluate.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
+namespace {
+namespace value_arithmetic_operators {
+Value operator+(const Value& a, const Value& b) {
+    return uassertStatusOK(exec::expression::evaluateAdd(a, b));
+}
+Value operator-(const Value& a, const Value& b) {
+    return uassertStatusOK(exec::expression::evaluateSubtract(a, b));
+}
+Value operator*(const Value& a, const Value& b) {
+    return uassertStatusOK(exec::expression::evaluateMultiply(a, b));
+}
+Value operator/(const Value& a, const Value& b) {
+    return uassertStatusOK(exec::expression::evaluateDivide(a, b));
+}
+}  // namespace value_arithmetic_operators
+
+// Given two known points (x1, y1) and (x2, y2) and a value x that lies between those two
+// points, we solve (or fill) for y with the following formula: y = y1 + (x - x1) * ((y2 -
+// y1)/(x2 - x1))
+Value interpolate(Value x1, Value y1, Value x2, Value y2, Value x) {
+    using namespace value_arithmetic_operators;
+    return y1 + (x - x1) * ((y2 - y1) / (x2 - x1));
+}
+}  // namespace
 
 boost::optional<Value> WindowFunctionExecLinearFill::evaluateInput(const Document& doc) {
     Value fillFieldValue = _input->evaluate(doc, &_input->getExpressionContext()->variables);
@@ -79,7 +92,7 @@ boost::optional<std::pair<Value, Value>> WindowFunctionExecLinearFill::findX2Y2(
     return boost::none;
 }
 
-Value WindowFunctionExecLinearFill::getNext() {
+Value WindowFunctionExecLinearFill::getNext(boost::optional<Document> current) {
     const auto currentDoc = *_iter[0];
     Value fillFieldValue = _input->evaluate(currentDoc, &_input->getExpressionContext()->variables);
     uassert(ErrorCodes::TypeMismatch,

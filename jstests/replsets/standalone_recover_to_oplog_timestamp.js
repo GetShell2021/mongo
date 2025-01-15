@@ -9,15 +9,14 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const dbName = "test";
 const collName = jsTestName();
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 const primary = rst.getPrimary();
 const primaryDB = primary.getDB(dbName);
 
@@ -37,7 +36,7 @@ const docs = [{_id: 1, a: 1}];
 const operationTime =
     assert.commandWorked(primaryDB.runCommand({insert: collName, documents: docs})).operationTime;
 
-rst.stopSet(/*signal=*/null, /*forRestart=*/true);
+rst.stopSet(/*signal=*/ null, /*forRestart=*/ true);
 
 // Restart as standalone in queryableBackupMode and run replication recovery up to the last insert.
 const primaryStandalone = MongoRunner.runMongod({
@@ -52,4 +51,3 @@ const primaryStandalone = MongoRunner.runMongod({
 assert.eq(primaryStandalone.getDB(dbName)[collName].find().toArray(), docs);
 
 MongoRunner.stopMongod(primaryStandalone);
-}());

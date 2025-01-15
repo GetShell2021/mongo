@@ -8,15 +8,6 @@
  *   assumes_read_concern_unchanged
  * ]
  */
-(function() {
-"use strict";
-const getSearchMetaParam = db.adminCommand({getParameter: 1, featureFlagSearchMeta: 1});
-const isSearchMetaEnabled = getSearchMetaParam.hasOwnProperty("featureFlagSearchMeta") &&
-    getSearchMetaParam.featureFlagSearchMeta.value;
-if (!isSearchMetaEnabled) {
-    return;
-}
-
 const coll = db.searchCollector;
 coll.drop();
 assert.commandWorked(coll.insert({"_id": 1, "title": "cakes"}));
@@ -46,8 +37,8 @@ const response = db.runCommand({
     cursor: {}
 });
 if (!response.ok) {
-    assert.commandFailedWithCode(response, [31082, 40324] /* community or mongos */);
+    assert.commandFailedWithCode(response,
+                                 [ErrorCodes.SearchNotEnabled, 6047401] /* mongos or community */);
 } else {
     assert.eq(response.cursor.firstBatch, []);
 }
-})();

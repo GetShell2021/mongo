@@ -28,14 +28,26 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/cleanup_reshard_collection_gen.h"
-#include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -54,7 +66,7 @@ public:
         void typedRun(OperationContext* opCtx) {
             const NamespaceString& nss = ns();
 
-            LOGV2(5403502, "Beginning reshard cleanup operation", "namespace"_attr = ns());
+            LOGV2(5403502, "Beginning reshard cleanup operation", logAttrs(ns()));
 
             ConfigsvrCleanupReshardCollection configsvrCleanupReshardCollection(nss);
             configsvrCleanupReshardCollection.setDbName(request().getDbName());
@@ -63,8 +75,8 @@ public:
             auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
                 opCtx,
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                "admin",
-                configsvrCleanupReshardCollection.toBSON({}),
+                DatabaseName::kAdmin,
+                configsvrCleanupReshardCollection.toBSON(),
                 Shard::RetryPolicy::kIdempotent));
             uassertStatusOK(cmdResponse.commandStatus);
             uassertStatusOK(cmdResponse.writeConcernStatus);
@@ -100,9 +112,7 @@ public:
         return "Abort and cleanup any in-progress resharding operations for this collection.";
     }
 };
-
-MONGO_REGISTER_FEATURE_FLAGGED_COMMAND(CleanupReshardCollectionCmd,
-                                       resharding::gFeatureFlagResharding);
+MONGO_REGISTER_COMMAND(CleanupReshardCollectionCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

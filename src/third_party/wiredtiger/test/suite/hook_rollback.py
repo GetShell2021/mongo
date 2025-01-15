@@ -41,7 +41,7 @@
 
 from __future__ import print_function
 
-import os, sys, wthooks, random, wiredtiger
+import wthooks, random, wiredtiger
 from wttest import WiredTigerTestCase
 
 # Print to /dev/tty for debugging, since anything extraneous to stdout/stderr will
@@ -103,14 +103,17 @@ class RollbackHookCreator(wthooks.WiredTigerHookCreator):
               format(failrate))
         self.mod = int(1 / failrate)
         self.rand = random.Random()
+        self.platform_api = wthooks.DefaultPlatformAPI()
+
+    def get_platform_api(self):
+        return self.platform_api
 
     def do_retry(self):
         return self.rand.randint(1, 1000000) % self.mod == 0
 
-    # No filtering needed
-    def filter_tests(self, tests):
-        #print('Filtering: ' + str(tests))
-        return tests
+    # No skipping needed
+    def register_skipped_tests(self, tests):
+        pass
 
     def setup_hooks(self):
         self.Session['begin_transaction'] = (wthooks.HOOK_NOTIFY, session_begin_transaction_notify)

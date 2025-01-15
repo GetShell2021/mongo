@@ -29,7 +29,10 @@
 
 #pragma once
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo {
 
@@ -40,7 +43,7 @@ class WiredTigerKVEngine;
  */
 class WiredTigerServerStatusSection : public ServerStatusSection {
 public:
-    WiredTigerServerStatusSection();
+    using ServerStatusSection::ServerStatusSection;
     bool includeByDefault() const override;
     BSONObj generateSection(OperationContext* opCtx,
                             const BSONElement& configElement) const override;

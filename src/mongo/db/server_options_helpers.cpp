@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-
 #include "mongo/db/server_options_helpers.h"
 
 #ifdef _WIN32
@@ -36,36 +35,38 @@
 #define SYSLOG_NAMES
 #include <syslog.h>
 #endif
-#include <boost/filesystem.hpp>
-#include <boost/filesystem/operations.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <fmt/format.h>
-#include <ios>
-#include <iostream>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <cstddef>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/config.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/server_options.h"
-#include "mongo/idl/server_parameter.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/log_component_settings.h"
+#include "mongo/logv2/log_format.h"
 #include "mongo/logv2/log_manager.h"
-#include "mongo/transport/message_compressor_registry.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/net/sock.h"
-#include "mongo/util/net/socket_utils.h"
-#include "mongo/util/net/ssl_options.h"
-#include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
-
-
-using std::endl;
-using std::string;
 
 namespace mongo {
 
@@ -136,42 +137,43 @@ Status validateBaseOptions(const moe::Environment& params) {
         }
     }
 
+    std::map<std::string, std::string> parameters;
     if (params.count("setParameter")) {
-        const auto parameters = params["setParameter"].as<std::map<std::string, std::string>>();
+        parameters = params["setParameter"].as<std::map<std::string, std::string>>();
+    }
 
-        const bool enableTestCommandsValue = ([&parameters] {
-            const auto etc = parameters.find("enableTestCommands");
-            if (etc == parameters.end()) {
-                return false;
-            }
-            const auto& val = etc->second;
-            return (0 == val.compare("1")) || (0 == val.compare("true"));
-        })();
+    const bool enableTestCommandsValue = ([&parameters] {
+        const auto etc = parameters.find("enableTestCommands");
+        if (etc == parameters.end()) {
+            return false;
+        }
+        const auto& val = etc->second;
+        return (0 == val.compare("1")) || (0 == val.compare("true"));
+    })();
 
-        if (enableTestCommandsValue) {
-            // Only register failpoint server parameters if enableTestCommands=1.
-            globalFailPointRegistry().registerAllFailPointsAsServerParameters();
-        } else {
-            // Deregister test-only parameters.
-            ServerParameterSet::getNodeParameterSet()->disableTestParameters();
-            ServerParameterSet::getClusterParameterSet()->disableTestParameters();
+    if (enableTestCommandsValue) {
+        // Only register failpoint server parameters if enableTestCommands=1.
+        globalFailPointRegistry().registerAllFailPointsAsServerParameters();
+    } else {
+        // Deregister test-only parameters.
+        ServerParameterSet::getNodeParameterSet()->disableTestParameters();
+        ServerParameterSet::getClusterParameterSet()->disableTestParameters();
+    }
+
+    // Must come after registerAllFailPointsAsServerParameters() above.
+    auto* paramSet = ServerParameterSet::getNodeParameterSet();
+    for (const auto& setParam : parameters) {
+        auto* param = paramSet->getIfExists(setParam.first);
+
+        if (!param) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << "Unknown --setParameter '" << setParam.first << "'"};
         }
 
-        // Must come after registerAllFailPointsAsServerParameters() above.
-        auto* paramSet = ServerParameterSet::getNodeParameterSet();
-        for (const auto& setParam : parameters) {
-            auto* param = paramSet->getIfExists(setParam.first);
-
-            if (!param) {
-                return {ErrorCodes::BadValue,
-                        str::stream() << "Unknown --setParameter '" << setParam.first << "'"};
-            }
-
-            if (!param->isEnabled()) {
-                return {ErrorCodes::BadValue,
-                        str::stream() << "--setParameter '" << setParam.first
-                                      << "' only available when used with 'enableTestCommands'"};
-            }
+        if (!param->isEnabled()) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << "--setParameter '" << setParam.first
+                                  << "' only available when used with 'enableTestCommands'"};
         }
     }
 
@@ -277,12 +279,12 @@ StatusWith<BSONObj> applySetParameterOptions(const std::map<std::string, std::st
             return Status(ErrorCodes::BadValue,
                           "Cannot use --setParameter to set \"{}\" at startup"_format(name));
         BSONObjBuilder sub(summaryBuilder.subobjStart(name));
-        sp->append(nullptr, sub, "default");
-        Status status = sp->setFromString(value);
+        sp->append(nullptr, &sub, "default", boost::none);
+        Status status = sp->setFromString(value, boost::none);
         if (!status.isOK())
             return Status(ErrorCodes::BadValue,
                           "Bad value for parameter \"{}\": {}"_format(name, status.reason()));
-        sp->append(nullptr, sub, "value");
+        sp->append(nullptr, &sub, "value", boost::none);
     }
     return summaryBuilder.obj();
 }
@@ -311,7 +313,8 @@ Status storeBaseOptions(const moe::Environment& params) {
         if (component == logv2::LogComponent::kDefault) {
             continue;
         }
-        const string dottedName = "systemLog.component." + component.getDottedName() + ".verbosity";
+        const std::string dottedName =
+            "systemLog.component." + component.getDottedName() + ".verbosity";
         if (params.count(dottedName)) {
             int verbosity = params[dottedName].as<int>();
             // Clear existing log level if log level is negative.
@@ -325,11 +328,6 @@ Status storeBaseOptions(const moe::Environment& params) {
         }
     }
 
-    if (params.count("enableExperimentalStorageDetailsCmd")) {
-        serverGlobalParams.experimental.storageDetailsCmdEnabled =
-            params["enableExperimentalStorageDetailsCmd"].as<bool>();
-    }
-
     if (params.count("systemLog.quiet")) {
         serverGlobalParams.quiet.store(params["systemLog.quiet"].as<bool>());
     }
@@ -339,7 +337,7 @@ Status storeBaseOptions(const moe::Environment& params) {
     }
 
     if (params.count("systemLog.timeStampFormat")) {
-        std::string formatterName = params["systemLog.timeStampFormat"].as<string>();
+        std::string formatterName = params["systemLog.timeStampFormat"].as<std::string>();
         if (formatterName == "iso8601-utc") {
             serverGlobalParams.logTimestampFormat = logv2::LogTimestampFormat::kISO8601UTC;
             setDateFormatIsLocalTimezone(false);
@@ -386,7 +384,7 @@ Status storeBaseOptions(const moe::Environment& params) {
 
 #ifndef _WIN32
     if (params.count("systemLog.syslogFacility")) {
-        std::string facility = params["systemLog.syslogFacility"].as<string>();
+        std::string facility = params["systemLog.syslogFacility"].as<std::string>();
         bool set = false;
         // match facility string to facility value
         size_t facilitynamesLength = sizeof(facilitynames) / sizeof(facilitynames[0]);
@@ -413,7 +411,7 @@ Status storeBaseOptions(const moe::Environment& params) {
     }
 
     if (params.count("systemLog.logRotate")) {
-        std::string logRotateParam = params["systemLog.logRotate"].as<string>();
+        std::string logRotateParam = params["systemLog.logRotate"].as<std::string>();
         if (logRotateParam == "reopen") {
             serverGlobalParams.logRenameOnRotate = false;
 
@@ -434,11 +432,12 @@ Status storeBaseOptions(const moe::Environment& params) {
     }
 
     if (params.count("processManagement.pidFilePath")) {
-        serverGlobalParams.pidFile = params["processManagement.pidFilePath"].as<string>();
+        serverGlobalParams.pidFile = params["processManagement.pidFilePath"].as<std::string>();
     }
 
     if (params.count("processManagement.timeZoneInfo")) {
-        serverGlobalParams.timeZoneInfoPath = params["processManagement.timeZoneInfo"].as<string>();
+        serverGlobalParams.timeZoneInfoPath =
+            params["processManagement.timeZoneInfo"].as<std::string>();
     }
 
     if (params.count("setParameter")) {
@@ -452,11 +451,12 @@ Status storeBaseOptions(const moe::Environment& params) {
     }
 
     if (params.count("operationProfiling.slowOpThresholdMs")) {
-        serverGlobalParams.slowMS = params["operationProfiling.slowOpThresholdMs"].as<int>();
+        serverGlobalParams.slowMS.store(params["operationProfiling.slowOpThresholdMs"].as<int>());
     }
 
     if (params.count("operationProfiling.slowOpSampleRate")) {
-        serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
+        serverGlobalParams.sampleRate.store(
+            params["operationProfiling.slowOpSampleRate"].as<double>());
     }
 
     if (params.count("operationProfiling.filter")) {

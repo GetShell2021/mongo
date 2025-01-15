@@ -5,10 +5,11 @@
  *
  * @tags: [requires_fcv_60, uses_transactions, requires_persistence]
  */
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {
+    withRetryOnTransientTxnErrorIncrementTxnNum
+} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {makeCommitTransactionCmdObj} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const st = new ShardingTest({shards: 2});
 
@@ -20,8 +21,8 @@ const testDB = st.s.getDB(dbName);
 // Set up a sharded collection with the following chunks:
 // shard0: [MinKey, 0]
 // shard1: [0, MaxKey]
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 0}}));
 assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {x: 0}, to: st.shard1.shardName}));
@@ -30,17 +31,19 @@ const parentLsid = {
     id: UUID()
 };
 const parentTxnNumber = NumberLong(35);
-
 // Perform a transaction against the chunk [MinKey, 0].
-assert.commandWorked(testDB.runCommand({
-    insert: collName,
-    documents: [{x: -1}],
-    lsid: parentLsid,
-    txnNumber: parentTxnNumber,
-    startTransaction: true,
-    autocommit: false
-}));
-assert.commandWorked(testDB.adminCommand(makeCommitTransactionCmdObj(parentLsid, parentTxnNumber)));
+withRetryOnTransientTxnErrorIncrementTxnNum(parentTxnNumber, (txnNumber) => {
+    assert.commandWorked(testDB.runCommand({
+        insert: collName,
+        documents: [{x: -1}],
+        lsid: parentLsid,
+        txnNumber: NumberLong(txnNumber),
+        startTransaction: true,
+        autocommit: false
+    }));
+    assert.commandWorked(
+        testDB.adminCommand(makeCommitTransactionCmdObj(parentLsid, NumberLong(txnNumber))));
+});
 
 // Move the chunk [MinKey, 0] from shard0 to shard1 and then back to shard0.
 assert.commandWorked(
@@ -56,21 +59,21 @@ const nonRetryableWriteChildLsid = {
     txnUUID: UUID()
 };
 const nonRetryableWriteTxnNumber = NumberLong(0);
-
-assert.commandWorked(testDB.runCommand({
-    insert: collName,
-    documents: [{x: 1}],
-    lsid: nonRetryableWriteChildLsid,
-    txnNumber: nonRetryableWriteTxnNumber,
-    startTransaction: true,
-    autocommit: false
-}));
-assert.commandWorked(testDB.adminCommand(
-    makeCommitTransactionCmdObj(nonRetryableWriteChildLsid, nonRetryableWriteTxnNumber)));
+withRetryOnTransientTxnErrorIncrementTxnNum(nonRetryableWriteTxnNumber, (txnNumber) => {
+    assert.commandWorked(testDB.runCommand({
+        insert: collName,
+        documents: [{x: 1}],
+        lsid: nonRetryableWriteChildLsid,
+        txnNumber: NumberLong(txnNumber),
+        startTransaction: true,
+        autocommit: false
+    }));
+    assert.commandWorked(testDB.adminCommand(
+        makeCommitTransactionCmdObj(nonRetryableWriteChildLsid, NumberLong(txnNumber))));
+});
 
 // Move the chunk [MinKey, 0] from shard0 and shard1. The migration should succeed.
 assert.commandWorked(
     st.s.adminCommand({moveChunk: ns, find: {x: MinKey}, to: st.shard1.shardName}));
 
 st.stop();
-})();

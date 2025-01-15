@@ -6,11 +6,9 @@
  * range deletion tasks, and migration coordinator state are deleted despite the killOps.
  */
 
-(function() {
-'use strict';
-
-load('jstests/libs/parallel_shell_helpers.js');
-load('jstests/libs/fail_point_util.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function getNewNs(dbName) {
     if (typeof getNewNs.counter == 'undefined') {
@@ -90,7 +88,18 @@ function testKillOpAfterFailPoint(failPointName, opToKillThreadName) {
     // Allow the moveChunk to finish:
     commitFailpoint.off();
     jsTest.log("Make sure the recovery is executed");
-    assert.eq(st.s0.getDB(dbName).getCollection(collName).countDocuments({}), 1000);
+    assert.soon(function() {
+        try {
+            return (st.s0.getDB(dbName).getCollection(collName).countDocuments({}) == 1000);
+        } catch (e) {
+            if (e.code == ErrorCodes.Interrupted) {
+                // Expected as the request may have joined the filtering metadata refresh that
+                // the killOp above interrupted.
+                return false;
+            }
+            throw e;
+        }
+    });
 }
 
 testKillOpAfterFailPoint("hangInEnsureChunkVersionIsGreaterThanInterruptible",
@@ -102,4 +111,3 @@ testKillOpAfterFailPoint("hangInReadyRangeDeletionLocallyInterruptible", "Recove
 testKillOpAfterFailPoint("hangInAdvanceTxnNumInterruptible", "RecoverRefreshThread");
 
 st.stop();
-})();

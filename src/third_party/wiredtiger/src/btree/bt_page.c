@@ -9,7 +9,7 @@
 #include "wt_internal.h"
 
 static int __inmem_col_fix(WT_SESSION_IMPL *, WT_PAGE *, bool *, size_t *);
-static void __inmem_col_int(WT_SESSION_IMPL *, WT_PAGE *);
+static int __inmem_col_int(WT_SESSION_IMPL *, WT_PAGE *, uint64_t);
 static int __inmem_col_var(WT_SESSION_IMPL *, WT_PAGE *, uint64_t, bool *, size_t *);
 static int __inmem_row_int(WT_SESSION_IMPL *, WT_PAGE *, size_t *);
 static int __inmem_row_leaf(WT_SESSION_IMPL *, WT_PAGE *, bool *);
@@ -23,7 +23,6 @@ int
 __wt_page_alloc(
   WT_SESSION_IMPL *session, uint8_t type, uint32_t alloc_entries, bool alloc_refs, WT_PAGE **pagep)
 {
-    WT_CACHE *cache;
     WT_DECL_RET;
     WT_PAGE *page;
     WT_PAGE_INDEX *pindex;
@@ -32,8 +31,6 @@ __wt_page_alloc(
     void *p;
 
     *pagep = NULL;
-
-    cache = S2C(session)->cache;
     page = NULL;
 
     size = sizeof(WT_PAGE);
@@ -63,7 +60,7 @@ __wt_page_alloc(
     WT_RET(__wt_calloc(session, 1, size, &page));
 
     page->type = type;
-    page->read_gen = WT_READGEN_NOTSET;
+    __wt_evict_page_init(page);
 
     switch (type) {
     case WT_PAGE_COL_FIX:
@@ -90,7 +87,8 @@ __wt_page_alloc(
             }
         if (0) {
 err:
-            if ((pindex = WT_INTL_INDEX_GET_SAFE(page)) != NULL) {
+            WT_INTL_INDEX_GET_SAFE(page, pindex);
+            if (pindex != NULL) {
                 for (i = 0; i < pindex->entries; ++i)
                     __wt_free(session, pindex->index[i]);
                 __wt_free(session, pindex);
@@ -113,8 +111,8 @@ err:
 
     /* Increment the cache statistics. */
     __wt_cache_page_inmem_incr(session, page, size);
-    (void)__wt_atomic_add64(&cache->pages_inmem, 1);
-    page->cache_create_gen = cache->evict_pass_gen;
+    (void)__wt_atomic_add64(&S2C(session)->cache->pages_inmem, 1);
+    page->cache_create_gen = __wt_atomic_load64(&S2C(session)->evict->evict_pass_gen);
 
     *pagep = page;
     return (0);
@@ -132,6 +130,7 @@ __page_inmem_prepare_update(WT_SESSION_IMPL *session, WT_ITEM *value, WT_CELL_UN
     WT_UPDATE *upd, *tombstone;
     size_t size, total_size;
 
+    size = 0;
     *sizep = 0;
 
     tombstone = upd = NULL;
@@ -142,7 +141,6 @@ __page_inmem_prepare_update(WT_SESSION_IMPL *session, WT_ITEM *value, WT_CELL_UN
     upd->durable_ts = unpack->tw.durable_start_ts;
     upd->start_ts = unpack->tw.start_ts;
     upd->txnid = unpack->tw.start_txn;
-    F_SET(upd, WT_UPDATE_PREPARE_RESTORED_FROM_DS);
 
     /*
      * Instantiate both update and tombstone if the prepared update is a tombstone. This is required
@@ -168,13 +166,16 @@ __page_inmem_prepare_update(WT_SESSION_IMPL *session, WT_ITEM *value, WT_CELL_UN
           unpack->tw.start_txn == unpack->tw.stop_txn) {
             upd->durable_ts = WT_TS_NONE;
             upd->prepare_state = WT_PREPARE_INPROGRESS;
-        }
+            F_SET(upd, WT_UPDATE_PREPARE_RESTORED_FROM_DS);
+        } else
+            F_SET(upd, WT_UPDATE_RESTORED_FROM_DS);
 
         tombstone->next = upd;
         *updp = tombstone;
     } else {
         upd->durable_ts = WT_TS_NONE;
         upd->prepare_state = WT_PREPARE_INPROGRESS;
+        F_SET(upd, WT_UPDATE_PREPARE_RESTORED_FROM_DS);
         *updp = upd;
     }
 
@@ -200,20 +201,16 @@ __page_inmem_prepare_update_col(WT_SESSION_IMPL *session, WT_REF *ref, WT_CURSOR
 
     /* Search the page and apply the modification. */
     WT_RET(__wt_col_search(cbt, recno, ref, true, NULL));
-#ifdef HAVE_DIAGNOSTIC
-    WT_RET(__wt_col_modify(cbt, recno, NULL, *updp, WT_UPDATE_INVALID, true, true));
-#else
-    WT_RET(__wt_col_modify(cbt, recno, NULL, *updp, WT_UPDATE_INVALID, true));
-#endif
+    WT_RET(__wt_col_modify(cbt, recno, NULL, updp, WT_UPDATE_INVALID, true, true));
     return (0);
 }
 
 /*
- * __wt_page_inmem_prepare --
+ * __wti_page_inmem_prepare --
  *     Instantiate prepared updates.
  */
 int
-__wt_page_inmem_prepare(WT_SESSION_IMPL *session, WT_REF *ref)
+__wti_page_inmem_prepare(WT_SESSION_IMPL *session, WT_REF *ref)
 {
     WT_BTREE *btree;
     WT_CELL *cell;
@@ -256,7 +253,9 @@ __wt_page_inmem_prepare(WT_SESSION_IMPL *session, WT_REF *ref)
             }
 
             /* Get the value. */
-            WT_ERR(__wt_page_cell_data_ref(session, page, &unpack, value));
+            WT_ERR(__wt_page_cell_data_ref_kv(session, page, &unpack, value));
+            WT_ASSERT_ALWAYS(session, __wt_cell_type_raw(unpack.cell) != WT_CELL_VALUE_OVFL_RM,
+              "Should never read an overflow removed value for a prepared update");
 
             /* For each record, create an update to resolve the prepare. */
             for (; rle > 0; --rle, ++recno) {
@@ -300,21 +299,24 @@ __wt_page_inmem_prepare(WT_SESSION_IMPL *session, WT_REF *ref)
 
             /* Get the key/value pair and create an update to resolve the prepare. */
             WT_ERR(__wt_row_leaf_key(session, page, rip, key, false));
-            WT_ERR(__wt_page_cell_data_ref(session, page, &unpack, value));
+            WT_ERR(__wt_page_cell_data_ref_kv(session, page, &unpack, value));
+            WT_ASSERT_ALWAYS(session, __wt_cell_type_raw(unpack.cell) != WT_CELL_VALUE_OVFL_RM,
+              "Should never read an overflow removed value for a prepared update");
             WT_ERR(__page_inmem_prepare_update(session, value, &unpack, &upd, &size));
             total_size += size;
 
             /* Search the page and apply the modification. */
             WT_ERR(__wt_row_search(&cbt, key, true, ref, true, NULL));
-#ifdef HAVE_DIAGNOSTIC
-            WT_ERR(__wt_row_modify(&cbt, key, NULL, upd, WT_UPDATE_INVALID, true, true));
-#else
-            WT_ERR(__wt_row_modify(&cbt, key, NULL, upd, WT_UPDATE_INVALID, true));
-#endif
+            WT_ERR(__wt_row_modify(&cbt, key, NULL, &upd, WT_UPDATE_INVALID, true, true));
             upd = NULL;
         }
     }
 
+    /*
+     * The data is written to the disk so we can mark the page clean after re-instantiating prepared
+     * updates to avoid reconciling the page every time.
+     */
+    __wt_page_modify_clear(session, page);
     __wt_cache_page_inmem_incr(session, page, total_size);
 
     if (0) {
@@ -328,13 +330,14 @@ err:
 }
 
 /*
- * __wt_page_inmem --
+ * __wti_page_inmem --
  *     Build in-memory page information.
  */
 int
-__wt_page_inmem(WT_SESSION_IMPL *session, WT_REF *ref, const void *image, uint32_t flags,
+__wti_page_inmem(WT_SESSION_IMPL *session, WT_REF *ref, const void *image, uint32_t flags,
   WT_PAGE **pagep, bool *preparedp)
 {
+    WT_CELL_UNPACK_ADDR unpack_addr;
     WT_DECL_RET;
     WT_PAGE *page;
     const WT_PAGE_HEADER *dsk;
@@ -355,17 +358,29 @@ __wt_page_inmem(WT_SESSION_IMPL *session, WT_REF *ref, const void *image, uint32
      */
     switch (dsk->type) {
     case WT_PAGE_COL_FIX:
-    case WT_PAGE_COL_INT:
     case WT_PAGE_COL_VAR:
         /*
          * Column-store leaf page entries map one-to-one to the number of physical entries on the
          * page (each physical entry is a value item). Note this value isn't necessarily correct, we
          * may skip values when reading the disk image.
-         *
-         * Column-store internal page entries map one-to-one to the number of physical entries on
-         * the page (each entry is a location cookie).
          */
         alloc_entries = dsk->u.entries;
+        break;
+    case WT_PAGE_COL_INT:
+        /*
+         * Column-store internal page entries map one-to-one to the number of physical entries on
+         * the page (each entry is a location cookie), but in some cases we need to allocate one
+         * extra slot. This arises if there's a gap between the page's own start recno and the first
+         * child's start recno; we need to insert a blank (deleted) page to cover that chunk of the
+         * namespace. Examine the first cell on the page to decide.
+         */
+        alloc_entries = dsk->u.entries;
+        WT_CELL_FOREACH_ADDR (session, dsk, unpack_addr) {
+            if (unpack_addr.v != dsk->recno)
+                alloc_entries++;
+            break;
+        }
+        WT_CELL_FOREACH_END;
         break;
     case WT_PAGE_ROW_INT:
         /*
@@ -413,7 +428,7 @@ __wt_page_inmem(WT_SESSION_IMPL *session, WT_REF *ref, const void *image, uint32
         WT_ERR(__inmem_col_fix(session, page, preparedp, &size));
         break;
     case WT_PAGE_COL_INT:
-        __inmem_col_int(session, page);
+        WT_ERR(__inmem_col_int(session, page, dsk->recno));
         break;
     case WT_PAGE_COL_VAR:
         WT_ERR(__inmem_col_var(session, page, dsk->recno, preparedp, &size));
@@ -454,7 +469,7 @@ err:
 }
 
 /*
- * __wt_col_fix_read_auxheader --
+ * __wti_col_fix_read_auxheader --
  *     Read the auxiliary header following the bitmap data, if any. This code is used by verify and
  *     needs to be accordingly careful. It is also used by mainline reads so it must also not crash
  *     or print on behalf of verify, and it should not waste time on checks that inmem doesn't need.
@@ -464,7 +479,7 @@ err:
  *     needn't bother. Salvage is protected by verify and doesn't need to check any of it.
  */
 int
-__wt_col_fix_read_auxheader(
+__wti_col_fix_read_auxheader(
   WT_SESSION_IMPL *session, const WT_PAGE_HEADER *dsk, WT_COL_FIX_AUXILIARY_HEADER *auxhdr)
 {
     WT_BTREE *btree;
@@ -535,11 +550,12 @@ __inmem_col_fix(WT_SESSION_IMPL *session, WT_PAGE *page, bool *preparedp, size_t
 
     btree = S2BT(session);
     dsk = page->dsk;
+    tmp = 0;
     prepare = false;
 
     page->pg_fix_bitf = WT_PAGE_HEADER_BYTE(btree, dsk);
 
-    WT_RET(__wt_col_fix_read_auxheader(session, dsk, &auxhdr));
+    WT_RET(__wti_col_fix_read_auxheader(session, dsk, &auxhdr));
     WT_ASSERT(session, auxhdr.dataoffset <= dsk->mem_size);
 
     switch (auxhdr.version) {
@@ -613,34 +629,103 @@ __inmem_col_fix(WT_SESSION_IMPL *session, WT_PAGE *page, bool *preparedp, size_t
 }
 
 /*
+ * __inmem_col_int_init_ref --
+ *     Initialize one ref in a column-store internal page.
+ */
+static int
+__inmem_col_int_init_ref(WT_SESSION_IMPL *session, WT_REF *ref, WT_PAGE *home, uint32_t hint,
+  void *addr, uint64_t recno, bool internal, bool deleted, WT_PAGE_DELETED *page_del)
+{
+    WT_BTREE *btree;
+
+    btree = S2BT(session);
+
+    ref->home = home;
+    ref->pindex_hint = hint;
+    ref->addr = addr;
+    ref->ref_recno = recno;
+    F_SET(ref, internal ? WT_REF_FLAG_INTERNAL : WT_REF_FLAG_LEAF);
+    if (deleted) {
+        /*
+         * If a page was deleted without being read (fast truncate), and the delete committed, but
+         * older transactions in the system required the previous version of the page to remain
+         * available or the delete can still be rolled back by RTS, a deleted-address type cell is
+         * type written. We'll see that cell on a page if we read from a checkpoint including a
+         * deleted cell or if we crash/recover and start off from such a checkpoint. Recreate the
+         * fast-delete state for the page.
+         */
+        if (page_del != NULL && F_ISSET(home->dsk, WT_PAGE_FT_UPDATE)) {
+            WT_RET(__wt_calloc_one(session, &ref->page_del));
+            *ref->page_del = *page_del;
+        }
+        WT_REF_SET_STATE(ref, WT_REF_DELETED);
+
+        /*
+         * If the tree is already dirty and so will be written, mark the page dirty. (We want to
+         * free the deleted pages, but if the handle is read-only or if the application never
+         * modifies the tree, we're not able to do so.)
+         */
+        if (btree->modified) {
+            WT_RET(__wt_page_modify_init(session, home));
+            __wt_page_only_modify_set(session, home);
+        }
+    }
+
+    return (0);
+}
+
+/*
  * __inmem_col_int --
  *     Build in-memory index for column-store internal pages.
  */
-static void
-__inmem_col_int(WT_SESSION_IMPL *session, WT_PAGE *page)
+static int
+__inmem_col_int(WT_SESSION_IMPL *session, WT_PAGE *page, uint64_t page_recno)
 {
     WT_CELL_UNPACK_ADDR unpack;
     WT_PAGE_INDEX *pindex;
     WT_REF **refp, *ref;
     uint32_t hint;
+    bool first;
+
+    first = true;
 
     /*
      * Walk the page, building references: the page contains value items. The value items are
      * on-page items (WT_CELL_VALUE).
      */
-    pindex = WT_INTL_INDEX_GET_SAFE(page);
+    WT_INTL_INDEX_GET_SAFE(page, pindex);
     refp = pindex->index;
     hint = 0;
     WT_CELL_FOREACH_ADDR (session, page->dsk, unpack) {
         ref = *refp++;
-        ref->home = page;
-        ref->pindex_hint = hint++;
-        ref->addr = unpack.cell;
-        ref->ref_recno = unpack.v;
 
-        F_SET(ref, unpack.type == WT_CELL_ADDR_INT ? WT_REF_FLAG_INTERNAL : WT_REF_FLAG_LEAF);
+        if (first && unpack.v != page_recno) {
+            /*
+             * There's a gap in the namespace. Create a deleted leaf page (with no address) to cover
+             * that gap. We allocated an extra slot in the array in __wt_page_alloc to make room for
+             * this case. (Note that this doesn't result in all gaps being covered, just ones on the
+             * left side of the tree where we need to be able to search to them. Other gaps end up
+             * covered by the insert list of the preceding leaf page.)
+             */
+
+            /* Assert that we allocated enough space for the extra ref. */
+            WT_ASSERT(session, pindex->entries == page->dsk->u.entries + 1);
+
+            /* Fill it in. */
+            WT_RET(__inmem_col_int_init_ref(
+              session, ref, page, hint++, NULL, page_recno, false, true, NULL));
+
+            /* Get the next ref. */
+            ref = *refp++;
+        }
+        first = false;
+
+        WT_RET(__inmem_col_int_init_ref(session, ref, page, hint++, unpack.cell, unpack.v,
+          unpack.type == WT_CELL_ADDR_INT, unpack.type == WT_CELL_ADDR_DEL, &unpack.page_del));
     }
     WT_CELL_FOREACH_END;
+
+    return (0);
 }
 
 /*
@@ -738,6 +823,7 @@ __inmem_col_var(
 static int
 __inmem_row_int(WT_SESSION_IMPL *session, WT_PAGE *page, size_t *sizep)
 {
+    WT_BTREE *btree;
     WT_CELL_UNPACK_ADDR unpack;
     WT_DECL_ITEM(current);
     WT_DECL_RET;
@@ -746,13 +832,15 @@ __inmem_row_int(WT_SESSION_IMPL *session, WT_PAGE *page, size_t *sizep)
     uint32_t hint;
     bool overflow_keys;
 
+    btree = S2BT(session);
+
     WT_RET(__wt_scr_alloc(session, 0, &current));
 
     /*
      * Walk the page, instantiating keys: the page contains sorted key and location cookie pairs.
      * Keys are on-page/overflow items and location cookies are WT_CELL_ADDR_XXX items.
      */
-    pindex = WT_INTL_INDEX_GET_SAFE(page);
+    WT_INTL_INDEX_GET_SAFE(page, pindex);
     refp = pindex->index;
     overflow_keys = false;
     hint = 0;
@@ -774,9 +862,6 @@ __inmem_row_int(WT_SESSION_IMPL *session, WT_PAGE *page, size_t *sizep)
 
         switch (unpack.type) {
         case WT_CELL_KEY:
-            /*
-             * Note: we don't Huffman encode internal page keys, there's no decoding work to do.
-             */
             __wt_ref_key_onpage_set(page, ref, &unpack);
             break;
         case WT_CELL_KEY_OVFL:
@@ -784,9 +869,9 @@ __inmem_row_int(WT_SESSION_IMPL *session, WT_PAGE *page, size_t *sizep)
              * Instantiate any overflow keys; WiredTiger depends on this, assuming any overflow key
              * is instantiated, and any keys that aren't instantiated cannot be overflow items.
              */
-            WT_ERR(__wt_dsk_cell_data_ref(session, page->type, &unpack, current));
+            WT_ERR(__wt_dsk_cell_data_ref_addr(session, page->type, &unpack, current));
 
-            WT_ERR(__wt_row_ikey_incr(session, page, WT_PAGE_DISK_OFFSET(page, unpack.cell),
+            WT_ERR(__wti_row_ikey_incr(session, page, WT_PAGE_DISK_OFFSET(page, unpack.cell),
               current->data, current->size, ref));
 
             *sizep += sizeof(WT_IKEY) + current->size;
@@ -802,10 +887,20 @@ __inmem_row_int(WT_SESSION_IMPL *session, WT_PAGE *page, size_t *sizep)
              * Recreate the fast-delete state for the page.
              */
             if (F_ISSET(page->dsk, WT_PAGE_FT_UPDATE)) {
-                WT_ERR(__wt_calloc_one(session, &ref->ft_info.del));
-                *ref->ft_info.del = unpack.page_del;
+                WT_ERR(__wt_calloc_one(session, &ref->page_del));
+                *ref->page_del = unpack.page_del;
             }
             WT_REF_SET_STATE(ref, WT_REF_DELETED);
+
+            /*
+             * If the tree is already dirty and so will be written, mark the page dirty. (We want to
+             * free the deleted pages, but if the handle is read-only or if the application never
+             * modifies the tree, we're not able to do so.)
+             */
+            if (btree->modified) {
+                WT_ERR(__wt_page_modify_init(session, page));
+                __wt_page_only_modify_set(session, page);
+            }
 
             ref->addr = unpack.cell;
             ++refp;
@@ -882,7 +977,6 @@ __inmem_row_leaf_entries(WT_SESSION_IMPL *session, const WT_PAGE_HEADER *dsk, ui
 static int
 __inmem_row_leaf(WT_SESSION_IMPL *session, WT_PAGE *page, bool *preparedp)
 {
-    WT_BTREE *btree;
     WT_CELL_UNPACK_KV unpack;
     WT_DECL_RET;
     WT_ROW *rip;
@@ -891,7 +985,6 @@ __inmem_row_leaf(WT_SESSION_IMPL *session, WT_PAGE *page, bool *preparedp)
     uint8_t smallest_prefix;
     bool prepare;
 
-    btree = S2BT(session);
     last_slot = 0;
     prepare = false;
 
@@ -982,8 +1075,11 @@ __inmem_row_leaf(WT_SESSION_IMPL *session, WT_PAGE *page, bool *preparedp)
              *
              * The visibility information is not referenced on the page so we need to ensure that
              * the value is globally visible at the point in time where we read the page into cache.
+             * Pages from checkpoint-related files that have been pushed onto the pre-fetch queue
+             * will be comprised of data that is globally visible, and so the reader thread which
+             * attempts to read the page into cache can skip the visible all check.
              */
-            if (!btree->huffman_value &&
+            if (!(WT_READING_CHECKPOINT(session) && F_ISSET(session, WT_SESSION_PREFETCH_THREAD)) &&
               (WT_TIME_WINDOW_IS_EMPTY(&unpack.tw) ||
                 (!WT_TIME_WINDOW_HAS_STOP(&unpack.tw) &&
                   __wt_txn_tw_start_visible_all(session, &unpack.tw))))

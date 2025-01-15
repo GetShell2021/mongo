@@ -29,12 +29,29 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <set>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/change_stream_event_transform.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 
-class DocumentSourceChangeStreamTransform : public DocumentSource {
+class DocumentSourceChangeStreamTransform : public DocumentSourceInternalChangeStreamStage {
 public:
     static constexpr StringData kStageName = "$_internalChangeStreamTransform"_sd;
 
@@ -52,9 +69,18 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
     DocumentSource::GetModPathsReturn getModifiedPaths() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
+
+    /**
+     * This function should never be called, since this DocumentSource has its own serialize method.
+     */
+    Value doSerialize(const SerializationOptions& opts) const final {
+        MONGO_UNREACHABLE;
+    }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 

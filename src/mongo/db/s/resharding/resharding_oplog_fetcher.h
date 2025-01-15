@@ -28,23 +28,30 @@
  */
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <memory>
+#include <utility>
 
 #include "mongo/base/status_with.h"
 #include "mongo/client/dbclient_base.h"
 #include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/client.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/background.h"
 #include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
@@ -81,9 +88,10 @@ public:
                            ReshardingDonorOplogId startAt,
                            ShardId donorShard,
                            ShardId recipientShard,
-                           NamespaceString toWriteInto);
+                           NamespaceString oplogBufferNss,
+                           bool storeProgress);
 
-    ~ReshardingOplogFetcher();
+    ~ReshardingOplogFetcher() override;
 
     Future<void> awaitInsert(const ReshardingDonorOplogId& lastSeen) override;
 
@@ -162,11 +170,12 @@ private:
     ReshardingDonorOplogId _startAt;
     const ShardId _donorShard;
     const ShardId _recipientShard;
-    const NamespaceString _toWriteInto;
+    const NamespaceString _oplogBufferNss;
+    const bool _storeProgress;
 
     int _numOplogEntriesCopied = 0;
 
-    Mutex _mutex = MONGO_MAKE_LATCH("ReshardingOplogFetcher::_mutex");
+    stdx::mutex _mutex;
     Promise<void> _onInsertPromise;
     Future<void> _onInsertFuture;
 

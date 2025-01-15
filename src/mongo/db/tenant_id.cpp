@@ -29,14 +29,28 @@
 
 #include "mongo/db/tenant_id.h"
 
+#include <fmt/format.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-const TenantId TenantId::kSystemTenantId(
-    OID("15650000"   /* timestamp: 1981-05-17 */
-        "0102030405" /* process id */
-        "060708" /* counter */));
+TenantId TenantId::parseFromString(StringData tenantId) {
+    uassert(ErrorCodes::BadValue, "Failed to parse empty tenantId string.", !tenantId.empty());
+
+    const auto res = OID::parse(tenantId);
+    uassert(ErrorCodes::BadValue,
+            fmt::format("Failed to parse malformatted tenantId: '{}', error: {}",
+                        tenantId,
+                        res.getStatus().reason()),
+            res.isOK());
+    return TenantId(res.getValue());
+}
 
 TenantId TenantId::parseFromBSON(const BSONElement& elem) {
     if (elem.isNull()) {

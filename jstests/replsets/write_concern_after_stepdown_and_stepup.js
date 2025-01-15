@@ -3,12 +3,10 @@
  * primary to incorrectly acknowledge a w:majority write that's about to be rolled back, even if the
  * stale primary is re-elected primary before waiting for the write concern acknowledgement.
  */
-(function() {
-'use strict';
-
-load("jstests/replsets/rslib.js");
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 var name = "writeConcernStepDownAndBackUp";
 var dbName = "wMajorityCheck";
@@ -24,7 +22,7 @@ var rst = new ReplSetTest({
     useBridge: true
 });
 var nodes = rst.startSet();
-rst.initiate();
+rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 function waitForPrimary(node) {
     assert.soon(function() {
@@ -53,7 +51,7 @@ rst.awaitReplication();
 
 // Wait for all data bearing nodes to get up to date.
 assert.commandWorked(nodes[0].getDB(dbName).getCollection(collName).insert(
-    {a: 1}, {writeConcern: {w: 3, wtimeout: rst.kDefaultTimeoutMS}}));
+    {a: 1}, {writeConcern: {w: 3, wtimeout: rst.timeoutMS}}));
 
 // Stop the secondaries from replicating.
 stopServerReplication(secondaries);
@@ -91,7 +89,7 @@ waitForPrimary(nodes[1]);
 
 jsTest.log("Do a write to the new primary");
 assert.commandWorked(nodes[1].getDB(dbName).getCollection(collName).insert(
-    {a: 3}, {writeConcern: {w: 2, wtimeout: rst.kDefaultTimeoutMS}}));
+    {a: 3}, {writeConcern: {w: 2, wtimeout: rst.timeoutMS}}));
 
 jsTest.log("Reconnect the old primary to the rest of the nodes");
 nodes[0].reconnect(nodes[1]);
@@ -126,4 +124,3 @@ hangBeforeWaitingForWriteConcern.off();
 joinMajorityWriter();
 
 rst.stopSet();
-}());

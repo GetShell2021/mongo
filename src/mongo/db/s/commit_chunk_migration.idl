@@ -32,7 +32,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/sharding_types.idl"
     - "mongo/s/chunk_version.idl"
 
@@ -40,10 +40,11 @@ structs:
     ConfigSvrCommitChunkMigrationResponse:
         description: "Response of the _configsvrCommitChunkMigration command."
         strict: false
+        is_command_reply: true
         fields:
             shardVersion:
                 type: ChunkVersion
-                description: "Collection version at the end of the migration."
+                description: "Placement information at the end of the migration."
 
     MigratedChunkType:
         description: "ChunkType describing a migrated chunk"
@@ -77,9 +78,5 @@ commands:
                 description: "ChunkType describing a migrated chunk"
 
             fromShardCollectionVersion:
-                type: ChunkVersion 
+                type: ChunkVersion
                 description: "{ shardVersionField: <version> }" 
-                
-            validAfter:
-                type: timestamp 
-                description: "The time after which this chunk is at the new shard"

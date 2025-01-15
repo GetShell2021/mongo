@@ -1,13 +1,12 @@
 // SERVER-15310 Ensure that stepDown kills all other running operations
 
-(function() {
-"use strict";
-load("jstests/libs/parallel_shell_helpers.js");
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replSet = new ReplSetTest({name: TestData.name, nodes: 2});
 const nodes = replSet.nodeList();
 replSet.startSet();
-replSet.initiateWithHighElectionTimeout();
+replSet.initiate();
 
 const primary = replSet.getPrimary();
 assert.eq(primary.host, nodes[0], "primary assumed to be node 0");
@@ -50,7 +49,7 @@ jsTestLog("Stepping down");
 assert.commandWorked(primary.getDB('admin').runCommand({replSetStepDown: 30}));
 
 jsTestLog("Waiting for former PRIMARY to become SECONDARY");
-replSet.waitForState(primary, ReplSetTest.State.SECONDARY, 30000);
+replSet.awaitSecondaryNodes(30000, [primary]);
 
 const newPrimary = replSet.getPrimary();
 assert.neq(primary, newPrimary, "SECONDARY did not become PRIMARY");
@@ -63,4 +62,3 @@ assert.lt(duration,
           "Sleep lock held longer than expected, possibly uninterrupted.");
 
 replSet.stopSet();
-})();

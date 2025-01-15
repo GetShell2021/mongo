@@ -3,11 +3,8 @@
  *
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
-(function() {
-
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {runWriteConcernRetryabilityTest} from "jstests/libs/write_concern_util.js";
 
 const kNodes = 2;
 
@@ -207,4 +204,3 @@ runWriteConcernRetryabilityTest(priConn,
                                 'admin');
 
 replTest.stopSet();
-})();

@@ -29,8 +29,21 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <memory>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/query/write_ops/write_ops.h"
 #include "mongo/db/s/reshard_collection_coordinator_document_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
@@ -61,18 +74,7 @@ private:
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
-    void _enterPhase(Phase newPhase);
-
     const mongo::ReshardCollectionRequest _request;
-
-    const bool _persistCoordinatorDocument;  // TODO: SERVER-62338 remove this then 6.0 branches out
-};
-
-// TODO: SERVER-62338 remove this then 6.0 branches out
-class ReshardCollectionCoordinator_NORESILIENT : public ReshardCollectionCoordinator {
-public:
-    ReshardCollectionCoordinator_NORESILIENT(ShardingDDLCoordinatorService* service,
-                                             const BSONObj& initialState);
 };
 
 }  // namespace mongo

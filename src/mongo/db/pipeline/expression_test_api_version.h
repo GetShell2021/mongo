@@ -29,7 +29,16 @@
 
 #pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_visitor.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 /**
@@ -48,7 +57,7 @@ public:
 
     Value evaluate(const Document& root, Variables* variables) const final;
 
-    Value serialize(bool explain) const final;
+    Value serialize(const SerializationOptions& options) const final;
 
     void acceptVisitor(ExpressionMutableVisitor* visitor) final {
         return visitor->visit(this);
@@ -60,7 +69,6 @@ public:
 
 private:
     ExpressionTestApiVersion(ExpressionContext* expCtx, bool unstable, bool deprecated);
-    void _doAddDependencies(DepsTracker* deps) const final override;
 
     bool _unstable;
     bool _deprecated;

@@ -29,9 +29,25 @@
 
 #pragma once
 
+#include <set>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/s/shard_key_pattern.h"
 
 namespace mongo {
@@ -49,6 +65,7 @@ public:
     static boost::intrusive_ptr<DocumentSourceReshardingOwnershipMatch> create(
         ShardId recipientShardId,
         ShardKeyPattern reshardingKey,
+        boost::optional<NamespaceString> temporaryReshardingNamespace,
         const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     static boost::intrusive_ptr<DocumentSourceReshardingOwnershipMatch> createFromBson(
@@ -56,9 +73,11 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
     DocumentSource::GetModPathsReturn getModifiedPaths() const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 
@@ -70,15 +89,22 @@ public:
         return DocumentSourceReshardingOwnershipMatch::kStageName.rawData();
     }
 
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kReshardingOwnershipMatch;
+    }
+
 private:
-    DocumentSourceReshardingOwnershipMatch(ShardId recipientShardId,
-                                           ShardKeyPattern reshardingKey,
-                                           const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    DocumentSourceReshardingOwnershipMatch(
+        ShardId recipientShardId,
+        ShardKeyPattern reshardingKey,
+        boost::optional<NamespaceString> temporaryReshardingNamespace,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     DocumentSource::GetNextResult doGetNext() final;
 
     const ShardId _recipientShardId;
     const ShardKeyPattern _reshardingKey;
+    const boost::optional<NamespaceString> _temporaryReshardingNamespace;
 
     // _tempReshardingChunkMgr is used to decide to which recipient shard that documents in the
     // source collection should be routed. It is safe to cache this information for the duration of

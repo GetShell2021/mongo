@@ -29,9 +29,14 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
+#include <vector>
 
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/stdx/utility.h"
@@ -59,9 +64,14 @@ constexpr StorageEngineInitFlags operator|(StorageEngineInitFlags a,
 
 /**
  * Initializes the storage engine on "service".
+ * The optional parameter `startupTimeElapsedBuilder` is for adding time elapsed of tasks done in
+ * this function into one single builder that records the time elapsed during startup. Its default
+ * value is nullptr because we only want to time this function when it is called during startup.
  */
-StorageEngine::LastShutdownState initializeStorageEngine(OperationContext* opCtx,
-                                                         StorageEngineInitFlags initFlags);
+StorageEngine::LastShutdownState initializeStorageEngine(
+    OperationContext* opCtx,
+    StorageEngineInitFlags initFlags,
+    BSONObjBuilder* startupTimeElapsedBuilder = nullptr);
 
 /**
  * Shuts down storage engine cleanly and releases any locks on mongod.lock.
@@ -115,9 +125,9 @@ Status validateStorageOptions(
     const BSONObj& storageEngineOptions,
     std::function<Status(const StorageEngine::Factory* const, const BSONObj&)> validateFunc);
 
-/*
- * Appends a the list of available storage engines to a BSONObjBuilder for reporting purposes.
+/**
+ * Returns the list of all storage engines.
  */
-void appendStorageEngineList(ServiceContext* service, BSONObjBuilder* result);
+std::vector<StringData> getStorageEngineNames(ServiceContext* svcCtx);
 
 }  // namespace mongo

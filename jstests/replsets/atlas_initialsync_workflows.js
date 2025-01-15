@@ -1,11 +1,8 @@
 /**
  * This test simulates initial sync workflows which are performed by the Atlas automation agent.
- * @tags: [live_record_incompatible]
  */
-(function() {
-"use strict";
-
-load('jstests/replsets/rslib.js');  // waitForState.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {disconnectSecondaries, reconnectSecondaries, waitForState} from "jstests/replsets/rslib.js";
 
 const testName = TestData.testName;
 // Set up a standard 3-node replica set.  Note the two secondaries are priority 0; this is
@@ -33,7 +30,7 @@ function testAddWithInitialSync(secondariesDown) {
     const majorityDown = secondariesDown > 1;
     if (majorityDown) {
         // Wait for the set to become unhealthy.
-        rst.waitForState(primary, ReplSetTest.State.SECONDARY);
+        rst.awaitSecondaryNodes(null, [primary]);
     }
     // Atlas always adds nodes with 0 votes and priority
     const newNode = rst.add({rsConfig: {votes: 0, priority: 0}});
@@ -47,7 +44,7 @@ function testAddWithInitialSync(secondariesDown) {
         {replSetReconfig: config, maxTimeMS: ReplSetTest.kDefaultTimeoutMS, force: majorityDown}));
 
     jsTestLog("Waiting for node to sync.");
-    rst.waitForState(newNode, ReplSetTest.State.SECONDARY);
+    rst.awaitSecondaryNodes(null, [newNode]);
 
     jsTestLog("Reconfiguring added node to have votes");
     config = rst.getReplSetConfigFromNode(primary.nodeId);
@@ -85,7 +82,7 @@ function testReplaceWithInitialSync(secondariesDown) {
     disconnectSecondaries(rst, secondariesDown);
     if (majorityDown) {
         // Wait for the set to become unhealthy.
-        rst.waitForState(primary, ReplSetTest.State.SECONDARY);
+        rst.awaitSecondaryNodes(null, [primary]);
     }
 
     jsTestLog("Stopping node for replacement of data");
@@ -140,4 +137,3 @@ jsTestLog("Test replacing a node with initial sync with two secondaries unreacha
 testReplaceWithInitialSync(2);
 
 rst.stopSet();
-})();

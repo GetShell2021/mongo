@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/transport/baton.h"
 #include "mongo/transport/transport_layer.h"
 
 namespace mongo {
@@ -57,6 +56,12 @@ const Status TransportLayer::TicketSessionClosedStatus = Status(
     ErrorCodes::TransportSessionClosed, "Operation attempted on a closed transport Session.");
 
 ReactorTimer::ReactorTimer() : _id(reactorTimerIdCounter.addAndFetch(1)) {}
+
+thread_local Reactor* Reactor::_reactorForThread = nullptr;
+
+Date_t Reactor::ReactorClockSource::now() {
+    return _reactor->now();
+}
 
 }  // namespace transport
 }  // namespace mongo

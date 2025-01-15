@@ -29,11 +29,21 @@
 
 #pragma once
 
-#include <string>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -59,14 +69,21 @@ public:
         IndexMetaData() {}
 
         IndexMetaData(const IndexMetaData& other)
-            : spec(other.spec),
-              ready(other.ready),
-              isBackgroundSecondaryBuild(other.isBackgroundSecondaryBuild),
-              buildUUID(other.buildUUID) {
+            : spec(other.spec), ready(other.ready), buildUUID(other.buildUUID) {
             // We need to hold the multikey mutex when copying, someone else might be modifying this
             stdx::lock_guard lock(other.multikeyMutex);
             multikey = other.multikey;
             multikeyPaths = other.multikeyPaths;
+        }
+
+        IndexMetaData(IndexMetaData&& other)
+            : spec(std::move(other.spec)),
+              ready(other.ready),
+              buildUUID(std::move(other.buildUUID)) {
+            // No need to hold mutex on move, there are no concurrent readers while we're moving
+            // the instance.
+            multikey = other.multikey;
+            multikeyPaths = std::move(other.multikeyPaths);
         }
 
         /**
@@ -82,7 +99,6 @@ public:
             if (&rhs != this) {
                 spec = std::move(rhs.spec);
                 ready = std::move(rhs.ready);
-                isBackgroundSecondaryBuild = std::move(rhs.isBackgroundSecondaryBuild);
                 buildUUID = std::move(rhs.buildUUID);
 
                 // No need to hold mutex on move, there are no concurrent readers while we're moving
@@ -107,7 +123,6 @@ public:
 
         BSONObj spec;
         bool ready = false;
-        bool isBackgroundSecondaryBuild = false;
 
         // If initialized, a two-phase index build is in progress.
         boost::optional<UUID> buildUUID;
@@ -117,9 +132,10 @@ public:
         // (starting at 0) into the corresponding indexed field that represent what prefixes of the
         // indexed field cause the index to be multikey.
         // multikeyMutex must be held when accessing multikey or multikeyPaths
-        mutable Mutex multikeyMutex;
+        mutable stdx::mutex multikeyMutex;
         mutable bool multikey = false;
         mutable MultikeyPaths multikeyPaths;
+        mutable AtomicWord<int32_t> concurrentWriters;
     };
 
     struct MetaData {
@@ -149,10 +165,15 @@ public:
          */
         bool eraseIndex(StringData name);
 
-        std::string ns;
+        NamespaceString nss;
         CollectionOptions options;
         // May include empty instances which represent indexes already dropped.
         std::vector<IndexMetaData> indexes;
+
+        // Note that collection cloning (initial sync, mongodump+mongorestore, resharding, etc.)
+        // use listCollections and listIndexes to obtain the collection metadata. Therefore, any
+        // additional field not contained inside options or indexes does not get cloned into the
+        // target collection, which is almost surely problematic; see SERVER-91195 for more details.
 
         // Time-series collections created in versions 5.1 and earlier are allowed to contain
         // measurements with arbitrarily mixed schema in the buckets. When upgrading from these
@@ -162,6 +183,13 @@ public:
         // up will have this flag set to false by default. This will be boost::none if this catalog
         // entry is not representing a time-series collection or if FCV < 5.2.
         boost::optional<bool> timeseriesBucketsMayHaveMixedSchemaData;
+
+        // The flag will be set to false at the time of time-series collection creation if FCV
+        // >= 7.1. For any other collection type and earlier versions the flag will be boost::none.
+        // Thus, if the field is absent, we assume the time-series bucketing parameters have
+        // changed. If a subsequent collMod operation changes either 'bucketRoundingSeconds' or
+        // 'bucketMaxSpanSeconds', we set the flag to true.
+        boost::optional<bool> timeseriesBucketingParametersHaveChanged;
     };
 };
 }  // namespace mongo

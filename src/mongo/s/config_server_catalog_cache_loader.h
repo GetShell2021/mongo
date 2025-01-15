@@ -29,35 +29,22 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/base/string_data.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/catalog_cache_loader.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
-class ConfigServerCatalogCacheLoader final : public CatalogCacheLoader {
+class ConfigServerCatalogCacheLoader : public CatalogCacheLoader {
 public:
-    ConfigServerCatalogCacheLoader();
-    ~ConfigServerCatalogCacheLoader() = default;
-    ;
-
-    /**
-     * These functions should never be called. They trigger invariants if called.
-     */
-    void initializeReplicaSetRole(bool isPrimary) override;
-    void onStepDown() override;
-    void onStepUp() override;
-    void shutDown() override;
-    void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override;
-    void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
-    void waitForDatabaseFlush(OperationContext* opCtx, StringData dbName) override;
-
-    SemiFuture<CollectionAndChangedChunks> getChunksSince(const NamespaceString& nss,
-                                                          ChunkVersion version) override;
-    SemiFuture<DatabaseType> getDatabase(StringData dbName) override;
-
-private:
-    // Thread pool to be used to perform metadata load
-    std::shared_ptr<ThreadPool> _executor;
+    ~ConfigServerCatalogCacheLoader() override = default;
 };
 
 }  // namespace mongo

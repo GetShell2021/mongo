@@ -29,8 +29,27 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <string>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/util/concurrency/ticketholder_queue_stats.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/tick_source.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -178,6 +197,14 @@ public:
         return &_opDebug;
     }
 
+    AtomicStorageMetrics& getTransactionStorageMetrics() {
+        return _storageMetrics;
+    }
+
+    const AtomicStorageMetrics& getTransactionStorageMetrics() const {
+        return _storageMetrics;
+    }
+
     /**
      * Returns the LastClientInfo object stored in this SingleTransactionStats instance.
      */
@@ -191,6 +218,21 @@ public:
      */
     void updateLastClientInfo(Client* client) {
         _lastClientInfo.update(client);
+    }
+
+
+    /**
+     * Returns the TicketHolderQueueStats object stored in this SingleTransactionStats.
+     */
+    const TicketHolderQueueStats& getQueueStats() const {
+        return _queueStats;
+    }
+    /**
+     * Updates the TicketHolderQueueStats to include the latest operation's queueing stats.
+     */
+    void updateQueueStats(OperationContext* opCtx) {
+        TicketHolderQueueStats newOpQueueStat(opCtx);
+        _queueStats.add(newOpQueueStat);
     }
 
     /**
@@ -262,6 +304,8 @@ private:
     // Tracks and accumulates stats from all operations that run inside the transaction.
     OpDebug _opDebug;
 
+    AtomicStorageMetrics _storageMetrics;
+
     // Holds information about the last client to run a transaction operation.
     LastClientInfo _lastClientInfo;
 
@@ -269,6 +313,10 @@ private:
     // not be set in a transaction that is in state kPrepared if an exception is thrown after the
     // transaction transitions to the prepared state but before setPreparedStartTime is called.
     boost::optional<TickSource::Tick> _preparedStartTime{boost::none};
+
+    // Tracks and aggregates statistics for admission and execution control queueing across all
+    // operations within a transaction.
+    TicketHolderQueueStats _queueStats;
 };
 
 }  // namespace mongo

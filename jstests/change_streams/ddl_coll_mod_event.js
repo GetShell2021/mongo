@@ -3,22 +3,16 @@
  *
  * @tags: [
  *   requires_fcv_60,
+ *   # TODO (SERVER-89668): Remove tag. Currently incompatible due to change
+ *   # events containing the recordIdsReplicated:true option, which
+ *   # this test dislikes.
+ *   exclude_when_record_ids_replicated
  * ]
  */
-(function() {
-"use strict";
-
-load('jstests/libs/collection_drop_recreate.js');  // For 'assertDropAndRecreateCollection' and
-                                                   // 'assertDropCollection'.
-load('jstests/libs/change_stream_util.js');        // For 'ChangeStreamTest' and
-                                                   // 'assertChangeStreamEventEq'.
-load("jstests/libs/fixture_helpers.js");
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ChangeStreamTest} from "jstests/libs/query/change_stream_util.js";
 
 const testDB = db.getSiblingDB(jsTestName());
-
-if (!isChangeStreamsVisibilityEnabled(testDB)) {
-    return;
-}
 
 const dbName = testDB.getName();
 const collName = jsTestName();
@@ -142,7 +136,6 @@ function runTest(startChangeStream) {
             arr.push(key[property]);
         }
         let indexName = arr.join("_");
-        let opDesc = {indexes: [Object.assign({v: 2, key: key, name: indexName}, options)]};
 
         // Create an index.
         assert.commandWorked(testDB[collName].createIndex(key, options));
@@ -251,4 +244,3 @@ runTest((() => cst.startWatchingChanges({pipeline, collection: 1})));
 
 // Run the test using a single collection change stream.
 runTest((() => cst.startWatchingChanges({pipeline, collection: collName})));
-}());

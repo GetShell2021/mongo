@@ -5,10 +5,7 @@
  *   requires_fcv_51,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");  // For arrayEq.
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
 
 function buildErrorString(found, expected) {
     return "Expected:\n" + tojson(expected) + "\nGot:\n" + tojson(found);
@@ -140,8 +137,10 @@ pipeline = [
 assert.commandFailedWithCode(
     db.runCommand({aggregate: coll.getName(), pipeline: pipeline, cursor: {}}), 5876900);
 
-// Verify that if 'step' is not representable as a double precision is not lost during computation.
-const preciseStep = NumberDecimal(.1243568735894448377382);
+// Verify that if 'step' is not representable as a double, precision is not lost during computation.
+const preciseStep = NumberDecimal(".1243568735894448377382");
+const preciseStepTimesTwo = NumberDecimal(".2487137471788896754764");
+const preciseStepTimesThree = NumberDecimal(".3730706207683345132146");
 pipeline = [
     {$project: {_id: 0}},
     {$densify: {field: "val", range: {step: preciseStep, bounds: "full"}}},
@@ -152,8 +151,7 @@ result = coll.aggregate(pipeline).toArray();
 expectedResult = [
     {val: 0},
     {val: preciseStep},
-    {val: NumberDecimal(preciseStep * 2)},
-    {val: NumberDecimal(preciseStep * 3)}
+    {val: preciseStepTimesTwo},
+    {val: preciseStepTimesThree},
 ];
 assert(arrayEq(result, expectedResult), buildErrorString(result, expectedResult));
-})();

@@ -28,19 +28,24 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/document_source_internal_apply_oplog_update.h"
-
-#include <boost/optional.hpp>
 #include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <utility>
 
-#include "mongo/db/exec/add_fields_projection_executor.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document.h"
-#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/field_ref_set.h"
+#include "mongo/db/pipeline/document_source_internal_apply_oplog_update.h"
 #include "mongo/db/pipeline/document_source_internal_apply_oplog_update_gen.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/update/update_driver.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -59,17 +64,15 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalApplyOplogUpdate::cre
                           << " stage must be an object, but found type: " << typeName(elem.type()),
             elem.type() == BSONType::Object);
 
-    auto spec = InternalApplyOplogUpdateSpec::parse(IDLParserErrorContext(kStageName),
-                                                    elem.embeddedObject());
+    auto spec =
+        InternalApplyOplogUpdateSpec::parse(IDLParserContext(kStageName), elem.embeddedObject());
 
     return new DocumentSourceInternalApplyOplogUpdate(pExpCtx, spec.getOplogUpdate());
 }
 
 DocumentSourceInternalApplyOplogUpdate::DocumentSourceInternalApplyOplogUpdate(
     const boost::intrusive_ptr<ExpressionContext>& pExpCtx, const BSONObj& oplogUpdate)
-    : DocumentSource(kStageName, pExpCtx),
-      _oplogUpdate(std::move(oplogUpdate)),
-      _updateDriver(pExpCtx) {
+    : DocumentSource(kStageName, pExpCtx), _oplogUpdate(oplogUpdate), _updateDriver(pExpCtx) {
     // Parse the raw oplog update description.
     const auto updateMod = write_ops::UpdateModification::parseFromOplogEntry(
         _oplogUpdate, {true /* mustCheckExistenceForInsertOperations */});
@@ -87,7 +90,7 @@ DocumentSource::GetNextResult DocumentSourceInternalApplyOplogUpdate::doGetNext(
 
     // Use _updateDriver to apply the update to the document.
     mutablebson::Document doc(next.getDocument().toBson());
-    uassertStatusOK(_updateDriver.update(pExpCtx->opCtx,
+    uassertStatusOK(_updateDriver.update(pExpCtx->getOperationContext(),
                                          StringData(),
                                          &doc,
                                          false /* validateForStorage */,
@@ -97,9 +100,9 @@ DocumentSource::GetNextResult DocumentSourceInternalApplyOplogUpdate::doGetNext(
     return Document(doc.getObject());
 }
 
-Value DocumentSourceInternalApplyOplogUpdate::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(Document{{kStageName, Document{{kOplogUpdateFieldName, _oplogUpdate}}}});
+Value DocumentSourceInternalApplyOplogUpdate::serialize(const SerializationOptions& opts) const {
+    return Value(Document{
+        {kStageName, Document{{kOplogUpdateFieldName, opts.serializeLiteral(_oplogUpdate)}}}});
 }
 
 }  // namespace mongo

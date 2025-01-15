@@ -2,10 +2,12 @@
  * Tests that a user projection which fakes an internal topology-change event is handled gracefully
  * in a sharded cluster.
  * TODO SERVER-65778: rework this test when we can handle faked internal events more robustly.
- * @tags: [assumes_read_preference_unchanged]
+ *
+ * Tests that if a user fakes an internal event with a projection nothing crashes, so not valuable
+ * to test with a config shard.
+ * @tags: [assumes_read_preference_unchanged, config_shard_incompatible]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const numShards = 2;
 
@@ -114,7 +116,10 @@ function assertChangeStreamBehaviour(projection, expectedEvents, expectedErrorCo
                                     }
                                 ])
                                 .toArray();
-        assert.eq(openCursors.length, numShards, openCursors);
+        assert.eq(openCursors.length,
+                  numShards,
+                  // Dump all the running operations for better debuggability.
+                  () => tojson(adminDB.aggregate([{$currentOp: {idleCursors: true}}]).toArray()));
     }
 
     // Close the change stream when we are done.
@@ -209,4 +214,3 @@ testProjection = {
 assertChangeStreamBehaviour(testProjection, null, ErrorCodes.TypeMismatch);
 
 st.stop();
-})();

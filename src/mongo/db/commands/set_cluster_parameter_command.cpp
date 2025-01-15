@@ -28,24 +28,47 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <memory>
+#include <string>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/shim.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/cluster_server_parameter_cmds_gen.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/set_cluster_parameter_command_impl.h"
 #include "mongo/db/commands/set_cluster_parameter_invocation.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/query_settings/query_settings_manager.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/idl/cluster_server_parameter_gen.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-
 namespace mongo {
 
+using namespace fmt::literals;
 namespace {
-
 const WriteConcernOptions kMajorityWriteConcern{WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
                                                 WriteConcernOptions::kNoTimeout};
@@ -66,31 +89,39 @@ public:
         return "Set cluster parameter on replica set or node";
     }
 
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::ErrorCodes::NotImplemented,
-                    "setClusterParameter can only run on mongos in sharded clusters",
-                    (serverGlobalParams.clusterRole == ClusterRole::None));
+            auto service = opCtx->getService();
+            invariant(service->role().hasExclusively(ClusterRole::ShardServer),
+                      "Attempted to run a shard-only command directly from the router role.");
 
-            // TODO SERVER-65249: This will eventually be made specific to the parameter being set
-            // so that some parameters will be able to use setClusterParameter even on standalones.
-            uassert(ErrorCodes::IllegalOperation,
-                    str::stream() << Request::kCommandName << " cannot be run on standalones",
-                    repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
-                        repl::ReplicationCoordinator::modeNone);
+            uassert(ErrorCodes::NoSuchKey,
+                    "No cluster parameter provided",
+                    request().getCommandParameter().nFields() > 0);
 
-            std::unique_ptr<ServerParameterService> parameterService =
-                std::make_unique<ClusterParameterService>();
+            uassert(ErrorCodes::InvalidOptions,
+                    "{} only supports setting exactly one parameter"_format(Request::kCommandName),
+                    request().getCommandParameter().nFields() == 1);
 
-            DBDirectClient dbClient(opCtx);
-            ClusterParameterDBClientService dbService(dbClient);
+            uassert(
+                ErrorCodes::NoSuchKey,
+                "Unknown server parameter: {}"_format(
+                    query_settings::QuerySettingsManager::kQuerySettingsClusterParameterName),
+                !request().getCommandParameter()
+                     [query_settings::QuerySettingsManager::kQuerySettingsClusterParameterName]);
 
-            SetClusterParameterInvocation invocation{std::move(parameterService), dbService};
-
-            invocation.invoke(opCtx, request(), boost::none, kMajorityWriteConcern);
+            static auto impl = getSetClusterParameterImpl(service);
+            impl(opCtx,
+                 request(),
+                 boost::none /* clusterParameterTime */,
+                 boost::none /* previousTime */);
         }
 
     private:
@@ -99,18 +130,20 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString();
+            return NamespaceString(request().getDbName());
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForPrivilege(Privilege{ResourcePattern::forClusterResource(),
-                                                             ActionType::setClusterParameter}));
+                        ->isAuthorizedForPrivilege(Privilege{
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::setClusterParameter}));
         }
     };
-} setClusterParameterCommand;
+};
+MONGO_REGISTER_COMMAND(SetClusterParameterCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

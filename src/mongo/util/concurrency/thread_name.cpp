@@ -41,13 +41,23 @@
 #endif
 #endif
 
+#include <cstddef>
+#include <cstdint>
 #include <fmt/format.h>
+#include <system_error>
 
-#include "mongo/base/init.h"
-#include "mongo/config.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/config.h"     // IWYU pragma: keep
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/process_id.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/errno_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
@@ -107,7 +117,6 @@ void setOSThreadName(const std::string& threadName) {
     int error = pthread_setname_np(threadNameCopy.c_str());
     if (error) {
         LOGV2(23102,
-              "Ignoring error from setting thread name: {error}",
               "Ignoring error from setting thread name",
               "error"_attr = errorMessage(posixError(error)));
     }
@@ -132,10 +141,7 @@ void setOSThreadName(const std::string& threadName) {
 
     int error = pthread_setname_np(pthread_self(), truncName);
     if (auto ec = posixError(error)) {
-        LOGV2(23103,
-              "Ignoring error from setting thread name: {error}",
-              "Ignoring error from setting thread name",
-              "error"_attr = errorMessage(ec));
+        LOGV2(23103, "Ignoring error from setting thread name", "error"_attr = errorMessage(ec));
     }
 #endif
 }

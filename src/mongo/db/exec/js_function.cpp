@@ -27,15 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <ostream>
+#include <utility>
 
-#include "mongo/db/exec/js_function.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/user_name.h"
 #include "mongo/db/client.h"
+#include "mongo/db/exec/js_function.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -46,7 +54,7 @@ std::string getAuthenticatedUserNamesToken(Client* client) {
     auto as = AuthorizationSession::get(client);
     if (auto name = as->getAuthenticatedUserName()) {
         // Using a NUL byte which isn't valid in usernames to separate them.
-        if (const auto& tenant = name->getTenant()) {
+        if (const auto& tenant = name->tenantId()) {
             sb << '\0' << tenant->toString();
         }
         sb << '\0' << name->getUnambiguousName();
@@ -56,8 +64,8 @@ std::string getAuthenticatedUserNamesToken(Client* client) {
 }
 }  // namespace
 
-JsFunction::JsFunction(OperationContext* opCtx, std::string code, std::string dbName) {
-    _init(opCtx, std::move(code), std::move(dbName));
+JsFunction::JsFunction(OperationContext* opCtx, std::string code, const DatabaseName& dbName) {
+    _init(opCtx, std::move(code), dbName);
 }
 
 JsFunction::JsFunction(const JsFunction& other) {
@@ -71,13 +79,13 @@ JsFunction& JsFunction::operator=(const JsFunction& other) {
     return *this;
 }
 
-void JsFunction::_init(OperationContext* opCtx, std::string code, std::string dbName) {
+void JsFunction::_init(OperationContext* opCtx, std::string code, const DatabaseName& dbName) {
     invariant(opCtx != nullptr);
     uassert(6108304, "no globalScriptEngine in $where parsing", getGlobalScriptEngine());
-    uassert(6108305, "ns for $where cannot be empty", !dbName.empty());
+    uassert(6108305, "ns for $where cannot be empty", !dbName.isEmpty());
 
     _code = std::move(code);
-    _dbName = std::move(dbName);
+    _dbName = dbName;
 
     const auto userToken = getAuthenticatedUserNamesToken(opCtx->getClient());
     _scope = getGlobalScriptEngine()->getPooledScope(opCtx, _dbName, "where" + userToken);

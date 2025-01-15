@@ -28,23 +28,61 @@
  */
 
 
+#include <algorithm>
+#include <iterator>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/s/database_sharding_state.h"
-#include "mongo/db/s/dist_lock_manager.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/drop_indexes_gen.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/profile_settings.h"
+#include "mongo/db/s/ddl_lock_manager.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/db/timeseries/catalog_helper.h"
 #include "mongo/db/timeseries/timeseries_commands_conversion_helper.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/s/stale_shard_version_helpers.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 
 namespace mongo {
 namespace {
@@ -65,7 +103,7 @@ void updateStateForStaleConfigRetry(OperationContext* opCtx,
                    std::inserter(okShardIds, okShardIds.begin()));
 
     retryState->shardsWithSuccessResponses = std::move(okShardIds);
-    retryState->shardSuccessResponses = std::move(response.successResponses);
+    retryState->shardSuccessResponses = response.successResponses;
 }
 
 class ShardsvrDropIndexesCommand final : public TypedCommand<ShardsvrDropIndexesCommand> {
@@ -123,47 +161,43 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-
-} shardsvrDropIndexesCommand;
+};
+MONGO_REGISTER_COMMAND(ShardsvrDropIndexesCommand).forShard();
 
 ShardsvrDropIndexesCommand::Invocation::Response ShardsvrDropIndexesCommand::Invocation::typedRun(
     OperationContext* opCtx) {
-    uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+    ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
+
+    opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
     CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName, opCtx->getWriteConcern());
 
     // Since this operation is not directly writing locally we need to force its db profile level
     // increase in order to be logged in "<db>.system.profile".
-    CurOp::get(opCtx)->raiseDbProfileLevel(
-        CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns().dbName()));
+    CurOp::get(opCtx)->raiseDbProfileLevel(DatabaseProfileSettings::get(opCtx->getServiceContext())
+                                               .getDatabaseProfileLevel(ns().dbName()));
 
     DropIndexes dropIdxCmd(ns());
     dropIdxCmd.setDropIndexesRequest(request().getDropIndexesRequest());
 
-    const auto lockTimeout = [&]() -> Milliseconds {
-        if (auto sfp = globalFailPointRegistry().find("overrideDDLLockTimeout")->scoped();
-            MONGO_unlikely(sfp.isActive())) {
-            if (auto timeoutElem = sfp.getData()["timeoutMillisecs"]; timeoutElem.ok()) {
-                const auto timeoutMillisecs = Milliseconds(timeoutElem.safeNumberLong());
-                LOGV2(649100, "Overriding DDL lock timeout", "timeout"_attr = timeoutMillisecs);
-                return timeoutMillisecs;
-            }
-        }
-        return DistLockManager::kDefaultLockTimeout;
-    }();
+    generic_argument_util::setMajorityWriteConcern(dropIdxCmd);
 
-    auto distLockManager = DistLockManager::get(opCtx);
-    auto dbLocalLock = distLockManager->lockDirectLocally(opCtx, ns().db(), lockTimeout);
+    // Acquire the DDL lock to serialize with other DDL operations. It also makes sure that we are
+    // targeting the primary shard for this database.
+    static constexpr StringData lockReason{"dropIndexes"_sd};
+    const DDLLockManager::ScopedCollectionDDLLock collDDLLock{opCtx, ns(), lockReason, MODE_X};
 
-    // Check under the dbLock if this is still the primary shard for the database
-    DatabaseShardingState::checkIsPrimaryShardForDb(opCtx, ns().db());
+    setReadWriteConcern(opCtx, dropIdxCmd, this);
 
     auto resolvedNs = ns();
-    auto dropIdxBSON = dropIdxCmd.toBSON({});
+    auto dropIdxBSON = dropIdxCmd.toBSON();
 
+    // Checking if it is a timeseries collection under the collection DDL lock
     if (auto timeseriesOptions = timeseries::getTimeseriesOptions(opCtx, ns(), true)) {
         dropIdxBSON =
             timeseries::makeTimeseriesCommand(dropIdxBSON,
@@ -174,34 +208,28 @@ ShardsvrDropIndexesCommand::Invocation::Response ShardsvrDropIndexesCommand::Inv
         resolvedNs = ns().makeTimeseriesBucketsNamespace();
     }
 
-    auto nsLocalLock = distLockManager->lockDirectLocally(opCtx, resolvedNs.ns(), lockTimeout);
-
     StaleConfigRetryState retryState;
     return shardVersionRetry(
         opCtx, Grid::get(opCtx)->catalogCache(), resolvedNs, "dropIndexes", [&] {
             // If the collection is sharded, we target only the primary shard and the shards that
             // own chunks for the collection.
-            const auto routingInfo = uassertStatusOK(
+            const auto cri = uassertStatusOK(
                 Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, resolvedNs));
-
-            auto cmdToBeSent = CommandHelpers::filterCommandRequestForPassthrough(
-                CommandHelpers::appendMajorityWriteConcern(dropIdxBSON));
 
             auto shardResponses =
                 scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
                     opCtx,
-                    resolvedNs.db(),
+                    resolvedNs.dbName(),
                     resolvedNs,
-                    routingInfo,
+                    cri,
                     retryState.shardsWithSuccessResponses,
-                    applyReadWriteConcern(
-                        opCtx,
-                        this,
-                        CommandHelpers::filterCommandRequestForPassthrough(cmdToBeSent)),
+                    CommandHelpers::filterCommandRequestForPassthrough(dropIdxBSON),
                     ReadPreferenceSetting::get(opCtx),
                     Shard::RetryPolicy::kNotIdempotent,
-                    BSONObj() /* query */,
-                    BSONObj() /* collation */);
+                    BSONObj() /*query*/,
+                    BSONObj() /*collation*/,
+                    boost::none /*letParameters*/,
+                    boost::none /*runtimeConstants*/);
 
             // Append responses we've received from previous retries of this operation due to a
             // stale config error.
@@ -210,9 +238,10 @@ ShardsvrDropIndexesCommand::Invocation::Response ShardsvrDropIndexesCommand::Inv
                                   retryState.shardSuccessResponses.end());
 
             std::string errmsg;
-            BSONObjBuilder output;
-            const auto aggregateResponse =
-                appendRawResponses(opCtx, &errmsg, &output, std::move(shardResponses));
+            BSONObjBuilder output, rawResBuilder;
+            bool isShardedCollection = cri.cm.isSharded();
+            const auto aggregateResponse = appendRawResponses(
+                opCtx, &errmsg, &rawResBuilder, shardResponses, isShardedCollection);
 
             // If we have a stale config error, update the success shards for the upcoming retry.
             if (!aggregateResponse.responseOK && aggregateResponse.firstStaleConfigError) {
@@ -220,6 +249,12 @@ ShardsvrDropIndexesCommand::Invocation::Response ShardsvrDropIndexesCommand::Inv
                 uassertStatusOK(*aggregateResponse.firstStaleConfigError);
             }
 
+            if (!isShardedCollection && aggregateResponse.responseOK) {
+                CommandHelpers::filterCommandReplyForPassthrough(
+                    shardResponses[0].swResponse.getValue().data, &output);
+            }
+
+            output.appendElements(rawResBuilder.obj());
             CommandHelpers::appendSimpleCommandStatus(output, aggregateResponse.responseOK, errmsg);
             return Response(output.obj());
         });

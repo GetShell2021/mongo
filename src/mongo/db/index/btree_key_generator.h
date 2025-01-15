@@ -29,15 +29,26 @@
 
 #pragma once
 
+#include <boost/dynamic_bitset.hpp>
+#include <boost/dynamic_bitset/dynamic_bitset.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
 #include <memory>
 #include <set>
 #include <vector>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/bson/ordering.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/util/shared_buffer_fragment.h"
 
 namespace mongo {
 
@@ -56,7 +67,7 @@ public:
     BtreeKeyGenerator(std::vector<const char*> fieldNames,
                       std::vector<BSONElement> fixed,
                       bool isSparse,
-                      KeyString::Version keyStringVersion,
+                      key_string::Version keyStringVersion,
                       Ordering ordering);
 
     /**
@@ -84,9 +95,19 @@ public:
                  KeyStringSet* keys,
                  MultikeyPaths* multikeyPaths,
                  const CollatorInterface* collator = nullptr,
-                 boost::optional<RecordId> id = boost::none) const;
+                 const boost::optional<RecordId>& id = boost::none) const;
 
     size_t getApproximateSize() const;
+
+    /**
+     * This function does _not_ generate any keys but extract non-array elements for building a key
+     * string. It throws an exception if any extracted element is an array. This can be useful when
+     * the caller wants to utilize these elements to build a set of index keys.
+     *
+     * This function returns a bit set denoting which fields in '_fieldNames' are existent in 'obj'.
+     */
+    boost::dynamic_bitset<size_t> extractElements(const BSONObj& obj,
+                                                  std::vector<BSONElement>* elems) const;
 
 private:
     /**
@@ -157,7 +178,7 @@ private:
                            const std::vector<PositionalPathInfo>& positionalInfo,
                            MultikeyPaths* multikeyPaths,
                            const CollatorInterface* collator,
-                           boost::optional<RecordId> id) const;
+                           const boost::optional<RecordId>& id) const;
 
     /**
      * An optimized version of the key generation algorithm to be used when it is known that 'obj'
@@ -166,7 +187,7 @@ private:
     void _getKeysWithoutArray(SharedBufferFragmentBuilder& pooledBufferBuilder,
                               const BSONObj& obj,
                               const CollatorInterface* collator,
-                              boost::optional<RecordId> id,
+                              const boost::optional<RecordId>& id,
                               KeyStringSet* keys) const;
 
     /**
@@ -228,11 +249,11 @@ private:
                              const std::vector<PositionalPathInfo>& positionalInfo,
                              MultikeyPaths* multikeyPaths,
                              const CollatorInterface* collator,
-                             boost::optional<RecordId> id) const;
+                             const boost::optional<RecordId>& id) const;
 
-    KeyString::Value _buildNullKeyString() const;
+    key_string::Value _buildNullKeyString() const;
 
-    const KeyString::Version _keyStringVersion;
+    const key_string::Version _keyStringVersion;
 
     const bool _isIdIndex;
     const bool _isSparse;
@@ -244,7 +265,7 @@ private:
 
     // These are used by getKeys below.
     const std::vector<const char*> _fieldNames;
-    const KeyString::Value _nullKeyString;  // A full key with all fields null.
+    const key_string::Value _nullKeyString;  // A full key with all fields null.
 
     std::vector<BSONElement> _fixed;
 

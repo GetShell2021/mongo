@@ -29,14 +29,14 @@
 
 #pragma once
 
-#include <shared_mutex>
+#include <memory>
 
 #include "mongo/db/operation_id.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/storage/storage_change_lock.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/platform/rwmutex.h"
 #include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/unordered_set.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -48,16 +48,16 @@ public:
      * Start to change the storage engine for the associated ServiceContext.  This will kill all
      * OperationContexts that have a non-noop Recovery Unit with an InterruptedDueToStorageChange
      * code, free the existing storage engine, and block any new operation contexts from being
-     * created while the returned StorageChangeToken is in scope.
+     * created while the returned lock is in scope.
      */
-    StorageChangeLock::Token killOpsForStorageEngineChange(ServiceContext* service);
+    WriteRarelyRWMutex::WriteLock killOpsForStorageEngineChange(ServiceContext* service);
 
     /**
      * Finish changing the storage engine for the associated ServiceContext.  This will change the
      * storage engine and allow operation contexts to again be created.
      */
     void changeStorageEngine(ServiceContext* service,
-                             StorageChangeLock::Token token,
+                             WriteRarelyRWMutex::WriteLock,
                              std::unique_ptr<StorageEngine> engine);
 
     /**
@@ -67,7 +67,7 @@ public:
     void notifyOpCtxDestroyed() noexcept;
 
 private:
-    Mutex _mutex = MONGO_MAKE_LATCH("StorageEngineChangeContext::_mutex");
+    stdx::mutex _mutex;
 
     // Keeps track of opCtxs associated with a storage engine that is being replaced.
     // Protected by _mutex

@@ -29,10 +29,19 @@
 
 #include "mongo/util/pcre.h"
 
+#include <array>
 #include <fmt/format.h>
+#include <initializer_list>
+#include <ostream>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/assert_that.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/matcher.h"
+#include "mongo/unittest/matcher_core.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/errno_util.h"
 
 namespace mongo::pcre {
 namespace {
@@ -48,7 +57,11 @@ template <typename Out, typename Ch, size_t N>
 Out u8Cast(const Ch (&in)[N]) {
     const Ch* inp = in;
     auto cp = reinterpret_cast<const char*>(inp);
-    return Out{cp, cp + N - 1};
+    if constexpr (std::is_same_v<Out, StringData>) {
+        return Out{cp, N - 1};
+    } else {
+        return Out{cp, cp + N - 1};
+    }
 }
 
 TEST(PcreTest, GoodPatterns) {
@@ -69,7 +82,7 @@ TEST(PcreTest, BadPatterns) {
         {"h)", Errc::ERROR_UNMATCHED_CLOSING_PARENTHESIS},
         {"h\\", Errc::ERROR_END_BACKSLASH},
     };
-    for (auto [in, err] : badPatterns) {
+    for (const auto& [in, err] : badPatterns) {
         Regex re{in};
         ASSERT_FALSE(!!re);
         ASSERT_EQ(re.error(), err);
@@ -124,7 +137,9 @@ TEST(PcreTest, RegexMoveAssign) {
 }
 
 TEST(PcreTest, CodeSize) {
-    auto reSize = [](std::string p) { return Regex{std::move(p)}.codeSize(); };
+    auto reSize = [](std::string p) {
+        return Regex{std::move(p)}.codeSize();
+    };
     ASSERT_LT(reSize(""), reSize("hi"));
     ASSERT_LT(reSize("hi"), reSize("^(hi)*|(\\d{45})$"));
 }

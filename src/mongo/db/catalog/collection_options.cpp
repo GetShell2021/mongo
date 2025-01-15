@@ -27,35 +27,51 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <limits>
+#include <memory>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
-#include "mongo/db/catalog/collection_options.h"
-
-#include <algorithm>
-
+#include "mongo/base/error_codes.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/basic_types_gen.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/collection_options_validation.h"
-#include "mongo/db/commands.h"
 #include "mongo/db/commands/create_gen.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/idl/command_generic_argument.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
 #include "mongo/util/str.h"
-#include "mongo/util/visit_helper.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 namespace mongo {
 namespace {
-long long adjustCappedSize(long long cappedSize) {
-    cappedSize += 0xff;
-    cappedSize &= 0xffffffffffffff00LL;
-    return cappedSize;
-}
-
 long long adjustCappedMaxDocs(long long cappedMaxDocs) {
     if (cappedMaxDocs <= 0 || cappedMaxDocs == std::numeric_limits<long long>::max()) {
+        auto originalCappedMaxDocs = cappedMaxDocs;
         cappedMaxDocs = 0x7fffffff;
+        LOGV2(7386101,
+              "Capped collection maxDocs being rounded off.",
+              "originalMaxDocs"_attr = originalCappedMaxDocs,
+              "adjustedMaxDocs"_attr = cappedMaxDocs);
     }
     return cappedMaxDocs;
 }
@@ -66,10 +82,6 @@ void setEncryptedDefaultEncryptedCollectionNames(const NamespaceString& ns,
 
     if (!config->getEscCollection()) {
         config->setEscCollection(StringData(prefix + ".esc"));
-    }
-
-    if (!config->getEccCollection()) {
-        config->setEccCollection(StringData(prefix + ".ecc"));
     }
 
     if (!config->getEcocCollection()) {
@@ -90,7 +102,7 @@ StatusWith<long long> CollectionOptions::checkAndAdjustCappedSize(long long capp
         return Status(ErrorCodes::BadValue, "size cannot exceed 1 PB");
     }
 
-    return adjustCappedSize(cappedSize);
+    return cappedSize;
 }
 
 StatusWith<long long> CollectionOptions::checkAndAdjustCappedMaxDocs(long long cappedMaxDocs) {
@@ -172,8 +184,6 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
             continue;
         } else if (fieldName == "temp") {
             collectionOptions.temp = e.trueValue();
-        } else if (fieldName == "recordPreImages") {
-            collectionOptions.recordPreImages = e.trueValue();
         } else if (fieldName == "changeStreamPreAndPostImages") {
             if (e.type() != mongo::Object) {
                 return {ErrorCodes::InvalidOptions,
@@ -183,7 +193,7 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
             try {
                 collectionOptions.changeStreamPreAndPostImagesOptions =
                     ChangeStreamPreAndPostImagesOptions::parse(
-                        {"changeStreamPreAndPostImagesOptions"}, e.Obj());
+                        IDLParserContext{"changeStreamPreAndPostImagesOptions"}, e.Obj());
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
@@ -204,8 +214,8 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
             }
 
             try {
-                collectionOptions.indexOptionDefaults =
-                    IndexOptionDefaults::parse({"CollectionOptions::parse"}, e.Obj());
+                collectionOptions.indexOptionDefaults = IndexOptionDefaults::parse(
+                    IDLParserContext{"CollectionOptions::parse"}, e.Obj());
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
@@ -222,7 +232,7 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
 
             try {
                 collectionOptions.validationAction =
-                    ValidationAction_parse({"validationAction"}, e.String());
+                    ValidationAction_parse(IDLParserContext{"validationAction"}, e.String());
             } catch (const DBException& exc) {
                 return exc.toStatus();
             }
@@ -233,7 +243,7 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
 
             try {
                 collectionOptions.validationLevel =
-                    ValidationLevel_parse({"validationLevel"}, e.String());
+                    ValidationLevel_parse(IDLParserContext{"validationLevel"}, e.String());
             } catch (const DBException& exc) {
                 return exc.toStatus();
             }
@@ -292,7 +302,7 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
 
             try {
                 collectionOptions.timeseries =
-                    TimeseriesOptions::parse({"CollectionOptions::parse"}, e.Obj());
+                    TimeseriesOptions::parse(IDLParserContext{"CollectionOptions::parse"}, e.Obj());
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
@@ -302,12 +312,16 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
             }
 
             try {
-                collectionOptions.encryptedFieldConfig =
-                    collection_options_validation::processAndValidateEncryptedFields(
-                        EncryptedFieldConfig::parse({"CollectionOptions::parse"}, e.Obj()));
+                collectionOptions.encryptedFieldConfig = EncryptedFieldConfig::parse(
+                    IDLParserContext{"CollectionOptions::parse"}, e.Obj());
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
+        } else if (fieldName == "recordIdsReplicated") {
+            if (e.type() != mongo::Bool) {
+                return {ErrorCodes::TypeMismatch, "'recordIdsReplicated' must be a boolean."};
+            }
+            collectionOptions.recordIdsReplicated = e.Bool();
         } else if (!createdOn24OrEarlier && !mongo::isGenericArgument(fieldName)) {
             return Status(ErrorCodes::InvalidOptions,
                           str::stream()
@@ -323,15 +337,14 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
     return collectionOptions;
 }
 
-CollectionOptions CollectionOptions::fromCreateCommand(const NamespaceString& nss,
-                                                       const CreateCommand& cmd) {
+CollectionOptions CollectionOptions::fromCreateCommand(const CreateCommand& cmd) {
     CollectionOptions options;
 
     options.validationLevel = cmd.getValidationLevel();
     options.validationAction = cmd.getValidationAction();
     options.capped = cmd.getCapped();
     if (auto size = cmd.getSize()) {
-        options.cappedSize = adjustCappedSize(*size);
+        options.cappedSize = *size;
     }
     if (auto max = cmd.getMax()) {
         options.cappedMaxDocs = adjustCappedMaxDocs(*max);
@@ -364,9 +377,6 @@ CollectionOptions CollectionOptions::fromCreateCommand(const NamespaceString& ns
     if (auto collation = cmd.getCollation()) {
         options.collation = collation->toBSON();
     }
-    if (auto recordPreImages = cmd.getRecordPreImages()) {
-        options.recordPreImages = *recordPreImages;
-    }
     if (auto changeStreamPreAndPostImagesOptions = cmd.getChangeStreamPreAndPostImages()) {
         options.changeStreamPreAndPostImagesOptions = *changeStreamPreAndPostImagesOptions;
     }
@@ -374,21 +384,20 @@ CollectionOptions CollectionOptions::fromCreateCommand(const NamespaceString& ns
         options.timeseries = std::move(*timeseries);
     }
     if (auto clusteredIndex = cmd.getClusteredIndex()) {
-        stdx::visit(
-            visit_helper::Overloaded{
-                [&](bool isClustered) {
-                    if (isClustered) {
-                        options.clusteredIndex =
-                            clustered_util::makeCanonicalClusteredInfoForLegacyFormat();
-                    } else {
-                        options.clusteredIndex = boost::none;
-                    }
-                },
-                [&](const ClusteredIndexSpec& clusteredIndexSpec) {
-                    options.clusteredIndex =
-                        clustered_util::makeCanonicalClusteredInfo(clusteredIndexSpec);
-                }},
-            *clusteredIndex);
+        visit(OverloadedVisitor{
+                  [&](bool isClustered) {
+                      if (isClustered) {
+                          options.clusteredIndex =
+                              clustered_util::makeCanonicalClusteredInfoForLegacyFormat();
+                      } else {
+                          options.clusteredIndex = boost::none;
+                      }
+                  },
+                  [&](const ClusteredIndexSpec& clusteredIndexSpec) {
+                      options.clusteredIndex =
+                          clustered_util::makeCanonicalClusteredInfo(clusteredIndexSpec);
+                  }},
+              *clusteredIndex);
     }
     if (auto expireAfterSeconds = cmd.getExpireAfterSeconds()) {
         options.expireAfterSeconds = expireAfterSeconds;
@@ -398,7 +407,12 @@ CollectionOptions CollectionOptions::fromCreateCommand(const NamespaceString& ns
     }
     if (auto encryptedFieldConfig = cmd.getEncryptedFields()) {
         options.encryptedFieldConfig = std::move(*encryptedFieldConfig);
-        setEncryptedDefaultEncryptedCollectionNames(nss, options.encryptedFieldConfig.get_ptr());
+        setEncryptedDefaultEncryptedCollectionNames(cmd.getNamespace(),
+                                                    options.encryptedFieldConfig.get_ptr());
+    }
+
+    if (auto recordIdsReplicated = cmd.getRecordIdsReplicated()) {
+        options.recordIdsReplicated = *recordIdsReplicated;
     }
 
     return options;
@@ -435,13 +449,7 @@ void CollectionOptions::appendBSON(BSONObjBuilder* builder,
     if (temp && shouldAppend(CreateCommand::kTempFieldName))
         builder->appendBool(CreateCommand::kTempFieldName, true);
 
-    if (recordPreImages && shouldAppend(CreateCommand::kRecordPreImagesFieldName)) {
-        builder->appendBool(CreateCommand::kRecordPreImagesFieldName, true);
-    }
-
-    // TODO SERVER-58584: remove the feature flag.
-    if (feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabledAndIgnoreFCV() &&
-        changeStreamPreAndPostImagesOptions.getEnabled() &&
+    if (changeStreamPreAndPostImagesOptions.getEnabled() &&
         shouldAppend(CreateCommand::kChangeStreamPreAndPostImagesFieldName)) {
         builder->append(CreateCommand::kChangeStreamPreAndPostImagesFieldName,
                         changeStreamPreAndPostImagesOptions.toBSON());
@@ -507,6 +515,10 @@ void CollectionOptions::appendBSON(BSONObjBuilder* builder,
     if (encryptedFieldConfig && shouldAppend(CreateCommand::kEncryptedFieldsFieldName)) {
         builder->append(CreateCommand::kEncryptedFieldsFieldName, encryptedFieldConfig->toBSON());
     }
+
+    if (recordIdsReplicated && shouldAppend(CreateCommand::kRecordIdsReplicatedFieldName)) {
+        builder->appendBool(CreateCommand::kRecordIdsReplicatedFieldName, true);
+    }
 }
 
 bool CollectionOptions::matchesStorageOptions(const CollectionOptions& other,
@@ -524,10 +536,6 @@ bool CollectionOptions::matchesStorageOptions(const CollectionOptions& other,
     }
 
     if (autoIndexId != other.autoIndexId) {
-        return false;
-    }
-
-    if (recordPreImages != other.recordPreImages) {
         return false;
     }
 
@@ -602,5 +610,33 @@ bool CollectionOptions::matchesStorageOptions(const CollectionOptions& other,
     }
 
     return true;
+}
+
+namespace {
+Status validateIsNotInDbs(const NamespaceString& ns,
+                          const std::vector<DatabaseName>& disallowedDbs,
+                          StringData optionName) {
+    if (std::find(disallowedDbs.begin(), disallowedDbs.end(), ns.dbName()) != disallowedDbs.end()) {
+        return {ErrorCodes::InvalidOptions,
+                str::stream() << optionName << " collection option is not supported on the "
+                              << ns.dbName().toStringForErrorMsg() << " database"};
+    }
+
+    return Status::OK();
+}
+}  // namespace
+
+// Validates that the option is not used on admin, local or config db as well as not being used on
+// config servers.
+Status validateChangeStreamPreAndPostImagesOptionIsPermitted(const NamespaceString& ns) {
+    auto validationStatus =
+        validateIsNotInDbs(ns,
+                           {DatabaseName::kAdmin, DatabaseName::kLocal, DatabaseName::kConfig},
+                           "changeStreamPreAndPostImages");
+    if (validationStatus != Status::OK()) {
+        return validationStatus;
+    }
+
+    return Status::OK();
 }
 }  // namespace mongo

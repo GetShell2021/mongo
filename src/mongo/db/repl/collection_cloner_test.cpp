@@ -27,20 +27,36 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/status.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <functional>
 #include <vector>
 
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/client.h"
+#include "mongo/db/index/index_constants.h"
 #include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/initial_sync_cloner_test_fixture.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
-#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
-#include "mongo/db/service_context_test_fixture.h"
-#include "mongo/dbtests/mock/mock_dbclient_connection.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/dbtests/mock/mock_remote_db_server.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace repl {
@@ -55,9 +71,12 @@ public:
     }
 };
 
+const std::string kTestNs = "testDb.testColl";
+
 class CollectionClonerTest : public InitialSyncClonerTestFixture {
 public:
-    CollectionClonerTest() {}
+    CollectionClonerTest()
+        : _nss(NamespaceString::createNamespaceString_forTest(boost::none, kTestNs)) {}
 
 protected:
     void setUp() override {
@@ -77,9 +96,10 @@ protected:
 
             return std::move(localLoader);
         };
+
         _storageInterface.createCollectionForBulkFn = _standardCreateCollectionFn;
 
-        _mockServer->assignCollectionUuid(_nss.ns(), _collUuid);
+        _mockServer->assignCollectionUuid(_nss.ns_forTest(), _collUuid);
         _mockServer->setCommandReply("replSetGetRBID",
                                      BSON("ok" << 1 << "rbid" << getSharedData()->getRollBackId()));
     }
@@ -125,10 +145,10 @@ protected:
     CollectionBulkLoaderMock* _loader = nullptr;  // Owned by CollectionCloner.
     CollectionOptions _options;
 
-    NamespaceString _nss = {"testDb", "testColl"};
+    NamespaceString _nss;
     UUID _collUuid = UUID::gen();
-    BSONObj _idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                    << "_id_");
+    BSONObj _idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
 
     std::vector<BSONObj> _secondaryIndexSpecs{BSON("v" << 1 << "key" << BSON("a" << 1) << "name"
                                                        << "a_1"),
@@ -137,7 +157,8 @@ protected:
 };
 
 class CollectionClonerTestResumable : public CollectionClonerTest {
-    void setUp() final {
+protected:
+    void setUp() override {
         CollectionClonerTest::setUp();
         setInitialSyncId();
     }
@@ -228,8 +249,9 @@ TEST_F(CollectionClonerTestResumable,
 TEST_F(CollectionClonerTestResumable, ListIndexesReturnedNoIndexes) {
     auto cloner = makeCollectionCloner();
     cloner->setStopAfterStage_forTest("listIndexes");
-    setMockServerReplies(
-        BSON("size" << 10), createCountResponse(1), createCursorResponse(_nss.ns(), BSONArray()));
+    setMockServerReplies(BSON("size" << 10),
+                         createCountResponse(1),
+                         createCursorResponse(_nss.ns_forTest(), BSONArray()));
     ASSERT_OK(cloner->run());
     ASSERT(getIdIndexSpec(cloner.get()).isEmpty());
     ASSERT(getIndexSpecs(cloner.get()).empty());
@@ -256,7 +278,7 @@ TEST_F(CollectionClonerTestResumable, ListIndexesHasResults) {
         BSON("size" << 10),
         createCountResponse(1),
         createCursorResponse(
-            _nss.ns(),
+            _nss.ns_forTest(),
             BSON_ARRAY(_secondaryIndexSpecs[0] << _idIndexSpec << _secondaryIndexSpecs[1])));
     ASSERT_OK(cloner->run());
     ASSERT_BSONOBJ_EQ(_idIndexSpec, getIdIndexSpec(cloner.get()));
@@ -276,7 +298,8 @@ TEST_F(CollectionClonerTestResumable, CollectionClonerResendsListIndexesCommandO
                          Status(ErrorCodes::HostNotFound, "HostNotFound"));
     _mockServer->setCommandReply(
         "listIndexes",
-        createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec << _secondaryIndexSpecs[0])));
+        createCursorResponse(_nss.ns_forTest(),
+                             BSON_ARRAY(_idIndexSpec << _secondaryIndexSpecs[0])));
 
     ASSERT_OK(cloner->run());
     ASSERT_BSONOBJ_EQ(_idIndexSpec, getIdIndexSpec(cloner.get()));
@@ -312,11 +335,11 @@ TEST_F(CollectionClonerTestResumable, BeginCollection) {
     }
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(1),
-                         createCursorResponse(_nss.ns(), indexSpecs.arr()));
+                         createCursorResponse(_nss.ns_forTest(), indexSpecs.arr()));
 
     ASSERT_EQUALS(Status::OK(), cloner->run());
 
-    ASSERT_EQUALS(_nss.ns(), collNss.ns());
+    ASSERT_EQUALS(_nss.ns_forTest(), collNss.ns_forTest());
     ASSERT_BSONOBJ_EQ(_options.toBSON(), collOptions.toBSON());
     ASSERT_EQUALS(_secondaryIndexSpecs.size(), collSecondaryIndexSpecs.size());
     for (std::vector<BSONObj>::size_type i = 0; i < _secondaryIndexSpecs.size(); ++i) {
@@ -334,8 +357,9 @@ TEST_F(CollectionClonerTestResumable, BeginCollectionFailed) {
 
     auto cloner = makeCollectionCloner();
     cloner->setStopAfterStage_forTest("createCollection");
-    setMockServerReplies(
-        BSON("size" << 10), createCountResponse(1), createCursorResponse(_nss.ns(), BSONArray()));
+    setMockServerReplies(BSON("size" << 10),
+                         createCountResponse(1),
+                         createCursorResponse(_nss.ns_forTest(), BSONArray()));
     ASSERT_EQUALS(ErrorCodes::OperationFailed, cloner->run());
 }
 
@@ -343,11 +367,11 @@ TEST_F(CollectionClonerTestResumable, InsertDocumentsSingleBatch) {
     // Set up data for preliminary stages
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(2),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(_idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
 
     auto cloner = makeCollectionCloner();
     ASSERT_OK(cloner->run());
@@ -367,17 +391,17 @@ TEST_F(CollectionClonerTestResumable, BatchSizeStoredInConstructor) {
     // Set up data for preliminary stages.
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(2),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(_idIndexSpec)));
 
     // Set up documents to be returned from upstream node. It should take 3 batches to clone the
     // documents.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 4));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 5));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 6));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 7));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 4));
+    _mockServer->insert(_nss, BSON("_id" << 5));
+    _mockServer->insert(_nss, BSON("_id" << 6));
+    _mockServer->insert(_nss, BSON("_id" << 7));
 
     auto cloner = makeCollectionCloner();
     ASSERT_OK(cloner->run());
@@ -393,12 +417,12 @@ TEST_F(CollectionClonerTestResumable, InsertDocumentsMultipleBatches) {
     // Set up data for preliminary stages
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(2),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(_idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
 
     auto cloner = makeCollectionCloner();
     cloner->setBatchSize_forTest(2);
@@ -415,12 +439,12 @@ TEST_F(CollectionClonerTestResumable, InsertDocumentsScheduleDBWorkFailed) {
     // Set up data for preliminary stages
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(2),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(_idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
 
     auto cloner = makeCollectionCloner();
     // Stop before running the query to set up the failure.
@@ -428,11 +452,11 @@ TEST_F(CollectionClonerTestResumable, InsertDocumentsScheduleDBWorkFailed) {
     auto timesEntered = collClonerBeforeFailPoint->setMode(
         FailPoint::alwaysOn,
         0,
-        fromjson("{cloner: 'CollectionCloner', stage: 'query', nss: '" + _nss.ns() + "'}"));
+        fromjson("{cloner: 'CollectionCloner', stage: 'query', nss: '" + _nss.ns_forTest() + "'}"));
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonnerRunner", getGlobalServiceContext()->getService());
         ASSERT_EQUALS(ErrorCodes::UnknownError, cloner->run());
     });
     // Wait for the failpoint to be reached
@@ -452,12 +476,12 @@ TEST_F(CollectionClonerTestResumable, InsertDocumentsCallbackCanceled) {
     // Set up data for preliminary stages
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(2),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(_idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
 
     auto cloner = makeCollectionCloner();
     // Stop before running the query to set up the failure.
@@ -465,11 +489,11 @@ TEST_F(CollectionClonerTestResumable, InsertDocumentsCallbackCanceled) {
     auto timesEntered = collClonerBeforeFailPoint->setMode(
         FailPoint::alwaysOn,
         0,
-        fromjson("{cloner: 'CollectionCloner', stage: 'query', nss: '" + _nss.ns() + "'}"));
+        fromjson("{cloner: 'CollectionCloner', stage: 'query', nss: '" + _nss.ns_forTest() + "'}"));
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonnerRunner", getGlobalServiceContext()->getService());
         ASSERT_EQUALS(ErrorCodes::CallbackCanceled, cloner->run());
     });
     // Wait for the failpoint to be reached
@@ -495,12 +519,12 @@ TEST_F(CollectionClonerTestResumable, InsertDocumentsFailed) {
     // Set up data for preliminary stages
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(2),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(_idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
 
     auto cloner = makeCollectionCloner();
     // Stop before running the query to set up the failure.
@@ -508,11 +532,11 @@ TEST_F(CollectionClonerTestResumable, InsertDocumentsFailed) {
     auto timesEntered = collClonerBeforeFailPoint->setMode(
         FailPoint::alwaysOn,
         0,
-        fromjson("{cloner: 'CollectionCloner', stage: 'query', nss: '" + _nss.ns() + "'}"));
+        fromjson("{cloner: 'CollectionCloner', stage: 'query', nss: '" + _nss.ns_forTest() + "'}"));
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonnerRunner", getGlobalServiceContext()->getService());
         ASSERT_EQUALS(ErrorCodes::OperationFailed, cloner->run());
     });
 
@@ -522,7 +546,8 @@ TEST_F(CollectionClonerTestResumable, InsertDocumentsFailed) {
     // Modify the loader so insert documents fails.
     ASSERT(_loader != nullptr);
     _loader->insertDocsFn = [](const std::vector<BSONObj>::const_iterator begin,
-                               const std::vector<BSONObj>::const_iterator end) {
+                               const std::vector<BSONObj>::const_iterator end,
+                               CollectionBulkLoader::ParseRecordIdAndDocFunc fn) {
         return Status(ErrorCodes::OperationFailed, "");
     };
 
@@ -550,11 +575,11 @@ TEST_F(CollectionClonerTestResumable, DoNotCreateIDIndexIfAutoIndexIdUsed) {
     };
 
     const BSONObj doc = BSON("_id" << 1);
-    _mockServer->insert(_nss.ns(), doc);
+    _mockServer->insert(_nss, doc);
 
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(1),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(_idIndexSpec)));
 
     CollectionOptions options;
     options.autoIndexId = CollectionOptions::NO;
@@ -572,19 +597,19 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryFailTransientlyBeforeFirstBa
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
 
     // Set up data for preliminary stages
-    auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                << "_id_");
+    auto idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     // The collection cloner pre-stage makes a remote call to collStats to store in-progress
     // metrics.
     _mockServer->setCommandReply("collStats", BSON("size" << 10));
     _mockServer->setCommandReply("count", createCountResponse(3));
     _mockServer->setCommandReply("listIndexes",
-                                 createCursorResponse(_nss.ns(), BSON_ARRAY(idIndexSpec)));
+                                 createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
 
     // Preliminary setup for failpoints.
     auto beforeStageFailPoint = globalFailPointRegistry().find("hangBeforeClonerStage");
@@ -599,7 +624,7 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryFailTransientlyBeforeFirstBa
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonnerRunner", getGlobalServiceContext()->getService());
         ASSERT_OK(cloner->run());
     });
 
@@ -637,18 +662,18 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryFailTransientlyAfterFirstBat
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
 
     // Set up data for preliminary stages
-    auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                << "_id_");
+    auto idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(5),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 4));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 5));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 4));
+    _mockServer->insert(_nss, BSON("_id" << 5));
 
     // Preliminary setup for hanging failpoint.
     auto afterBatchFailpoint =
@@ -660,7 +685,7 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryFailTransientlyAfterFirstBat
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonnerRunner", getGlobalServiceContext()->getService());
         ASSERT_OK(cloner->run());
     });
 
@@ -693,16 +718,16 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryNonRetriableError) {
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
 
     // Set up data for preliminary stages
-    auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                << "_id_");
+    auto idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(3),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
 
     auto cloner = makeCollectionCloner();
     auto beforeStageFailPoint = globalFailPointRegistry().find("hangBeforeClonerStage");
@@ -711,7 +736,7 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryNonRetriableError) {
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonnerRunner", getGlobalServiceContext()->getService());
         auto status = cloner->run();
         ASSERT_EQUALS(ErrorCodes::UnknownError, status);
     });
@@ -738,16 +763,16 @@ TEST_F(CollectionClonerTestResumable,
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
 
     // Set up data for preliminary stages
-    auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                << "_id_");
+    auto idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(3),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
 
     auto cloner = makeCollectionCloner();
     cloner->setBatchSize_forTest(2);
@@ -757,7 +782,7 @@ TEST_F(CollectionClonerTestResumable,
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonnerRunner", getGlobalServiceContext()->getService());
         auto status = cloner->run();
         ASSERT_EQUALS(ErrorCodes::UnknownError, status);
     });
@@ -783,16 +808,16 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryNonTransientErrorAtRetry) {
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
 
     // Set up data for preliminary stages
-    auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                << "_id_");
+    auto idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(5),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
 
     // Preliminary setup for hanging failpoints.
     auto afterBatchFailpoint =
@@ -808,7 +833,7 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryNonTransientErrorAtRetry) {
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonnerRunner", getGlobalServiceContext()->getService());
         auto status = cloner->run();
         ASSERT_EQUALS(ErrorCodes::UnknownError, status);
     });
@@ -844,18 +869,18 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryNonTransientErrorAfterPastRe
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
 
     // Set up data for preliminary stages
-    auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                << "_id_");
+    auto idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(5),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 4));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 5));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 4));
+    _mockServer->insert(_nss, BSON("_id" << 5));
 
     // Preliminary setup for hanging failpoints.
     auto afterBatchFailpoint =
@@ -871,7 +896,7 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryNonTransientErrorAfterPastRe
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonerRunner", getGlobalServiceContext()->getService());
         auto status = cloner->run();
         ASSERT_EQUALS(ErrorCodes::UnknownError, status);
     });
@@ -921,22 +946,24 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryTwoResumes) {
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
 
     // Set up data for preliminary stages
-    auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                << "_id_");
+    auto idIndexSpec =
+        BSON("v" << 1 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName);
     setMockServerReplies(BSON("size" << 10),
                          createCountResponse(5),
-                         createCursorResponse(_nss.ns(), BSON_ARRAY(idIndexSpec)));
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(idIndexSpec)));
 
     // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 4));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 5));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 6));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 7));
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
+    _mockServer->insert(_nss, BSON("_id" << 4));
+    _mockServer->insert(_nss, BSON("_id" << 5));
+    _mockServer->insert(_nss, BSON("_id" << 6));
+    _mockServer->insert(_nss, BSON("_id" << 7));
 
     // Preliminary setup for hanging failpoints.
+    auto beforeBatchFailpoint = globalFailPointRegistry().find(
+        "initialSyncHangCollectionClonerBeforeHandlingBatchResponse");
     auto afterBatchFailpoint =
         globalFailPointRegistry().find("initialSyncHangCollectionClonerAfterHandlingBatchResponse");
     auto timesEnteredAfterBatch = afterBatchFailpoint->setMode(FailPoint::alwaysOn, 0);
@@ -950,7 +977,7 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryTwoResumes) {
 
     // Run the cloner in a separate thread.
     stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
+        Client::initThread("ClonnerRunner", getGlobalServiceContext()->getService());
         ASSERT_OK(cloner->run());
     });
 
@@ -966,6 +993,8 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryTwoResumes) {
     failNextBatch->setMode(FailPoint::nTimes, 1, fromjson("{errorType: 'HostUnreachable'}"));
 
     afterBatchFailpoint->setMode(FailPoint::off, 0);
+    // Ensure that the retry state is initially cleared.
+    ASSERT_EQUALS(0, cloner->getRetryableOperationCount_forTest());
     beforeRetryFailPoint->waitForTimesEntered(timesEnteredBeforeRetry + 1);
 
     // Allow copying two more batches before the next error.
@@ -974,20 +1003,38 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryTwoResumes) {
     failNextBatch->setMode(FailPoint::skip, 2, fromjson("{errorType: 'HostUnreachable'}"));
 
     // Do a failpoint dance so we can get to the next retry.
+    auto timesEnteredBeforeBatch = beforeBatchFailpoint->setMode(FailPoint::alwaysOn, 0);
     timesEnteredAfterBatch = afterBatchFailpoint->setMode(FailPoint::alwaysOn, 0);
     beforeRetryFailPoint->setMode(FailPoint::off, 0);
+    beforeBatchFailpoint->waitForTimesEntered(timesEnteredBeforeBatch + 1);
+    // Ensure that the retry state records the last transient error retrial.
+    ASSERT_EQUALS(1, cloner->getRetryableOperationCount_forTest());
+    beforeBatchFailpoint->setMode(FailPoint::off, 0);
+
     afterBatchFailpoint->waitForTimesEntered(timesEnteredAfterBatch + 1);
+    // Ensure that the retry state is cleared after a successful batch.
+    ASSERT_EQUALS(0, cloner->getRetryableOperationCount_forTest());
+
     timesEnteredBeforeRetry = beforeRetryFailPoint->setMode(
         FailPoint::alwaysOn, 0, fromjson("{cloner: 'CollectionCloner', stage: 'query'}"));
     afterBatchFailpoint->setMode(FailPoint::off, 0);
     beforeRetryFailPoint->waitForTimesEntered(timesEnteredBeforeRetry + 1);
+    timesEnteredBeforeBatch = beforeBatchFailpoint->setMode(FailPoint::alwaysOn, 0);
 
     // Allow the clone to finish.
     failNextBatch->setMode(FailPoint::off, 0);
     beforeRetryFailPoint->setMode(FailPoint::off, 0);
 
+    beforeBatchFailpoint->waitForTimesEntered(timesEnteredBeforeBatch + 1);
+    // Ensure that the retry state records the last transient error retrial.
+    ASSERT_EQUALS(1, cloner->getRetryableOperationCount_forTest());
+    beforeBatchFailpoint->setMode(FailPoint::off, 0);
+
+
     clonerThread.join();
 
+    // Ensure that the retry state is cleared after a successful batch.
+    ASSERT_EQUALS(0, cloner->getRetryableOperationCount_forTest());
     /**
      * Since the CollectionMockStats class does not de-duplicate inserts, it is possible to insert
      * the same document more than once, thereby also increasing the insertCount more than once.
@@ -1006,6 +1053,143 @@ TEST_F(CollectionClonerTestResumable, ResumableQueryTwoResumes) {
     ASSERT_EQUALS(7u, stats.documentsCopied);
 }
 
+// Test that the collection cloner uses a project to fetch documents from the upstream
+// node.
+TEST_F(CollectionClonerTestResumable, RecordIdsReplicatedFindProjects) {
+    // Set up data for preliminary stages
+    setMockServerReplies(BSON("size" << 10),
+                         createCountResponse(2),
+                         createCursorResponse(_nss.ns_forTest(), BSON_ARRAY(_idIndexSpec)));
+
+    // Set up documents to be returned from upstream node. Unfortunately, because the
+    // documents are not really stored in a storage engine on the mock server, they don't
+    // have recordIds associated with them and therefore the CollectionCloner's projection to
+    // return recordIds doesn't work.
+    // However, the document projection still works. Therefore the returned documents
+    // are of the form {d: <original document>}.
+    _mockServer->insert(_nss, BSON("_id" << 1));
+    _mockServer->insert(_nss, BSON("_id" << 2));
+    _mockServer->insert(_nss, BSON("_id" << 3));
+
+    auto collClonerBeforeFailPoint = globalFailPointRegistry().find("hangBeforeClonerStage");
+    auto timesEntered = collClonerBeforeFailPoint->setMode(
+        FailPoint::alwaysOn,
+        0,
+        fromjson("{cloner: 'CollectionCloner', stage: 'query', nss: '" + _nss.ns_forTest() + "'}"));
+
+    // Create a cloner that tries to replicate recordIds.
+    CollectionOptions options;
+    options.recordIdsReplicated = true;
+    auto cloner = makeCollectionCloner(options);
+    // Get multiple batches.
+    cloner->setBatchSize_forTest(1);
+
+    // Run the cloner in a separate thread.
+    stdx::thread clonerThread([&] {
+        Client::initThread("ClonnerRunner", getGlobalServiceContext()->getService());
+        ASSERT_OK(cloner->run());
+    });
+
+    // Wait for the failpoint to be reached
+    collClonerBeforeFailPoint->waitForTimesEntered(timesEntered + 1);
+
+    // Intercept the loader's attempt to insert documents.
+    ASSERT(_loader != nullptr);
+    _loader->insertDocsFn = [](const std::vector<BSONObj>::const_iterator begin,
+                               const std::vector<BSONObj>::const_iterator end,
+                               CollectionBulkLoader::ParseRecordIdAndDocFunc fn) {
+        for (auto iter = begin; iter != end; iter++) {
+            LOGV2(8613800, "Processing projected document", "doc"_attr = *iter);
+            ASSERT(iter->nFields() == 1);
+            ASSERT(iter->hasField("d"));
+        }
+
+        // Assert that the correct parsing function was passed in, i.e. a function
+        // that can parse documents of the form {r: <long recordId>, d: <original document>}.
+        auto testDoc = BSON("r" << 10LL << "d" << BSON("_id" << 42));
+        const auto& [rid, doc] = fn(testDoc);
+        ASSERT_EQUALS(rid, RecordId(10));
+        ASSERT_EQUALS(doc.woCompare(BSON("_id" << 42)), 0);
+
+        return Status::OK();
+    };
+
+    collClonerBeforeFailPoint->setMode(FailPoint::off, 0);
+    clonerThread.join();
+
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(3u, stats.receivedBatches);
+}
+
+class CollectionClonerMultitenancyTest : public CollectionClonerTestResumable {
+public:
+    CollectionClonerMultitenancyTest()
+        : _nss(NamespaceString::createNamespaceString_forTest(TenantId(OID::gen()), kTestNs)) {}
+
+protected:
+    void setUp() final {
+        RAIIServerParameterControllerForTest multitenancySupportController("multitenancySupport",
+                                                                           true);
+        CollectionClonerTestResumable::setUp();
+    }
+
+    std::unique_ptr<CollectionCloner> makeCollectionCloner(
+        CollectionOptions options = CollectionOptions()) {
+        options.uuid = _collUuid;
+        _options = options;
+        return std::make_unique<CollectionCloner>(_nss,
+                                                  options,
+                                                  getSharedData(),
+                                                  _source,
+                                                  _mockClient.get(),
+                                                  &_storageInterface,
+                                                  _dbWorkThreadPool.get());
+    }
+
+    NamespaceString _nss;
+};
+
+TEST_F(CollectionClonerMultitenancyTest, CollectionClonerMultitenancy) {
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRequireTenantID", true);
+
+    auto cloner = makeCollectionCloner();
+    cloner->setBatchSize_forTest(1);
+
+    int numOperations = 2;
+
+    // Set up responses to be returned from upstream node.
+    setMockServerReplies(
+        BSON("size" << 10),
+        createCountResponse(numOperations),
+        createCursorResponse(
+            _nss.ns_forTest(),
+            BSON_ARRAY(_secondaryIndexSpecs[0] << _idIndexSpec << _secondaryIndexSpecs[1])));
+
+    // Set up documents to be returned from upstream node.
+    for (int i = 0; i < numOperations; ++i) {
+        _mockServer->insert(_nss, BSON("_id" << i));
+    }
+
+    ASSERT_OK(cloner->run());
+
+    // Check the count stage correctly updated the number of documents to copy.
+    ASSERT_EQ(numOperations, cloner->getStats().documentToCopy);
+
+    // Check the listIndexes stage correctly found the indexes to copy.
+    ASSERT_BSONOBJ_EQ(_idIndexSpec, getIdIndexSpec(cloner.get()));
+    ASSERT_EQ(_secondaryIndexSpecs.size(), getIndexSpecs(cloner.get()).size());
+    ASSERT_BSONOBJ_EQ(_secondaryIndexSpecs[0], getIndexSpecs(cloner.get())[0]);
+    ASSERT_BSONOBJ_EQ(_secondaryIndexSpecs[1], getIndexSpecs(cloner.get())[1]);
+    // Account for the _id index as well
+    ASSERT_EQ(_secondaryIndexSpecs.size() + 1, cloner->getStats().indexes);
+
+    // Check the documents to copy were inserted correctly.
+    ASSERT_EQUALS(numOperations, _collectionStats->insertCount);
+    ASSERT_TRUE(_collectionStats->commitCalled);
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(2u, stats.receivedBatches);
+    ASSERT_EQ(numOperations, cloner->getStats().documentsCopied);
+}
 
 }  // namespace repl
 }  // namespace mongo

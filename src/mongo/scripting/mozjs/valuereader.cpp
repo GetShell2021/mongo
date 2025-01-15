@@ -28,24 +28,49 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/scripting/mozjs/valuereader.h"
-
 #include <cmath>
 #include <cstdio>
+#include <iosfwd>
 #include <js/Array.h>
 #include <js/CharacterEncoding.h>
 #include <js/Date.h>
+#include <js/GCVector.h>
 #include <js/Object.h>
+#include <js/String.h>
+#include <js/Utility.h>
+#include <js/Value.h>
 #include <js/ValueArray.h>
+#include <jscustomallocator.h>
+#include <mozilla/UniquePtr.h>
+
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/scripting/mozjs/bindata.h"
+#include "mongo/scripting/mozjs/bson.h"
+#include "mongo/scripting/mozjs/code.h"
+#include "mongo/scripting/mozjs/dbpointer.h"
+#include "mongo/scripting/mozjs/dbref.h"
 #include "mongo/scripting/mozjs/implscope.h"
-#include "mongo/scripting/mozjs/objectwrapper.h"
+#include "mongo/scripting/mozjs/maxkey.h"
+#include "mongo/scripting/mozjs/minkey.h"
+#include "mongo/scripting/mozjs/numberdecimal.h"
+#include "mongo/scripting/mozjs/numberlong.h"
+#include "mongo/scripting/mozjs/oid.h"
+#include "mongo/scripting/mozjs/regexp.h"
+#include "mongo/scripting/mozjs/timestamp.h"
+#include "mongo/scripting/mozjs/valuereader.h"
+#include "mongo/scripting/mozjs/wraptype.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -156,7 +181,7 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
             JS::RootedValueArray<2> args(_context);
 
             ValueReader(_context, args[0])
-                .fromDouble(elem.timestampTime().toMillisSinceEpoch() / 1000);
+                .fromDouble(static_cast<double>(elem.timestampTime().toMillisSinceEpoch()) / 1000);
             ValueReader(_context, args[1]).fromDouble(elem.timestampInc());
 
             scope->getProto<TimestampInfo>().newInstance(args, _value);
@@ -166,7 +191,9 @@ void ValueReader::fromBSONElement(const BSONElement& elem, const BSONObj& parent
         case mongo::NumberLong: {
             JS::RootedObject thisv(_context);
             scope->getProto<NumberLongInfo>().newObject(&thisv);
-            JS::SetPrivate(thisv, scope->trackedNew<int64_t>(elem.numberLong()));
+            JS::SetReservedSlot(thisv,
+                                NumberLongInfo::Int64Slot,
+                                JS::PrivateValue(scope->trackedNew<int64_t>(elem.numberLong())));
             _value.setObjectOrNull(thisv);
             return;
         }
@@ -233,7 +260,7 @@ void ValueReader::fromBSON(const BSONObj& obj, const BSONObj* parent, bool readO
 void ValueReader::fromBSONArray(const BSONObj& obj, const BSONObj* parent, bool readOnly) {
     JS::RootedValueVector avv(_context);
 
-    BSONForEach(elem, obj) {
+    for (auto&& elem : obj) {
         JS::RootedValue member(_context);
 
         ValueReader(_context, &member).fromBSONElement(elem, parent ? *parent : obj, readOnly);
@@ -311,7 +338,8 @@ void ValueReader::fromInt64(int64_t i) {
     auto scope = getScope(_context);
     JS::RootedObject num(_context);
     scope->getProto<NumberLongInfo>().newObject(&num);
-    JS::SetPrivate(num, scope->trackedNew<int64_t>(i));
+    JS::SetReservedSlot(
+        num, NumberLongInfo::Int64Slot, JS::PrivateValue(scope->trackedNew<int64_t>(i)));
     _value.setObjectOrNull(num);
 }
 

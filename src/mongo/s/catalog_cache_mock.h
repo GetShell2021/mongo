@@ -29,8 +29,18 @@
 
 #pragma once
 
+#include <memory>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/catalog_cache_loader_mock.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/config_server_catalog_cache_loader_mock.h"
 
 namespace mongo {
 
@@ -43,22 +53,75 @@ class CatalogCacheMock final : public CatalogCache {
     CatalogCacheMock& operator=(const CatalogCacheMock&) = delete;
 
 public:
-    CatalogCacheMock(ServiceContext* context, CatalogCacheLoaderMock& loader);
-    ~CatalogCacheMock() = default;
+    CatalogCacheMock(ServiceContext* context, std::shared_ptr<CatalogCacheLoader> loader);
+    ~CatalogCacheMock() override = default;
 
-    StatusWith<ChunkManager> getCollectionRoutingInfo(OperationContext* opCtx,
-                                                      const NamespaceString& nss,
-                                                      bool allowLocks) override;
+    StatusWith<CachedDatabaseInfo> getDatabase(OperationContext* opCtx,
+                                               const DatabaseName& dbName) override;
 
-    void setChunkManagerReturnValue(StatusWith<ChunkManager> statusWithChunks);
-    void clearChunkManagerReturnValue();
+    StatusWith<CollectionRoutingInfo> getCollectionRoutingInfo(OperationContext* opCtx,
+                                                               const NamespaceString& nss,
+                                                               bool allowLocks) override;
+
+    StatusWith<ChunkManager> getCollectionPlacementInfoWithRefresh(
+        OperationContext* opCtx, const NamespaceString& nss) override;
+
+    void setDatabaseReturnValue(const DatabaseName& dbName, CachedDatabaseInfo databaseInfo);
+
+    void setCollectionReturnValue(const NamespaceString& nss, CollectionRoutingInfo chunkManager);
+
+    void advanceCollectionTimeInStore(const NamespaceString& nss,
+                                      const ChunkVersion& newVersionInStore) override;
 
     static std::unique_ptr<CatalogCacheMock> make();
 
     static const Status kChunkManagerInternalErrorStatus;
 
+    static CollectionRoutingInfo makeCollectionRoutingInfoUntracked(const NamespaceString& nss,
+                                                                    const ShardId& dbPrimaryShard,
+                                                                    DatabaseVersion dbVersion);
+    struct ExtraCollectionOptions {
+        boost::optional<TimeseriesOptions> timeseriesOptions;
+    };
+
+    struct Chunk {
+        ChunkRange range;
+        ShardId shard;
+    };
+
+    static CollectionRoutingInfo makeCollectionRoutingInfoUnsplittable(
+        const NamespaceString& nss,
+        const ShardId& dbPrimaryShard,
+        DatabaseVersion dbVersion,
+        const ShardId& dataShard,
+        ExtraCollectionOptions extraOptions = {});
+
+    static CollectionRoutingInfo makeCollectionRoutingInfoSharded(
+        const NamespaceString& nss,
+        const ShardId& dbPrimaryShard,
+        DatabaseVersion dbVersion,
+        KeyPattern shardKeyPattern,
+        std::vector<Chunk> chunks,
+        ExtraCollectionOptions extraOptions = {});
+
+    static CachedDatabaseInfo makeDatabaseInfo(const DatabaseName& dbName,
+                                               const ShardId& dbPrimaryShard,
+                                               const DatabaseVersion& dbVersion);
+
+    stdx::unordered_map<NamespaceString, ChunkVersion> lastNotifiedTimeInStore;
+
 private:
-    StatusWith<ChunkManager> _swChunkManagerReturnValue{kChunkManagerInternalErrorStatus};
+    stdx::unordered_map<DatabaseName, CachedDatabaseInfo> _dbCache;
+    stdx::unordered_map<NamespaceString, CollectionRoutingInfo> _collectionCache;
+
+    static CollectionRoutingInfo _makeCollectionRoutingInfoTracked(
+        const NamespaceString& nss,
+        const ShardId& dbPrimaryShard,
+        DatabaseVersion dbVersion,
+        KeyPattern shardKeyPattern,
+        std::vector<Chunk> chunks,
+        bool unsplittable,
+        ExtraCollectionOptions extraOptions = {});
 };
 
 }  // namespace mongo

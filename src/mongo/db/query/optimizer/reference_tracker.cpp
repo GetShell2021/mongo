@@ -27,20 +27,54 @@
  *    it in the license file.
  */
 
-#include <iostream>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/query/optimizer/cascades/memo.h"
+#include <absl/meta/type_traits.h>
+
+#include "mongo/db/query/optimizer/algebra/operator.h"
+#include "mongo/db/query/optimizer/containers.h"
 #include "mongo/db/query/optimizer/reference_tracker.h"
+#include "mongo/db/query/optimizer/strong_alias.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
 
 namespace mongo::optimizer {
 
-struct CollectedInfo {
-    using VarRefsMap = opt::unordered_map<std::string, opt::unordered_map<const Variable*, bool>>;
+/**
+ * A Variable is 'resolved' when it is associated with a Definition.
+ */
+struct ResolvedVariable {
+    const Variable* var;
+    const Definition def;
+};
 
+/**
+ * While analyzing an ABT tree via the Collector transport class, there is a need
+ * for state that is 'global' for the duration of the analysis and is accessible to
+ * all Collector::transport methods. This class represents such a state.
+ * Notice:
+ * This is a struct instead of simple 'using' because at least one more future task
+ * will add more state to it - namely, SERVER-80954.
+ */
+struct CollectorState {
     /**
-     * All resolved variables so far, regardless of visibility in the ABT.
+     * All resolved variables, regardless of visibility in the ABT.
      */
-    opt::unordered_map<const Variable*, Definition> useMap;
+    std::unique_ptr<ResolvedVariablesMap> resolvedVariablesMap;
+};
+
+/**
+ * Information collected by each Collector::transport method for each ABT node in a tree.
+ * The Collector passes the CollectedInfo of a node's children to the parent's node
+ * transport method, where the child/children CollectedInfo is typically merged into
+ * the parent's CollectedInfo.
+ */
+struct CollectedInfo {
+    CollectedInfo(CollectorState& collr) : collector(collr){};
+
+    using VarRefsMap = ProjectionNameMap<opt::unordered_map<const Variable*, bool>>;
 
     /**
      * Current definitions available for use in ancestor nodes (projections).
@@ -50,44 +84,37 @@ struct CollectedInfo {
     /**
      * All free variables (i.e. so far not resolved) seen so far, regardless of visibility in the
      * ABT. Maps from projection name to all Variable instances referencing that name. Variables
-     * move from 'freeVars' to 'useMap' when they are resolved.
+     * move from 'freeVars' to 'Collector::resolvedVariables' when they are resolved.
      */
-    opt::unordered_map<std::string, std::vector<std::reference_wrapper<const Variable>>> freeVars;
+    ProjectionNameMap<std::vector<std::reference_wrapper<const Variable>>> freeVars;
 
     /**
-     * Maps from a node to the definitions (projections) available for use in its ancestor nodes.
+     * The collector transport class stores global information that is updated by some
+     * CollectedInfo methods. Hence we need a pointer to the collector.
      */
-    opt::unordered_map<const Node*, DefinitionsMap> nodeDefs;
-
-    /**
-     * Support for tracking last local variable reference. A Variable moves from 'varLastRefs' to
-     * 'lastRefs' while building the environment when we are sure it is a last reference.
-     */
-    VarRefsMap varLastRefs;
-    opt::unordered_set<const Variable*> lastRefs;
+    CollectorState& collector;
 
     /**
      * This is a destructive merge, the 'other' will be siphoned out.
      */
+    template <bool resolveFreeVarsWithOther = true>
     void merge(CollectedInfo&& other) {
-        // Incoming (other) info has some definitions. So let's try to resolve our free variables.
-        if (!other.defs.empty() && !freeVars.empty()) {
-            for (auto&& [name, def] : other.defs) {
-                resolveFreeVars(name, def);
+        if constexpr (resolveFreeVarsWithOther) {
+            // Incoming (other) info has some definitions. So let's try to resolve our free
+            // variables.
+            if (!other.defs.empty() && !freeVars.empty()) {
+                for (auto&& [name, def] : other.defs) {
+                    resolveFreeVars(name, def);
+                }
+            }
+
+            // We have some definitions so let try to resolve other's free variables.
+            if (!defs.empty() && !other.freeVars.empty()) {
+                for (auto&& [name, def] : defs) {
+                    other.resolveFreeVars(name, def);
+                }
             }
         }
-
-        // We have some definitions so let try to resolve other's free variables.
-        if (!defs.empty() && !other.freeVars.empty()) {
-            for (auto&& [name, def] : defs) {
-                other.resolveFreeVars(name, def);
-            }
-        }
-
-        // It should be impossible to have duplicate Variable pointer so every Variable should be
-        // moved from other.
-        useMap.merge(other.useMap);
-        tassert(6624024, "Found a duplicate Variable pointer", other.useMap.empty());
 
         // There should not be two projections of the same name propagated up by a single operator,
         // so every definition should be moved from other.
@@ -99,86 +126,6 @@ struct CollectedInfo {
             v.insert(v.end(), vars.begin(), vars.end());
         }
         other.freeVars.clear();
-
-        // It should be impossible to have duplicate Node pointer so every Node should be moved from
-        // other.
-        nodeDefs.merge(other.nodeDefs);
-        tassert(6624026, "Found a duplicate Node pointer", other.nodeDefs.empty());
-
-        // Merge last references.
-        mergeLastRefs(std::move(other.varLastRefs));
-        lastRefs.merge(other.lastRefs);
-        tassert(6624027, "Found a duplicate Variable pointer in lastRefs", other.lastRefs.empty());
-    }
-
-    /**
-     * Merges variable references from 'other' and adjust last references as needed; i.e. it resets
-     * any last ref to false if it appears on both sides.
-     */
-    void mergeLastRefs(VarRefsMap&& other) {
-        mergeLastRefsImpl(std::move(other), false, true);
-    }
-
-    /**
-     * Merges variable references from 'other' but only keeps the last references from 'this'; i.e.
-     * it resets the 'other' side.
-     */
-    void mergeKeepLastRefs(VarRefsMap&& other) {
-        mergeLastRefsImpl(std::move(other), true, false);
-    }
-
-    /**
-     * Merges variable references from 'other' and keeps the last references from both sides.
-     */
-    void unionLastRefs(VarRefsMap&& other) {
-        mergeLastRefsImpl(std::move(other), false, false);
-    }
-
-    void mergeLastRefsImpl(VarRefsMap&& other, bool resetOther, bool resetBoth) {
-        for (auto otherIt = other.begin(), end = other.end(); otherIt != end;) {
-            if (auto localIt = varLastRefs.find(otherIt->first); localIt != varLastRefs.end()) {
-                // This variable is referenced in both sets. If requested, set other's last refs to
-                // false.
-                if (resetOther) {
-                    for (auto& [k, isLastRef] : otherIt->second) {
-                        isLastRef = false;
-                    }
-                }
-
-                // Merge the maps.
-                localIt->second.merge(otherIt->second);
-
-                // This variable is referenced in both sets. If requested, set all last refs for the
-                // variable to false.
-                if (resetBoth) {
-                    for (auto& [k, isLastRef] : localIt->second) {
-                        isLastRef = false;
-                    }
-                }
-                other.erase(otherIt++);
-            } else {
-                ++otherIt;
-            }
-        }
-        varLastRefs.merge(other);
-        tassert(6624098, "varLastRefs must be empty", other.empty());
-    }
-
-    /**
-     * Records collected last variable references for a specific variable. Should only be called
-     * when the variable is guaranteed not to be referenced again in the ABT.
-     */
-    void finalizeLastRefs(const std::string& name) {
-        if (auto it = varLastRefs.find(name); it != varLastRefs.end()) {
-            for (auto& [var, isLastRef] : it->second) {
-                if (isLastRef) {
-                    lastRefs.emplace(var);
-                }
-            }
-
-            // After the finalization the map is not needed anymore.
-            varLastRefs.erase(it);
-        }
     }
 
     /**
@@ -192,7 +139,7 @@ struct CollectedInfo {
 
     /**
      * A special merge asserting that the 'other' has no defined projections. Expressions do not
-     * project anything, only Nodes do.
+     * project anything.
      *
      * We still have to track free variables though.
      */
@@ -220,7 +167,7 @@ struct CollectedInfo {
     void resolveFreeVars(const ProjectionName& name, const Definition& def) {
         if (auto it = freeVars.find(name); it != freeVars.end()) {
             for (const Variable& var : it->second) {
-                useMap.emplace(&var, def);
+                collector.resolvedVariablesMap->emplace(&var, def);
             }
             freeVars.erase(it);
         }
@@ -232,64 +179,59 @@ struct CollectedInfo {
 };
 
 /**
- * Collect all Variables into a set.
+ * Walks over all variables in the ABT and calls a callback for each variable.
  */
-class VariableCollector {
+class VariableTransporter {
 public:
+    VariableTransporter(
+        const std::function<void(const Variable&)>& variableCallback,
+        const std::function<void(const ProjectionName&)>& variableDefinitionCallback)
+        : _variableCallback(variableCallback),
+          _variableDefinitionCallback(variableDefinitionCallback) {}
+
     template <typename T, typename... Ts>
     void transport(const T& /*op*/, Ts&&... /*ts*/) {}
 
     void transport(const Variable& op) {
-        _result._variables.push_back(op);
+        _variableCallback(op);
     }
 
     void transport(const LambdaAbstraction& op, const ABT& /*bind*/) {
-        _result._definedVars.insert(op.varName());
+        _variableDefinitionCallback(op.varName());
     }
 
     void transport(const Let& op, const ABT& /*bind*/, const ABT& /*expr*/) {
-        _result._definedVars.insert(op.varName());
-    }
-
-    static VariableCollectorResult collect(const ABT& n) {
-        VariableCollector collector;
-        collector.collectInternal(n);
-        return std::move(collector._result);
+        _variableDefinitionCallback(op.varName());
     }
 
 private:
-    void collectInternal(const ABT& n) {
-        algebra::transport<false>(n, *this);
-    }
+    // Callback used on each Variable in the ABT.
+    const std::function<void(const Variable&)>& _variableCallback;
 
-    VariableCollectorResult _result;
+    // Callback used on any defined variable name (via a Let or Lambda) in the ABT.
+    const std::function<void(const ProjectionName&)>& _variableDefinitionCallback;
 };
 
 struct Collector {
-    explicit Collector(const cascades::Memo* memo) : _memo(memo) {}
+    explicit Collector() {
+        collectorState.resolvedVariablesMap = std::make_unique<ResolvedVariablesMap>();
+    }
 
     template <typename T, typename... Ts>
     CollectedInfo transport(const ABT&, const T& op, Ts&&... ts) {
         // The default behavior resolves free variables, merges known definitions and propagates
         // them up unmodified.
-        CollectedInfo result{};
+        CollectedInfo result{collectorState};
         (result.merge(std::forward<Ts>(ts)), ...);
-
-        if constexpr (std::is_base_of_v<Node, T>) {
-            result.nodeDefs[&op] = result.defs;
-        }
 
         return result;
     }
 
     CollectedInfo transport(const ABT& n, const Variable& variable) {
-        CollectedInfo result{};
+        CollectedInfo result{collectorState};
 
         // Every variable starts as a free variable until it is resolved.
         result.freeVars[variable.name()].push_back(variable);
-
-        // Similarly, every variable starts as the last reference until proven otherwise.
-        result.varLastRefs[variable.name()].emplace(&variable, true);
 
         return result;
     }
@@ -298,13 +240,7 @@ struct Collector {
                             const Let& let,
                             CollectedInfo bindResult,
                             CollectedInfo inResult) {
-        CollectedInfo result{};
-
-        // The 'in' portion of the Let will execute after the bind, so its last refs should be kept
-        // over the last refs from the bind. Then, its safe to finalize the last ref for the
-        // variable defined by the Let here (we know it can't be referenced elsewhere in the ABT).
-        inResult.mergeKeepLastRefs(std::move(bindResult.varLastRefs));
-        inResult.finalizeLastRefs(let.varName());
+        CollectedInfo result{collectorState};
 
         result.merge(std::move(bindResult));
 
@@ -317,10 +253,7 @@ struct Collector {
     }
 
     CollectedInfo transport(const ABT& n, const LambdaAbstraction& lam, CollectedInfo inResult) {
-        CollectedInfo result{};
-
-        // As in the Let case, we can finalize the last ref for the local variable.
-        inResult.finalizeLastRefs(lam.varName());
+        CollectedInfo result{collectorState};
 
         // Local variables are not part of projections (i.e. we do not track them in defs) so
         // resolve any free variables manually.
@@ -330,355 +263,235 @@ struct Collector {
         return result;
     }
 
-    CollectedInfo transport(const ABT& n,
-                            const If&,
-                            CollectedInfo condResult,
-                            CollectedInfo thenResult,
-                            CollectedInfo elseResult) {
-        CollectedInfo result{};
+    CollectedInfo collect(const ABT& n) {
+        return algebra::transport<true>(n, *this);
+    }
+    /**
+     * The collector transport class stores here global information that is updated by
+     * some CollectedInfo methods. This object is passed to each CollectedInfo, so that
+     * it can update the collectorState.
+     */
+    CollectorState collectorState;
+};
+
+/**
+ * Finds Variable references that are safe to mark moveFrom in SBE. See 'LastRefsSet'.
+ */
+struct LastRefsTransporter {
+    /**
+     * Maps each name that occurs free to the set of its last references.
+     * If a name has one or more free occurrences, but none are last, then the set is empty.
+     * If a name has no free occurrences at all, then there won't be a map entry.
+     *
+     * This distinction is important when combining results from two subtrees.
+     * For example, in 'let a = f(x) in g()', we know that 'x' does not occur in 'g()',
+     * so the 'x' in 'f(x)' is a last reference. On other hand in 'let a = f(x) in g(x, x)',
+     * 'x' does occur in 'g(x, x)', so the one in 'f(x)' is not a last reference--even if we don't
+     * know which use of 'x' in 'g(x, x)' is last.
+     */
+    using Result = ProjectionNameMap<LastRefsSet>;
+
+    explicit LastRefsTransporter(LastRefsSet& lastRefs) : _lastRefs(lastRefs) {}
+
+    /**
+     * Merge results, siphoning out r2 and putting results in r1.
+     *
+     * Variables that only occur on one side have their last-references preserved.
+     * Variables that occur on both sides have their last-references cleared, because we don't know
+     * which side is evaluated last.
+     */
+    static void merge(Result& result, Result& other) {
+        mergeImpl(result, other, false /*resetOther*/, true /*resetBoth*/);
+    }
+
+    /**
+     * Same as merge() but accepts a vector; this allows the generic transport() to handle Result
+     * and vector<Result> uniformly.
+     *
+     * Both of these overloads make no assumptions about evaluation order: if a variable occurs in
+     * more than one Result then all its last-references are cleared.
+     */
+    static void merge(Result& result, std::vector<Result>& others) {
+        for (auto& other : others) {
+            merge(result, other);
+        }
+    }
+
+    /**
+     * Like merge(), but assumes the left-hand side 'result' will be evaluated after 'other'.
+     *
+     * This means when a variable occurs on both sides, its last-references in 'result' can be
+     * preserved.
+     */
+    static void mergeKeepLastRefs(Result& result, Result& other) {
+        mergeImpl(result, other, true /*resetOther*/, false /*resetBoth*/);
+    }
+
+    /**
+     * Merges variable references from 'other' and keeps the last-references from both sides.
+     *
+     * This is appropriate when neither side is evaluated after the other. For example the two
+     * branches of a conditional.
+     */
+    static void unionLastRefs(Result& result, Result& other) {
+        mergeImpl(result, other, false /*resetOther*/, false /*resetBoth*/);
+    }
+
+    /**
+     * Combine all the occurrences from 'result' and 'other' into 'result'.
+     *
+     * The boolean flags control what to do when a variable occurs in both arguments:
+     * - 'resetOther' means preserve the last-references of 'result' but clear the ones in 'other'.
+     * - 'resetBoth' means clear the last-references flags of both 'result' and 'other'.
+     *
+     * If both flags are false then all last-references flags are preserved.
+     */
+    static void mergeImpl(Result& result, Result& other, bool resetOther, bool resetBoth) {
+        for (auto otherIt = other.begin(), end = other.end(); otherIt != end;) {
+            if (auto localIt = result.find(otherIt->first); localIt != result.end()) {
+                // This variable is referenced in both sets.
+
+                // If requested, stop treating occurrences in 'other' as last references.
+                if (resetOther) {
+                    otherIt->second.clear();
+                }
+
+                // Combine the last references from each side.
+                // Each side may contribute zero or more.
+                localIt->second.merge(otherIt->second);
+                other.erase(otherIt++);
+
+                // If requested, stop treating occurrences in the combined set as last references.
+                if (resetBoth) {
+                    localIt->second.clear();
+                }
+            } else {
+                // This variable is only referenced in 'other', so preserve its last-references.
+                // Preserve it by not erasing: we'll combine these not-erased entries at the end.
+                ++otherIt;
+            }
+        }
+        // Combine all the not-erased map entries.
+        result.merge(other);
+    }
+
+    /**
+     * Should be called once we know that we've seen all occurrences of a variable: removes all
+     * information about this variable from 'result', and records the last-references in the global
+     * set '_lastRefs'.
+     */
+    void finalizeLastRefs(Result& result, const ProjectionName& name) {
+        if (auto it = result.find(name); it != result.end()) {
+            _lastRefs.merge(it->second);
+            result.erase(it);
+        }
+    }
+
+    template <typename T>
+    Result transport(const ABT&, const T& op, auto... ts) {
+        Result result{};
+        (merge(result, ts), ...);
+
+        return result;
+    }
+
+    Result transport(const ABT& n, const Variable& variable) {
+        Result result{};
+
+        // Every variable starts as a last reference until proven otherwise.
+        result[variable.name()].emplace(&variable);
+
+        return result;
+    }
+
+    Result transport(const ABT& n, const Let& let, Result bindResult, Result inResult) {
+        // The 'in' portion of the Let will execute after the bind, so its last refs should be kept
+        // over the last refs from the bind. Then, it's safe to finalize the last ref for the
+        // variable defined by the Let here (we know it can't be referenced elsewhere in the ABT).
+        mergeKeepLastRefs(inResult, bindResult);
+        finalizeLastRefs(inResult, let.varName());
+
+        return inResult;
+    }
+
+    Result transport(const ABT& n, const LambdaAbstraction& lam, Result inResult) {
+        // As in the Let case, we can finalize the last ref for the local variable.
+        finalizeLastRefs(inResult, lam.varName());
+
+        return inResult;
+    }
+
+    Result transport(
+        const ABT& n, const If&, Result condResult, Result thenResult, Result elseResult) {
+        Result result{};
 
         // Only one of the 'then' or 'else' will be executed, so it's safe to union the last refs.
         // Since the condition will be executed before either of the then/else, its last refs should
         // be reset if there's a collision.
-        result.unionLastRefs(std::move(thenResult.varLastRefs));
-        result.unionLastRefs(std::move(elseResult.varLastRefs));
-        result.mergeKeepLastRefs(std::move(condResult.varLastRefs));
-
-        result.merge(std::move(condResult));
-        result.merge(std::move(thenResult));
-        result.merge(std::move(elseResult));
+        unionLastRefs(result, thenResult);
+        unionLastRefs(result, elseResult);
+        mergeKeepLastRefs(result, condResult);
 
         return result;
     }
 
-    static CollectedInfo collectForScan(const ABT& n,
-                                        const Node& node,
-                                        const ExpressionBinder& binder,
-                                        CollectedInfo refs) {
-        CollectedInfo result{};
-
-        // 'refs' should just track references to projections from any children of a Scan/Seek.
-        result.mergeNoDefs(std::move(refs));
-
-        for (size_t i = 0; i < binder.names().size(); i++) {
-            result.defs[binder.names()[i]] = Definition{n.ref(), binder.exprs()[i].ref()};
-        }
-        result.nodeDefs[&node] = result.defs;
-
-        return result;
-    }
-
-    CollectedInfo transport(const ABT& n, const ScanNode& node, CollectedInfo /*bindResult*/) {
-        return collectForScan(n, node, node.binder(), {});
-    }
-
-    CollectedInfo transport(const ABT& n, const ValueScanNode& node, CollectedInfo /*bindResult*/) {
-        return collectForScan(n, node, node.binder(), {});
-    }
-
-    CollectedInfo transport(const ABT& n,
-                            const PhysicalScanNode& node,
-                            CollectedInfo /*bindResult*/) {
-        return collectForScan(n, node, node.binder(), {});
-    }
-
-    CollectedInfo transport(const ABT& n, const IndexScanNode& node, CollectedInfo /*bindResult*/) {
-        return collectForScan(n, node, node.binder(), {});
-    }
-
-    CollectedInfo transport(const ABT& n,
-                            const SeekNode& node,
-                            CollectedInfo /*bindResult*/,
-                            CollectedInfo refResult) {
-        return collectForScan(n, node, node.binder(), std::move(refResult));
-    }
-
-    CollectedInfo transport(const ABT& n,
-                            const MemoLogicalDelegatorNode& memoLogicalDelegatorNode) {
-        CollectedInfo result{};
-
-        tassert(6624029, "Uninitialized memo", _memo);
-
-        auto& group = _memo->getGroup(memoLogicalDelegatorNode.getGroupId());
-
-        auto& projectionNames = group.binder().names();
-        auto& projections = group.binder().exprs();
-        for (size_t i = 0; i < projectionNames.size(); i++) {
-            result.defs[projectionNames.at(i)] = Definition{n.ref(), projections[i].ref()};
-        }
-
-        result.nodeDefs[&memoLogicalDelegatorNode] = result.defs;
-
-        return result;
-    }
-
-    CollectedInfo transport(const ABT& n,
-                            const EvaluationNode& evaluationNode,
-                            CollectedInfo childResult,
-                            CollectedInfo exprResult) {
-        CollectedInfo result{};
-
-        tassert(6624030,
-                str::stream() << "Cannot overwrite project " << evaluationNode.getProjectionName(),
-                childResult.defs.count(evaluationNode.getProjectionName()) == 0);
-
-        result.merge(std::move(childResult));
-        result.mergeNoDefs(std::move(exprResult));
-
-        // Make the definition available upstream.
-        result.defs[evaluationNode.getProjectionName()] =
-            Definition{n.ref(), evaluationNode.getProjection().ref()};
-
-        result.nodeDefs[&evaluationNode] = result.defs;
-
-        return result;
-    }
-
-    CollectedInfo transport(const ABT& n,
-                            const SargableNode& node,
-                            CollectedInfo childResult,
-                            CollectedInfo bindResult,
-                            CollectedInfo /*refResult*/) {
-        CollectedInfo result{};
-
-        result.merge(std::move(childResult));
-        result.mergeNoDefs(std::move(bindResult));
-
-        const auto& projectionNames = node.binder().names();
-        const auto& projections = node.binder().exprs();
-        for (size_t i = 0; i < projectionNames.size(); i++) {
-            result.defs[projectionNames.at(i)] = Definition{n.ref(), projections[i].ref()};
-        }
-
-        result.nodeDefs[&node] = result.defs;
-
-        return result;
-    }
-
-    CollectedInfo transport(const ABT& n,
-                            const RIDIntersectNode& node,
-                            CollectedInfo leftChildResult,
-                            CollectedInfo rightChildResult) {
-        CollectedInfo result{};
-
-        // This is a special case where both children of 'node' have a definition for the scan
-        // projection. Remove the definition from one side to avoid running into the conflict of two
-        // projections with the same name during the merge step below.
-        rightChildResult.defs.erase(node.getScanProjectionName());
-
-        result.merge(std::move(leftChildResult));
-        result.merge(std::move(rightChildResult));
-
-        result.nodeDefs[&node] = result.defs;
-
-        return result;
-    }
-
-    CollectedInfo transport(const ABT& n,
-                            const BinaryJoinNode& binaryJoinNode,
-                            CollectedInfo leftChildResult,
-                            CollectedInfo rightChildResult,
-                            CollectedInfo filterResult) {
-        CollectedInfo result{};
-
-        const ProjectionNameSet& correlatedProjNames =
-            binaryJoinNode.getCorrelatedProjectionNames();
-        {
-            const ProjectionNameSet& leftProjections = leftChildResult.getProjections();
-            for (const ProjectionName& boundProjectionName : correlatedProjNames) {
-                tassert(6624099,
-                        "Correlated projections must exist in left child.",
-                        leftProjections.find(boundProjectionName) != leftProjections.cend());
-            }
-        }
-
-        // The correlated projections will be resolved automatically by the merging. We need to
-        // propagate the right child projections here, since these may be useful to ancestor ndoes.
-        result.merge(std::move(leftChildResult));
-        result.merge(std::move(rightChildResult));
-        result.mergeNoDefs(std::move(filterResult));
-
-        result.nodeDefs[&binaryJoinNode] = result.defs;
-
-        return result;
-    }
-
-    CollectedInfo transport(const ABT& n,
-                            const UnionNode& unionNode,
-                            std::vector<CollectedInfo> childResults,
-                            CollectedInfo bindResult,
-                            CollectedInfo refsResult) {
-        CollectedInfo result{};
-
-        const auto& names = unionNode.binder().names();
-
-        refsResult.assertEmptyDefs();
-
-        // Merge children but disregard any defined projections.
-        // Note that refsResult follows the structure as built by buildUnionReferences, meaning
-        // it contains a free variable for each name for each child of the union and no other info.
-        size_t counter = 0;
-        for (auto& u : childResults) {
-            // Manually copy and resolve references of specific child. We do this manually because
-            // each Variable must be resolved by the appropriate child's definition.
-            for (const auto& name : names) {
-                tassert(6624031, "Union projection does not exist", u.defs.count(name) != 0);
-                u.useMap.emplace(&refsResult.freeVars[name][counter].get(), u.defs[name]);
-            }
-            u.defs.clear();
-            result.merge(std::move(u));
-            ++counter;
-        }
-
-        result.mergeNoDefs(std::move(bindResult));
-
-        // Propagate union projections. Note that these are the only defs propagated, since we clear
-        // the child defs before merging above.
-        const auto& defs = unionNode.binder().exprs();
-        for (size_t idx = 0; idx < names.size(); ++idx) {
-            result.defs[names[idx]] = Definition{n.ref(), defs[idx].ref()};
-        }
-
-        result.nodeDefs[&unionNode] = result.defs;
-
-        return result;
-    }
-
-    CollectedInfo transport(const ABT& n,
-                            const GroupByNode& groupNode,
-                            CollectedInfo childResult,
-                            CollectedInfo bindAggResult,
-                            CollectedInfo refsAggResult,
-                            CollectedInfo bindGbResult,
-                            CollectedInfo refsGbResult) {
-        CollectedInfo result{};
-
-        // First resolve all variables from the inside point of view; i.e. agg expressions and group
-        // by expressions reference variables from the input child.
-        result.merge(std::move(refsAggResult));
-        result.merge(std::move(refsGbResult));
-        // Make a copy of 'childResult' as we need it later and 'merge' is destructive.
-        result.merge(CollectedInfo{childResult});
-
-        // GroupBy completely masks projected variables; i.e. outside expressions cannot reach
-        // inside the groupby. We will create a brand new set of projections from aggs and gbs here.
-        result.defs.clear();
-
-        const auto& aggs = groupNode.getAggregationProjectionNames();
-        const auto& gbs = groupNode.getGroupByProjectionNames();
-        for (size_t idx = 0; idx < aggs.size(); ++idx) {
-            tassert(6624032,
-                    "Aggregation overwrites a child projection",
-                    childResult.defs.count(aggs[idx]) == 0);
-            result.defs[aggs[idx]] =
-                Definition{n.ref(), groupNode.getAggregationProjections()[idx].ref()};
-        }
-
-        for (size_t idx = 0; idx < gbs.size(); ++idx) {
-            tassert(6624033,
-                    "Group-by projection does not exist",
-                    childResult.defs.count(gbs[idx]) != 0);
-            result.defs[gbs[idx]] =
-                Definition{n.ref(), groupNode.getGroupByProjections()[idx].ref()};
-        }
-
-        result.mergeNoDefs(std::move(bindAggResult));
-        result.mergeNoDefs(std::move(bindGbResult));
-
-        result.nodeDefs[&groupNode] = result.defs;
-
-        return result;
-    }
-
-    CollectedInfo transport(const ABT& n,
-                            const UnwindNode& unwindNode,
-                            CollectedInfo childResult,
-                            CollectedInfo bindResult,
-                            CollectedInfo refsResult) {
-        CollectedInfo result{};
-
-        // First resolve all variables from the inside point of view.
-        result.merge(std::move(refsResult));
-        result.merge(std::move(childResult));
-
-        const auto& name = unwindNode.getProjectionName();
-        tassert(6624034, "Unwind projection does not exist", result.defs.count(name) != 0);
-
-        // Redefine unwind projection.
-        result.defs[name] = Definition{n.ref(), unwindNode.getProjection().ref()};
-        // Define unwind PID.
-        result.defs[unwindNode.getPIDProjectionName()] =
-            Definition{n.ref(), unwindNode.getPIDProjection().ref()};
-
-        result.mergeNoDefs(std::move(bindResult));
-
-        result.nodeDefs[&unwindNode] = result.defs;
-
-        return result;
-    }
-
-    CollectedInfo collect(const ABT& n) {
-        return algebra::transport<true>(n, *this);
+    void collect(const ABT& n) {
+        algebra::transport<true>(n, *this);
     }
 
 private:
-    const cascades::Memo* _memo;
+    /**
+     * The set of Variable occurrences that are safe to move from.
+     *
+     * We only add to this map once a variable is resolved, because that's when we know we've seen
+     * all of its uses.
+     */
+    LastRefsSet& _lastRefs;
 };
 
-VariableEnvironment VariableEnvironment::build(const ABT& root, const cascades::Memo* memo) {
-    Collector c(memo);
+VariableEnvironment VariableEnvironment::build(const ABT& root, bool computeLastRefs) {
+    Collector c;
     auto info = std::make_unique<CollectedInfo>(c.collect(root));
 
-    return VariableEnvironment{std::move(info), memo};
+    boost::optional<LastRefsSet> lastRefs;
+    if (computeLastRefs) {
+        lastRefs.emplace();
+        LastRefsTransporter lrt(*lastRefs);
+        lrt.collect(root);
+    }
+
+    return VariableEnvironment{
+        std::move(info), std::move(lastRefs), std::move(c.collectorState.resolvedVariablesMap)};
 }
 
 void VariableEnvironment::rebuild(const ABT& root) {
-    _info = std::make_unique<CollectedInfo>(Collector{_memo}.collect(root));
+    Collector c;
+    _info = std::make_unique<CollectedInfo>(c.collect(root));
+
+    if (_lastRefs) {
+        _lastRefs->clear();
+        LastRefsTransporter lrt(*_lastRefs);
+        lrt.collect(root);
+    }
+
+    // Reset the Variable map to the newly computed one.
+    _resolvedVariablesMap = std::move(c.collectorState.resolvedVariablesMap);
 }
 
 VariableEnvironment::VariableEnvironment(std::unique_ptr<CollectedInfo> info,
-                                         const cascades::Memo* memo)
-    : _info(std::move(info)), _memo(memo) {}
+                                         boost::optional<LastRefsSet> lastRefs,
+                                         std::unique_ptr<ResolvedVariablesMap> resVarMap)
+    : _info(std::move(info)),
+      _lastRefs(std::move(lastRefs)),
+      _resolvedVariablesMap(std::move(resVarMap)) {}
 
 VariableEnvironment::~VariableEnvironment() {}
 
 Definition VariableEnvironment::getDefinition(const Variable& var) const {
-    auto it = _info->useMap.find(&var);
-    if (it == _info->useMap.end()) {
-        return Definition();
+    if (auto it = _resolvedVariablesMap->find(&var); it != _resolvedVariablesMap->cend()) {
+        return it->second;
     }
-
-    return it->second;
-}
-
-const DefinitionsMap& VariableEnvironment::getDefinitions(const Node& node) const {
-    auto it = _info->nodeDefs.find(&node);
-    tassert(6624035, "No definitions found for node", it != _info->nodeDefs.end());
-
-    return it->second;
-}
-
-bool VariableEnvironment::hasDefinitions(const Node& node) const {
-    return _info->nodeDefs.find(&node) != _info->nodeDefs.cend();
-}
-
-ProjectionNameSet VariableEnvironment::getProjections(const Node& node) const {
-    return CollectedInfo::getProjections(getDefinitions(node));
-}
-
-ProjectionNameSet VariableEnvironment::getProjections(ABT::reference_type node) const {
-    tassert(6199000, "Invalid node type", node.is<Node>());
-    return CollectedInfo::getProjections(getDefinitions(*node.cast<Node>()));
-}
-
-const DefinitionsMap& VariableEnvironment::getDefinitions(ABT::reference_type node) const {
-    tassert(6624036, "Invalid node type", node.is<Node>());
-    return getDefinitions(*node.cast<Node>());
-}
-
-bool VariableEnvironment::hasDefinitions(ABT::reference_type node) const {
-    tassert(6624037, "Invalid node type", node.is<Node>());
-    return hasDefinitions(*node.cast<Node>());
+    return {};
 }
 
 ProjectionNameSet VariableEnvironment::topLevelProjections() const {
@@ -689,7 +502,15 @@ bool VariableEnvironment::hasFreeVariables() const {
     return !_info->freeVars.empty();
 }
 
-size_t VariableEnvironment::freeOccurences(const std::string& variable) const {
+ProjectionNameSet VariableEnvironment::freeVariableNames() const {
+    ProjectionNameSet freeVarNames;
+    for (auto&& [name, vars] : _info->freeVars) {
+        freeVarNames.insert(name);
+    }
+    return freeVarNames;
+}
+
+size_t VariableEnvironment::freeOccurences(const ProjectionName& variable) const {
     auto it = _info->freeVars.find(variable);
     if (it == _info->freeVars.end()) {
         return 0;
@@ -699,11 +520,16 @@ size_t VariableEnvironment::freeOccurences(const std::string& variable) const {
 }
 
 bool VariableEnvironment::isLastRef(const Variable& var) const {
-    return _info->lastRefs.count(&var) > 0;
+    return _lastRefs && _lastRefs->contains(&var);
 }
 
-VariableCollectorResult VariableEnvironment::getVariables(const ABT& n) {
-    return VariableCollector::collect(n);
+void VariableEnvironment::walkVariables(
+    const ABT& n,
+    const std::function<void(const Variable&)>& variableCallback,
+    const std::function<void(const ProjectionName&)>& variableDefinitionCallback) {
+    VariableTransporter transporter(variableCallback, variableDefinitionCallback);
+    algebra::transport<false>(n, transporter);
 }
+
 
 }  // namespace mongo::optimizer

@@ -1,11 +1,11 @@
 // Tests the replSetStepUp command.
 
-load("jstests/replsets/rslib.js");
-load('jstests/replsets/libs/election_metrics.js');
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {
+    verifyServerStatusElectionReasonCounterChange
+} from "jstests/replsets/libs/election_metrics.js";
 
-(function() {
-"use strict";
 var name = "stepup";
 var rst = new ReplSetTest({name: name, nodes: 2});
 
@@ -40,6 +40,7 @@ assert.commandWorked(primary.getDB("test").bar.insert({x: 3}, {writeConcern: {w:
 // Step up the secondary. Retry since the old primary may step down when we try to ask for its
 // vote.
 let numStepUpCmds = 0;
+rst.awaitReplication();
 assert.soonNoExcept(function() {
     numStepUpCmds++;
     return secondary.adminCommand({replSetStepUp: 1}).ok;
@@ -74,4 +75,3 @@ verifyServerStatusElectionReasonCounterChange(
     initialSecondaryStatus.electionMetrics, newSecondaryStatus.electionMetrics, "freezeTimeout", 0);
 
 rst.stopSet();
-})();

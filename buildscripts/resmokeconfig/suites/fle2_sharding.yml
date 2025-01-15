@@ -1,23 +1,26 @@
 test_kind: js_test
 selector:
   roots:
-  - jstests/fle2/*.js
-  - src/mongo/db/modules/*/jstests/fle2/*.js
-  - src/mongo/db/modules/*/jstests/fle2/query/*.js
-
+    - jstests/fle2/*.js
+    - src/mongo/db/modules/*/jstests/fle2/**/*.js
+  exclude_with_any_tags:
+    # Don't run tests that require the encrypted collscan mode in this suite.
+    - requires_fle2_encrypted_collscan
+    - fle2_no_mongos
+    - requires_2_or_more_shards
 executor:
   archive:
     hooks:
       - CheckReplDBHash
+      - CheckMetadataConsistencyInBackground
       - ValidateCollections
-  config:
-    shell_options:
-      eval: "testingReplication = false; testingFLESharding = true;"
   hooks:
-  - class: CheckReplDBHash
-  - class: ValidateCollections
-  - class: CleanEveryN
-    n: 20
+    - class: CheckReplDBHash
+    - class: CheckMetadataConsistencyInBackground
+    - class: ValidateCollections
+    - class: CheckOrphansDeleted
+    - class: CleanEveryN
+      n: 20
   fixture:
     class: ShardedClusterFixture
     mongos_options:
@@ -27,5 +30,3 @@ executor:
       set_parameters:
         enableTestCommands: 1
     num_rs_nodes_per_shard: 2
-    enable_sharding:
-    - test

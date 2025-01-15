@@ -1,10 +1,7 @@
 // Tests for the $merge stage with whenMatched: "replace" and whenNotMatched: "insert".
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/merge_helpers.js");  // For dropWithoutImplicitRecreate.
-load("jstests/aggregation/extras/utils.js");          // For assertErrorCode.
-load("jstests/libs/fixture_helpers.js");              // For FixtureHelpers.isMongos.
+import {dropWithoutImplicitRecreate} from "jstests/aggregation/extras/merge_helpers.js";
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const coll = db.merge_replace_insert;
 const outColl = db.merge_replace_insert_out;
@@ -108,7 +105,7 @@ assert.neq(null, outResult[1]._id, errmsgFn);
 
 // Test that $merge with a missing non-id "on" field fails.
 dropWithoutImplicitRecreate(outColl.getName());
-assert.commandWorked(outColl.createIndex({missing: 1}, {unique: true}));
+assert.commandWorked(outColl.createIndex({missing: 1}, {unique: true, sparse: true}));
 assertErrorCode(
     coll,
     [{
@@ -153,7 +150,7 @@ assertErrorCode(coll,
                         }
                     }
                 ],
-                51132);
+                [51132, 51185]);
 
 coll.drop();
 assert.commandWorked(coll.insert({_id: 0, a: [{b: 1}]}));
@@ -169,7 +166,7 @@ assertErrorCode(coll,
                         }
                     }
                 ],
-                51132);
+                [51132, 51185]);
 
 // Tests for $merge to a database that differs from the aggregation database.
 const foreignDb = db.getSiblingDB("merge_replace_insert_foreign");
@@ -211,4 +208,3 @@ const newDocuments = [{_id: 0, newField: 1}, {_id: 1}];
 assert.commandWorked(coll.insert(newDocuments));
 coll.aggregate(pipelineDifferentOutputDb);
 assert.eq(foreignDb[foreignTargetCollName].find().sort({_id: 1}).toArray(), newDocuments);
-}());

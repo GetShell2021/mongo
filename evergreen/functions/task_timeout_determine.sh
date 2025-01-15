@@ -25,13 +25,27 @@ if [[ -n "${burn_in_bypass}" ]]; then
   build_variant_for_timeout=${burn_in_bypass}
 fi
 
+if [[ -n "${alias}" ]]; then
+  evg_alias=${alias}
+else
+  evg_alias="evg-alias-absent"
+fi
+
+resmoke_test_flags=""
+if [[ -n "${test_flags}" ]]; then
+  resmoke_test_flags="--test-flags='${test_flags}'"
+fi
+
 activate_venv
-PATH=$PATH:$HOME:/ $python buildscripts/evergreen_task_timeout.py $timeout_factor \
+PATH=$PATH:$HOME:/ eval $python buildscripts/evergreen_task_timeout.py \
+  $timeout_factor \
+  $resmoke_test_flags \
   --install-dir "${install_dir}" \
   --task-name ${task_name} \
   --suite-name ${suite_name} \
+  --project ${project} \
   --build-variant $build_variant_for_timeout \
-  --evg-alias '${alias}' \
+  --evg-alias $evg_alias \
   --timeout ${timeout_secs} \
   --exec-timeout ${exec_timeout_secs} \
   --evg-api-config ./.evergreen.yml \

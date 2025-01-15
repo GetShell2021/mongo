@@ -49,7 +49,6 @@ class test_prepare04(wttest.WiredTigerTestCase, suite_subprocess):
     types = [
         ('col', dict(extra_config=',key_format=r')),
         ('col-fix', dict(extra_config=',key_format=r,value_format=8t')),
-        ('lsm', dict(extra_config=',type=lsm')),
         ('row', dict(extra_config='')),
     ]
 
@@ -120,6 +119,3 @@ class test_prepare04(wttest.WiredTigerTestCase, suite_subprocess):
         self.session.timestamp_transaction('commit_timestamp=' + timestamp_str(300))
         self.session.timestamp_transaction('durable_timestamp=' + timestamp_str(300))
         self.session.commit_transaction()
-
-if __name__ == '__main__':
-    wttest.run()

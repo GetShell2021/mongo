@@ -27,37 +27,57 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
 
-#include <functional>
-#include <memory>
+#include <cstdint>
+#include <list>
+#include <mutex>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/hello_response.h"
-#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
+#include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery_mock.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/topology_coordinator.h"
-#include "mongo/db/storage/storage_engine_init.h"
-#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_mock.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
-#include "mongo/unittest/log_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/topology_version_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/concurrency/admission_context.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
 
 namespace mongo {
 namespace repl {
@@ -116,6 +136,7 @@ void ReplCoordTest::addSelf(const HostAndPort& selfHost) {
 void ReplCoordTest::init() {
     invariant(!_repl);
     invariant(!_callShutdown);
+    cc().setOperationUnkillable_ForTest();
 
     auto service = getGlobalServiceContext();
     _storageInterface = new StorageInterfaceMock();
@@ -126,7 +147,9 @@ void ReplCoordTest::init() {
     _storageInterface->insertDocumentFn = [this](OperationContext* opCtx,
                                                  const NamespaceStringOrUUID& nsOrUUID,
                                                  const TimestampedBSONObj& doc,
-                                                 long long term) { return Status::OK(); };
+                                                 long long term) {
+        return Status::OK();
+    };
 
     _storageInterface->createCollFn = [this](OperationContext* opCtx,
                                              const NamespaceString& nss,
@@ -146,7 +169,7 @@ void ReplCoordTest::init() {
 
     // The ReadWriteConcernDefaults decoration on the service context won't always be created,
     // so we should manually instantiate it to ensure it exists in our tests.
-    ReadWriteConcernDefaults::create(service, lookupMock.getFetchDefaultsFn());
+    ReadWriteConcernDefaults::create(service->getService(), lookupMock.getFetchDefaultsFn());
 
     TopologyCoordinator::Options settings;
     auto topo = std::make_unique<TopologyCoordinator>(settings);
@@ -156,10 +179,14 @@ void ReplCoordTest::init() {
     auto externalState = std::make_unique<ReplicationCoordinatorExternalStateMock>();
     _externalState = externalState.get();
     executor::ThreadPoolMock::Options tpOptions;
-    tpOptions.onCreateThread = []() { Client::initThread("replexec"); };
+    tpOptions.onCreateThread = []() {
+        Client::initThread("replexec",
+                           getGlobalServiceContext()->getService(),
+                           Client::noSession(),
+                           ClientOperationKillableByStepdown{false});
+    };
     auto pool = std::make_unique<executor::ThreadPoolMock>(_net, seed, tpOptions);
-    auto replExec =
-        std::make_unique<executor::ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
+    auto replExec = executor::ThreadPoolTaskExecutor::create(std::move(pool), std::move(net));
     _replExec = replExec.get();
     _repl = std::make_unique<ReplicationCoordinatorImpl>(service,
                                                          _settings,
@@ -186,12 +213,10 @@ void ReplCoordTest::start() {
     // construct ServiceEntryPoint and this causes a segmentation fault when
     // reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
     FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
-    // Skip recovering tenant migration access blockers for the same reason as the above.
-    FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
-        "skipRecoverTenantMigrationAccessBlockers");
     // Skip recovering user writes critical sections for the same reason as the above.
     FailPointEnableBlock skipRecoverUserWriteCriticalSections(
         "skipRecoverUserWriteCriticalSections");
+    // Skip recovering of serverless mutual exclusion locks for the same reason as the above.
     invariant(!_callShutdown);
     // if we haven't initialized yet, do that first.
     if (!_repl) {
@@ -239,7 +264,7 @@ executor::RemoteCommandResponse ReplCoordTest::makeResponseStatus(const BSONObj&
           "Responding with {doc} (elapsed: {millis})",
           "doc"_attr = doc,
           "millis"_attr = millis);
-    return RemoteCommandResponse(doc, millis);
+    return RemoteCommandResponse::make_forTest(doc, millis);
 }
 
 void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
@@ -261,6 +286,8 @@ void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
             hbResp.setState(MemberState::RS_SECONDARY);
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
             hbResp.setAppliedOpTimeAndWallTime(
+                {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
+            hbResp.setWrittenOpTimeAndWallTime(
                 {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
             hbResp.setDurableOpTimeAndWallTime(
                 {OpTime(Timestamp(100, 2), 0), Date_t() + Seconds(100)});
@@ -337,7 +364,8 @@ void ReplCoordTest::simulateSuccessfulDryRun(
 }
 
 void ReplCoordTest::simulateSuccessfulDryRun() {
-    auto onDryRunRequest = [](const RemoteCommandRequest& request) {};
+    auto onDryRunRequest = [](const RemoteCommandRequest& request) {
+    };
     simulateSuccessfulDryRun(onDryRunRequest);
 }
 
@@ -348,11 +376,13 @@ void ReplCoordTest::simulateSuccessfulV1Election() {
           "Election timeout scheduled at {electionTimeoutWhen} (simulator time)",
           "electionTimeoutWhen"_attr = electionTimeoutWhen);
 
-    simulateSuccessfulV1ElectionAt(electionTimeoutWhen);
+    auto opCtx{makeOperationContext()};
+    simulateSuccessfulV1ElectionAt(opCtx.get(), electionTimeoutWhen);
 }
 
 void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t electionTime,
                                                                         OperationContext* opCtx) {
+    RAIIServerParameterControllerForTest controller("featureFlagReduceMajorityWriteLatency", true);
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
     NetworkInterfaceMock* net = getNet();
 
@@ -387,6 +417,7 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
             // The smallest valid optime in PV1.
             OpTime opTime(Timestamp(), 0);
             hbResp.setAppliedOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
+            hbResp.setWrittenOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
             hbResp.setDurableOpTimeAndWallTime({opTime, Date_t() + Seconds(opTime.getSecs())});
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
             net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
@@ -409,7 +440,8 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
         hasReadyRequests = net->hasReadyRequests();
         getNet()->exitNetwork();
     }
-    ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
+    ASSERT(replCoord->getOplogSyncState() ==
+           ReplicationCoordinator::OplogSyncState::WriterDraining);
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
 
     auto helloResponse = replCoord->awaitHelloResponse(opCtx, {}, boost::none, boost::none);
@@ -417,46 +449,73 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
     ASSERT_TRUE(helloResponse->isSecondary()) << helloResponse->toBSON().toString();
 }
 
-void ReplCoordTest::simulateSuccessfulV1ElectionAt(Date_t electionTime) {
-    auto opCtx = makeOperationContext();
-    simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTime, opCtx.get());
+void ReplCoordTest::simulateSuccessfulV1ElectionAt(OperationContext* opCtx, Date_t electionTime) {
+    simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTime, opCtx);
     ReplicationCoordinatorImpl* replCoord = getReplCoord();
 
-    signalDrainComplete(opCtx.get());
+    signalWriterDrainComplete(opCtx);
+    signalApplierDrainComplete(opCtx);
 
-    ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
-    auto helloResponse = replCoord->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
+    auto helloResponse = replCoord->awaitHelloResponse(opCtx, {}, boost::none, boost::none);
     ASSERT_TRUE(helloResponse->isWritablePrimary()) << helloResponse->toBSON().toString();
     ASSERT_FALSE(helloResponse->isSecondary()) << helloResponse->toBSON().toString();
 
     ASSERT(replCoord->getMemberState().primary()) << replCoord->getMemberState().toString();
 }
 
-void ReplCoordTest::signalDrainComplete(OperationContext* opCtx) noexcept {
-    // Writes that occur in code paths that call signalDrainComplete are expected to be excluded
-    // from Flow Control.
-    opCtx->setShouldParticipateInFlowControl(false);
+void ReplCoordTest::signalWriterDrainComplete(OperationContext* opCtx) noexcept {
+    getReplCoord()->signalWriterDrainComplete(opCtx, getReplCoord()->getTerm());
+    ASSERT(getReplCoord()->getOplogSyncState() ==
+           ReplicationCoordinator::OplogSyncState::ApplierDraining);
+}
+
+void ReplCoordTest::signalApplierDrainComplete(OperationContext* opCtx) noexcept {
+    // Writes that occur in code paths that call signalApplierDrainComplete are expected to have
+    // Immediate priority.
+    ScopedAdmissionPriority<ExecutionAdmissionContext> priority(
+        opCtx, AdmissionContext::Priority::kExempt);
     getExternalState()->setFirstOpTimeOfMyTerm(OpTime(Timestamp(1, 1), getReplCoord()->getTerm()));
-    getReplCoord()->signalDrainComplete(opCtx, getReplCoord()->getTerm());
+    getReplCoord()->signalApplierDrainComplete(opCtx, getReplCoord()->getTerm());
+    ASSERT(getReplCoord()->getOplogSyncState() == ReplicationCoordinator::OplogSyncState::Stopped);
 }
 
 void ReplCoordTest::runSingleNodeElection(OperationContext* opCtx) {
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(1, 1), 0), Date_t() + Seconds(1));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(1, 1), 0), Date_t() + Seconds(1));
+    RAIIServerParameterControllerForTest controller("featureFlagReduceMajorityWriteLatency", true);
+    replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(1, 1), 0),
+                                                        Date_t() + Seconds(1));
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
     getReplCoord()->waitForElectionFinish_forTest();
 
-    ASSERT(getReplCoord()->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
+    ASSERT(getReplCoord()->getOplogSyncState() ==
+           ReplicationCoordinator::OplogSyncState::WriterDraining);
     ASSERT(getReplCoord()->getMemberState().primary())
         << getReplCoord()->getMemberState().toString();
 
-    signalDrainComplete(opCtx);
+    signalWriterDrainComplete(opCtx);
+    signalApplierDrainComplete(opCtx);
 }
 
 void ReplCoordTest::shutdown(OperationContext* opCtx) {
     invariant(_callShutdown);
+    _callShutdown = false;
+
+    if (!_repl->getSettings().isReplSet()) {
+        return;
+    }
+
     _net->exitNetwork();
-    _repl->shutdown(opCtx);
+
+    // ReplCoordinator shutdown shuts down the ThreadPoolTaskExecutor and joins it, but we need to
+    // advance the NetworkInterfaceMock "thread" to complete cancellation tasks created during
+    // shutdown. To achieve this, we shut down the coordinator in a separate thread. We use the fail
+    // point as signal for when the main thread can consume networking tasks.
+    boost::optional<FailPointEnableBlock> fp("tpteHangsBeforeDrainingCallbacks");
+    auto shutdownThread =
+        stdx::thread([&] { _repl->shutdown(opCtx, nullptr /* shutdownTimeElapsedBuilder */); });
+    ON_BLOCK_EXIT([&] { shutdownThread.join(); });
+    (*fp)->waitForTimesEntered(fp->initialTimesEntered() + 1);
+    NetworkInterfaceMock::InNetworkGuard(getNet())->runReadyNetworkOperations();
+    fp.reset();
     _callShutdown = false;
 }
 
@@ -484,6 +543,7 @@ bool ReplCoordTest::consumeHeartbeatV1(const NetworkInterfaceMock::NetworkOperat
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setConfigTerm(rsConfig.getConfigTerm());
     hbResp.setAppliedOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
+    hbResp.setWrittenOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
     hbResp.setDurableOpTimeAndWallTime({lastApplied, Date_t() + Seconds(lastApplied.getSecs())});
     BSONObjBuilder respObj;
     net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
@@ -501,7 +561,7 @@ void ReplCoordTest::disableSnapshots() {
 void ReplCoordTest::simulateCatchUpAbort() {
     NetworkInterfaceMock* net = getNet();
     auto heartbeatTimeoutWhen =
-        net->now() + getReplCoord()->getConfigHeartbeatTimeoutPeriodMillis();
+        net->now() + getReplCoord()->getConfig().getHeartbeatTimeoutPeriodMillis();
     bool hasRequest = false;
     net->enterNetwork();
     if (net->now() < heartbeatTimeoutWhen) {

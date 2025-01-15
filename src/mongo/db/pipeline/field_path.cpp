@@ -27,14 +27,12 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include "mongo/db/pipeline/field_path.h"
+
+#include <absl/container/node_hash_map.h>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bson_depth.h"
-#include "mongo/db/pipeline/field_path.h"
-#include "mongo/db/query/query_feature_flags_gen.h"
-#include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/server_options.h"
 #include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
 
@@ -54,14 +52,16 @@ const StringDataSet kAllowedDollarPrefixedFields = {
     "$sortKey",
 
     // This is necessary for the "showRecordId" feature.
-    "$recordId"};
+    "$recordId",
+
+    // This is necessary for $search queries with a specified sort.
+    "$searchSortValues"_sd,
+    "$searchScore"_sd,
+};
 
 }  // namespace
 
-using std::string;
-using std::vector;
-
-string FieldPath::getFullyQualifiedPath(StringData prefix, StringData suffix) {
+std::string FieldPath::getFullyQualifiedPath(StringData prefix, StringData suffix) {
     if (prefix.empty()) {
         return suffix.toString();
     }
@@ -69,56 +69,62 @@ string FieldPath::getFullyQualifiedPath(StringData prefix, StringData suffix) {
     return str::stream() << prefix << "." << suffix;
 }
 
-FieldPath::FieldPath(std::string inputPath)
-    : _fieldPath(std::move(inputPath)),
-      _fieldPathDotPosition{string::npos},
-      _fieldHash{kHashUninitialized} {
+FieldPath::FieldPath(std::string inputPath, bool precomputeHashes, bool validateFieldNames)
+    : _fieldPath(std::move(inputPath)), _fieldPathDotPosition{std::string::npos} {
     uassert(40352, "FieldPath cannot be constructed with empty string", !_fieldPath.empty());
     uassert(40353, "FieldPath must not end with a '.'.", _fieldPath[_fieldPath.size() - 1] != '.');
 
     // Store index delimiter position for use in field lookup.
     size_t dotPos;
     size_t startPos = 0;
-    while (string::npos != (dotPos = _fieldPath.find('.', startPos))) {
+    while (std::string::npos != (dotPos = _fieldPath.find('.', startPos))) {
         _fieldPathDotPosition.push_back(dotPos);
-        _fieldHash.push_back(kHashUninitialized);
         startPos = dotPos + 1;
     }
 
     _fieldPathDotPosition.push_back(_fieldPath.size());
 
-    // Validate the path length and the fields.
+    // Validate the path length and the fields, and precompute their hashes if requested.
     const auto pathLength = getPathLength();
     uassert(ErrorCodes::Overflow,
             "FieldPath is too long",
             pathLength <= BSONDepth::getMaxAllowableDepth());
+    _fieldHash.reserve(pathLength);
     for (size_t i = 0; i < pathLength; ++i) {
-        uassertValidFieldName(getFieldName(i));
+        const auto& fieldName = getFieldName(i);
+        if (validateFieldNames) {
+            uassertStatusOKWithContext(
+                validateFieldName(fieldName),
+                "Consider using $getField or $setField for a field path with '.' or '$'.");
+        }
+        _fieldHash.push_back(precomputeHashes ? FieldNameHasher()(fieldName) : kHashUninitialized);
     }
 }
 
-void FieldPath::uassertValidFieldName(StringData fieldName) {
-    uassert(15998, "FieldPath field names may not be empty strings.", !fieldName.empty());
-
-    const auto dotsAndDollarsHint =
-        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-                multiversion::FeatureCompatibilityVersion::kFullyDowngradedTo_5_0)
-        ? " Consider using $getField or $setField."
-        : "";
-
-    if (fieldName[0] == '$' && !kAllowedDollarPrefixedFields.count(fieldName)) {
-        uasserted(16410,
-                  str::stream() << "FieldPath field names may not start with '$'."
-                                << dotsAndDollarsHint);
+Status FieldPath::validateFieldName(StringData fieldName) {
+    if (fieldName.empty()) {
+        return Status(ErrorCodes::Error{15998}, "FieldPath field names may not be empty strings.");
     }
 
-    uassert(
-        16411, "FieldPath field names may not contain '\0'.", fieldName.find('\0') == string::npos);
+    if (fieldName[0] == '$' && !kAllowedDollarPrefixedFields.count(fieldName)) {
+        return Status(ErrorCodes::Error{16410},
+                      str::stream() << "FieldPath field names may not start with '$', given '"
+                                    << fieldName << "'.");
+    }
 
-    uassert(16412,
-            str::stream() << "FieldPath field names may not contain '.'." << dotsAndDollarsHint,
-            fieldName.find('.') == string::npos);
+    if (fieldName.find('\0') != std::string::npos) {
+        return Status(ErrorCodes::Error{16411},
+                      str::stream() << "FieldPath field names may not contain '\0', given '"
+                                    << fieldName << "'.");
+    }
+
+    if (fieldName.find('.') != std::string::npos) {
+        return Status(ErrorCodes::Error{16412},
+                      str::stream() << "FieldPath field names may not contain '.', given '"
+                                    << fieldName << "'.");
+    }
+
+    return Status::OK();
 }
 
 FieldPath FieldPath::concat(const FieldPath& tail) const {

@@ -8,21 +8,16 @@
  *   # could break the test.
  *   assumes_unsharded_collection,
  *   assumes_against_mongod_not_mongos,
+ *   # TODO (SERVER-89668): Remove tag. Currently incompatible due to change
+ *   # change containing the recordIdsReplicated:true option, which
+ *   # this test dislikes.
+ *   exclude_when_record_ids_replicated
  * ]
  */
-(function() {
-"use strict";
-
-load('jstests/libs/collection_drop_recreate.js');  // For 'assertDropAndRecreateCollection' and
-                                                   // 'assertDropCollection'.
-load('jstests/libs/change_stream_util.js');        // For 'ChangeStreamTest' and
-                                                   // 'assertChangeStreamEventEq'.
+import {ChangeStreamTest} from "jstests/libs/query/change_stream_util.js";
 
 const testDB = db.getSiblingDB(jsTestName());
 const collName = "coll1";
-if (!isChangeStreamsVisibilityEnabled(testDB)) {
-    return;
-}
 
 const test = new ChangeStreamTest(testDB);
 const ns = {
@@ -31,7 +26,7 @@ const ns = {
 };
 
 function runTest(collNameForChangeStream) {
-    let pipeline = [{$changeStream: {showExpandedEvents: true}}];
+    let pipeline = [{$changeStream: {showExpandedEvents: true, showSystemEvents: true}}];
     let cursor = test.startWatchingChanges({
         pipeline,
         collection: collNameForChangeStream,
@@ -45,7 +40,8 @@ function runTest(collNameForChangeStream) {
         expectedChanges: {
             operationType: "create",
             ns: ns,
-            operationDescription: {idIndex: {v: 2, key: {_id: 1}, name: "_id_"}}
+            operationDescription: {idIndex: {v: 2, key: {_id: 1}, name: "_id_"}},
+            nsType: "collection",
         }
     })[0];
 
@@ -73,8 +69,16 @@ function runTest(collNameForChangeStream) {
         }
     })[0];
 
-    // Test the 'createIndexes' event on a non-empty collection.
+    // Test the 'startIndexBuild' and 'createIndexes' events on a non-empty collection.
     assert.commandWorked(testDB[collName].createIndex({b: -1}));
+    const startIndexBuildEvent = test.assertNextChangesEqual({
+        cursor: cursor,
+        expectedChanges: {
+            operationType: "startIndexBuild",
+            ns: ns,
+            operationDescription: {indexes: [{v: 2, key: {b: -1}, name: "b_-1"}]},
+        }
+    })[0];
     const createIndexesEvent2 = test.assertNextChangesEqual({
         cursor: cursor,
         expectedChanges: {
@@ -110,13 +114,17 @@ function runTest(collNameForChangeStream) {
 
     function testResume(resumeOption) {
         function testResumeForEvent(event, nextEventDesc) {
-            pipeline = [{$changeStream: {showExpandedEvents: true, [resumeOption]: event._id}}];
+            pipeline = [{
+                $changeStream:
+                    {showExpandedEvents: true, showSystemEvents: true, [resumeOption]: event._id},
+            }];
             cursor = test.startWatchingChanges({pipeline, collection: collNameForChangeStream});
             test.assertNextChangesEqual({cursor: cursor, expectedChanges: nextEventDesc});
         }
 
         testResumeForEvent(createEvent, createIndexesEvent1);
         testResumeForEvent(createIndexesEvent1, insertEvent1);
+        testResumeForEvent(startIndexBuildEvent, createIndexesEvent2);
         testResumeForEvent(createIndexesEvent2, dropIndexesEvent);
         testResumeForEvent(dropIndexesEvent, insertEvent2);
     }
@@ -130,4 +138,3 @@ function runTest(collNameForChangeStream) {
 
 runTest(1);  // Runs the test using a whole-db change stream
 runTest(collName);
-}());

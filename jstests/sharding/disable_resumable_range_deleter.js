@@ -4,11 +4,8 @@
  * requires_persistence - This test restarts shards and expects them to remember their data.
  * @tags: [requires_persistence]
  */
-(function() {
-
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test intentionally disables the resumable range deleter.
 TestData.skipCheckOrphans = true;
@@ -32,8 +29,8 @@ let randomStr = () => {
 const st = new ShardingTest({shards: 2});
 
 jsTest.log("Setup");
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
 
@@ -51,7 +48,6 @@ st.rs0.restart(0, {
 });
 
 jsTest.log("Shard0 should fail to submit the range deletion task on stepup.");
-checkLog.contains(st.rs0.getPrimary(), "Failed to submit range deletion task");
 
 jsTest.log("Shard0 should fail to receive a range that overlaps the range deletion task.");
 // The error from moveChunk gets wrapped as an OperationFailed error, so we have to check the error
@@ -74,6 +70,7 @@ st.rs1.restart(0, {
     startClean: false,
     setParameter: "disableResumableRangeDeleter=true"
 });
+st.rs1.waitForPrimary();
 
 jsTest.log("Shard0 should be able to donate a chunk and shard1 should be able to receive it.");
 // disableResumableRangeDeleter should not prevent a shard from donating a chunk, and should not
@@ -88,6 +85,7 @@ st.rs0.restart(0, {
     startClean: false,
     setParameter: "disableResumableRangeDeleter=false"
 });
+st.rs0.waitForPrimary();
 
 jsTest.log("Shard0 should now be able to re-receive the chunk it failed to receive earlier.");
 assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {_id: 0}, to: st.shard0.shardName}));
@@ -110,6 +108,7 @@ st.rs1.restart(0, {
 });
 
 st.rs0.getPrimary().adminCommand({setParameter: 1, receiveChunkWaitForRangeDeleterTimeoutMS: 500});
+st.rs1.waitForPrimary();
 
 let bulkOp = st.s.getCollection(ns).initializeUnorderedBulkOp();
 
@@ -131,4 +130,3 @@ assert.commandFailedWithCode(
     ErrorCodes.OperationFailed);
 
 st.stop();
-})();

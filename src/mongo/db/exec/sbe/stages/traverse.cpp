@@ -27,10 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/inlined_vector.h>
+#include <string>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/size_estimator.h"
 #include "mongo/db/exec/sbe/stages/traverse.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo::sbe {
 TraverseStage::TraverseStage(std::unique_ptr<PlanStage> outer,
@@ -44,7 +53,8 @@ TraverseStage::TraverseStage(std::unique_ptr<PlanStage> outer,
                              PlanNodeId planNodeId,
                              boost::optional<size_t> nestedArraysDepth,
                              bool participateInTrialRunTracking)
-    : PlanStage("traverse"_sd, planNodeId, participateInTrialRunTracking),
+    : PlanStage(
+          "traverse"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
       _inField(inField),
       _outField(outField),
       _outFieldInner(outFieldInner),
@@ -71,7 +81,7 @@ std::unique_ptr<PlanStage> TraverseStage::clone() const {
                                            _final ? _final->clone() : nullptr,
                                            _commonStats.nodeId,
                                            _nestedArraysDepth,
-                                           _participateInTrialRunTracking);
+                                           participateInTrialRunTracking());
 }
 
 void TraverseStage::prepare(CompileCtx& ctx) {
@@ -217,11 +227,11 @@ bool TraverseStage::traverse(value::SlotAccessor* inFieldAccessor,
                         // We have to copy (or move optimization) the value to the array
                         // as by definition all composite values (arrays, objects) own their
                         // constituents.
-                        auto [tag, val] = _outFieldInputAccessor->copyOrMoveValue();
+                        auto [tag, val] = _outFieldInputAccessor->getCopyOfValue();
                         arrOut->push_back(tag, val);
                     } else {
                         if (firstValue) {
-                            auto [tag, val] = _outFieldInputAccessor->copyOrMoveValue();
+                            auto [tag, val] = _outFieldInputAccessor->getCopyOfValue();
                             outFieldOutputAccessor->reset(true, tag, val);
                             firstValue = false;
                         } else {
@@ -290,11 +300,11 @@ void TraverseStage::doSaveState(bool relinquishCursor) {
         _outFieldOutputAccessor.reset();
     }
 
-    if (!slotsAccessible() || !relinquishCursor) {
+    if (!relinquishCursor) {
         return;
     }
 
-    prepareForYielding(_outFieldOutputAccessor);
+    prepareForYielding(_outFieldOutputAccessor, slotsAccessible());
 }
 
 void TraverseStage::doRestoreState(bool relinquishCursor) {
@@ -370,6 +380,10 @@ std::vector<DebugPrinter::Block> TraverseStage::debugPrint() const {
         DebugPrinter::addBlocks(ret, _final->debugPrint());
     }
     ret.emplace_back("`}");
+
+    if (_nestedArraysDepth) {
+        ret.emplace_back(std::to_string(*_nestedArraysDepth));
+    }
 
     DebugPrinter::addNewLine(ret);
     DebugPrinter::addIdentifier(ret, "from");

@@ -33,7 +33,7 @@
 #include <string>
 
 #include "mongo/base/string_data.h"
-#include "mongo/config.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 
 namespace mongo::logv2 {
 
@@ -61,6 +61,10 @@ namespace mongo::logv2 {
     X(kNetwork,                , "network"               , "NETWORK" , kDefault) \
     X(kProcessHealth,          , "processHealth"         , "HEALTH"  , kDefault) \
     X(kQuery,                  , "query"                 , "QUERY"   , kDefault) \
+    X(kQueryStats,             , "queryStats"            , "QRYSTATS", kDefault) \
+    X(kQueryOptimizer,         , "optimizer"             , "Q_OPT"   , kQuery) \
+    X(kQueryCE,                , "ce"                    , "Q_CE"    , kQuery) \
+    X(kQueryRejected,          , "rejected"              , "Q_REJECT", kQuery) \
     X(kReplication,            , "replication"           , "REPL"    , kDefault) \
     X(kReplicationElection,    , "election"              , "ELECTION", kReplication) \
     X(kReplicationHeartbeats,  , "heartbeats"            , "REPL_HB" , kReplication) \
@@ -76,6 +80,7 @@ namespace mongo::logv2 {
     X(kStorageRecovery,        , "recovery"              , "RECOVERY", kStorage) \
     X(kJournal,                , "journal"               , "JOURNAL" , kStorage) \
     X(kWiredTiger,             , "wt"                    , "WT"      , kStorage) \
+    X(kMagicRestore,           , "magicRestore"          , "RESTORE" , kStorage) \
     X(kWiredTigerBackup,       , "wtBackup"              , "WTBACKUP", kWiredTiger) \
     X(kWiredTigerCheckpoint,   , "wtCheckpoint"          , "WTCHKPT" , kWiredTiger) \
     X(kWiredTigerCompact,      , "wtCompact"             , "WTCMPCT" , kWiredTiger) \
@@ -93,12 +98,11 @@ namespace mongo::logv2 {
     X(kFTDC,                   , "ftdc"                  , "FTDC"    , kDefault) \
     X(kASIO,                   , "asio"                  , "ASIO"    , kNetwork) \
     X(kBridge,                 , "bridge"                , "BRIDGE"  , kNetwork) \
-    X(kTracking,               , "tracking"              , "TRACKING", kDefault) \
     X(kTransaction,            , "transaction"           , "TXN"     , kDefault) \
-    X(kTenantMigration,        , "tenantMigration"       , "TENANT_M", kDefault) \
     X(kConnectionPool,         , "connectionPool"        , "CONNPOOL", kNetwork) \
     X(kTest,                   , "test"                  , "TEST"    , kDefault) \
     X(kResourceConsumption,    , "resourceConsumption"   , "RES_CONS", kDefault) \
+    X(kStreams,                , "streams"               , "STREAMS" , kDefault) \
     X(kNumLogComponents,       , "total"                 , "TOTAL"   , kNumLogComponents) \
     /**/
 // clang-format on

@@ -29,10 +29,25 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/s/dist_lock_manager.h"
+#include "mongo/db/s/shard_server_catalog_cache_loader_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/sharding_test_fixture_common.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -44,16 +59,13 @@ namespace mongo {
  * by which a real config or shard server does sharding initialization. Provides a set of default
  * components (including a NetworkInterface/TaskExecutor subsystem backed by the NetworkTestEnv),
  * but allows subclasses to replace any component with its real implementation, a mock, or nullptr.
- *
- * The ordering of the base classes here matter because both ShardingTestFixtureCommon and
- * ServiceContextMongoDTest inherit from ServiceContextTest, which overrides the global service
- * context.
  */
-class ShardingMongodTestFixture : public ShardingTestFixtureCommon,
-                                  public ServiceContextMongoDTest {
+class ShardingMongoDTestFixture : public ShardingTestFixtureCommon {
 protected:
-    ShardingMongodTestFixture(Options options = {}, bool allowMajorityReads = true);
-    ~ShardingMongodTestFixture();
+    using Options = MongoDScopedGlobalServiceContextForTest::Options;
+
+    ShardingMongoDTestFixture(Options options = {}, bool allowMajorityReads = true);
+    ~ShardingMongoDTestFixture() override;
 
     void setUp() override;
     void tearDown() override;
@@ -63,10 +75,12 @@ protected:
      * serverGlobalParams.clusterRole and puts the components on the Grid, mimicking the
      * initialization done by an actual config or shard mongod server.
      *
-     * It is illegal to call this if serverGlobalParams.clusterRole is not ClusterRole::ShardServer
-     * or ClusterRole::ConfigServer.
+     * It is illegal to call this if serverGlobalParams.clusterRole is not ClusterRole::ShardServer.
      */
-    Status initializeGlobalShardingStateForMongodForTest(const ConnectionString& configConnStr);
+    Status initializeGlobalShardingStateForMongodForTest(
+        const ConnectionString& configConnStr,
+        std::unique_ptr<CatalogCache> catalogCache,
+        std::shared_ptr<ShardServerCatalogCacheLoader> catalogCacheLoader = nullptr);
 
     // Syntactic sugar for getting sharding components off the Grid, if they have been initialized.
 
@@ -76,14 +90,6 @@ protected:
     std::shared_ptr<executor::TaskExecutor> executor() const;
     ClusterCursorManager* clusterCursorManager() const;
     executor::TaskExecutorPool* executorPool() const;
-
-    /**
-     * Shuts down the TaskExecutorPool and remembers that it has been shut down, so that it is not
-     * shut down again on tearDown.
-     *
-     * Not safe to call from multiple threads.
-     */
-    void shutdownExecutorPool();
 
     repl::ReplicationCoordinatorMock* replicationCoordinator() const;
 
@@ -106,11 +112,6 @@ protected:
      * Base class returns a real implementation of ShardRegistry.
      */
     virtual std::unique_ptr<ShardRegistry> makeShardRegistry(ConnectionString configConnStr);
-
-    /**
-     * Allows tests to conditionally construct a DistLockManager
-     */
-    virtual std::unique_ptr<DistLockManager> makeDistLockManager();
 
     /**
      * Base class returns nullptr.
@@ -140,9 +141,6 @@ private:
         HostAndPort("node1:12345"), HostAndPort("node2:12345"), HostAndPort("node3:12345")};
 
     repl::ReplicationCoordinatorMock* _replCoord = nullptr;
-
-    // Records if a component has been shut down, so that it is only shut down once.
-    bool _executorPoolShutDown = false;
 
     // Whether the test fixture should set a committed snapshot during setup so that tests can
     // perform majority reads without doing any writes.

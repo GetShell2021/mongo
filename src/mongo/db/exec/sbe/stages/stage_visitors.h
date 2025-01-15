@@ -28,7 +28,6 @@
  */
 
 #include "mongo/db/exec/sbe/stages/ix_scan.h"
-#include "mongo/db/query/plan_explainer_sbe.h"
 
 namespace mongo::sbe {
 /**
@@ -66,24 +65,24 @@ public:
     }
 
 protected:
-    virtual void visit(const sbe::PlanStage* root) {
+    void visit(const sbe::PlanStage* root) override {
         auto stats = root->getCommonStats();
         if (stats->stageType == "seek"_sd) {
             collectionSeeks += stats->opens;
         } else if (stats->stageType == "scan"_sd) {
             collectionScans += stats->opens;
         } else if (stats->stageType == "ixseek"_sd || stats->stageType == "ixscan"_sd) {
-            auto indexScanStage = dynamic_cast<const IndexScanStage*>(root);
-            uassert(6267647,
-                    str::stream() << stats->stageType
-                                  << " stage is not an instance of IndexScanStage",
-                    indexScanStage);
+            auto indexScanStage = checked_cast<const SimpleIndexScanStage*>(root);
             indexesUsed.push_back(indexScanStage->getIndexName());
             if (stats->stageType == "ixseek"_sd) {
                 indexSeeks += stats->opens;
             } else if (stats->stageType == "ixscan"_sd) {
                 indexScans += stats->opens;
             }
+        } else if (stats->stageType == "ixscan_generic"_sd) {
+            auto indexScanStage = checked_cast<const GenericIndexScanStage*>(root);
+            indexesUsed.push_back(indexScanStage->getIndexName());
+            indexSeeks += stats->opens;
         }
     }
 

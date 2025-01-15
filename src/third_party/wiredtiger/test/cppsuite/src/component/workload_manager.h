@@ -26,8 +26,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef WORKLOAD_MANAGER_H
-#define WORKLOAD_MANAGER_H
+#pragma once
 
 #include <functional>
 
@@ -41,7 +40,7 @@ namespace test_harness {
  * Class that can execute operations based on a given configuration.
  */
 class workload_manager : public component {
-    public:
+public:
     workload_manager(configuration *configuration, database_operation *db_operation,
       timestamp_manager *timestamp_manager, database &database);
 
@@ -57,11 +56,12 @@ class workload_manager : public component {
 
     database &get_database();
     bool db_populated() const;
+    void do_work() override final;
 
     /* Set the tracking component. */
     void set_operation_tracker(operation_tracker *op_tracker);
 
-    private:
+private:
     database &_database;
     database_operation *_database_operation = nullptr;
     thread_manager _thread_manager;
@@ -71,5 +71,3 @@ class workload_manager : public component {
     bool _db_populated = false;
 };
 } // namespace test_harness
-
-#endif

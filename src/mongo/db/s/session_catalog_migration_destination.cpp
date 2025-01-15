@@ -28,50 +28,73 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/s/session_catalog_migration_destination.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include <functional>
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/client/connection_string.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/ops/write_ops_retryability.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops_retryability.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/s/session_catalog_migration_destination.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/logv2/redaction.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-
 namespace mongo {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(interruptBeforeProcessingPrePostImageOriginatingOp);
 
 const auto kOplogField = "oplog";
 const WriteConcernOptions kMajorityWC(WriteConcernOptions::kMajority,
                                       WriteConcernOptions::SyncMode::UNSET,
                                       Milliseconds(0));
-
-struct ProcessOplogResult {
-    LogicalSessionId sessionId;
-    TxnNumber txnNum{kUninitializedTxnNumber};
-
-    repl::OpTime oplogTime;
-    bool isPrePostImage = false;
-};
 
 /**
  * Returns the command request to extract session information from the source shard.
@@ -90,7 +113,8 @@ BSONObj buildMigrateSessionCmd(const MigrationSessionId& migrationSessionId) {
  *
  * It is an error to have both preImage and postImage as well as not having them at all.
  */
-void setPrePostImageTs(const ProcessOplogResult& lastResult, repl::MutableOplogEntry* entry) {
+void setPrePostImageTs(const SessionCatalogMigrationDestination::ProcessOplogResult& lastResult,
+                       repl::MutableOplogEntry* entry) {
     if (!lastResult.isPrePostImage) {
         uassert(40628,
                 str::stream() << "expected oplog with ts: " << entry->getTimestamp().toString()
@@ -118,7 +142,7 @@ void setPrePostImageTs(const ProcessOplogResult& lastResult, repl::MutableOplogE
     // the appropriate no-op. This code on the destination patches up the CRUD operation oplog entry
     // to look like the classic format.
     if (entry->getNeedsRetryImage()) {
-        switch (entry->getNeedsRetryImage().get()) {
+        switch (entry->getNeedsRetryImage().value()) {
             case repl::RetryImageEnum::kPreImage:
                 entry->setPreImageOpTime({repl::OpTime()});
                 break;
@@ -180,7 +204,7 @@ BSONObj getNextSessionOplogBatch(OperationContext* opCtx,
     auto shard = shardStatus.getValue();
     auto responseStatus = shard->runCommand(opCtx,
                                             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                            "admin",
+                                            DatabaseName::kAdmin,
                                             buildMigrateSessionCmd(migrationSessionId),
                                             Shard::RetryPolicy::kNoRetry);
 
@@ -196,15 +220,203 @@ BSONObj getNextSessionOplogBatch(OperationContext* opCtx,
 
     return result;
 }
+}  // namespace
+
+SessionCatalogMigrationDestination::SessionCatalogMigrationDestination(
+    NamespaceString nss,
+    ShardId fromShard,
+    MigrationSessionId migrationSessionId,
+    CancellationToken cancellationToken)
+    : _nss(std::move(nss)),
+      _fromShard(std::move(fromShard)),
+      _migrationSessionId(std::move(migrationSessionId)),
+      _cancellationToken(std::move(cancellationToken)) {}
+
+SessionCatalogMigrationDestination::~SessionCatalogMigrationDestination() {
+    if (_thread.joinable()) {
+        _errorOccurred("Destructor cleaning up thread");
+        _thread.join();
+    }
+}
+
+void SessionCatalogMigrationDestination::start(ServiceContext* service) {
+    {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        invariant(_state == State::NotStarted);
+        _state = State::Migrating;
+    }
+
+    _thread = stdx::thread([=, this] {
+        try {
+            _retrieveSessionStateFromSource(service);
+        } catch (const DBException& ex) {
+            if (ex.code() == ErrorCodes::CommandNotFound) {
+                // TODO: remove this after v3.7
+                //
+                // This means that the donor shard is running at an older version so it is safe to
+                // just end this because there is no session information to transfer.
+                return;
+            }
+
+            _errorOccurred(ex.toString());
+        }
+    });
+}
+
+void SessionCatalogMigrationDestination::finish() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    if (_state != State::ErrorOccurred) {
+        _state = State::Committing;
+    }
+}
+
+bool SessionCatalogMigrationDestination::joinable() const {
+    return _thread.joinable();
+}
+
+void SessionCatalogMigrationDestination::join() {
+    invariant(_thread.joinable());
+    _thread.join();
+}
+
+/**
+ * Outline:
+ *
+ * 1. Get oplog with session info from the source shard.
+ * 2. For each oplog entry, convert to type 'n' if not yet type 'n' while preserving all info
+ *    needed for retryable writes.
+ * 3. Also update the sessionCatalog for every oplog entry.
+ * 4. Once the source shard returned an empty oplog buffer, it means that this should enter
+ *    ReadyToCommit state and wait for the commit signal (by calling finish()).
+ * 5. Once finish() is called, keep on trying to get more oplog from the source shard until it
+ *    returns an empty result again.
+ * 6. Wait for writes to be committed to majority of the replica set.
+ */
+void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(ServiceContext* service) {
+    Client::initThread("sessionCatalogMigrationProducer-" + _migrationSessionId.toString(),
+                       service->getService(ClusterRole::ShardServer),
+                       Client::noSession());
+    bool oplogDrainedAfterCommiting = false;
+    ProcessOplogResult lastResult;
+    repl::OpTime lastOpTimeWaited;
+
+    while (true) {
+        {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            if (_state == State::ErrorOccurred) {
+                return;
+            }
+        }
+
+        BSONObj nextBatch;
+        BSONArray oplogArray;
+        {
+            auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
+            auto uniqueCtx = CancelableOperationContext(
+                cc().makeOperationContext(), _cancellationToken, executor);
+            auto opCtx = uniqueCtx.get();
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
+            nextBatch = getNextSessionOplogBatch(opCtx, _fromShard, _migrationSessionId);
+            oplogArray = BSONArray{nextBatch[kOplogField].Obj()};
+
+            if (oplogArray.isEmpty()) {
+                {
+                    stdx::lock_guard<stdx::mutex> lk(_mutex);
+                    if (_state == State::Committing) {
+                        // The migration is considered done only when it gets an empty result from
+                        // the source shard while this is in state committing. This is to make sure
+                        // that it doesn't miss any new oplog created between the time window where
+                        // this depleted the buffer from the source shard and receiving the commit
+                        // command.
+                        if (oplogDrainedAfterCommiting) {
+                            LOGV2(5087100,
+                                  "Recipient finished draining oplog entries for retryable writes "
+                                  "and transactions from donor again after receiving "
+                                  "_recvChunkCommit",
+                                  logAttrs(_nss),
+                                  "migrationSessionId"_attr = _migrationSessionId,
+                                  "fromShard"_attr = _fromShard);
+                            break;
+                        }
+
+                        oplogDrainedAfterCommiting = true;
+                    }
+                }
+
+                WriteConcernResult unusedWCResult;
+                uassertStatusOK(
+                    waitForWriteConcern(opCtx, lastResult.oplogTime, kMajorityWC, &unusedWCResult));
+
+                {
+                    stdx::lock_guard<stdx::mutex> lk(_mutex);
+                    // Note: only transition to "ready to commit" if state is not error/force stop.
+                    if (_state == State::Migrating) {
+                        // We depleted the buffer at least once, transition to ready for commit.
+                        LOGV2(5087101,
+                              "Recipient finished draining oplog entries for retryable writes and "
+                              "transactions from donor for the first time, before receiving "
+                              "_recvChunkCommit",
+                              logAttrs(_nss),
+                              "migrationSessionId"_attr = _migrationSessionId,
+                              "fromShard"_attr = _fromShard);
+                        _state = State::ReadyToCommit;
+                    }
+                }
+
+                lastOpTimeWaited = lastResult.oplogTime;
+            }
+        }
+
+        for (BSONArrayIteratorSorted oplogIter(oplogArray); oplogIter.more();) {
+            auto oplogEntry = oplogIter.next().Obj();
+            interruptBeforeProcessingPrePostImageOriginatingOp.executeIf(
+                [&](const auto&) {
+                    uasserted(6749200,
+                              "Intentionally failing session migration before processing post/pre "
+                              "image originating update oplog entry");
+                },
+                [&](const auto&) {
+                    return !oplogEntry["needsRetryImage"].eoo() ||
+                        !oplogEntry["preImageOpTime"].eoo() || !oplogEntry["postImageOpTime"].eoo();
+                });
+            try {
+                lastResult =
+                    _processSessionOplog(oplogEntry, lastResult, service, _cancellationToken);
+            } catch (const ExceptionFor<ErrorCodes::TransactionTooOld>&) {
+                // This means that the server has a newer txnNumber than the oplog being
+                // migrated, so just skip it
+                continue;
+            }
+        }
+    }
+
+    WriteConcernResult unusedWCResult;
+
+    auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
+    auto uniqueOpCtx =
+        CancelableOperationContext(cc().makeOperationContext(), _cancellationToken, executor);
+    uniqueOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
+    uassertStatusOK(
+        waitForWriteConcern(uniqueOpCtx.get(), lastResult.oplogTime, kMajorityWC, &unusedWCResult));
+
+    {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        _state = State::Done;
+    }
+}
 
 /**
  * Insert a new oplog entry by converting the oplogBSON into type 'n' oplog with the session
  * information. The new oplogEntry will also link to prePostImageTs if not null.
  */
-ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
-                                       const ProcessOplogResult& lastResult,
-                                       ServiceContext* serviceContext,
-                                       CancellationToken cancellationToken) {
+SessionCatalogMigrationDestination::ProcessOplogResult
+SessionCatalogMigrationDestination::_processSessionOplog(const BSONObj& oplogBSON,
+                                                         const ProcessOplogResult& lastResult,
+                                                         ServiceContext* serviceContext,
+                                                         CancellationToken cancellationToken) {
+
     auto oplogEntry = parseOplog(oplogBSON);
 
     ProcessOplogResult result;
@@ -254,16 +466,29 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
     auto uniqueOpCtx =
         CancelableOperationContext(cc().makeOperationContext(), cancellationToken, executor);
     auto opCtx = uniqueOpCtx.get();
-    opCtx->setLogicalSessionId(result.sessionId);
-    opCtx->setTxnNumber(result.txnNum);
-    MongoDOperationContextSession ocs(opCtx);
+    opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+
+    {
+        auto lk = stdx::lock_guard(*opCtx->getClient());
+        opCtx->setLogicalSessionId(result.sessionId);
+        opCtx->setTxnNumber(result.txnNum);
+    }
+
+    // Irrespective of whether or not the oplog gets logged, we want to update the
+    // entriesMigrated counter to signal that we have succesfully recieved the oplog
+    // from the source and have processed it.
+    _sessionOplogEntriesMigrated.addAndFetch(1);
+
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
+
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     try {
         txnParticipant.beginOrContinue(opCtx,
                                        {result.txnNum},
                                        boost::none /* autocommit */,
-                                       boost::none /* startTransaction */);
+                                       TransactionParticipant::TransactionActions::kNone);
         if (txnParticipant.checkStatementExecuted(opCtx, stmtIds.front())) {
             // Skip the incoming statement because it has already been logged locally
             return lastResult;
@@ -300,10 +525,7 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
     oplogEntry.setOpTime(OplogSlot());
 
     writeConflictRetry(
-        opCtx,
-        "SessionOplogMigration",
-        NamespaceString::kSessionTransactionsTableNamespace.ns(),
-        [&] {
+        opCtx, "SessionOplogMigration", NamespaceString::kSessionTransactionsTableNamespace, [&] {
             // Need to take global lock here so repl::logOp will not unlock it and trigger the
             // invariant that disallows unlocking global lock while inside a WUOW. Take the
             // transaction table db lock to ensure the same lock ordering with normal replicated
@@ -320,7 +542,7 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
                                   << oplogEntry.getOpTime().toString() << ": " << redact(oplogBSON),
                     !oplogOpTime.isNull());
 
-            // Do not call onWriteOpCompletedOnPrimary if we inserted a pre/post image, because the
+            // Do not call onWriteOpCompletedO nPrimary if we inserted a pre/post image, because the
             // next oplog will contain the real operation
             if (!result.isPrePostImage) {
                 SessionTxnRecord sessionTxnRecord;
@@ -346,200 +568,30 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
     return result;
 }
 
-}  // namespace
-
-SessionCatalogMigrationDestination::SessionCatalogMigrationDestination(
-    NamespaceString nss,
-    ShardId fromShard,
-    MigrationSessionId migrationSessionId,
-    CancellationToken cancellationToken)
-    : _nss(std::move(nss)),
-      _fromShard(std::move(fromShard)),
-      _migrationSessionId(std::move(migrationSessionId)),
-      _cancellationToken(std::move(cancellationToken)) {}
-
-SessionCatalogMigrationDestination::~SessionCatalogMigrationDestination() {
-    if (_thread.joinable()) {
-        _errorOccurred("Destructor cleaning up thread");
-        _thread.join();
-    }
-}
-
-void SessionCatalogMigrationDestination::start(ServiceContext* service) {
-    {
-        stdx::lock_guard<Latch> lk(_mutex);
-        invariant(_state == State::NotStarted);
-        _state = State::Migrating;
-    }
-
-    _thread = stdx::thread([=] {
-        try {
-            _retrieveSessionStateFromSource(service);
-        } catch (const DBException& ex) {
-            if (ex.code() == ErrorCodes::CommandNotFound) {
-                // TODO: remove this after v3.7
-                //
-                // This means that the donor shard is running at an older version so it is safe to
-                // just end this because there is no session information to transfer.
-                return;
-            }
-
-            _errorOccurred(ex.toString());
-        }
-    });
-}
-
-void SessionCatalogMigrationDestination::finish() {
-    stdx::lock_guard<Latch> lk(_mutex);
-    if (_state != State::ErrorOccurred) {
-        _state = State::Committing;
-    }
-}
-
-void SessionCatalogMigrationDestination::join() {
-    invariant(_thread.joinable());
-    _thread.join();
-}
-
-/**
- * Outline:
- *
- * 1. Get oplog with session info from the source shard.
- * 2. For each oplog entry, convert to type 'n' if not yet type 'n' while preserving all info
- *    needed for retryable writes.
- * 3. Also update the sessionCatalog for every oplog entry.
- * 4. Once the source shard returned an empty oplog buffer, it means that this should enter
- *    ReadyToCommit state and wait for the commit signal (by calling finish()).
- * 5. Once finish() is called, keep on trying to get more oplog from the source shard until it
- *    returns an empty result again.
- * 6. Wait for writes to be committed to majority of the replica set.
- */
-void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(ServiceContext* service) {
-    Client::initThread(
-        "sessionCatalogMigrationProducer-" + _migrationSessionId.toString(), service, nullptr);
-    auto client = Client::getCurrent();
-    {
-        stdx::lock_guard lk(*client);
-        client->setSystemOperationKillableByStepdown(lk);
-    }
-
-    bool oplogDrainedAfterCommiting = false;
-    ProcessOplogResult lastResult;
-    repl::OpTime lastOpTimeWaited;
-
-    while (true) {
-        {
-            stdx::lock_guard<Latch> lk(_mutex);
-            if (_state == State::ErrorOccurred) {
-                return;
-            }
-        }
-
-        BSONObj nextBatch;
-        BSONArray oplogArray;
-        {
-            auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
-            auto uniqueCtx = CancelableOperationContext(
-                cc().makeOperationContext(), _cancellationToken, executor);
-            auto opCtx = uniqueCtx.get();
-
-            nextBatch = getNextSessionOplogBatch(opCtx, _fromShard, _migrationSessionId);
-            oplogArray = BSONArray{nextBatch[kOplogField].Obj()};
-
-            if (oplogArray.isEmpty()) {
-                {
-                    stdx::lock_guard<Latch> lk(_mutex);
-                    if (_state == State::Committing) {
-                        // The migration is considered done only when it gets an empty result from
-                        // the source shard while this is in state committing. This is to make sure
-                        // that it doesn't miss any new oplog created between the time window where
-                        // this depleted the buffer from the source shard and receiving the commit
-                        // command.
-                        if (oplogDrainedAfterCommiting) {
-                            LOGV2(5087100,
-                                  "Recipient finished draining oplog entries for retryable writes "
-                                  "and transactions from donor again after receiving "
-                                  "_recvChunkCommit",
-                                  "namespace"_attr = _nss,
-                                  "migrationSessionId"_attr = _migrationSessionId,
-                                  "fromShard"_attr = _fromShard);
-                            break;
-                        }
-
-                        oplogDrainedAfterCommiting = true;
-                    }
-                }
-
-                WriteConcernResult unusedWCResult;
-                uassertStatusOK(
-                    waitForWriteConcern(opCtx, lastResult.oplogTime, kMajorityWC, &unusedWCResult));
-
-                {
-                    stdx::lock_guard<Latch> lk(_mutex);
-                    // Note: only transition to "ready to commit" if state is not error/force stop.
-                    if (_state == State::Migrating) {
-                        // We depleted the buffer at least once, transition to ready for commit.
-                        LOGV2(5087101,
-                              "Recipient finished draining oplog entries for retryable writes and "
-                              "transactions from donor for the first time, before receiving "
-                              "_recvChunkCommit",
-                              "namespace"_attr = _nss,
-                              "migrationSessionId"_attr = _migrationSessionId,
-                              "fromShard"_attr = _fromShard);
-                        _state = State::ReadyToCommit;
-                    }
-                }
-
-                lastOpTimeWaited = lastResult.oplogTime;
-            }
-        }
-        for (BSONArrayIteratorSorted oplogIter(oplogArray); oplogIter.more();) {
-            try {
-                lastResult = processSessionOplog(
-                    oplogIter.next().Obj(), lastResult, service, _cancellationToken);
-            } catch (const ExceptionFor<ErrorCodes::TransactionTooOld>&) {
-                // This means that the server has a newer txnNumber than the oplog being
-                // migrated, so just skip it
-                continue;
-            }
-        }
-    }
-
-    WriteConcernResult unusedWCResult;
-
-    auto executor = Grid::get(service)->getExecutorPool()->getFixedExecutor();
-    auto uniqueOpCtx =
-        CancelableOperationContext(cc().makeOperationContext(), _cancellationToken, executor);
-
-    uassertStatusOK(
-        waitForWriteConcern(uniqueOpCtx.get(), lastResult.oplogTime, kMajorityWC, &unusedWCResult));
-
-    {
-        stdx::lock_guard<Latch> lk(_mutex);
-        _state = State::Done;
-    }
-}
-
 std::string SessionCatalogMigrationDestination::getErrMsg() {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _errMsg;
 }
 
 void SessionCatalogMigrationDestination::_errorOccurred(StringData errMsg) {
     LOGV2(5087102,
           "Recipient failed to copy oplog entries for retryable writes and transactions from donor",
-          "namespace"_attr = _nss,
+          logAttrs(_nss),
           "migrationSessionId"_attr = _migrationSessionId,
           "fromShard"_attr = _fromShard,
           "error"_attr = errMsg);
 
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _state = State::ErrorOccurred;
     _errMsg = errMsg.toString();
 }
 
+MigrationSessionId SessionCatalogMigrationDestination::getMigrationSessionId() const {
+    return _migrationSessionId;
+}
+
 SessionCatalogMigrationDestination::State SessionCatalogMigrationDestination::getState() {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _state;
 }
 
@@ -547,4 +599,7 @@ void SessionCatalogMigrationDestination::forceFail(StringData errMsg) {
     _errorOccurred(errMsg);
 }
 
+long long SessionCatalogMigrationDestination::getSessionOplogEntriesMigrated() {
+    return _sessionOplogEntriesMigrated.load();
+}
 }  // namespace mongo

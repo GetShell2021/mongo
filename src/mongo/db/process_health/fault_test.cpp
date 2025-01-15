@@ -29,9 +29,16 @@
 
 #include "mongo/db/process_health/fault.h"
 
+#include <utility>
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/process_health/fault_facet_mock.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/process_health/health_check_status.h"
+#include "mongo/db/service_context.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/synchronized_value.h"
 
 namespace mongo {
 namespace process_health {
@@ -40,8 +47,7 @@ namespace {
 class FaultTest : public unittest::Test {
 public:
     void setUp() override {
-        _svcCtx = ServiceContext::make();
-        _svcCtx->setFastClockSource(std::make_unique<ClockSourceMock>());
+        _svcCtx = ServiceContext::make(std::make_unique<ClockSourceMock>());
         _faultImpl = std::make_unique<Fault>(_svcCtx->getFastClockSource());
     }
 

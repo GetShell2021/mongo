@@ -9,12 +9,16 @@
  * of 5MB across all sharding tests in wiredTiger.
  * @tags: [
  *   resource_intensive,
+ *   requires_scripting
  * ]
  */
-load('jstests/libs/write_concern_util.js');
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    assertWriteConcernError,
+    runCommandCheckAdmin,
+    shardCollectionWithChunks
+} from "jstests/libs/write_concern_util.js";
 
-(function() {
-"use strict";
 var st = new ShardingTest({
     // Set priority of secondaries to zero to prevent spurious elections.
     shards: {
@@ -41,7 +45,6 @@ function dropTestDatabase() {
     db.runCommand({dropDatabase: 1});
     db.extra.insert({a: 1});
     coll = db[collName];
-    st.ensurePrimaryShard(db.toString(), st.shard0.shardName);
     assert.eq(0, coll.find().itcount(), "test collection not empty");
     assert.eq(1, db.extra.find().itcount(), "extra collection should have 1 document");
 }
@@ -69,7 +72,6 @@ commands.push({
     req: {createIndexes: collName, indexes: [{key: {'type': 1}, name: 'type_index'}]},
     setupFunc: function() {
         coll.insert({type: 'oak'});
-        st.ensurePrimaryShard(db.toString(), st.shard0.shardName);
         assert.eq(coll.getIndexes().length, 1);
     },
     confirmFunc: function() {
@@ -98,7 +100,6 @@ commands.push({
         db = db.getSiblingDB("renameCollWC");
         // Ensure that database is created.
         db.leaves.insert({type: 'oak'});
-        st.ensurePrimaryShard(db.toString(), st.shard0.shardName);
         db.leaves.drop();
         db.pine_needles.drop();
         db.leaves.insert({type: 'oak'});
@@ -521,7 +522,7 @@ function testInvalidWriteConcern(cmd) {
     // a writeConcernError object to exceed maximum BSON size.
     if (cmd.req.aggregate || cmd.req.mapReduce) {
         assert.commandFailedWithCode(
-            res, [ErrorCodes.WriteConcernFailed, ErrorCodes.UnknownReplWriteConcern]);
+            res, [ErrorCodes.WriteConcernTimeout, ErrorCodes.UnknownReplWriteConcern]);
 
         cmd.confirmFunc(cmd.isExpectedToWriteOnWriteConcernFailure);
     } else if (cmd.req.renameCollection) {
@@ -546,4 +547,3 @@ commands.forEach(function(cmd) {
 });
 
 st.stop();
-})();

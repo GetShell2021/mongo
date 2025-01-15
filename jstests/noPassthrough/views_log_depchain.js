@@ -14,11 +14,6 @@
 //     <repeat for all other views that had to be resolved for the query>
 //   }
 // ],
-(function() {
-'use strict';
-
-load("jstests/libs/logv2_helpers.js");
-
 function resetProfiler(db) {
     assert.commandWorked(db.setProfilingLevel(0, {slowms: 0}));
     db.system.profile.drop();
@@ -99,4 +94,3 @@ assertResolvedView(resolvedViews[1], `${db.getName()}.c_view`, 3, 2);
 
 assert.commandWorked(db.dropDatabase());
 MongoRunner.stopMongod(conn);
-})();

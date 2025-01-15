@@ -31,9 +31,20 @@ if [ "$SEORDER" == "0" ]; then
 fi
 
 pkg="$(find "$HOME"/repo -name 'mongodb-*-server-*.x86_64.rpm' | tee /dev/stderr)"
-sudo --non-interactive rpm --install --verbose --verbose --hash --nodeps "$pkg"
-if [ "$?" -gt "1" ]; then exit 1; fi # exit code 1 is OK
+if ! sudo --non-interactive rpm --install --verbose --verbose --hash --nodeps "$pkg"; then
+  if [ "$?" -gt "1" ]; then exit 1; fi # exit code 1 is OK
+fi
 
 if [ "$SEORDER" == "1" ]; then
   apply_selinux_policy
+fi
+
+# install packages needed by check_has_tag.py
+PYTHON=/opt/mongodbtoolchain/v4/bin/python3
+if [[ (-f "$PYTHON" || -L "$PYTHON") && -x "$PYTHON" ]]; then
+  echo "==== Found python3 in $PYTHON"
+  $PYTHON -m pip install pyyaml
+else
+  echo "==== Could not find $PYTHON; needed by SELinux tests"
+  exit 1
 fi

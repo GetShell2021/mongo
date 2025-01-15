@@ -4,18 +4,23 @@
  *
  * This test is labeled resource intensive because its total io_write is 30MB compared to a median
  * of 5MB across all sharding tests in wiredTiger.
- * @tags: [resource_intensive]
+ * @tags: [
+ *   resource_intensive,
+ *   # TODO (SERVER-97257): Re-enable this test.
+ *   # Test doesn't start enough mongods to have num_mongos routers
+ *   embedded_router_incompatible,
+ *   requires_scripting
+ * ]
  */
-(function() {
-'use strict';
-load("jstests/replsets/rslib.js");
-load("jstests/sharding/libs/find_chunks_util.js");
-load("jstests/libs/feature_flag_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {traceMissingDoc} from "jstests/libs/trace_missing_docs.js";
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
 
 // Replica set nodes started with --shardsvr do not enable key generation until they are added
 // to a sharded cluster and reject commands with gossiped clusterTime from users without the
 // advanceClusterTime privilege. This causes ShardingTest setup to fail because the shell
-// briefly authenticates as __system and recieves clusterTime metadata then will fail trying to
+// briefly authenticates as __system and receives clusterTime metadata then will fail trying to
 // gossip that time later in setup.
 //
 
@@ -52,13 +57,13 @@ function getShardName(rsTest) {
 var s = new ShardingTest({
     name: "auth",
     mongos: 1,
-    shards: 0,
-    other: {keyFile: "jstests/libs/key1", chunkSize: 1, enableAutoSplit: false},
+    shards: TestData.configShard ? 1 : 0,
+    other: {keyFile: "jstests/libs/key1", chunkSize: 1},
 });
 
 if (s.getDB('admin').runCommand('buildInfo').bits < 64) {
     print('Skipping test on 32-bit platforms');
-    return;
+    quit();
 }
 
 print("Configuration: Add user " + tojson(adminUser));
@@ -108,9 +113,16 @@ assert(thrown);
 
 print("start rs w/correct key");
 
-d1.stopSet();
-d1.startSet({keyFile: "jstests/libs/key1", restart: true});
-d1.initiate();
+d1.stopSet(null /* signal */, true /* forRestart */);
+// If we are using the in-memory storage engine, we need to re-initiate the replica set
+// after restart before an election can occur, since the config does not persist. So
+// we must disable the auto stepup-on-restart behavior.
+if (jsTest.options().storageEngine == "inMemory") {
+    d1.startSet({keyFile: "jstests/libs/key1"}, true /* restart */, true /* skipStepUpOnRestart */);
+    d1.initiate();
+} else {
+    d1.startSet({keyFile: "jstests/libs/key1", restart: true});
+}
 
 var primary = d1.getPrimary();
 
@@ -122,7 +134,7 @@ assert.commandWorked(result);
 s.getDB("admin").runCommand({enableSharding: "test"});
 s.getDB("admin").runCommand({shardCollection: "test.foo", key: {x: 1}});
 
-d1.waitForState(d1.getSecondaries(), ReplSetTest.State.SECONDARY, 5 * 60 * 1000);
+d1.awaitSecondaryNodes(5 * 60 * 1000);
 
 s.getDB(testUser.db)
     .createUser({user: testUser.username, pwd: testUser.password, roles: jsTest.basicUserRoles});
@@ -186,22 +198,6 @@ assert.commandWorked(bulk.execute());
 
 s.startBalancer(60000);
 
-const balanceAccordingToDataSize =
-    FeatureFlagUtil.isEnabled(s.configRS.getPrimary().getDB('admin'), "BalanceAccordingToDataSize");
-if (!balanceAccordingToDataSize) {
-    assert.soon(function() {
-        var d1Chunks =
-            findChunksUtil.countChunksForNs(s.getDB("config"), 'test.foo', {shard: "d1"});
-        var d2Chunks =
-            findChunksUtil.countChunksForNs(s.getDB("config"), 'test.foo', {shard: "d2"});
-        var totalChunks = findChunksUtil.countChunksForNs(s.getDB("config"), 'test.foo');
-
-        print("chunks: " + d1Chunks + " " + d2Chunks + " " + totalChunks);
-
-        return d1Chunks > 0 && d2Chunks > 0 && (d1Chunks + d2Chunks == totalChunks);
-    }, "Chunks failed to balance", 60000, 5000);
-}
-
 // SERVER-33753: count() without predicate can be wrong on sharded collections.
 // assert.eq(s.getDB("test").foo.count(), num+1);
 var numDocs = s.getDB("test").foo.find().itcount();
@@ -225,8 +221,6 @@ if (numDocs != num) {
     }
     assert.eq(numDocs, numDocsSeen, "More docs discovered on second find()");
     assert.eq(num - numDocs, missingDocNumbers.length);
-
-    load('jstests/libs/trace_missing_docs.js');
 
     for (var i = 0; i < missingDocNumbers.length; i++) {
         jsTest.log("Tracing doc: " + missingDocNumbers[i]);
@@ -254,8 +248,8 @@ assert.eq(count, 5);
 
 logout(adminUser);
 
-d1.waitForState(d1.getSecondaries(), ReplSetTest.State.SECONDARY, 5 * 60 * 1000);
-d2.waitForState(d2.getSecondaries(), ReplSetTest.State.SECONDARY, 5 * 60 * 1000);
+d1.awaitSecondaryNodes(5 * 60 * 1000);
+d2.awaitSecondaryNodes(5 * 60 * 1000);
 
 authutil.asCluster(d1.nodes, "jstests/libs/key1", function() {
     d1.awaitReplication();
@@ -342,4 +336,3 @@ assert.commandFailed(readOnlyDB.killOp(2000000000));
 s.stop();
 d1.stopSet();
 d2.stopSet();
-})();

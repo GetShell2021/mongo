@@ -29,8 +29,15 @@
 
 #include "mongo/client/replica_set_monitor_server_parameters.h"
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/replica_set_monitor_server_parameters_gen.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -46,12 +53,14 @@ std::string toString(ReplicaSetMonitorProtocol protocol) {
 }
 
 void RSMProtocolServerParameter::append(OperationContext*,
-                                        BSONObjBuilder& builder,
-                                        const std::string& name) {
-    builder.append(name, toString(gReplicaSetMonitorProtocol));
+                                        BSONObjBuilder* builder,
+                                        StringData name,
+                                        const boost::optional<TenantId>&) {
+    builder->append(name, toString(gReplicaSetMonitorProtocol));
 }
 
-Status RSMProtocolServerParameter::setFromString(const std::string& protocolStr) {
+Status RSMProtocolServerParameter::setFromString(StringData protocolStr,
+                                                 const boost::optional<TenantId>&) {
     if (protocolStr == toString(ReplicaSetMonitorProtocol::kStreamable)) {
         gReplicaSetMonitorProtocol = ReplicaSetMonitorProtocol::kStreamable;
     } else if (protocolStr == toString(ReplicaSetMonitorProtocol::kSdam)) {

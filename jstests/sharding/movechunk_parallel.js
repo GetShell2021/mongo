@@ -9,19 +9,23 @@
  *  ]
  */
 
-load('./jstests/libs/chunk_manipulation_util.js');
-load("jstests/sharding/libs/find_chunks_util.js");
-
-(function() {
-'use strict';
+import {
+    migrateStepNames,
+    moveChunkParallel,
+    pauseMigrateAtStep,
+    unpauseMigrateAtStep,
+    waitForMigrateStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 // For startParallelOps to write its state
 var staticMongod = MongoRunner.runMongod({});
 
 var st = new ShardingTest({shards: 4});
 
-assert.commandWorked(st.s0.adminCommand({enableSharding: 'TestDB'}));
-st.ensurePrimaryShard('TestDB', st.shard0.shardName);
+assert.commandWorked(
+    st.s0.adminCommand({enableSharding: 'TestDB', primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s0.adminCommand({shardCollection: 'TestDB.TestColl', key: {Key: 1}}));
 
 var coll = st.s0.getDB('TestDB').TestColl;
@@ -93,4 +97,3 @@ assert.eq(
 
 st.stop();
 MongoRunner.stopMongod(staticMongod);
-})();

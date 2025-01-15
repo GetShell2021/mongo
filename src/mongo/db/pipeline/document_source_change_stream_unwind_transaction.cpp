@@ -28,14 +28,43 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <iterator>
+#include <list>
+#include <string>
+#include <utility>
 
-#include "mongo/db/pipeline/document_source_change_stream_unwind_transaction.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/matcher/expression_always_boolean.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/expression_tree.h"
 #include "mongo/db/pipeline/change_stream_filter_helpers.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
 #include "mongo/db/pipeline/change_stream_rewrite_helpers.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
+#include "mongo/db/pipeline/document_source_change_stream_unwind_transaction.h"
+#include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -59,17 +88,20 @@ namespace change_stream_filter {
  * against the possibility of stale string references.
  */
 std::unique_ptr<MatchExpression> buildUnwindTransactionFilter(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MatchExpression* userMatch,
+    std::vector<BSONObj>& bsonObj) {
     // The transaction unwind filter is the same as the operation filter applied to the oplog. This
     // includes a namespace filter, which ensures that it will discard all documents that would be
     // filtered out by the default 'ns' filter this stage gets initialized with.
-    auto unwindFilter = std::make_unique<AndMatchExpression>(buildOperationFilter(expCtx, nullptr));
+    auto unwindFilter =
+        std::make_unique<AndMatchExpression>(buildOperationFilter(expCtx, nullptr, bsonObj));
 
     // To correctly handle filtering out entries of direct write operations on orphaned documents,
     // we include a filter for "fromMigrate" flagged operations, unless "fromMigrate" events are
     // explicitly requested in the spec.
-    if (!expCtx->changeStreamSpec->getShowMigrationEvents()) {
-        unwindFilter->add(buildNotFromMigrateFilter(expCtx, userMatch));
+    if (!expCtx->getChangeStreamSpec()->getShowMigrationEvents()) {
+        unwindFilter->add(buildNotFromMigrateFilter(expCtx, userMatch, bsonObj));
     }
 
     // Attempt to rewrite the user's filter and combine it with the standard operation filter. We do
@@ -77,19 +109,35 @@ std::unique_ptr<MatchExpression> buildUnwindTransactionFilter(
     // transaction events do not have these fields until we populate them from the commitTransaction
     // event. We already applied these predicates during the oplog scan, so we know that they match.
     static const std::set<std::string> excludedFields = {"clusterTime", "lsid", "txnNumber"};
-    if (auto rewrittenMatch =
-            change_stream_rewrite::rewriteFilterForFields(expCtx, userMatch, {}, excludedFields)) {
+    if (auto rewrittenMatch = change_stream_rewrite::rewriteFilterForFields(
+            expCtx, userMatch, bsonObj, {}, excludedFields)) {
         unwindFilter->add(std::move(rewrittenMatch));
     }
     return MatchExpression::optimize(std::move(unwindFilter));
+}
+
+/**
+ * This filter is only used internally, to test the applicability of the EOT event we generate for
+ * unprepared transactions.
+ */
+std::unique_ptr<MatchExpression> buildEndOfTransactionFilter(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    if (!expCtx->getChangeStreamSpec()->getShowExpandedEvents()) {
+        return std::make_unique<AlwaysFalseMatchExpression>();
+    }
+
+    auto nsRegex = DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx);
+    return std::make_unique<RegexMatchExpression>(
+        "o2.endOfTransaction"_sd, nsRegex, "" /*options*/);
 }
 }  // namespace change_stream_filter
 
 boost::intrusive_ptr<DocumentSourceChangeStreamUnwindTransaction>
 DocumentSourceChangeStreamUnwindTransaction::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    std::vector<BSONObj> bsonObj = std::vector<BSONObj>{};
     std::unique_ptr<MatchExpression> matchExpr =
-        change_stream_filter::buildUnwindTransactionFilter(expCtx, nullptr);
+        change_stream_filter::buildUnwindTransactionFilter(expCtx, nullptr, bsonObj);
     return new DocumentSourceChangeStreamUnwindTransaction(matchExpr->serialize(), expCtx);
 }
 
@@ -100,14 +148,14 @@ DocumentSourceChangeStreamUnwindTransaction::createFromBson(
             str::stream() << "the '" << kStageName << "' stage spec must be an object",
             elem.type() == BSONType::Object);
     auto parsedSpec = DocumentSourceChangeStreamUnwindTransactionSpec::parse(
-        IDLParserErrorContext("DocumentSourceChangeStreamUnwindTransactionSpec"), elem.Obj());
+        IDLParserContext("DocumentSourceChangeStreamUnwindTransactionSpec"), elem.Obj());
     return new DocumentSourceChangeStreamUnwindTransaction(parsedSpec.getFilter(), expCtx);
 }
 
 DocumentSourceChangeStreamUnwindTransaction::DocumentSourceChangeStreamUnwindTransaction(
-    const BSONObj& filter, const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(kStageName, expCtx) {
-    rebuild(filter);
+    BSONObj filter, const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    : DocumentSourceInternalChangeStreamStage(kStageName, expCtx) {
+    rebuild(std::move(filter));
 }
 
 void DocumentSourceChangeStreamUnwindTransaction::rebuild(BSONObj filter) {
@@ -128,19 +176,23 @@ StageConstraints DocumentSourceChangeStreamUnwindTransaction::constraints(
                             ChangeStreamRequirement::kChangeStreamStage);
 }
 
-Value DocumentSourceChangeStreamUnwindTransaction::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    tassert(5467604, "expression has not been initialized", _expression);
+Value DocumentSourceChangeStreamUnwindTransaction::doSerialize(
+    const SerializationOptions& opts) const {
+    tassert(7481400, "expression has not been initialized", _expression);
 
-    if (explain) {
-        return Value(
-            DOC(DocumentSourceChangeStream::kStageName << DOC("stage"
-                                                              << "internalUnwindTransaction"_sd
-                                                              << "filter" << _filter)));
+    if (opts.verbosity) {
+        BSONObjBuilder builder;
+        builder.append("stage"_sd, "internalUnwindTransaction"_sd);
+        builder.append(DocumentSourceChangeStreamUnwindTransactionSpec::kFilterFieldName,
+                       _expression->serialize(opts));
+
+        return Value(DOC(DocumentSourceChangeStream::kStageName << builder.obj()));
     }
 
-    DocumentSourceChangeStreamUnwindTransactionSpec spec(_filter);
-    return Value(Document{{kStageName, Value(spec.toBSON())}});
+    // 'SerializationOptions' are not required here, since serialization for explain and query
+    // stats occur before this function call.
+    return Value(Document{
+        {kStageName, Value{DocumentSourceChangeStreamUnwindTransactionSpec{_filter}.toBSON()}}});
 }
 
 DepsTracker::State DocumentSourceChangeStreamUnwindTransaction::getDependencies(
@@ -153,25 +205,26 @@ DepsTracker::State DocumentSourceChangeStreamUnwindTransaction::getDependencies(
     deps->fields.insert(repl::OplogEntry::kTermFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kTxnNumberFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kWallClockTimeFieldName.toString());
+    deps->fields.insert(repl::OplogEntry::kMultiOpTypeFieldName.toString());
 
     return DepsTracker::State::SEE_NEXT;
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceChangeStreamUnwindTransaction::getModifiedPaths()
     const {
-    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, std::set<std::string>{}, {}};
+    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, OrderedPathSet{}, {}};
 }
 
 DocumentSource::GetNextResult DocumentSourceChangeStreamUnwindTransaction::doGetNext() {
     uassert(5543812,
-            str::stream() << kStageName << " cannot be executed from mongos",
-            !pExpCtx->inMongos);
+            str::stream() << kStageName << " cannot be executed from router",
+            !pExpCtx->getInRouter());
 
     while (true) {
         // If we're unwinding an 'applyOps' from a transaction, check if there are any documents
         // we have stored that can be returned.
         if (_txnIterator) {
-            if (auto next = _txnIterator->getNextTransactionOp(pExpCtx->opCtx)) {
+            if (auto next = _txnIterator->getNextTransactionOp(pExpCtx->getOperationContext())) {
                 return std::move(*next);
             }
 
@@ -202,15 +255,13 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamUnwindTransaction::doGet
         // call 'getNextTransactionOp' on it. Note that is possible for the transaction iterator
         // to be empty of any relevant operations, meaning that this loop may need to execute
         // multiple times before it encounters a relevant change to return.
-        _txnIterator.emplace(
-            pExpCtx->opCtx, pExpCtx->mongoProcessInterface, doc, _expression.get());
+        _txnIterator.emplace(pExpCtx, doc, _expression.get());
     }
 }
 
 bool DocumentSourceChangeStreamUnwindTransaction::_isTransactionOplogEntry(const Document& doc) {
     auto op = doc[repl::OplogEntry::kOpTypeFieldName];
-    auto opType =
-        repl::OpType_parse(IDLParserErrorContext("ChangeStreamEntry.op"), op.getStringData());
+    auto opType = repl::OpType_parse(IDLParserContext("ChangeStreamEntry.op"), op.getStringData());
     auto commandVal = doc["o"];
 
     if (opType != repl::OpTypeEnum::kCommand ||
@@ -226,22 +277,34 @@ bool DocumentSourceChangeStreamUnwindTransaction::_isTransactionOplogEntry(const
 }
 
 DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::TransactionOpIterator(
-    OperationContext* opCtx,
-    std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const Document& input,
     const MatchExpression* expression)
-    : _mongoProcessInterface(mongoProcessInterface), _expression(expression) {
+    : _mongoProcessInterface(expCtx->getMongoProcessInterface()),
+      _expression(expression),
+      _endOfTransactionExpression(change_stream_filter::buildEndOfTransactionFilter(expCtx)) {
 
-    // The lsid and txnNumber can be missing in case of batched writes.
-    Value lsidValue = input["lsid"];
-    DocumentSourceChangeStream::checkValueTypeOrMissing(lsidValue, "lsid", BSONType::Object);
-    _lsid = lsidValue.missing() ? boost::none : boost::optional<Document>(lsidValue.getDocument());
-    Value txnNumberValue = input["txnNumber"];
+    Value multiOpTypeValue = input[repl::OplogEntry::kMultiOpTypeFieldName];
     DocumentSourceChangeStream::checkValueTypeOrMissing(
-        txnNumberValue, "txnNumber", BSONType::NumberLong);
-    _txnNumber = txnNumberValue.missing() ? boost::none
-                                          : boost::optional<TxnNumber>(txnNumberValue.getLong());
+        multiOpTypeValue, repl::OplogEntry::kMultiOpTypeFieldName, BSONType::NumberInt);
+    const bool applyOpsAppliedSeparately = !multiOpTypeValue.missing() &&
+        multiOpTypeValue.getInt() == int(repl::MultiOplogEntryType::kApplyOpsAppliedSeparately);
 
+    // The lsid and txnNumber can be missing in case of batched writes, and are ignored when
+    // multiOpType is kApplyOpsAppliedSeparately.  The latter indicates an applyOps that is part of
+    // a retryable write and not a multi-document transaction.
+    if (!applyOpsAppliedSeparately) {
+        Value lsidValue = input["lsid"];
+        DocumentSourceChangeStream::checkValueTypeOrMissing(lsidValue, "lsid", BSONType::Object);
+        _lsid =
+            lsidValue.missing() ? boost::none : boost::optional<Document>(lsidValue.getDocument());
+        Value txnNumberValue = input["txnNumber"];
+        DocumentSourceChangeStream::checkValueTypeOrMissing(
+            txnNumberValue, "txnNumber", BSONType::NumberLong);
+        _txnNumber = txnNumberValue.missing()
+            ? boost::none
+            : boost::optional<TxnNumber>(txnNumberValue.getLong());
+    }
     // We want to parse the OpTime out of this document using the BSON OpTime parser. Instead of
     // converting the entire Document back to BSON, we convert only the fields we need.
     repl::OpTime txnOpTime = repl::OpTime::parse(BSON(repl::OpTime::kTimestampFieldName
@@ -277,13 +340,23 @@ DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::TransactionO
                 !commandObj["commitTransaction"].missing());
     }
 
-    if (BSONType::Object ==
-        input[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName].getType()) {
+    // We need endOfTransaction only for unprepared transactions: so this must be an applyOps with
+    // set lsid and txnNumber but not a retryable write.
+    _needEndOfTransaction = feature_flags::gFeatureFlagEndOfTransactionChangeEvent.isEnabled(
+                                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
+        !applyOps.missing() && !applyOpsAppliedSeparately && _lsid.has_value() &&
+        _txnNumber.has_value();
+
+    // If there's no previous optime, or if this applyOps is of the kApplyOpsAppliedSeparately
+    // multiOptype, we don't need to collect other apply ops operations.
+    if (!applyOpsAppliedSeparately &&
+        BSONType::Object ==
+            input[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName].getType()) {
         // As with the 'txnOpTime' parsing above, we convert a portion of 'input' back to BSON
         // in order to parse an OpTime, this time from the "prevOpTime" field.
         repl::OpTime prevOpTime = repl::OpTime::parse(
             input[repl::OplogEntry::kPrevWriteOpTimeInTransactionFieldName].getDocument().toBson());
-        _collectAllOpTimesFromTransaction(opCtx, prevOpTime);
+        _collectAllOpTimesFromTransaction(expCtx->getOperationContext(), prevOpTime);
     }
 
     // Pop the first OpTime off the stack and use it to load the first oplog entry into the
@@ -303,7 +376,8 @@ DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::TransactionO
     } else {
         // This transaction consists of multiple oplog entries; grab the chronologically first
         // entry and extract its "applyOps" array.
-        auto firstApplyOpsEntry = _lookUpOplogEntryByOpTime(opCtx, firstTimestamp);
+        auto firstApplyOpsEntry =
+            _lookUpOplogEntryByOpTime(expCtx->getOperationContext(), firstTimestamp);
 
         auto bsonOp = firstApplyOpsEntry.getOperationToApply();
         tassert(5543806,
@@ -331,15 +405,20 @@ DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::getNextTrans
             ++_currentApplyOpsIndex;
             ++_txnOpIndex;
 
+            _assertExpectedTransactionEventFormat(doc);
+
+            if (_needEndOfTransaction) {
+                _addAffectedNamespaces(doc);
+            }
             // If the document is relevant, update it with the required txn fields before returning.
-            if (_isDocumentRelevant(doc)) {
+            if (_expression->matchesBSON(doc.toBson())) {
                 return _addRequiredTransactionFields(doc);
             }
         }
 
         if (_txnOplogEntries.empty()) {
             // There are no more operations in this transaction.
-            return boost::none;
+            return _createEndOfTransactionIfNeeded();
         }
 
         // We've processed all the operations in the previous applyOps entry, but we have a new
@@ -360,25 +439,23 @@ DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::getNextTrans
     }
 }
 
-bool DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::_isDocumentRelevant(
-    const Document& d) const {
+void DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::
+    _assertExpectedTransactionEventFormat(const Document& d) const {
     tassert(5543808,
             str::stream() << "Unexpected format for entry within a transaction oplog entry: "
                              "'op' field was type "
                           << typeName(d["op"].getType()),
             d["op"].getType() == BSONType::String);
     tassert(5543809,
-            "Unexpected noop entry within a transaction",
+            str::stream() << "Unexpected noop entry within a transaction "
+                          << redact(d["o"].toString()),
             ValueComparator::kInstance.evaluate(d["op"] != Value("n"_sd)));
-
-    return _expression->matchesBSON(d.toBson());
 }
 
 Document
 DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::_addRequiredTransactionFields(
-    const Document& doc) {
+    const Document& doc) const {
     MutableDocument newDoc(doc);
-
     // The 'getNextTransactionOp' increments the '_txnOpIndex' by 1, to point to the next
     // transaction number. The 'txnOpIndex()' must be called to get the current transaction number.
     newDoc.addField(DocumentSourceChangeStream::kTxnOpIndexField,
@@ -392,10 +469,11 @@ DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::_addRequired
     newDoc.addField(DocumentSourceChangeStream::kApplyOpsTsField, Value(applyOpsTs()));
 
     newDoc.addField(repl::OplogEntry::kTimestampFieldName, Value(_clusterTime));
+    newDoc.addField(repl::OplogEntry::kWallClockTimeFieldName, Value(_wallTime));
+
     newDoc.addField(repl::OplogEntry::kSessionIdFieldName, _lsid ? Value(*_lsid) : Value());
     newDoc.addField(repl::OplogEntry::kTxnNumberFieldName,
                     _txnNumber ? Value(static_cast<long long>(*_txnNumber)) : Value());
-    newDoc.addField(repl::OplogEntry::kWallClockTimeFieldName, Value(_wallTime));
 
     return newDoc.freeze();
 }
@@ -437,15 +515,71 @@ void DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::
     }
 }
 
+void DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::_addAffectedNamespaces(
+    const Document& doc) {
+    // TODO SERVER-78670:  move namespace extraction to change_stream_helpers.cpp and make generic
+    const auto tid = [&]() -> boost::optional<TenantId> {
+        if (!gMultitenancySupport) {
+            return boost::none;
+        }
+        const auto tidField = doc["tid"];
+        return !tidField.missing() ? boost::make_optional(TenantId(tidField.getOid()))
+                                   : boost::none;
+    }();
+
+    const auto dbCmdNs = NamespaceStringUtil::deserialize(
+        tid, doc["ns"].getStringData(), SerializationContext::stateDefault());
+    if (doc["op"].getStringData() != "c") {
+        _affectedNamespaces.insert(dbCmdNs);
+        return;
+    }
+
+    static const std::vector<std::string> kCollectionField = {"create", "createIndexes"};
+    const Document& object = doc["o"].getDocument();
+    for (const auto& fieldName : kCollectionField) {
+        const auto field = object[fieldName];
+        if (field.getType() == BSONType::String) {
+            _affectedNamespaces.insert(
+                NamespaceStringUtil::deserialize(dbCmdNs.dbName(), field.getStringData()));
+            return;
+        }
+    }
+
+    tasserted(7694300,
+              str::stream() << "Unexpected op in applyOps at " << _currentApplyOpsTs << " index "
+                            << _currentApplyOpsIndex << " object " << redact(object.toString()));
+}
+
+boost::optional<Document> DocumentSourceChangeStreamUnwindTransaction::TransactionOpIterator::
+    _createEndOfTransactionIfNeeded() {
+    if (!_needEndOfTransaction || _endOfTransactionReturned) {
+        return boost::none;
+    }
+    ++_currentApplyOpsIndex;
+    ++_txnOpIndex;
+    _endOfTransactionReturned = true;
+
+    std::vector<NamespaceString> namespaces{_affectedNamespaces.begin(), _affectedNamespaces.end()};
+    auto lsid = LogicalSessionId::parse(IDLParserContext("LogicalSessionId"), _lsid->toBson());
+    repl::MutableOplogEntry oplogEntry = change_stream::createEndOfTransactionOplogEntry(
+        lsid, *_txnNumber, namespaces, _clusterTime, _wallTime);
+
+    MutableDocument newDoc(Document(oplogEntry.toBSON()));
+    newDoc.addField(DocumentSourceChangeStream::kTxnOpIndexField,
+                    Value(static_cast<long long>(txnOpIndex())));
+    newDoc.addField(DocumentSourceChangeStream::kApplyOpsIndexField,
+                    Value(static_cast<long long>(applyOpsIndex())));
+    newDoc.addField(DocumentSourceChangeStream::kApplyOpsTsField, Value(applyOpsTs()));
+
+    Document endOfTransaction = newDoc.freeze();
+    return {_endOfTransactionExpression->matchesBSON(endOfTransaction.toBson()), endOfTransaction};
+}
+
 Pipeline::SourceContainer::iterator DocumentSourceChangeStreamUnwindTransaction::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     tassert(5687205, "Iterator mismatch during optimization", *itr == this);
 
     auto nextChangeStreamStageItr = std::next(itr);
-
-    if (!feature_flags::gFeatureFlagChangeStreamsRewrite.isEnabledAndIgnoreFCV()) {
-        return nextChangeStreamStageItr;
-    }
 
     // The additional filtering added by this optimization may incorrectly filter out events if it
     // runs with the non-simple collation.
@@ -475,8 +609,9 @@ Pipeline::SourceContainer::iterator DocumentSourceChangeStreamUnwindTransaction:
 
     // Build a filter which discards unwound transaction operations which would have been filtered
     // out later in the pipeline by the user's $match filter.
+    std::vector<BSONObj> bsonObj = std::vector<BSONObj>{};
     auto unwindTransactionFilter = change_stream_filter::buildUnwindTransactionFilter(
-        pExpCtx, matchStage->getMatchExpression());
+        pExpCtx, matchStage->getMatchExpression(), bsonObj);
 
     // Replace the default filter with the new, more restrictive one. Note that the resulting
     // expression must be serialized then deserialized to ensure it does not retain unsafe

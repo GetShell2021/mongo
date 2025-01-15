@@ -28,17 +28,50 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <ctime>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/secure_allocator.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/commands/server_status_internal.h"
+#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/process_id.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/concurrency/admission_context.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/http_client.h"
 #include "mongo/util/net/socket_utils.h"
+#include "mongo/util/processinfo.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
@@ -69,16 +102,24 @@ public:
                "retrieve all server status sections.";
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const final {
-        ActionSet actions;
-        actions.addAction(ActionType::serverStatus);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(dbName.tenantId()), ActionType::serverStatus)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
         const auto service = opCtx->getServiceContext();
@@ -86,18 +127,15 @@ public:
         const auto runStart = clock->now();
         BSONObjBuilder timeBuilder(256);
 
-        const auto authSession = AuthorizationSession::get(Client::getCurrent());
-
-        // This command is important to observability, and like FTDC, does not need to acquire the
-        // PBWM lock to return correct results.
-        ShouldNotConflictWithSecondaryBatchApplicationBlock noPBWMBlock(opCtx->lockState());
-        opCtx->lockState()->skipAcquireTicket();
+        ScopedAdmissionPriority<ExecutionAdmissionContext> admissionPriority(
+            opCtx, AdmissionContext::Priority::kExempt);
 
         // --- basic fields that are global
 
-        result.append("host", prettyHostName());
+        result.append("host", prettyHostName(opCtx->getClient()->getLocalPort()));
         result.append("version", VersionInfoInterface::instance().version());
         result.append("process", serverGlobalParams.binaryName);
+        result.append("service", toBSON(opCtx->getService()->role()));
         result.append("pid", ProcessId::getCurrent().asLongLong());
         result.append("uptime", (double)(time(nullptr) - serverGlobalParams.started));
         auto uptime = clock->now() - _started;
@@ -114,14 +152,13 @@ public:
         bool includeAllSections = allElem.type() ? allElem.trueValue() : false;
 
         // --- all sections
-        auto registry = ServerStatusSectionRegistry::get();
+        auto registry = ServerStatusSectionRegistry::instance();
         for (auto i = registry->begin(); i != registry->end(); ++i) {
-            ServerStatusSection* section = i->second;
+            auto& section = i->second;
 
-            std::vector<Privilege> requiredPrivileges;
-            section->addRequiredPrivileges(&requiredPrivileges);
-            if (!authSession->isAuthorizedForPrivileges(requiredPrivileges))
+            if (!section->checkAuthForOperation(opCtx).isOK()) {
                 continue;
+            }
 
             bool include = section->includeByDefault();
             const auto& elem = cmdObj[section->getSectionName()];
@@ -133,6 +170,10 @@ public:
                 continue;
             }
 
+            if (!section->relevantTo(opCtx->getService()->role())) {
+                continue;
+            }
+
             section->appendSection(opCtx, elem, &result);
             timeBuilder.appendNumber(
                 static_cast<std::string>(str::stream() << "after " << section->getSectionName()),
@@ -140,18 +181,19 @@ public:
         }
 
         // --- counters
-        bool includeMetricTree = MetricTree::theMetricTree != nullptr;
         auto metricsEl = cmdObj["metrics"_sd];
-        if (metricsEl.type() && !metricsEl.trueValue())
-            includeMetricTree = false;
-
-        if (includeMetricTree) {
-            if (metricsEl.type() == BSONType::Object) {
-                MetricTree::theMetricTree->appendTo(BSON("metrics" << metricsEl.embeddedObject()),
-                                                    result);
-            } else {
-                MetricTree::theMetricTree->appendTo(result);
-            }
+        if (metricsEl.eoo() || metricsEl.trueValue()) {
+            // Always gather the role-agnostic metrics. If `opCtx` has a role,
+            // additionally merge that role's associated metrics.
+            std::vector<const MetricTree*> metricTrees;
+            auto& treeSet = globalMetricTreeSet();
+            metricTrees.push_back(&treeSet[ClusterRole::None]);
+            if (auto svc = opCtx->getService())
+                metricTrees.push_back(&treeSet[svc->role()]);
+            BSONObj excludePaths;
+            if (metricsEl.type() == BSONType::Object)
+                excludePaths = BSON("metrics" << metricsEl.embeddedObject());
+            appendMergedTrees(metricTrees, result, excludePaths);
         }
 
         // --- some hard coded global things hard to pull out
@@ -160,10 +202,7 @@ public:
         timeBuilder.appendNumber("at end", durationCount<Milliseconds>(runElapsed));
         if (runElapsed > Milliseconds(1000)) {
             BSONObj t = timeBuilder.obj();
-            LOGV2(20499,
-                  "serverStatus was very slow: {timeStats}",
-                  "serverStatus was very slow",
-                  "timeStats"_attr = t);
+            LOGV2(20499, "serverStatus was very slow", "timeStats"_attr = t);
 
             bool include_timing = true;
             const auto& elem = cmdObj[kTimingSection];
@@ -183,24 +222,19 @@ private:
     const Date_t _started;
 };
 
-Command* serverStatusCommand;
-
-MONGO_INITIALIZER(CreateCmdServerStatus)(InitializerContext* context) {
-    serverStatusCommand = new CmdServerStatus();
-}
+MONGO_REGISTER_COMMAND(CmdServerStatus).forRouter().forShard();
 
 }  // namespace
 
-OpCounterServerStatusSection::OpCounterServerStatusSection(const std::string& sectionName,
-                                                           OpCounters* counters)
-    : ServerStatusSection(sectionName), _counters(counters) {}
+auto& shardRoleGlobalOpCounterServerStatusSection =
+    *ServerStatusSectionBuilder<OpCounterServerStatusSection>("opcounters")
+         .forShard()
+         .bind(&serviceOpCounters(ClusterRole::ShardServer));
 
-BSONObj OpCounterServerStatusSection::generateSection(OperationContext* opCtx,
-                                                      const BSONElement& configElement) const {
-    return _counters->getObj();
-}
-
-OpCounterServerStatusSection globalOpCounterServerStatusSection("opcounters", &globalOpCounters);
+auto& routerRoleGlobalOpCounterServerStatusSection =
+    *ServerStatusSectionBuilder<OpCounterServerStatusSection>("opcounters")
+         .forRouter()
+         .bind(&serviceOpCounters(ClusterRole::RouterServer));
 
 namespace {
 
@@ -208,7 +242,7 @@ namespace {
 
 class ExtraInfo : public ServerStatusSection {
 public:
-    ExtraInfo() : ServerStatusSection("extra_info") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -224,12 +258,13 @@ public:
 
         return bb.obj();
     }
-
-} extraInfo;
+};
+// Register one instance of the section shared by both roles; this contains process-wide info.
+auto extraInfo = *ServerStatusSectionBuilder<ExtraInfo>("extra_info").forShard().forRouter();
 
 class Asserts : public ServerStatusSection {
 public:
-    Asserts() : ServerStatusSection("asserts") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const override {
         return true;
@@ -246,43 +281,48 @@ public:
         asserts.append("rollovers", assertionCount.rollovers.loadRelaxed());
         return asserts.obj();
     }
+};
+auto asserts = *ServerStatusSectionBuilder<Asserts>("asserts");
 
-} asserts;
-
-class MemBase : public ServerStatusMetric {
-public:
-    MemBase() : ServerStatusMetric(".mem.bits") {}
-    virtual void appendAtLeaf(BSONObjBuilder& b) const {
-        b.append("bits", sizeof(int*) == 4 ? 32 : 64);
+struct MemBaseMetricPolicy {
+    void appendTo(BSONObjBuilder& bob, StringData leafName) const {
+        BSONObjBuilder b{bob.subobjStart(leafName)};
+        b.append("bits", static_cast<int>(sizeof(void*) * CHAR_BIT));
 
         ProcessInfo p;
-        int v = 0;
         if (p.supported()) {
             b.appendNumber("resident", p.getResidentSize());
-            v = p.getVirtualMemorySize();
-            b.appendNumber("virtual", v);
+            b.appendNumber("virtual", p.getVirtualMemorySize());
             b.appendBool("supported", true);
         } else {
             b.append("note", "not all mem info support on this platform");
             b.appendBool("supported", false);
         }
+
+        using namespace mongo::secure_allocator_details;
+        b.appendNumber("secureAllocByteCount",
+                       static_cast<int>(gSecureAllocCountInfo().getSecureAllocByteCount()));
+        b.appendNumber("secureAllocBytesInPages",
+                       static_cast<int>(gSecureAllocCountInfo().getSecureAllocBytesInPages()));
     }
-} memBase;
+};
+auto& memBase = *CustomMetricBuilder<MemBaseMetricPolicy>{".mem"};
 
 class HttpClientServerStatus : public ServerStatusSection {
 public:
-    HttpClientServerStatus() : ServerStatusSection("http_client") {}
+    using ServerStatusSection::ServerStatusSection;
 
     bool includeByDefault() const final {
         return false;
     }
 
-    void addRequiredPrivileges(std::vector<Privilege>* out) final {}
-
     BSONObj generateSection(OperationContext*, const BSONElement& configElement) const final {
         return HttpClient::getServerStatus();
     }
-} httpClientServerStatus;
+};
+// Register one instance of the section shared by both roles; this contains process-wide info.
+auto httpClientServerStatus =
+    *ServerStatusSectionBuilder<HttpClientServerStatus>("http_client").forShard().forRouter();
 
 }  // namespace
 

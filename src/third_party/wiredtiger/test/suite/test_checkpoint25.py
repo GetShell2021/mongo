@@ -38,18 +38,16 @@ from wtscenario import make_scenarios
 # Test reading a checkpoint that contains fast-delete pages.
 # This version uses timestamps.
 
+@wttest.skip_for_hook("nonstandalone", "timestamped truncate not supported for nonstandalone")
+@wttest.skip_for_hook("tiered", "Fails with tiered storage")
 class test_checkpoint(wttest.WiredTigerTestCase):
     conn_config = 'statistics=(all)'
 
     format_values = [
         ('string_row', dict(key_format='S', value_format='S', extraconfig='')),
-        # For now, because column-store doesn't support fast-delete, run just the
-        # FLCS case (which is smaller and faster) as a crosscheck on the behavior,
-        # and turn off VLCS. This should be turned on when/if fast-delete for
-        # columns gets implemented.
         ('column-fix', dict(key_format='r', value_format='8t',
             extraconfig=',allocation_size=512,leaf_page_max=512')),
-        #('column', dict(key_format='r', value_format='S', extraconfig='')),
+        ('column', dict(key_format='r', value_format='S', extraconfig='')),
     ]
     name_values = [
         # Reopening and unnamed checkpoints will not work as intended because the reopen makes
@@ -68,7 +66,7 @@ class test_checkpoint(wttest.WiredTigerTestCase):
     ]
     scenarios = make_scenarios(
         format_values, name_values, advance_oldest_values, advance_stable_values)
-        
+
 
     def large_updates(self, uri, ds, nrows, value, ts):
         cursor = self.session.open_cursor(uri)
@@ -150,10 +148,10 @@ class test_checkpoint(wttest.WiredTigerTestCase):
         self.conn.set_timestamp('stable_timestamp=' + self.timestamp_str(20))
 
         # Check stats to make sure we fast-deleted at least one page.
-        # Since VLCS and FLCS do not (yet) support fast-delete, instead assert we didn't.
+        # (Except for FLCS, where it's not supported and we should fast-delete zero pages.)
         stat_cursor = self.session.open_cursor('statistics:', None, None)
         fastdelete_pages = stat_cursor[stat.conn.rec_page_delete_fast][2]
-        if self.key_format == 'r':
+        if self.value_format == '8t':
             self.assertEqual(fastdelete_pages, 0)
         else:
             self.assertGreater(fastdelete_pages, 0)
@@ -175,6 +173,3 @@ class test_checkpoint(wttest.WiredTigerTestCase):
         self.check(ds, self.first_checkpoint, nonzeros, zeros, value_a, 25)
         self.check(ds, self.first_checkpoint, nonzeros, zeros, value_a, None) # default read ts
         self.check(ds, self.first_checkpoint, nonzeros, zeros, value_a, 0) # no read ts
-
-if __name__ == '__main__':
-    wttest.run()

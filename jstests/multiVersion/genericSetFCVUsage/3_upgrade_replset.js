@@ -1,9 +1,8 @@
-//
-// Tests upgrading then downgrading a replica set
-//
+import "jstests/multiVersion/libs/multi_rs.js";
 
-load('./jstests/multiVersion/libs/multi_rs.js');
-load('./jstests/libs/test_background_ops.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isFinished, startParallelOps} from "jstests/libs/test_background_ops.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 for (let oldVersion of ["last-lts", "last-continuous"]) {
     jsTest.log("Testing upgrade/downgrade with " + oldVersion);
@@ -17,7 +16,7 @@ for (let oldVersion of ["last-lts", "last-continuous"]) {
     var rst = new ReplSetTest({nodes: nodes});
 
     rst.startSet();
-    rst.initiate();
+    rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
     // Wait for a primary node...
     var primary = rst.getPrimary();

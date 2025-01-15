@@ -30,12 +30,16 @@
 
 #include "mongo/s/grid.h"
 
+#include <utility>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/query/exec/cluster_cursor_manager.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 
 namespace mongo {
 namespace {
@@ -77,7 +81,13 @@ void Grid::init(std::unique_ptr<ShardingCatalogClient> catalogClient,
     _executorPool = std::move(executorPool);
     _network = network;
 
-    _shardRegistry->init(grid.owner(this));
+    _shardRegistry->init();
+
+    _isGridInitialized.store(true);
+}
+
+bool Grid::isInitialized() const {
+    return _isGridInitialized.load();
 }
 
 bool Grid::isShardingInitialized() const {
@@ -96,12 +106,12 @@ void Grid::setShardingInitialized() {
 }
 
 Grid::CustomConnectionPoolStatsFn Grid::getCustomConnectionPoolStatsFn() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _customConnectionPoolStatsFn;
 }
 
 void Grid::setCustomConnectionPoolStatsFn(CustomConnectionPoolStatsFn statsFn) {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     invariant(!_customConnectionPoolStatsFn || !statsFn);
     _customConnectionPoolStatsFn = std::move(statsFn);
 }
@@ -114,6 +124,8 @@ void Grid::clearForUnitTests() {
     _balancerConfig.reset();
     _executorPool.reset();
     _network = nullptr;
+    _isGridInitialized.store(false);
+    _shardingInitialized.store(false);
 }
 
 }  // namespace mongo

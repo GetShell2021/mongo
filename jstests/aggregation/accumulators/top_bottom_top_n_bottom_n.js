@@ -1,8 +1,7 @@
 /**
  * Basic tests for the $top/$bottom/$topN/$bottomN accumulators.
  */
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
 const coll = db[jsTestName()];
 coll.drop();
@@ -329,6 +328,23 @@ const embeddedResult =
         .toArray();
 assert.eq([2, 3, 4], embeddedResult[0].result);
 
+// Sort on array
+assert(coll.drop());
+const makeArray = (i) => [i, i + 1, i + 2];
+assert.commandWorked(coll.insertMany([4, 2, 3, 1].map((i) => ({a: makeArray(i)}))));
+const nestedResult =
+    coll.aggregate({$group: {_id: "", result: {$bottomN: {n: 3, output: "$a", sortBy: {"a": 1}}}}})
+        .toArray();
+assert.eq([makeArray(2), makeArray(3), makeArray(4)], nestedResult[0].result);
+
+// Sort on doubly nested array.
+assert(coll.drop());
+assert.commandWorked(coll.insertMany([4, 2, 3, 1].map((i) => ({a: [makeArray(i)]}))));
+const doublyNestedResult =
+    coll.aggregate({$group: {_id: "", result: {$bottomN: {n: 3, output: "$a", sortBy: {"a": 1}}}}})
+        .toArray();
+assert.eq([[makeArray(2)], [makeArray(3)], [makeArray(4)]], doublyNestedResult[0].result);
+
 // Compound Sorting.
 coll.drop();
 const as = [1, 2, 3];
@@ -392,4 +408,17 @@ const testOperatorText = (op) => {
 // most relevant results first.
 testOperatorText("$bottomN");
 testOperatorText("$topN");
-})();
+
+// Test constant output and sortBy.
+assert(coll.drop());
+assert.commandWorked(coll.insertMany([{a: 1}, {a: 2}, {a: 3}]));
+const testConstantOutputAndSort = (op) => {
+    const results =
+        coll.aggregate(
+                [{$group: {_id: null, result: {[op]: {n: 3, output: "abc", sortBy: {a: 1}}}}}])
+            .toArray();
+    assert.eq(results.length, 1, results);
+    assert.docEq(results[0], {_id: null, result: ["abc", "abc", "abc"]}, results);
+};
+testConstantOutputAndSort("$topN");
+testConstantOutputAndSort("$bottomN");

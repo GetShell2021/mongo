@@ -1,10 +1,14 @@
 /**
  * Tests behavior of non-critical fault facet.
  *
- *  @tags: [multiversion_incompatible]
+ *  @tags: [
+ *    multiversion_incompatible,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 const ACTIVE_FAULT_DURATION_SECS = 1;
 
 const params = {
@@ -16,7 +20,6 @@ const params = {
                 {type: "dns", intensity: "off"}
             ]
         }),
-        featureFlagHealthMonitoring: true
     }
 };
 
@@ -52,4 +55,3 @@ assert.eq(result.state, "TransientFault");
 assert(result.faultInformation.facets.testObserver.description.includes("InternalError: test msg"));
 
 st.stop();
-})();

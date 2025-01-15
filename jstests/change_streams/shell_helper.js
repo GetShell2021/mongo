@@ -6,12 +6,15 @@
 // the oplog entry. When operations get bundled into a transaction, their operationTime is instead
 // based on the commit oplog entry, which would cause this test to fail.
 // @tags: [change_stream_does_not_expect_txns]
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
-load("jstests/libs/fixture_helpers.js");           // For FixtureHelpers.
-load("jstests/libs/change_stream_util.js");        // For assertInvalidateOp.
+import {
+    assertDropAndRecreateCollection,
+    assertDropCollection
+} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {
+    assertChangeStreamEventEq,
+    assertInvalidateOp
+} from "jstests/libs/query/change_stream_util.js";
 
 const coll = assertDropAndRecreateCollection(db, "change_stream_shell_helper");
 
@@ -74,7 +77,7 @@ resumeToken = change._id;
 delete change._id;
 delete change.clusterTime;
 delete change.wallTime;
-assert.docEq(change, expected);
+assert.docEq(expected, change);
 
 jsTestLog("Testing watch() with pipeline");
 changeStreamCursor = coll.watch([{$project: {clusterTime: 1, docId: "$documentKey._id"}}]);
@@ -124,8 +127,7 @@ checkNextChange(changeStreamCursor, expected);
 jsTestLog("Testing watch() with batchSize");
 // Only test mongod because mongos uses batch size 0 for aggregate commands internally to
 // establish cursors quickly. GetMore on mongos doesn't respect batch size due to SERVER-31992.
-const isMongos = FixtureHelpers.isMongos(db);
-if (!isMongos) {
+if (!FixtureHelpers.isMongos(db) || TestData.testingReplicaSetEndpoint) {
     // Increase a field by 5 times and verify the batch size is respected.
     for (let i = 0; i < 5; i++) {
         assert.commandWorked(coll.update({_id: 1}, {$inc: {x: 1}}));
@@ -136,6 +138,10 @@ if (!isMongos) {
         [{$match: {$or: [{_id: resumeToken}, {documentKey: {_id: 1}, operationType: "update"}]}}],
         {resumeAfter: resumeToken, batchSize: 2});
 
+    if (TestData.testingReplicaSetEndpoint) {
+        // GetMore on mongos doesn't respect batch size due to SERVER-31992.
+        assert.soon(() => changeStreamCursor.hasNext());
+    }
     // Check the first batch.
     assert.eq(changeStreamCursor.objsLeftInBatch(), 2);
     // Consume the first batch.
@@ -147,14 +153,14 @@ if (!isMongos) {
     assert.eq(changeStreamCursor.objsLeftInBatch(), 0);
 
     // Check the batch returned by getMore.
-    assert(changeStreamCursor.hasNext());
+    assert.soon(() => changeStreamCursor.hasNext());
     assert.eq(changeStreamCursor.objsLeftInBatch(), 2);
     changeStreamCursor.next();
     assert(changeStreamCursor.hasNext());
     changeStreamCursor.next();
     assert.eq(changeStreamCursor.objsLeftInBatch(), 0);
     // There are more changes coming, just not in the batch.
-    assert(changeStreamCursor.hasNext());
+    assert.soon(() => changeStreamCursor.hasNext());
 }
 
 jsTestLog("Testing watch() with maxAwaitTimeMS");
@@ -222,4 +228,19 @@ if (invalidateDoc) {
 
     assert.eq(firstChangeAfterDrop.documentKey._id, "After drop", tojson(change));
 }
-}());
+
+jsTestLog("Test hasNext/next behavior when there is no more data");
+let cs = coll.watch([]);
+assert(!cs.hasNext(), "hasNext() should return false because there is no more data available");
+assert.throws(() => cs.next(), [], "next() should throw because there is no more data available");
+
+// Make more data available on the server side.
+coll.insert({_id: "next"});
+
+// Temporarily override hasNext() to always return false.
+const hasNext = DBCommandCursor.prototype.hasNext;
+DBCommandCursor.prototype.hasNext = () => false;
+assert.throws(() => cs.next(), [], "next() should always throw");
+DBCommandCursor.prototype.hasNext = hasNext;
+assert.soon(() => cs.hasNext());
+assert.eq("next", cs.next().fullDocument._id);

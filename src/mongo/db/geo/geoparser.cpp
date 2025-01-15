@@ -30,17 +30,36 @@
 
 #include "mongo/db/geo/geoparser.h"
 
+#include <cstddef>
+#include <s1angle.h>
+#include <s1interval.h>
+#include <s2.h>
+#include <s2cap.h>
+#include <s2cell.h>
+#include <s2cellid.h>
+#include <s2latlng.h>
+#include <s2loop.h>
+#include <s2polygon.h>
+#include <s2polyline.h>
+#include <util/math/vector3-inl.h>
+#include <util/math/vector3.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <cmath>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
-#include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/geo/big_polygon.h"
 #include "mongo/db/geo/shapes.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
-#include "third_party/s2/s2polygonbuilder.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kGeo
 
@@ -51,19 +70,24 @@ namespace mongo {
 
 namespace dps = ::mongo::dotted_path_support;
 
-static Status parseFlatPoint(const BSONElement& elem, Point* out, bool allowAddlFields = false) {
+// Convenience function to extract flat point coordinates from enclosing element.
+// Note, coordinate elements must not outlive the parent element.
+Status GeoParser::parseFlatPointCoordinates(const BSONElement& elem,
+                                            BSONElement& x,
+                                            BSONElement& y,
+                                            bool allowAddlFields /* = false */) {
     if (!elem.isABSONObj()) {
         return BAD_VALUE("Point must be an array or object, instead got type "
                          << typeName(elem.type()));
     }
 
     BSONObjIterator it(elem.Obj());
-    BSONElement x = it.next();
+    x = it.next();
     if (!x.isNumber()) {
         return BAD_VALUE("Point must only contain numeric elements, instead got type "
                          << typeName(x.type()));
     }
-    BSONElement y = it.next();
+    y = it.next();
     if (!y.isNumber()) {
         return BAD_VALUE("Point must only contain numeric elements, instead got type "
                          << typeName(y.type()));
@@ -71,6 +95,16 @@ static Status parseFlatPoint(const BSONElement& elem, Point* out, bool allowAddl
     if (!allowAddlFields && it.more()) {
         return BAD_VALUE("Point must only contain two numeric elements");
     }
+    return Status::OK();
+}
+
+static Status parseFlatPoint(const BSONElement& elem, Point* out, bool allowAddlFields = false) {
+    BSONElement x, y;
+    auto status = GeoParser::parseFlatPointCoordinates(elem, x, y, allowAddlFields);
+    if (!status.isOK()) {
+        return status;
+    }
+
     out->x = x.number();
     out->y = y.number();
     // Point coordinates must be finite numbers, neither NaN or infinite.
@@ -126,7 +160,7 @@ static Status parseArrayOfCoordinates(const BSONElement& elem, vector<S2Point>* 
                          << typeName(elem.type()));
     }
     BSONObjIterator it(elem.Obj());
-    // Iterate all coordinates in array
+    // Iterate all coordinates in array.
     while (it.more()) {
         S2Point p;
         Status status = parseGeoJSONCoordinate(it.next(), &p);
@@ -138,11 +172,20 @@ static Status parseArrayOfCoordinates(const BSONElement& elem, vector<S2Point>* 
 }
 
 static void eraseDuplicatePoints(vector<S2Point>* vertices) {
-    for (size_t i = 1; i < vertices->size(); ++i) {
-        if ((*vertices)[i - 1] == (*vertices)[i]) {
-            vertices->erase(vertices->begin() + i);
-            // We could have > 2 adjacent identical vertices, and must examine i again.
-            --i;
+    // Duplicates can't exist in a vector of 0 or 1 elements, and we want to be careful about
+    // possible underflow of size - 1 in the next block.
+    if (vertices->size() < 2) {
+        return;
+    }
+
+    size_t i = 0;
+    while (i < vertices->size() - 1) {
+        if ((*vertices)[i] == (*vertices)[i + 1]) {
+            vertices->erase(vertices->begin() + i + 1);
+            // We could have > 2 adjacent identical vertices, and must examine i again, so we don't
+            // increment the iterator.
+        } else {
+            ++i;
         }
     }
 }
@@ -334,7 +377,7 @@ static Status parseBigSimplePolygonCoordinates(const BSONElement& elem, BigSimpl
 static Status parseGeoJSONCRS(const BSONObj& obj, CRS* crs, bool allowStrictSphere = false) {
     *crs = SPHERE;
 
-    BSONElement crsElt = obj["crs"];
+    BSONElement crsElt = obj[kCrsField];
     // "crs" field doesn't exist, return the default SPHERE
     if (crsElt.eoo()) {
         return Status::OK();
@@ -347,22 +390,22 @@ static Status parseGeoJSONCRS(const BSONObj& obj, CRS* crs, bool allowStrictSphe
     BSONObj crsObj = crsElt.embeddedObject();
 
     // "type": "name"
-    if (String != crsObj["type"].type() || "name" != crsObj["type"].String())
+    if (String != crsObj[kCrsTypeField].type() || kCrsNameField != crsObj[kCrsTypeField].String())
         return BAD_VALUE("GeoJSON CRS must have field \"type\": \"name\"");
 
     // "properties"
-    BSONElement propertiesElt = crsObj["properties"];
+    BSONElement propertiesElt = crsObj[kCrsPropertiesField];
     if (!propertiesElt.isABSONObj()) {
         return BAD_VALUE("CRS must have field \"properties\" which is an object, instead got type "
                          << typeName(propertiesElt.type()));
     }
     BSONObj propertiesObj = propertiesElt.embeddedObject();
-    if (String != propertiesObj["name"].type()) {
+    if (String != propertiesObj[kPropertiesNameField].type()) {
         return BAD_VALUE("In CRS, \"properties.name\" must be a string, instead got type "
-                         << typeName(propertiesObj["name"].type()));
+                         << typeName(propertiesObj[kPropertiesNameField].type()));
     }
 
-    const string& name = propertiesObj["name"].String();
+    const string& name = propertiesObj[kPropertiesNameField].String();
     if (CRS_CRS84 == name || CRS_EPSG_4326 == name) {
         *crs = SPHERE;
     } else if (CRS_STRICT_WINDING == name) {
@@ -470,6 +513,15 @@ Status GeoParser::parseLegacyPolygon(const BSONObj& obj, PolygonWithCRS* out) {
 
 // { "type": "Point", "coordinates": [100.0, 0.0] }
 Status GeoParser::parseGeoJSONPoint(const BSONObj& obj, PointWithCRS* out) {
+    if (obj.hasField(GEOJSON_TYPE)) {
+        // GeoJSON Point must explicitly specify the type as "Point".
+        auto typeVal = GeoParser::parseGeoJSONType(obj);
+        if (GeoParser::GEOJSON_POINT != typeVal) {
+            return BAD_VALUE("Expected geojson geometry with type Point, but got type "
+                             << GeoParser::geoJSONTypeEnumToString(typeVal));
+        }
+    }
+
     Status status = Status::OK();
     // "crs"
     status = parseGeoJSONCRS(obj, &out->crs);
@@ -784,15 +836,15 @@ GeoParser::GeoSpecifier GeoParser::parseGeoSpecifier(const BSONElement& type) {
         return GeoParser::UNKNOWN;
     }
     StringData fieldName = type.fieldNameStringData();
-    if (fieldName == "$box") {
+    if (fieldName == kBoxField) {
         return GeoParser::BOX;
-    } else if (fieldName == "$center") {
+    } else if (fieldName == kCenterField) {
         return GeoParser::CENTER;
-    } else if (fieldName == "$polygon") {
+    } else if (fieldName == kPolygonField) {
         return GeoParser::POLYGON;
-    } else if (fieldName == "$centerSphere") {
+    } else if (fieldName == kCenterSphereField) {
         return GeoParser::CENTER_SPHERE;
-    } else if (fieldName == "$geometry") {
+    } else if (fieldName == kGeometryField) {
         return GeoParser::GEOMETRY;
     }
     return GeoParser::UNKNOWN;
@@ -803,23 +855,61 @@ GeoParser::GeoJSONType GeoParser::parseGeoJSONType(const BSONObj& obj) {
     if (String != type.type()) {
         return GeoParser::GEOJSON_UNKNOWN;
     }
-    const string& typeString = type.String();
-    if (GEOJSON_TYPE_POINT == typeString) {
+    return geoJSONTypeStringToEnum(type.checkAndGetStringData());
+}
+
+// TODO: SERVER-86141 audit if this method is needed else remove.
+void GeoParser::assertValidGeoJSONType(const BSONObj& obj) {
+    BSONElement type = dps::extractElementAtPath(obj, GEOJSON_TYPE);
+    uassert(8459801,
+            str::stream() << "Expected valid geojson of type string, got non-string type of value "
+                          << type,
+            String == type.type());
+    auto str = type.checkAndGetStringData();
+    uassert(8459800,
+            str::stream() << "Expected valid geojson type, got " << str,
+            geoJSONTypeStringToEnum(str) != GeoParser::GEOJSON_UNKNOWN);
+}
+
+GeoParser::GeoJSONType GeoParser::geoJSONTypeStringToEnum(StringData type) {
+    if (GEOJSON_TYPE_POINT == type) {
         return GeoParser::GEOJSON_POINT;
-    } else if (GEOJSON_TYPE_LINESTRING == typeString) {
+    } else if (GEOJSON_TYPE_LINESTRING == type) {
         return GeoParser::GEOJSON_LINESTRING;
-    } else if (GEOJSON_TYPE_POLYGON == typeString) {
+    } else if (GEOJSON_TYPE_POLYGON == type) {
         return GeoParser::GEOJSON_POLYGON;
-    } else if (GEOJSON_TYPE_MULTI_POINT == typeString) {
+    } else if (GEOJSON_TYPE_MULTI_POINT == type) {
         return GeoParser::GEOJSON_MULTI_POINT;
-    } else if (GEOJSON_TYPE_MULTI_LINESTRING == typeString) {
+    } else if (GEOJSON_TYPE_MULTI_LINESTRING == type) {
         return GeoParser::GEOJSON_MULTI_LINESTRING;
-    } else if (GEOJSON_TYPE_MULTI_POLYGON == typeString) {
+    } else if (GEOJSON_TYPE_MULTI_POLYGON == type) {
         return GeoParser::GEOJSON_MULTI_POLYGON;
-    } else if (GEOJSON_TYPE_GEOMETRY_COLLECTION == typeString) {
+    } else if (GEOJSON_TYPE_GEOMETRY_COLLECTION == type) {
         return GeoParser::GEOJSON_GEOMETRY_COLLECTION;
     }
     return GeoParser::GEOJSON_UNKNOWN;
+}
+
+StringData GeoParser::geoJSONTypeEnumToString(GeoParser::GeoJSONType type) {
+    switch (type) {
+        case GEOJSON_UNKNOWN:
+            return "unknown"_sd;
+        case GEOJSON_POINT:
+            return GEOJSON_TYPE_POINT;
+        case GEOJSON_LINESTRING:
+            return GEOJSON_TYPE_LINESTRING;
+        case GEOJSON_POLYGON:
+            return GEOJSON_TYPE_POLYGON;
+        case GEOJSON_MULTI_POINT:
+            return GEOJSON_TYPE_MULTI_POINT;
+        case GEOJSON_MULTI_LINESTRING:
+            return GEOJSON_TYPE_MULTI_LINESTRING;
+        case GEOJSON_MULTI_POLYGON:
+            return GEOJSON_TYPE_MULTI_POLYGON;
+        case GEOJSON_GEOMETRY_COLLECTION:
+            return GEOJSON_TYPE_GEOMETRY_COLLECTION;
+    }
+    MONGO_UNREACHABLE_TASSERT(8459802);
 }
 
 }  // namespace mongo

@@ -28,24 +28,36 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include <functional>
+#include <boost/none.hpp>
 #include <iostream>
 #include <memory>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/client.h"
 #include "mongo/db/repl/hello_response.h"
-#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
 #include "mongo/db/repl/topology_version_observer.h"
+#include "mongo/executor/network_interface_mock.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/barrier.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/clock_source.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -75,15 +87,15 @@ protected:
     }
 
 public:
-    virtual void setUp() {
+    void setUp() override {
         auto configObj = getConfigObj();
         assertStartSuccess(configObj, HostAndPort("node1", 12345));
         ReplSetConfig config = assertMakeRSConfig(configObj);
         replCoord = getReplCoord();
 
         ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_SECONDARY));
-        replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 1), Date_t() + Seconds(100));
-        replCoordSetMyLastDurableOpTime(OpTime(Timestamp(100, 1), 1), Date_t() + Seconds(100));
+        replCoordSetMyLastWrittenAndAppliedAndDurableOpTime(OpTime(Timestamp(100, 1), 1),
+                                                            Date_t() + Seconds(100));
         simulateSuccessfulV1Election();
         ASSERT(replCoord->getMemberState().primary());
 
@@ -96,7 +108,7 @@ public:
         observer->init(serviceContext, replCoord);
     }
 
-    virtual void tearDown() {
+    void tearDown() override {
         observer->shutdown();
         ASSERT(observer->isShutdown());
         observer.reset();
@@ -120,6 +132,9 @@ protected:
     const Milliseconds sleepTime = Milliseconds(100);
 
     std::unique_ptr<TopologyVersionObserver> observer;
+
+    unittest::MinimumLoggedSeverityGuard severityGuard{logv2::LogComponent::kDefault,
+                                                       logv2::LogSeverity::Debug(4)};
 };
 
 
@@ -142,11 +157,15 @@ TEST_F(TopologyVersionObserverTest, UpdateCache) {
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
     simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTimeoutWhen, opCtx.get());
 
+    auto sleepCounter = 0;
     // Wait for the observer to update its cache
     while (observer->getCached()->getTopologyVersion()->getCounter() ==
            cachedResponse->getTopologyVersion()->getCounter()) {
         sleepFor(sleepTime);
+        // Make sure the test doesn't wait here for longer than 15 seconds.
+        ASSERT_LTE(sleepCounter++, 150);
     }
+    LOGV2(9326401, "Observer topology incremented after successful election");
 
     auto newResponse = observer->getCached();
     ASSERT(newResponse && newResponse->getTopologyVersion());
@@ -179,7 +198,7 @@ TEST_F(TopologyVersionObserverTest, HandleDBException) {
     ASSERT(observerClient);
 
     auto tryKillOperation = [&] {
-        stdx::lock_guard clientLock(*observerClient);
+        ClientLock clientLock(observerClient);
 
         if (auto opCtx = observerClient->getOperationContext()) {
             observerClient->getServiceContext()->killOperation(clientLock, opCtx);

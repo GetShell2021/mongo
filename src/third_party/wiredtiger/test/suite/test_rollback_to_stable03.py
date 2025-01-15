@@ -30,11 +30,11 @@ import wttest
 from wtdataset import SimpleDataSet
 from wiredtiger import stat
 from wtscenario import make_scenarios
-from test_rollback_to_stable01 import test_rollback_to_stable_base
+from rollback_to_stable_util import test_rollback_to_stable_base
 
 # test_rollback_to_stable03.py
 # Test that rollback to stable clears the history store updates from reconciled pages.
-class test_rollback_to_stable01(test_rollback_to_stable_base):
+class test_rollback_to_stable03(test_rollback_to_stable_base):
 
     format_values = [
         ('column', dict(key_format='r', value_format='S')),
@@ -52,10 +52,16 @@ class test_rollback_to_stable01(test_rollback_to_stable_base):
         ('prepare', dict(prepare=True))
     ]
 
-    scenarios = make_scenarios(format_values, in_memory_values, prepare_values)
+    worker_thread_values = [
+        ('0', dict(threads=0)),
+        ('4', dict(threads=4)),
+        ('8', dict(threads=8))
+    ]
+
+    scenarios = make_scenarios(format_values, in_memory_values, prepare_values, worker_thread_values)
 
     def conn_config(self):
-        config = 'cache_size=4GB,statistics=(all)'
+        config = 'cache_size=4GB,statistics=(all),verbose=(rts:5)'
         if self.in_memory:
             config += ',in_memory=true'
         return config
@@ -104,7 +110,7 @@ class test_rollback_to_stable01(test_rollback_to_stable_base):
         if not self.in_memory:
             self.session.checkpoint()
 
-        self.conn.rollback_to_stable()
+        self.conn.rollback_to_stable('threads=' + str(self.threads))
         # Check that the old updates are only seen even with the update timestamp.
         self.check(valueb, uri, nrows, None, 20)
         self.check(valuea, uri, nrows, None, 10)
@@ -127,6 +133,3 @@ class test_rollback_to_stable01(test_rollback_to_stable_base):
         else:
             self.assertGreaterEqual(upd_aborted + hs_removed, nrows)
         self.assertGreater(pages_visited, 0)
-
-if __name__ == '__main__':
-    wttest.run()

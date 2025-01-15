@@ -30,15 +30,18 @@
 
 global:
     cpp_namespace: "mongo::repl"
+    cpp_includes:
+        - "mongo/db/repl/oplog_entry_serialization.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
-    - "mongo/db/logical_session_id.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
     - "mongo/db/pipeline/value.idl"
     - "mongo/db/repl/optime_base.idl"
     - "mongo/db/repl/replication_types.idl"
     - "mongo/db/multitenancy.idl"
     - "mongo/s/sharding_types.idl"
+    - "mongo/db/record_id.idl"
 
 enums:
     OpType:
@@ -57,11 +60,54 @@ enums:
         values:
             kPreImage: "preImage"
             kPostImage: "postImage"
+    MultiOplogEntryType:
+        description: >-
+            Describes this oplog entry's role in a chain of oplog entries.
+            kLegacyMultiOpType: Role must be determined by consulting session/txn, prevOpTime
+                                and partialTxn fields
+            kApplyOpsAppliedSeparately: This oplog entry is an applyOps which should be applied
+                                        independently of other applyOps entries in the chain.
+                                        Used for vectored inserts which require more than one
+                                        storage transaction.
+        type: int
+        values:
+            kLegacyMultiOpType: 0
+            kApplyOpsAppliedSeparately: 1
+    CommandType:
+        description: "The type of the command in an oplog entry"
+        type: string
+        values:
+            kNotCommand: ""
+            kCreate: "create"
+            kRenameCollection: "renameCollection"
+            kDbCheck: "dbCheck"
+            kDrop: "drop"
+            kCollMod: "collMod"
+            kApplyOps: "applyOps"
+            kDropDatabase: "dropDatabase"
+            kCreateIndexes: "createIndexes"
+            kStartIndexBuild: "startIndexBuild"
+            kCommitIndexBuild: "commitIndexBuild"
+            kAbortIndexBuild: "abortIndexBuild"
+            kDropIndexes: "dropIndexes"
+            kCommitTransaction: "commitTransaction"
+            kAbortTransaction: "abortTransaction"
+            kImportCollection: "importCollection"
+            kModifyCollectionShardingIndexCatalog: "modifyCollectionShardingIndexCatalog"
 
+types:
+    zeroOneManyStmtId:
+        bson_serialization_type: any
+        description: >-
+            May be absent, a single StmtId, or an array(size > 1) of StmtIds.  Serialized
+            as appropriate depending on the array size.
+        cpp_type: std::vector<StmtId>
+        default: std::vector<StmtId>()
+        serializer: ::mongo::repl::zeroOneManyStmtIdAppend
+        deserializer: ::mongo::repl::parseZeroOneManyStmtId
+        # std::vector<StmtId> is not a view.
+        is_view: false
 structs:
-    # TODO SERVER-67155 Ensure the tenantId is included in the serialized "ns" field when
-    # multitenancySupport is on but featureFlagRequireTenantId is off. Currently it will not be
-    # included in either place
     DurableReplOperation:
         description: "A document that represents an operation. Should never be used directly in
                       server code. Instead, create an instance of ReplOperation."
@@ -93,15 +139,22 @@ structs:
                 type: object
                 optional: true
                 description: "Additional information about the operation applied"
+            rid:
+                cpp_name: recordId
+                type: RecordId
+                optional: true
+                description: "The RecordId corresponding to the CRUD operation that generated
+                              this oplog entry. Added when operating on a collection with
+                              'recordIdsReplicated' set to true."
             b:
                 cpp_name: upsert
                 type: bool
                 optional: true
                 description: "If true, treats this update operation as an upsert.
                               Used when extracting individual update oplog entries from the oplog
-                              entry of an applyOps command that was executed with alwaysUpsert true
-                              (the default). Originally added for backwards compatibility with
-                              updates from 3.6 and before."
+                              entry of an applyOps command that was executed with alwaysUpsert true.
+                              Originally added for backwards compatibility with updates from 3.6
+                              and before."
             preImageOpTime:
                 type: optime
                 optional: true
@@ -125,15 +178,22 @@ structs:
                               Only included when a resharding operation is in progress."
             stmtId:
                 cpp_name: statementIds
-                type:
-                    variant: [StmtId, array<StmtId>]
-                optional: true
+                type: zeroOneManyStmtId
                 description: "Identifier of the transaction statement(s) which generated this oplog
                               entry"
             fromMigrate:
                 type: bool
                 optional: true
-                description: "An operation caused by a chunk migration"
+                description: "Marks the operation as an internal event that should be hidden to the
+                              end user. The field (originally introduced to flag specific meta/data
+                              deletions performed during a chunk migration) maintains its original
+                              name for retro compatibility, but it is now used in a wider range of 
+                              contexts."
+            checkExistenceForDiffInsert:
+                type: bool
+                optional: true
+                description: "Marks that checks on field existence are needed for insert operations
+                              in the diff update."
 
     OplogEntryBase:
         description: A document in which the server stores an oplog entry.
@@ -143,11 +203,6 @@ structs:
             DurableReplOperation: DurableReplOperation
             OpTimeBase: OpTimeBase
         fields:
-            h:
-                cpp_name: hash
-                type: long
-                optional: true # Only used for backwards compatibility with 4.0 and before.
-                description: "The hash of the oplog entry"
             v:
                 cpp_name: version
                 type: safeInt64
@@ -157,11 +212,6 @@ structs:
                 cpp_name: wallClockTime
                 type: date
                 description: "A wallclock time with MS resolution"
-            fromTenantMigration:
-                type: uuid
-                optional: true
-                description: "Contains the UUID of a tenant migration for an operation caused by
-                              one."
             _id:
                 cpp_name: _id
                 type: Value
@@ -173,3 +223,8 @@ structs:
                 type: optime
                 optional: true # Only for writes that are part of a transaction
                 description: "The opTime of the previous write with the same transaction."
+            multiOpType:
+                cpp_name: multiOpType
+                type: MultiOplogEntryType
+                optional: true
+                description: "This oplog entry's role in an oplog entry chain."

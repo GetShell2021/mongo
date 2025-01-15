@@ -27,52 +27,50 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <memory>
+#include <ostream>
+#include <string>
 
-#include "mongo/db/storage/record_store_test_harness.h"
-
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/record_data.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/unittest/unittest.h"
-
+#include "mongo/db/storage/record_store_test_harness.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
-
-using std::string;
-using std::stringstream;
-using std::unique_ptr;
 
 // Insert a record and verify its contents by calling dataFor()
 // on the returned RecordId.
 TEST(RecordStoreTestHarness, DataFor) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(0, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(0, rs->numRecords());
 
-    string data = "record-";
+    std::string data = "record-";
     RecordId loc;
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
         {
-            WriteUnitOfWork uow(opCtx.get());
+            StorageWriteTransaction txn(ru);
             StatusWith<RecordId> res =
                 rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             loc = res.getValue();
-            uow.commit();
+            txn.commit();
         }
     }
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(1, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(1, rs->numRecords());
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -88,42 +86,37 @@ TEST(RecordStoreTestHarness, DataFor) {
 // on each of the returned RecordIds.
 TEST(RecordStoreTestHarness, DataForMultiple) {
     const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
+    std::unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(0, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(0, rs->numRecords());
 
     const int nToInsert = 10;
     RecordId locs[nToInsert];
     for (int i = 0; i < nToInsert; i++) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx.get());
         {
-            stringstream ss;
+            std::stringstream ss;
             ss << "record----" << i;
-            string data = ss.str();
+            std::string data = ss.str();
 
-            WriteUnitOfWork uow(opCtx.get());
+            StorageWriteTransaction txn(ru);
             StatusWith<RecordId> res =
                 rs->insertRecord(opCtx.get(), data.c_str(), data.size() + 1, Timestamp());
             ASSERT_OK(res.getStatus());
             locs[i] = res.getValue();
-            uow.commit();
+            txn.commit();
         }
     }
 
-    {
-        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-        ASSERT_EQUALS(nToInsert, rs->numRecords(opCtx.get()));
-    }
+    ASSERT_EQUALS(nToInsert, rs->numRecords());
 
     for (int i = 0; i < nToInsert; i++) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         {
-            stringstream ss;
+            std::stringstream ss;
             ss << "record----" << i;
-            string data = ss.str();
+            std::string data = ss.str();
 
             RecordData record = rs->dataFor(opCtx.get(), locs[i]);
             ASSERT_EQUALS(data.size() + 1, static_cast<size_t>(record.size()));

@@ -29,11 +29,36 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/donor_document_gen.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
+#include "mongo/db/s/sharding_recovery_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/s/resharding/common_types_gen.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 
 namespace mongo {
 
@@ -42,8 +67,8 @@ public:
     static constexpr StringData kServiceName = "ReshardingDonorService"_sd;
 
     explicit ReshardingDonorService(ServiceContext* serviceContext)
-        : PrimaryOnlyService(serviceContext) {}
-    ~ReshardingDonorService() = default;
+        : PrimaryOnlyService(serviceContext), _serviceContext(serviceContext) {}
+    ~ReshardingDonorService() override = default;
 
     class DonorStateMachine;
 
@@ -66,6 +91,9 @@ public:
         const std::vector<const Instance*>& existingInstances) override {}
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override;
+
+private:
+    ServiceContext* _serviceContext;
 };
 
 /**
@@ -77,9 +105,10 @@ class ReshardingDonorService::DonorStateMachine final
 public:
     explicit DonorStateMachine(const ReshardingDonorService* donorService,
                                const ReshardingDonorDocument& donorDoc,
-                               std::unique_ptr<DonorStateMachineExternalState> externalState);
+                               std::unique_ptr<DonorStateMachineExternalState> externalState,
+                               ServiceContext* serviceContext);
 
-    ~DonorStateMachine() = default;
+    ~DonorStateMachine() override = default;
 
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                          const CancellationToken& stepdownToken) noexcept override;
@@ -132,6 +161,8 @@ public:
      * Initiates the cancellation of the resharding operation.
      */
     void abort(bool isUserCancelled);
+
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const final {}
 
 private:
     /**
@@ -197,6 +228,9 @@ private:
     // Transitions the on-disk and in-memory state to DonorStateEnum::kError.
     void _transitionToError(Status abortReason);
 
+    // Transitions the on-disk and in-memory state to DonorStateEnum::kDone.
+    void _transitionToDone(bool aborted);
+
     BSONObj _makeQueryForCoordinatorUpdate(const ShardId& shardId, DonorStateEnum newState);
 
     ExecutorFuture<void> _updateCoordinator(
@@ -217,6 +251,8 @@ private:
 
     // The primary-only service instance corresponding to the donor instance. Not owned.
     const ReshardingDonorService* const _donorService;
+
+    ServiceContext* const _serviceContext;
 
     std::unique_ptr<ReshardingMetrics> _metrics;
 
@@ -241,7 +277,7 @@ private:
     boost::optional<CancelableOperationContextFactory> _cancelableOpCtxFactory;
 
     // Protects the state below
-    Mutex _mutex = MONGO_MAKE_LATCH("DonorStateMachine::_mutex");
+    stdx::mutex _mutex;
 
     // Canceled by 2 different sources: (1) This DonorStateMachine when it learns of an
     // unrecoverable error (2) The primary-only service instance driving this DonorStateMachine that
@@ -297,9 +333,11 @@ public:
                                            const BSONObj& query,
                                            const BSONObj& update) = 0;
 
-    virtual void clearFilteringMetadata(OperationContext* opCtx,
-                                        const NamespaceString& sourceNss,
-                                        const NamespaceString& tempReshardingNss) = 0;
+    virtual std::unique_ptr<ShardingRecoveryService::BeforeReleasingCustomAction>
+    getOnReleaseCriticalSectionCustomAction() = 0;
+
+    virtual void refreshCollectionPlacementInfo(OperationContext* opCtx,
+                                                const NamespaceString& sourceNss) = 0;
 };
 
 }  // namespace mongo

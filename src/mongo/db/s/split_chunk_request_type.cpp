@@ -29,9 +29,20 @@
 
 #include "mongo/db/s/split_chunk_request_type.h"
 
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -41,7 +52,6 @@ const char kCollEpoch[] = "collEpoch";
 const char kCollTimestamp[] = "collTimestamp";
 const char kSplitPoints[] = "splitPoints";
 const char kShardName[] = "shard";
-const char kFromChunkSplitter[] = "fromChunkSplitter";
 
 }  // namespace
 
@@ -50,15 +60,13 @@ SplitChunkRequest::SplitChunkRequest(NamespaceString nss,
                                      OID epoch,
                                      boost::optional<Timestamp> timestamp,
                                      ChunkRange chunkRange,
-                                     std::vector<BSONObj> splitPoints,
-                                     bool fromChunkSplitter)
+                                     std::vector<BSONObj> splitPoints)
     : _nss(std::move(nss)),
       _epoch(std::move(epoch)),
       _timestamp(std::move(timestamp)),
       _chunkRange(std::move(chunkRange)),
       _splitPoints(std::move(splitPoints)),
-      _shardName(std::move(shardName)),
-      _fromChunkSplitter(fromChunkSplitter) {}
+      _shardName(std::move(shardName)) {}
 
 StatusWith<SplitChunkRequest> SplitChunkRequest::parseFromConfigCommand(const BSONObj& cmdObj) {
     std::string ns;
@@ -86,7 +94,14 @@ StatusWith<SplitChunkRequest> SplitChunkRequest::parseFromConfigCommand(const BS
         }
     }
 
-    auto chunkRangeStatus = ChunkRange::fromBSON(cmdObj);
+
+    auto chunkRangeStatus = [&]() -> StatusWith<ChunkRange> {
+        try {
+            return ChunkRange::fromBSON(cmdObj);
+        } catch (const DBException& e) {
+            return e.toStatus().withContext("Failed to parse chunk range");
+        }
+    }();
 
     if (!chunkRangeStatus.isOK()) {
         return chunkRangeStatus.getStatus();
@@ -114,19 +129,13 @@ StatusWith<SplitChunkRequest> SplitChunkRequest::parseFromConfigCommand(const BS
         return parseShardNameStatus;
     }
 
-    bool fromChunkSplitter = [&]() {
-        bool field = false;
-        Status status = bsonExtractBooleanField(cmdObj, kFromChunkSplitter, &field);
-        return status.isOK() && field;
-    }();
-
-    auto request = SplitChunkRequest(NamespaceString(ns),
-                                     std::move(shardName),
-                                     std::move(epoch),
-                                     std::move(timestamp),
-                                     std::move(chunkRangeStatus.getValue()),
-                                     std::move(splitPoints),
-                                     fromChunkSplitter);
+    auto request = SplitChunkRequest(
+        NamespaceStringUtil::deserialize(boost::none, ns, SerializationContext::stateDefault()),
+        std::move(shardName),
+        std::move(epoch),
+        std::move(timestamp),
+        std::move(chunkRangeStatus.getValue()),
+        std::move(splitPoints));
     Status validationStatus = request._validate();
     if (!validationStatus.isOK()) {
         return validationStatus;
@@ -146,9 +155,10 @@ BSONObj SplitChunkRequest::toConfigCommandBSON(const BSONObj& writeConcern) {
 }
 
 void SplitChunkRequest::appendAsConfigCommand(BSONObjBuilder* cmdBuilder) {
-    cmdBuilder->append(kConfigsvrSplitChunk, _nss.ns());
+    cmdBuilder->append(kConfigsvrSplitChunk,
+                       NamespaceStringUtil::serialize(_nss, SerializationContext::stateDefault()));
     cmdBuilder->append(kCollEpoch, _epoch);
-    _chunkRange.append(cmdBuilder);
+    _chunkRange.serialize(cmdBuilder);
     {
         BSONArrayBuilder splitPointsArray(cmdBuilder->subarrayStart(kSplitPoints));
         for (const auto& splitPoint : _splitPoints) {
@@ -156,9 +166,6 @@ void SplitChunkRequest::appendAsConfigCommand(BSONObjBuilder* cmdBuilder) {
         }
     }
     cmdBuilder->append(kShardName, _shardName);
-    if (_fromChunkSplitter) {
-        cmdBuilder->append(kFromChunkSplitter, _fromChunkSplitter);
-    }
 }
 
 const NamespaceString& SplitChunkRequest::getNamespace() const {
@@ -181,15 +188,11 @@ const std::string& SplitChunkRequest::getShardName() const {
     return _shardName;
 }
 
-bool SplitChunkRequest::isFromChunkSplitter() const {
-    return _fromChunkSplitter;
-}
-
 Status SplitChunkRequest::_validate() {
     if (!getNamespace().isValid()) {
         return Status(ErrorCodes::InvalidNamespace,
-                      str::stream()
-                          << "invalid namespace '" << _nss.ns() << "' specified for request");
+                      str::stream() << "invalid namespace '" << _nss.toStringForErrorMsg()
+                                    << "' specified for request");
     }
 
     if (getSplitPoints().empty()) {

@@ -29,9 +29,14 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 
@@ -56,11 +61,6 @@ public:
     bool getInitialSyncFlag(OperationContext* opCtx) const override;
     void setInitialSyncFlag(OperationContext* opCtx) override;
     void clearInitialSyncFlag(OperationContext* opCtx) override;
-
-    OpTime getMinValid(OperationContext* opCtx) const override;
-    void setMinValid(OperationContext* opCtx,
-                     const OpTime& minValid,
-                     bool alwaysAllowUntimestampedWrite = false) override;
 
     void ensureFastCountOnOplogTruncateAfterPoint(OperationContext* opCtx) override;
 
@@ -87,12 +87,10 @@ public:
     BSONObj getInitialSyncId(OperationContext* opCtx) override;
 
 private:
-    mutable Mutex _initialSyncFlagMutex =
-        MONGO_MAKE_LATCH("ReplicationConsistencyMarkersMock::_initialSyncFlagMutex");
+    mutable stdx::mutex _initialSyncFlagMutex;
     bool _initialSyncFlag = false;
 
-    mutable Mutex _minValidBoundariesMutex =
-        MONGO_MAKE_LATCH("ReplicationConsistencyMarkersMock::_minValidBoundariesMutex");
+    mutable stdx::mutex _minValidBoundariesMutex;
     OpTime _appliedThrough;
     OpTime _minValid;
     Timestamp _oplogTruncateAfterPoint;

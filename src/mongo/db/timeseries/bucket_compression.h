@@ -29,8 +29,11 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
 
@@ -58,8 +61,9 @@ struct CompressionResult {
 CompressionResult compressBucket(const BSONObj& bucketDoc,
                                  StringData timeFieldName,
                                  const NamespaceString& nss,
-                                 bool eligibleForReopening,
                                  bool validateDecompression);
+
+boost::optional<BSONObj> decompressBucket(const BSONObj& bucketDoc);
 
 /**
  * Returns whether a timeseries bucket has been compressed to the v2 format.

@@ -27,20 +27,27 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/remove_saver.h"
-
 #include <boost/filesystem/operations.hpp>
-#include <fstream>
-#include <ios>
+#include <cstddef>
+#include <cstdint>
+#include <fstream>  // IWYU pragma: keep
+#include <utility>
 
+#include <boost/filesystem/path.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/encryption_hooks.h"
+#include "mongo/db/storage/remove_saver.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/errno_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
@@ -64,7 +71,7 @@ RemoveSaver::RemoveSaver(const string& a,
         _root /= a;
     if (b.size())
         _root /= b;
-    verify(a.size() || b.size());
+    MONGO_verify(a.size() || b.size());
 
     _file = _root;
 
@@ -91,7 +98,6 @@ RemoveSaver::~RemoveSaver() {
         Status status = _protector->finalize(protectedBuffer.get(), protectedSizeMax, &resultLen);
         if (!status.isOK()) {
             LOGV2_FATAL(34350,
-                        "Unable to finalize DataProtector while closing RemoveSaver: {error}",
                         "Unable to finalize DataProtector while closing RemoveSaver",
                         "error"_attr = redact(status));
         }
@@ -100,8 +106,6 @@ RemoveSaver::~RemoveSaver() {
         if (_out->fail()) {
             auto ec = lastSystemError();
             LOGV2_FATAL(34351,
-                        "Couldn't write finalized DataProtector data to: {file} for remove "
-                        "saving: {error}",
                         "Couldn't write finalized DataProtector for remove saving",
                         "file"_attr = _file.generic_string(),
                         "error"_attr = redact(errorMessage(ec)));
@@ -110,17 +114,13 @@ RemoveSaver::~RemoveSaver() {
         protectedBuffer.reset(new uint8_t[protectedSizeMax]);
         status = _protector->finalizeTag(protectedBuffer.get(), protectedSizeMax, &resultLen);
         if (!status.isOK()) {
-            LOGV2_FATAL(
-                34352,
-                "Unable to get finalizeTag from DataProtector while closing RemoveSaver: {error}",
-                "Unable to get finalizeTag from DataProtector while closing RemoveSaver",
-                "error"_attr = redact(status));
+            LOGV2_FATAL(34352,
+                        "Unable to get finalizeTag from DataProtector while closing RemoveSaver",
+                        "error"_attr = redact(status));
         }
 
         if (resultLen != _protector->getNumberOfBytesReservedForTag()) {
             LOGV2_FATAL(34353,
-                        "Attempted to write tag of size {sizeBytes} when DataProtector only "
-                        "reserved {reservedBytes} bytes",
                         "Attempted to write tag of larger size than DataProtector reserved size",
                         "sizeBytes"_attr = resultLen,
                         "reservedBytes"_attr = _protector->getNumberOfBytesReservedForTag());
@@ -132,8 +132,6 @@ RemoveSaver::~RemoveSaver() {
         if (_out->fail()) {
             auto ec = lastSystemError();
             LOGV2_FATAL(34354,
-                        "Couldn't write finalizeTag from DataProtector to: {file} for "
-                        "remove saving: {error}",
                         "Couldn't write finalizeTag from DataProtector for remove saving",
                         "file"_attr = _file.generic_string(),
                         "error"_attr = redact(errorMessage(ec)));

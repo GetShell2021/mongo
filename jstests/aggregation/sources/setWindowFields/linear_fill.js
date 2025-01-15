@@ -4,17 +4,8 @@
  *   requires_fcv_52,
  * ]
  */
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-load("jstests/aggregation/extras/window_function_helpers.js");
-load("jstests/aggregation/extras/utils.js");  // For arrayEq.
-load("jstests/libs/feature_flag_util.js");    // For isEnabled.
-
-if (!FeatureFlagUtil.isEnabled(db, "Fill")) {
-    jsTestLog("Skipping as featureFlagFill is not enabled");
-    return;
-}
 const coll = db.linear_fill;
 coll.drop();
 
@@ -54,6 +45,60 @@ let expected = [
     {_id: 2, val: 2},
     {_id: 9, val: 9},
     {_id: 10, val: 10},
+];
+assert.eq(result, expected);
+
+coll.drop();
+collection = [
+    {_id: 0, val: 0},
+    {_id: 1},
+    {_id: 2},
+    {_id: 9},
+    {_id: 10, val: 10},
+];
+assert.commandWorked(coll.insert(collection));
+
+result = coll.aggregate([{
+                 $setWindowFields: {
+                     sortBy: {_id: 1},
+                     output: {val: {$linearFill: "$val"}},
+                 }
+             }])
+             .toArray();
+
+expected = [
+    {_id: 0, val: 0},
+    {_id: 1, val: 1},
+    {_id: 2, val: 2},
+    {_id: 9, val: 9},
+    {_id: 10, val: 10},
+];
+assert.eq(result, expected);
+
+coll.drop();
+collection = [
+    {_id: 0},
+    {_id: 1},
+    {_id: 2},
+    {_id: 9},
+    {_id: 10},
+];
+assert.commandWorked(coll.insert(collection));
+
+result = coll.aggregate([{
+                 $setWindowFields: {
+                     sortBy: {_id: 1},
+                     output: {val: {$linearFill: "$val"}},
+                 }
+             }])
+             .toArray();
+
+expected = [
+    {_id: 0, val: null},
+    {_id: 1, val: null},
+    {_id: 2, val: null},
+    {_id: 9, val: null},
+    {_id: 10, val: null},
 ];
 assert.eq(result, expected);
 
@@ -521,4 +566,3 @@ assert.commandFailedWithCode(db.runCommand({
     cursor: {}
 }),
                              ErrorCodes.TypeMismatch);
-})();

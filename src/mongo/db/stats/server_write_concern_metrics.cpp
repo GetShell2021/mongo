@@ -27,15 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <variant>
 
-#include "mongo/db/stats/server_write_concern_metrics.h"
+#include <absl/container/flat_hash_map.h>
 
+#include "mongo/bson/bsonelement.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/read_write_concern_provenance.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/server_write_concern_metrics.h"
 #include "mongo/db/stats/server_write_concern_metrics_gen.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 
@@ -58,7 +65,7 @@ void ServerWriteConcernMetrics::recordWriteConcernForInserts(
         return;
     }
 
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     _insertMetrics.recordWriteConcern(writeConcernOptions, numInserts);
 }
 
@@ -68,7 +75,7 @@ void ServerWriteConcernMetrics::recordWriteConcernForUpdate(
         return;
     }
 
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     _updateMetrics.recordWriteConcern(writeConcernOptions);
 }
 
@@ -78,7 +85,7 @@ void ServerWriteConcernMetrics::recordWriteConcernForDelete(
         return;
     }
 
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     _deleteMetrics.recordWriteConcern(writeConcernOptions);
 }
 
@@ -87,7 +94,7 @@ BSONObj ServerWriteConcernMetrics::toBSON() const {
         return BSONObj();
     }
 
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
 
     BSONObjBuilder builder;
 
@@ -108,7 +115,7 @@ BSONObj ServerWriteConcernMetrics::toBSON() const {
 
 void ServerWriteConcernMetrics::WriteConcernCounters::recordWriteConcern(
     const WriteConcernOptions& writeConcernOptions, size_t numOps) {
-    if (auto wMode = stdx::get_if<std::string>(&writeConcernOptions.w)) {
+    if (auto wMode = get_if<std::string>(&writeConcernOptions.w)) {
         if (writeConcernOptions.isMajority()) {
             wMajorityCount += numOps;
             return;
@@ -118,12 +125,12 @@ void ServerWriteConcernMetrics::WriteConcernCounters::recordWriteConcern(
         return;
     }
 
-    if (stdx::holds_alternative<WTags>(writeConcernOptions.w)) {
+    if (holds_alternative<WTags>(writeConcernOptions.w)) {
         // wTags is an internal feature that we don't track metrics for
         return;
     }
 
-    wNumCounts[stdx::get<int64_t>(writeConcernOptions.w)] += numOps;
+    wNumCounts[std::get<int64_t>(writeConcernOptions.w)] += numOps;
 }
 
 void ServerWriteConcernMetrics::WriteConcernMetricsForOperationType::recordWriteConcern(
@@ -134,17 +141,28 @@ void ServerWriteConcernMetrics::WriteConcernMetricsForOperationType::recordWrite
         } else {
             // Provenance is either:
             //  - "implicitDefault" : implicit default WC (w:1 or w:"majority") is used.
-            //  - "clientSupplied"  : set without "w" value, so implicit default WC (w:1) is used.
             //  - "internalWriteDefault" : if internal command sets empty WC ({writeConcern: {}}),
             //    then default constructed WC (w:1) is used.
             implicitDefaultWC.recordWriteConcern(writeConcernOptions, numOps);
         }
 
         notExplicitWCount += numOps;
-        return;
+    } else {
+        // Supplied write concern contains 'w' field, the provenance can still be default if it is
+        // being set by mongos.
+        if (writeConcernOptions.getProvenance().isCustomDefault()) {
+            cWWC.recordWriteConcern(writeConcernOptions, numOps);
+            notExplicitWCount += numOps;
+        } else if (writeConcernOptions.getProvenance().isImplicitDefault()) {
+            implicitDefaultWC.recordWriteConcern(writeConcernOptions, numOps);
+            notExplicitWCount += numOps;
+        } else {
+            if (writeConcernOptions.majorityJFalseOverridden) {
+                majorityJFalseOverriddenCount += numOps;
+            }
+            explicitWC.recordWriteConcern(writeConcernOptions, numOps);
+        }
     }
-
-    explicitWC.recordWriteConcern(writeConcernOptions, numOps);
 }
 
 void ServerWriteConcernMetrics::WriteConcernCounters::toBSON(BSONObjBuilder* builder) const {
@@ -169,6 +187,9 @@ void ServerWriteConcernMetrics::WriteConcernMetricsForOperationType::toBSON(
     BSONObjBuilder* builder) const {
     explicitWC.toBSON(builder);
 
+    builder->append("majorityJFalseOverridden",
+                    static_cast<long long>(majorityJFalseOverriddenCount));
+
     builder->append("none", static_cast<long long>(notExplicitWCount));
     BSONObjBuilder noneBuilder(builder->subobjStart("noneInfo"));
 
@@ -186,7 +207,7 @@ void ServerWriteConcernMetrics::WriteConcernMetricsForOperationType::toBSON(
 namespace {
 class OpWriteConcernCountersSSS : public ServerStatusSection {
 public:
-    OpWriteConcernCountersSSS() : ServerStatusSection("opWriteConcernCounters") {}
+    using ServerStatusSection::ServerStatusSection;
 
     ~OpWriteConcernCountersSSS() override = default;
 
@@ -201,8 +222,9 @@ public:
                             const BSONElement& configElement) const override {
         return ServerWriteConcernMetrics::get(opCtx)->toBSON();
     }
-
-} opWriteConcernCountersSSS;
+};
+auto& opWriteConcernCountersSSS =
+    *ServerStatusSectionBuilder<OpWriteConcernCountersSSS>("opWriteConcernCounters").forShard();
 }  // namespace
 
 }  // namespace mongo

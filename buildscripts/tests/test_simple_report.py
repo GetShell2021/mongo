@@ -1,11 +1,11 @@
-# pylint: disable=missing-function-docstring,missing-class-docstring
 """Simple_report test."""
-import unittest
-import random
-import textwrap
-import sys
+
 import os
-from unittest.mock import patch, mock_open
+import random
+import sys
+import textwrap
+import unittest
+from unittest.mock import mock_open, patch
 
 from click.testing import CliRunner
 
@@ -34,9 +34,9 @@ class TestSimpleReport(unittest.TestCase):
         for _ in range(0, 100):
             self._test_trivial_report()  # pylint: disable=no-value-for-parameter
 
-    @patch(ns("_try_combine_reports"))
+    @patch(ns("try_combine_reports"))
     @patch(ns("_clean_log_file"))
-    @patch(ns("_put_report"))
+    @patch(ns("put_report"))
     def _test_trivial_report(self, mock_put_report, mock_clean_log_file, _mock_try_combine_reports):
         exit_code = self.rng.randint(0, 254)
         print(f"Trying exit code: {exit_code}")
@@ -44,8 +44,8 @@ class TestSimpleReport(unittest.TestCase):
         runner = CliRunner()
         result = runner.invoke(
             buildscripts.simple_report.main,
-            ["--test-name", "potato", "--log-file", "test.log", "--exit-code",
-             str(exit_code)])
+            ["--test-name", "potato", "--log-file", "test.log", "--exit-code", str(exit_code)],
+        )
         report = mock_put_report.call_args[0][0]
         results = mock_put_report.call_args[0][0]["results"]
         if exit_code == 0:
@@ -56,8 +56,8 @@ class TestSimpleReport(unittest.TestCase):
             self.assertEqual(report["failures"], 1)
         self.assertEqual(result.exit_code, 0)
 
-    @patch(ns("_try_combine_reports"))
-    @patch(ns("_put_report"))
+    @patch(ns("try_combine_reports"))
+    @patch(ns("put_report"))
     def test_truncate_scons(self, mock_put_report, _mock_try_combine_reports):
         exit_code = 0
         data = fix_newlines(
@@ -68,14 +68,15 @@ TO BE TRUNCATED
 TO BE TRUNCATED
 scons: done reading SConscript files.
 scons: Building targets ...
-interesting part"""))
+interesting part""")
+        )
 
         with patch("builtins.open", mock_open(read_data=data)) as _mock_file:
             runner = CliRunner()
             result = runner.invoke(
                 buildscripts.simple_report.main,
-                ["--test-name", "potato", "--log-file", "test.log", "--exit-code",
-                 str(exit_code)])
+                ["--test-name", "potato", "--log-file", "test.log", "--exit-code", str(exit_code)],
+            )
         report = mock_put_report.call_args[0][0]
         results = mock_put_report.call_args[0][0]["results"]
         self.assertEqual(results[0]["status"], "pass")
@@ -83,8 +84,8 @@ interesting part"""))
         self.assertEqual(report["failures"], 0)
         self.assertEqual(result.exit_code, 0)
 
-    @patch(ns("_try_combine_reports"))
-    @patch(ns("_put_report"))
+    @patch(ns("try_combine_reports"))
+    @patch(ns("put_report"))
     def test_non_scons_log(self, mock_put_report, _mock_try_combine_reports):
         exit_code = 0
         data = fix_newlines(
@@ -93,14 +94,15 @@ interesting part"""))
 *NOT* TO BE TRUNCATED
 *NOT* TO BE TRUNCATED
 *NOT* TO BE TRUNCATED
-interesting part"""))
+interesting part""")
+        )
 
         with patch("builtins.open", mock_open(read_data=data)) as _mock_file:
             runner = CliRunner()
             result = runner.invoke(
                 buildscripts.simple_report.main,
-                ["--test-name", "potato", "--log-file", "test.log", "--exit-code",
-                 str(exit_code)])
+                ["--test-name", "potato", "--log-file", "test.log", "--exit-code", str(exit_code)],
+            )
         report = mock_put_report.call_args[0][0]
         results = mock_put_report.call_args[0][0]["results"]
         self.assertEqual(results[0]["status"], "pass")

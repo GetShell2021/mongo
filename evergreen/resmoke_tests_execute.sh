@@ -14,6 +14,11 @@ if [[ ${disable_unit_tests} = "false" && ! -f ${skip_tests} ]]; then
 
   # activate the virtualenv if it has been set up
   activate_venv
+  # Install db-contrib-tool to symbolize crashes during resmoke suite runs
+  # This is not supported on Windows and MacOS, so doing it only on Linux
+  if [ "$(uname)" == "Linux" ]; then
+    setup_db_contrib_tool
+  fi
 
   if [[ -f "patch_test_tags.tgz" ]]; then
     tags_build_variant="${build_variant}"
@@ -22,7 +27,7 @@ if [[ ${disable_unit_tests} = "false" && ! -f ${skip_tests} ]]; then
       # Use the RHEL 8 all feature flags variant for the classic engine variant. The original
       # classic engine variant is not a required builder and therefore not captured in patch
       # test failure history.
-      tags_build_variant="enterprise-rhel-80-64-bit-dynamic-all-feature-flags-required"
+      tags_build_variant="enterprise-rhel-8-64-bit-dynamic-all-feature-flags-required"
     fi
 
     $python buildscripts/testmatrix/getdisplaytaskname.py "${task_name}" "${build_variant}" > display_task_name.txt
@@ -75,6 +80,8 @@ if [[ ${disable_unit_tests} = "false" && ! -f ${skip_tests} ]]; then
 
   if [ ${should_shuffle} = true ]; then
     extra_args="$extra_args --shuffle"
+  elif [ ${should_shuffle} = false ]; then
+    extra_args="$extra_args --shuffleMode=off"
   fi
 
   if [ ${continue_on_failure} = true ]; then
@@ -100,8 +107,26 @@ if [[ ${disable_unit_tests} = "false" && ! -f ${skip_tests} ]]; then
   set -o errexit
 
   # Reduce the JSHeapLimit for the serial_run task task on Code Coverage builder variant.
-  if [[ "${build_variant}" = "enterprise-rhel-80-64-bit-coverage" && "${task_name}" = "serial_run" ]]; then
+  if [[ "${build_variant}" = "enterprise-rhel-8-64-bit-coverage" && "${task_name}" = "serial_run" ]]; then
     extra_args="$extra_args --mongodSetParameter \"{'jsHeapLimitMB':10}\""
+  fi
+
+  # Introduce JS_GC_ZEAL to be used specifically under mongod/mongos.
+  if [[ "${build_variant}" = "enterprise-rhel-8-64-bit-dynamic-spider-monkey-dbg" && ! -z "${mongo_mozjs_options}" ]]; then
+    extra_args="$extra_args --mozjsJsGcZeal='${mongo_mozjs_options}'"
+  fi
+
+  if [ "${is_patch}" = "true" ]; then
+    extra_args="$extra_args --patchBuild"
+  fi
+
+  if [ "${skip_symbolization}" = "true" ]; then
+    extra_args="$extra_args --skipSymbolization"
+  fi
+
+  # Add test selection flag based on patch parameter
+  if [ "${enable_evergreen_api_test_selection}" = "true" ]; then
+    extra_args="$extra_args --enableEvergreenApiTestSelection"
   fi
 
   path_value="$PATH:/data/multiversion"
@@ -112,6 +137,9 @@ if [[ ${disable_unit_tests} = "false" && ! -f ${skip_tests} ]]; then
     suite_name=${suite}
   fi
 
+  resmoke_env_options="${gcov_environment} ${lang_environment} ${san_options} ${mozjs_options}"
+  echo $resmoke_env_options > resmoke_env_options.txt
+
   # The "resmoke_wrapper" expansion is used by the 'burn_in_tests' task to wrap the resmoke.py
   # invocation. It doesn't set any environment variables and should therefore come last in
   # this list of expansions.
@@ -119,18 +147,14 @@ if [[ ${disable_unit_tests} = "false" && ! -f ${skip_tests} ]]; then
   PATH="$path_value" \
     AWS_PROFILE=${aws_profile_remote} \
     eval \
-    ${gcov_environment} \
-    ${lang_environment} \
-    ${san_options} \
-    ${snmp_config_path} \
+    $resmoke_env_options \
     ${resmoke_wrapper} \
     $python buildscripts/resmoke.py run \
-    ${record_with} \
     ${resmoke_args} \
     $extra_args \
     ${test_flags} \
     --suites=${suite_name} \
-    --log=buildlogger \
+    --log=${resmoke_logger} \
     --staggerJobs=on \
     --installDir=${install_dir} \
     --buildId=${build_id} \
@@ -143,21 +167,13 @@ if [[ ${disable_unit_tests} = "false" && ! -f ${skip_tests} ]]; then
     --taskName=${task_name} \
     --variantName=${build_variant} \
     --versionId=${version_id} \
+    --requester=${requester} \
+    --taskWorkDir='${workdir}' \
+    --projectConfigPath ${evergreen_config_file_path} \
     --reportFile=report.json \
-    --perfReportFile=perf.json \
     --cedarReportFile=cedar_report.json
   resmoke_exit_code=$?
   set -o errexit
-
-  if [[ -n "${record_with}" ]]; then
-    recording_size=$( (du -ch ./*.undo ./*.undo.tokeep || true) | grep total)
-    echo "UndoDB produced recordings that were $recording_size (uncompressed) on disk"
-    # Unittests recordings are renamed so there's never a need to store any .undo files.
-    if [[ $resmoke_exit_code = 0 || "${task_name}" == "run_unittests_with_recording" ]]; then
-      echo "Removing UndoDB recordings of successful tests."
-      rm *.undo || true
-    fi
-  fi
 
   # 74 is exit code for IOError on POSIX systems, which is raised when the machine is
   # shutting down.
@@ -173,8 +189,10 @@ if [[ ${disable_unit_tests} = "false" && ! -f ${skip_tests} ]]; then
     exit 0
   elif [ $resmoke_exit_code = 0 ]; then
     # On success delete core files.
+    set +o errexit
     core_files=$(/usr/bin/find -H .. \( -name "*.core" -o -name "*.mdmp" \) 2> /dev/null)
     rm -rf $core_files
+    set -o errexit
   fi
 
   exit $resmoke_exit_code

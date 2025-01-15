@@ -6,15 +6,33 @@
  *
  * @tags: [requires_fcv_60, uses_transactions]
  */
-(function() {
-"use strict";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {extractUUIDFromObject} from "jstests/libs/uuid_util.js";
+import {
+    awaitRSClientHosts,
+    createRstArgs,
+} from "jstests/replsets/rslib.js";
+import {
+    makeAbortTransactionCmdObj,
+    makeCommitTransactionCmdObj,
+    makePrepareTransactionCmdObj,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/uuid_util.js");
-load("jstests/replsets/rslib.js");
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+// This test requires running transactions directly against the shard.
+TestData.replicaSetEndpointIncompatible = true;
 
-const st = new ShardingTest({shards: 1, rs: {nodes: 2}});
+const st = new ShardingTest({
+    shards: 1,
+    rs: {nodes: 2},
+    // By default, our test infrastructure sets the election timeout to a very high value (24
+    // hours). For this test, we need a shorter election timeout because it relies on nodes running
+    // an election when they do not detect an active primary. Therefore, we are setting the
+    // electionTimeoutMillis to its default value.
+    initiateWithDefaultElectionTimeout: true
+});
 let shard0Primary = st.rs0.getPrimary();
 
 const kDbName = "testDb";
@@ -50,11 +68,7 @@ let currentParentTxnNumber = 35;
  * blocked until the transaction commits or aborts and does not cause the write statement to execute
  * more than once.
  */
-function testBlockingRetry(retryFunc, testOpts = {
-    prepareBeforeRetry,
-    abortAfterBlockingRetry,
-    stepDownPrimaryAfterBlockingRetry
-}) {
+function testBlockingRetry(retryFunc, testOpts) {
     jsTest.log("Test blocking retry with test options " + tojson(testOpts));
     const parentTxnNumber = currentParentTxnNumber++;
     const docToInsert = {x: 1};
@@ -131,6 +145,10 @@ function testBlockingRetry(retryFunc, testOpts = {
     }
     assert.eq(shard0TestColl.count(docToInsert), 1);
 
+    // Ensure mongos has learned of the new primary.
+    if (testOpts.stepDownPrimaryAfterBlockingRetry) {
+        awaitRSClientHosts(st.s, st.rs0.getPrimary(), {ok: true, ismaster: true});
+    }
     assert.commandWorked(mongosTestColl.remove({}));
 }
 
@@ -173,9 +191,8 @@ function runTests(retryFunc) {
         "retryable write in the parent session while the transaction has not been committed " +
         "or aborted");
 
-    let retryFunc = (testOpts) => {
-        load("jstests/replsets/rslib.js");
-        load("jstests/sharding/libs/sharded_transactions_helpers.js");
+    let retryFunc = async (testOpts) => {
+        const {createRst} = await import("jstests/replsets/rslib.js");
         const shard0Rst = createRst(testOpts.shard0RstArgs);
         let shard0Primary = shard0Rst.getPrimary();
 
@@ -205,9 +222,10 @@ function runTests(retryFunc) {
         "different retryable internal transaction while the original transaction has not been " +
         "committed or aborted");
 
-    let retryFunc = (testOpts) => {
-        load("jstests/replsets/rslib.js");
-        load("jstests/sharding/libs/sharded_transactions_helpers.js");
+    let retryFunc = async (testOpts) => {
+        const {createRst} = await import("jstests/replsets/rslib.js");
+        const {makeCommitTransactionCmdObj} =
+            await import("jstests/sharding/libs/sharded_transactions_helpers.js");
         const shard0Rst = createRst(testOpts.shard0RstArgs);
         let shard0Primary = shard0Rst.getPrimary();
 
@@ -242,4 +260,3 @@ function runTests(retryFunc) {
 }
 
 st.stop();
-})();

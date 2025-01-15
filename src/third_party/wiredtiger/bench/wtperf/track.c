@@ -111,15 +111,13 @@ uint64_t
 sum_scan_ops(WTPERF *wtperf)
 {
     CONFIG_OPTS *opts;
-    uint64_t total;
 
     opts = wtperf->opts;
 
-    if (opts->scan_interval > 0)
-        total = wtperf->scanthreads->scan.ops;
-    else
-        total = 0;
-    return (total);
+    if (opts->scan_interval == 0)
+        return (0);
+
+    return (wtperf->scanthreads->scan.ops);
 }
 
 /*
@@ -371,7 +369,7 @@ latency_print_single(WTPERF *wtperf, TRACK *total, const char *name)
     uint64_t cumops;
     char path[1024];
 
-    testutil_check(__wt_snprintf(path, sizeof(path), "%s/latency.%s", wtperf->monitor_dir, name));
+    testutil_snprintf(path, sizeof(path), "%s/latency.%s", wtperf->monitor_dir, name);
     if ((fp = fopen(path, "w")) == NULL) {
         lprintf(wtperf, errno, 0, "%s", path);
         return;

@@ -3,8 +3,7 @@
  * the new primary.
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replSet = new ReplSetTest({
     nodes: 3,
@@ -15,7 +14,7 @@ const replSet = new ReplSetTest({
     nodeOptions: {setParameter: {writePeriodicNoops: false, periodicNoopIntervalSecs: 1}}
 });
 replSet.startSet();
-replSet.initiateWithHighElectionTimeout();
+replSet.initiate();
 
 const oldPrimary = replSet.getPrimary();
 const [newPrimary, secondary] = replSet.getSecondaries();
@@ -30,4 +29,3 @@ assert.commandWorked(newPrimary.adminCommand({setParameter: 1, writePeriodicNoop
 replSet.awaitSyncSource(secondary, newPrimary);
 
 replSet.stopSet();
-})();

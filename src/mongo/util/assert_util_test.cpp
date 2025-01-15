@@ -28,24 +28,60 @@
  */
 
 
-#include "mongo/config.h"
-#include "mongo/platform/basic.h"
-
+#include <ostream>
 #include <type_traits>
 
+
 #include "mongo/base/static_assert.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/assert_that.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/matcher.h"
+#include "mongo/unittest/matcher_core.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+namespace mongo {
+namespace {
+struct PrinterMockTassert {
+    auto format(auto& fc) const {
+        tasserted(9513401, "tasserting in mock printer");
+        return fc.out();
+    }
+};
 
+struct PrinterMockUassert {
+    auto format(auto& fc) const {
+        uasserted(9513402, "uasserting in mock printer");
+        return fc.out();
+    }
+};
+
+struct MemberCallFormatter {
+    constexpr auto parse(auto& ctx) {
+        return ctx.begin();
+    }
+    auto format(const auto& obj, auto& ctx) {
+        return obj.format(ctx);
+    }
+};
+}  // namespace
+}  // namespace mongo
+namespace fmt {
+template <>
+struct formatter<mongo::PrinterMockTassert> : mongo::MemberCallFormatter {};
+
+template <>
+struct formatter<mongo::PrinterMockUassert> : mongo::MemberCallFormatter {};
+}  // namespace fmt
 
 namespace mongo {
 namespace {
-
 #define ASSERT_CATCHES(code, Type)                                         \
     ([] {                                                                  \
         try {                                                              \
@@ -77,8 +113,6 @@ MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError
                                      ExceptionFor<ErrorCodes::BadValue>>());
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NotPrimaryError>,
                                      ExceptionFor<ErrorCodes::BadValue>>());
-MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::Interruption>,
-                                     ExceptionFor<ErrorCodes::BadValue>>());
 
 TEST(AssertUtils, UassertNamedCodeWithoutCategories) {
     ASSERT_CATCHES(ErrorCodes::BadValue, DBException);
@@ -87,7 +121,6 @@ TEST(AssertUtils, UassertNamedCodeWithoutCategories) {
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionFor<ErrorCodes::DuplicateKey>);
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::NetworkError>);
     ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::NotPrimaryError>);
-    ASSERT_NOT_CATCHES(ErrorCodes::BadValue, ExceptionForCat<ErrorCategory::Interruption>);
 }
 
 // NotWritablePrimary - NotPrimaryError, RetriableError
@@ -100,8 +133,6 @@ MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError
                                      ExceptionFor<ErrorCodes::NotWritablePrimary>>());
 MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::NotPrimaryError>,
                                     ExceptionFor<ErrorCodes::NotWritablePrimary>>());
-MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::Interruption>,
-                                     ExceptionFor<ErrorCodes::NotWritablePrimary>>());
 
 TEST(AssertUtils, UassertNamedCodeWithOneCategory) {
     ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, DBException);
@@ -111,11 +142,10 @@ TEST(AssertUtils, UassertNamedCodeWithOneCategory) {
     ASSERT_NOT_CATCHES(ErrorCodes::NotWritablePrimary,
                        ExceptionForCat<ErrorCategory::NetworkError>);
     ASSERT_CATCHES(ErrorCodes::NotWritablePrimary, ExceptionForCat<ErrorCategory::NotPrimaryError>);
-    ASSERT_NOT_CATCHES(ErrorCodes::NotWritablePrimary,
-                       ExceptionForCat<ErrorCategory::Interruption>);
 }
 
 // InterruptedDueToReplStateChange - NotPrimaryError, Interruption, RetriableError
+// TODO(SERVER-56251): revise list when removing the Interruption category.
 MONGO_STATIC_ASSERT(
     std::is_same<error_details::ErrorCategoriesFor<ErrorCodes::InterruptedDueToReplStateChange>,
                  error_details::CategoryList<ErrorCategory::Interruption,
@@ -126,8 +156,6 @@ MONGO_STATIC_ASSERT(std::is_base_of<AssertionException,
 MONGO_STATIC_ASSERT(!std::is_base_of<ExceptionForCat<ErrorCategory::NetworkError>,
                                      ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::NotPrimaryError>,
-                                    ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
-MONGO_STATIC_ASSERT(std::is_base_of<ExceptionForCat<ErrorCategory::Interruption>,
                                     ExceptionFor<ErrorCodes::InterruptedDueToReplStateChange>>());
 
 TEST(AssertUtils, UassertNamedCodeWithTwoCategories) {
@@ -141,12 +169,10 @@ TEST(AssertUtils, UassertNamedCodeWithTwoCategories) {
                        ExceptionForCat<ErrorCategory::NetworkError>);
     ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
                    ExceptionForCat<ErrorCategory::NotPrimaryError>);
-    ASSERT_CATCHES(ErrorCodes::InterruptedDueToReplStateChange,
-                   ExceptionForCat<ErrorCategory::Interruption>);
 }
 
 MONGO_STATIC_ASSERT(!error_details::isNamedCode<19999>);
-// ExceptionFor<ErrorCodes::Error(19999)> invalidType;  // Must not compile.
+// ExceptionFor<ErrorCodes::Error19999)> invalidType;  // Must not compile.
 
 TEST(AssertUtils, UassertNumericCode) {
     ASSERT_CATCHES(19999, DBException);
@@ -154,7 +180,6 @@ TEST(AssertUtils, UassertNumericCode) {
     ASSERT_NOT_CATCHES(19999, ExceptionFor<ErrorCodes::DuplicateKey>);
     ASSERT_NOT_CATCHES(19999, ExceptionForCat<ErrorCategory::NetworkError>);
     ASSERT_NOT_CATCHES(19999, ExceptionForCat<ErrorCategory::NotPrimaryError>);
-    ASSERT_NOT_CATCHES(19999, ExceptionForCat<ErrorCategory::Interruption>);
 }
 
 TEST(AssertUtils, UassertStatusOKPreservesExtraInfo) {
@@ -325,7 +350,7 @@ DEATH_TEST_REGEX(TassertTerminationTest,
                  tassertUncleanLogMsg,
                  "4457002.*Detected prior failed tripwire assertions") {
     doTassert();
-    quickExit(EXIT_ABRUPT);
+    quickExit(ExitCode::abrupt);
 }
 
 DEATH_TEST(TassertTerminationTest, mongoUnreachableNonFatal, "Hit a MONGO_UNREACHABLE_TASSERT!") {
@@ -347,47 +372,47 @@ DEATH_TEST_REGEX(TassertTerminationTest,
 }
 
 // fassert and its friends
-DEATH_TEST(FassertionTerminationTest, fassert, "40206") {
+DEATH_TEST(FassertionTerminationTest, BoolCondition, "40206") {
     fassert(40206, false);
 }
 
-DEATH_TEST(FassertionTerminationTest, fassertOverload, "Terminating with fassert") {
+DEATH_TEST(FassertionTerminationTest, Overload, "Terminating with fassert") {
     fassert(40207, {ErrorCodes::InternalError, "Terminating with fassert"});
 }
 
-DEATH_TEST(FassertionTerminationTest, fassertStatusWithOverload, "Terminating with fassert") {
+DEATH_TEST(FassertionTerminationTest, StatusWithOverload, "Terminating with fassert") {
     fassert(50733,
             StatusWith<std::string>{ErrorCodes::InternalError,
                                     "Terminating with fassertStatusWithOverload"});
 }
 
-DEATH_TEST(FassertionTerminationTest, fassertNoTrace, "Terminating with fassertNoTrace") {
+DEATH_TEST(FassertionTerminationTest, NoTrace, "Terminating with fassertNoTrace") {
     fassertNoTrace(50734, Status(ErrorCodes::InternalError, "Terminating with fassertNoTrace"));
 }
 
-DEATH_TEST(FassertionTerminationTest, fassertNoTraceOverload, "Terminating with fassertNoTrace") {
+DEATH_TEST(FassertionTerminationTest, NoTraceOverload, "Terminating with fassertNoTrace") {
     fassertNoTrace(50735,
                    StatusWith<std::string>(ErrorCodes::InternalError,
                                            "Terminating with fassertNoTraceOverload"));
 }
 
-DEATH_TEST(FassertionTerminationTest, fassertFailed, "40210") {
+DEATH_TEST(FassertionTerminationTest, FassertFailed, "40210") {
     fassertFailed(40210);
 }
 
-DEATH_TEST(FassertionTerminationTest, fassertFailedNoTrace, "40211") {
+DEATH_TEST(FassertionTerminationTest, FassertFailedNoTrace, "40211") {
     fassertFailedNoTrace(40211);
 }
 
 DEATH_TEST(FassertionTerminationTest,
-           fassertFailedWithStatus,
+           FassertFailedWithStatus,
            "Terminating with fassertFailedWithStatus") {
     fassertFailedWithStatus(
         40212, {ErrorCodes::InternalError, "Terminating with fassertFailedWithStatus"});
 }
 
 DEATH_TEST(FassertionTerminationTest,
-           fassertFailedWithStatusNoTrace,
+           FassertFailedWithStatusNoTrace,
            "Terminating with fassertFailedWithStatusNoTrace") {
     fassertFailedWithStatusNoTrace(
         40213, {ErrorCodes::InternalError, "Terminating with fassertFailedWithStatusNoTrace"});
@@ -510,6 +535,146 @@ DEATH_TEST(DassertTerminationTest,
     dassert(false, msg);
 }
 #endif  // defined(MONGO_CONFIG_DEBUG_BUILD)
+
+TEST(ScopedDebugInfo, Stack) {
+    using namespace unittest::match;
+    ScopedDebugInfoStack infoStack{};  // Avoiding the tls instance for now.
+    std::vector<std::string> expected;
+    ASSERT_THAT(infoStack.getAll(), Eq(expected));
+    {
+        ScopedDebugInfo greetingGuard("greeting", "hello", &infoStack);
+        expected.push_back("greeting: hello");
+        ASSERT_THAT(infoStack.getAll(), Eq(expected));
+
+        ScopedDebugInfo numberGuard("age", 123, &infoStack);
+        expected.push_back("age: 123");
+        ASSERT_THAT(infoStack.getAll(), Eq(expected));
+
+        {
+            ScopedDebugInfo innerGuard("inner", 222, &infoStack);
+            expected.push_back("inner: 222");
+            ASSERT_THAT(infoStack.getAll(), Eq(expected));
+            expected.pop_back();  // innerGuard
+        }
+        ASSERT_THAT(infoStack.getAll(), Eq(expected));
+        expected.pop_back();  // numberGuard
+        expected.pop_back();  // greetingGuard
+    }
+    ASSERT_THAT(infoStack.getAll(), Eq(expected));
+}
+
+void someRiskyBusiness() {
+    invariant(false, "ouch");
+}
+
+DEATH_TEST(ScopedDebugInfo, PrintedOnInvariant, "mission: ATestInjectedString") {
+    ScopedDebugInfo g("mission", "ATestInjectedString");
+    someRiskyBusiness();
+}
+
+// The following test relies on SIGSEGV which is not supported on Windows.
+#if !defined(_WIN32)
+DEATH_TEST(ScopedDebugInfo, PrintedOnSignal, "mission: ATestInjectedString") {
+    ScopedDebugInfo g("mission", "ATestInjectedString");
+    raise(SIGSEGV);
+}
+#endif
+
+TEST(ScopedDebugInfo, FormattingCanBeCalledMoreThanOnce) {
+    using namespace unittest::match;
+    ScopedDebugInfoStack infoStack{};
+
+    ScopedDebugInfo guard("greeting", "hello", &infoStack);
+    // A second call to `getAll` returns correct results.
+    auto _ = infoStack.getAll();
+    ASSERT_THAT(infoStack.getAll(), ElementsAre(Eq("greeting: hello")));
+}
+
+// Test that we are able to incrementally log ScopedDebugInfos from the stack (if one throws an
+// exception, we are able to attempt to print the next one).
+DEATH_TEST_REGEX(ScopedDebugInfo,
+                 CorrectScopedDebugInfosOnStackAfterIncorrectOne,
+                 "(?s)tasserting in mock printer.*BACKTRACE"
+                 ".*ScopedDebugInfo failed.*test.*9513401") {
+    ScopedDebugInfoStack infoStack{};
+    ScopedDebugInfo greetingGuard("greeting", "hello", &infoStack);
+    ScopedDebugInfo guardTasserts("test", PrinterMockTassert(), &infoStack);
+    ScopedDebugInfo anotherGreetingGuard("greeting", "hey there", &infoStack);
+
+    using namespace unittest::match;
+    ASSERT_THAT(infoStack.getAll(), ElementsAre(Eq("greeting: hello"), Eq("greeting: hey there")));
+}
+
+// Test that if we log the `ScopedDebugInfoStack` due to a tassert, and we hit a tassert during
+// logging, we only surface the original tassert.
+DEATH_TEST_REGEX(ScopedDebugInfo,
+                 TassertAndTassertDuringLogging,
+                 "(?s)tasserting in test.*BACKTRACE"
+                 ".*tasserting in mock printer.*BACKTRACE"
+                 ".*ScopedDebugInfo failed.*test.*9513401") {
+    ScopedDebugInfo guardTasserts("test", PrinterMockTassert());
+    tasserted(9513403, "tasserting in test");
+}
+
+// Same as above, but with `uassert` instead of `tassert`.
+DEATH_TEST_REGEX(ScopedDebugInfo,
+                 TassertAndUassertDuringLogging,
+                 "(?s)tasserting in test.*BACKTRACE"
+                 ".*ScopedDebugInfo failed.*test.*9513402") {
+    ScopedDebugInfo guardUasserts("test", PrinterMockUassert());
+    tasserted(9513404, "tasserting in test");
+}
+
+// Test that we end the process as expected due to an invariant even if we hit a tassert during
+// logging of the `ScopedDebugInfoStack`.
+DEATH_TEST_REGEX(ScopedDebugInfo,
+                 InvariantAndTassertDuringLogging,
+                 "(?s)ouch.*abruptQuit"
+                 ".*tasserting in mock printer.*mongo::tassertFailed"
+                 ".*ScopedDebugInfo failed.*test.*9513401") {
+    ScopedDebugInfo guardTasserts("test", PrinterMockTassert());
+    someRiskyBusiness();
+}
+
+// Same as above, but with `uassert` instead of `tassert`.
+DEATH_TEST_REGEX(ScopedDebugInfo,
+                 InvariantAndUassertDuringLogging,
+                 "(?s)ouch.*abruptQuit"
+                 ".*ScopedDebugInfo failed.*test.*9513402") {
+    ScopedDebugInfo guardUasserts("test", PrinterMockUassert());
+    someRiskyBusiness();
+}
+
+// The following tests relies on SIGSEGV which is not supported on Windows.
+// Test that we end the process as expected due to a seg fault even if we hit a tassert during
+// logging of the `ScopedDebugInfoStack`.
+#if !defined(_WIN32)
+DEATH_TEST_REGEX(ScopedDebugInfo,
+                 SignalAndTassertDuringLogging,
+                 "(?s)Invalid access at address.*abruptQuit"
+                 ".*tasserting in mock printer.*BACKTRACE"
+                 ".*ScopedDebugInfo failed.*test.*9513401") {
+    ScopedDebugInfo guardTasserts("test", PrinterMockTassert());
+    raise(SIGSEGV);
+}
+
+// Same as above, but with `uassert` instead of `tassert`.
+DEATH_TEST_REGEX(ScopedDebugInfo,
+                 SignalAndUassertDuringLogging,
+                 "(?s)Invalid access at address.*abruptQuit"
+                 ".*ScopedDebugInfo failed.*test.*9513402") {
+    ScopedDebugInfo guardUasserts("test", PrinterMockUassert());
+    raise(SIGSEGV);
+}
+#endif
+
+void mustNotCompile() {
+#if 0
+    fassert(9079709, "match");
+    fassert(true, Status::OK());
+    fassert(ErrorCodes::InternalError, "hi");
+#endif
+}
 
 }  // namespace
 }  // namespace mongo

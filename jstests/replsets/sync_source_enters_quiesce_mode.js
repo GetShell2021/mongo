@@ -1,22 +1,16 @@
 /**
  * Tests that reading from an existing sync source continues uninterrupted when the sync source
  * enters quiesce mode.
- *
- * @tags: [
- *   live_record_incompatible,
- * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Set the oplog fetcher batch size to 1, in order to test fetching multiple batches while the sync
 // source is in quiesce mode.
 const rst = new ReplSetTest(
     {nodes: 3, useBridge: true, nodeOptions: {setParameter: "bgSyncOplogFetcherBatchSize=1"}});
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const primary = rst.getPrimary();
 const testDB = primary.getDB("testDB");
@@ -53,4 +47,3 @@ syncingNode.reconnect(primary);
 quiesceModeFailPoint.off();
 rst.restart(syncSource);
 rst.stopSet();
-})();

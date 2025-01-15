@@ -27,24 +27,111 @@
  *    it in the license file.
  */
 
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/docval_to_sbeval.h"
 #include "mongo/db/exec/sbe/abt/abt_lower.h"
-#include "mongo/db/exec/sbe/abt/sbe_abt_test_util.h"
-#include "mongo/db/pipeline/abt/abt_document_source_visitor.h"
-#include "mongo/db/query/optimizer/explain.h"
-#include "mongo/db/query/optimizer/opt_phase_manager.h"
-#include "mongo/db/query/optimizer/rewrites/const_eval.h"
-#include "mongo/db/query/optimizer/rewrites/path_lower.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/exec/sbe/abt/abt_lower_defs.h"
+#include "mongo/db/exec/sbe/abt/abt_unit_test_literals.h"
+#include "mongo/db/exec/sbe/abt/abt_unit_test_utils.h"
+#include "mongo/db/exec/sbe/expression_test_base.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
+#include "mongo/db/exec/sbe/expressions/runtime_environment.h"
+#include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/optimizer/algebra/operator.h"
+#include "mongo/db/query/optimizer/comparison_op.h"
+#include "mongo/db/query/optimizer/defs.h"
+#include "mongo/db/query/optimizer/reference_tracker.h"
+#include "mongo/db/query/optimizer/strong_alias.h"
+#include "mongo/db/query/optimizer/syntax/expr.h"
+#include "mongo/db/query/optimizer/syntax/syntax.h"
+#include "mongo/db/query/stage_builder/sbe/expression_const_eval.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+
 
 namespace mongo::optimizer {
 namespace {
 
-TEST_F(ABTSBE, Lower1) {
+using namespace unit_test_abt_literals;
+
+class AbtToSbeExpression : public sbe::EExpressionTestFixture {
+public:
+    ABT constFold(ABT tree) {
+        stage_builder::ExpressionConstEval{nullptr /* collator */}.optimize(tree);
+        return tree;
+    }
+
+    // Helper that lowers and compiles an ABT expression and returns the evaluated result.
+    // If the expression contains a variable, it will be bound to a slot along with its definition
+    // before lowering.
+    std::pair<sbe::value::TypeTags, sbe::value::Value> evalExpr(
+        const ABT& tree,
+        boost::optional<
+            std::pair<ProjectionName, std::pair<sbe::value::TypeTags, sbe::value::Value>>> var) {
+        auto env = VariableEnvironment::build(tree);
+
+        SlotVarMap map;
+        sbe::value::OwnedValueAccessor accessor;
+        auto slotId = bindAccessor(&accessor);
+        if (var) {
+            auto& projName = var.get().first;
+            map[projName] = slotId;
+
+            auto [tag, val] = var.get().second;
+            accessor.reset(tag, val);
+        }
+
+        sbe::InputParamToSlotMap inputParamToSlotMap;
+        auto expr =
+            SBEExpressionLowering{env, map, *runtimeEnv(), slotIdGenerator(), inputParamToSlotMap}
+                .optimize(tree);
+
+        auto compiledExpr = compileExpression(*expr);
+        return runCompiledExpression(compiledExpr.get());
+    }
+
+    void assertEqualValues(std::pair<sbe::value::TypeTags, sbe::value::Value> res,
+                           std::pair<sbe::value::TypeTags, sbe::value::Value> resConstFold) {
+        auto [tag, val] = sbe::value::compareValue(
+            res.first, res.second, resConstFold.first, resConstFold.second);
+        ASSERT_EQ(tag, sbe::value::TypeTags::NumberInt32);
+        ASSERT_EQ(val, 0);
+    }
+};
+
+TEST_F(AbtToSbeExpression, Lower1) {
     auto tree = Constant::int64(100);
     auto env = VariableEnvironment::build(tree);
     SlotVarMap map;
-
-    auto expr = SBEExpressionLowering{env, map}.optimize(tree);
+    sbe::InputParamToSlotMap inputParamToSlotMap;
+    auto expr =
+        SBEExpressionLowering{env, map, *runtimeEnv(), slotIdGenerator(), inputParamToSlotMap}
+            .optimize(tree);
 
     ASSERT(expr);
 
@@ -55,16 +142,17 @@ TEST_F(ABTSBE, Lower1) {
     ASSERT_EQ(sbe::value::bitcastTo<int64_t>(resultVal), 100);
 }
 
-TEST_F(ABTSBE, Lower2) {
+TEST_F(AbtToSbeExpression, Lower2) {
     auto tree =
         make<Let>("x",
                   Constant::int64(100),
                   make<BinaryOp>(Operations::Add, make<Variable>("x"), Constant::int64(100)));
-
     auto env = VariableEnvironment::build(tree);
     SlotVarMap map;
-
-    auto expr = SBEExpressionLowering{env, map}.optimize(tree);
+    sbe::InputParamToSlotMap inputParamToSlotMap;
+    auto expr =
+        SBEExpressionLowering{env, map, *runtimeEnv(), slotIdGenerator(), inputParamToSlotMap}
+            .optimize(tree);
 
     ASSERT(expr);
 
@@ -75,12 +163,14 @@ TEST_F(ABTSBE, Lower2) {
     ASSERT_EQ(sbe::value::bitcastTo<int64_t>(resultVal), 200);
 }
 
-TEST_F(ABTSBE, Lower3) {
+TEST_F(AbtToSbeExpression, Lower3) {
     auto tree = make<FunctionCall>("isNumber", makeSeq(Constant::int64(10)));
     auto env = VariableEnvironment::build(tree);
     SlotVarMap map;
-
-    auto expr = SBEExpressionLowering{env, map}.optimize(tree);
+    sbe::InputParamToSlotMap inputParamToSlotMap;
+    auto expr =
+        SBEExpressionLowering{env, map, *runtimeEnv(), slotIdGenerator(), inputParamToSlotMap}
+            .optimize(tree);
 
     ASSERT(expr);
 
@@ -90,7 +180,7 @@ TEST_F(ABTSBE, Lower3) {
     ASSERT(result);
 }
 
-TEST_F(ABTSBE, Lower4) {
+TEST_F(AbtToSbeExpression, Lower4) {
     auto [tagArr, valArr] = sbe::value::makeNewArray();
     auto arr = sbe::value::getArrayView(valArr);
     arr->push_back(sbe::value::TypeTags::NumberInt64, 1);
@@ -104,14 +194,16 @@ TEST_F(ABTSBE, Lower4) {
 
     auto tree = make<FunctionCall>(
         "traverseP",
-        makeSeq(
-            make<Constant>(tagArr, valArr),
-            make<LambdaAbstraction>(
-                "x", make<BinaryOp>(Operations::Add, make<Variable>("x"), Constant::int64(10)))));
+        makeSeq(make<Constant>(tagArr, valArr),
+                make<LambdaAbstraction>(
+                    "x", make<BinaryOp>(Operations::Add, make<Variable>("x"), Constant::int64(10))),
+                Constant::nothing()));
     auto env = VariableEnvironment::build(tree);
     SlotVarMap map;
-
-    auto expr = SBEExpressionLowering{env, map}.optimize(tree);
+    sbe::InputParamToSlotMap inputParamToSlotMap;
+    auto expr =
+        SBEExpressionLowering{env, map, *runtimeEnv(), slotIdGenerator(), inputParamToSlotMap}
+            .optimize(tree);
 
     ASSERT(expr);
 
@@ -122,14 +214,15 @@ TEST_F(ABTSBE, Lower4) {
     ASSERT_EQ(sbe::value::TypeTags::Array, resultTag);
 }
 
-TEST_F(ABTSBE, Lower5) {
+TEST_F(AbtToSbeExpression, Lower5) {
     auto tree = make<FunctionCall>(
         "setField", makeSeq(Constant::nothing(), Constant::str("fieldA"), Constant::int64(10)));
-
     auto env = VariableEnvironment::build(tree);
     SlotVarMap map;
-
-    auto expr = SBEExpressionLowering{env, map}.optimize(tree);
+    sbe::InputParamToSlotMap inputParamToSlotMap;
+    auto expr =
+        SBEExpressionLowering{env, map, *runtimeEnv(), slotIdGenerator(), inputParamToSlotMap}
+            .optimize(tree);
 
     ASSERT(expr);
 
@@ -138,107 +231,7 @@ TEST_F(ABTSBE, Lower5) {
     sbe::value::ValueGuard guard(resultTag, resultVal);
 }
 
-TEST_F(ABTSBE, Lower6) {
-    PrefixId prefixId;
-
-    auto [tagObj, valObj] = sbe::value::makeNewObject();
-    auto obj = sbe::value::getObjectView(valObj);
-
-    auto [tagObjIn, valObjIn] = sbe::value::makeNewObject();
-    auto objIn = sbe::value::getObjectView(valObjIn);
-    objIn->push_back("fieldB", sbe::value::TypeTags::NumberInt64, 100);
-    obj->push_back("fieldA", tagObjIn, valObjIn);
-
-    sbe::value::OwnedValueAccessor accessor;
-    auto slotId = bindAccessor(&accessor);
-    SlotVarMap map;
-    map["root"] = slotId;
-
-    accessor.reset(tagObj, valObj);
-
-    auto tree = make<EvalPath>(
-        make<PathField>("fieldA",
-                        make<PathTraverse>(make<PathComposeM>(
-                            make<PathField>("fieldB", make<PathDefault>(Constant::int64(0))),
-                            make<PathField>("fieldC", make<PathConstant>(Constant::int64(50)))))),
-        make<Variable>("root"));
-    auto env = VariableEnvironment::build(tree);
-
-    // Run rewriters while things change
-    bool changed = false;
-    do {
-        changed = false;
-        if (PathLowering{prefixId, env}.optimize(tree)) {
-            changed = true;
-        }
-        if (ConstEval{env}.optimize(tree)) {
-            changed = true;
-        }
-    } while (changed);
-
-    // std::cout << ExplainGenerator::explain(tree);
-
-    auto expr = SBEExpressionLowering{env, map}.optimize(tree);
-
-    ASSERT(expr);
-
-    auto compiledExpr = compileExpression(*expr);
-    auto [resultTag, resultVal] = runCompiledExpression(compiledExpr.get());
-    sbe::value::ValueGuard guard(resultTag, resultVal);
-
-    // std::cout << std::pair{resultTag, resultVal} << "\n";
-
-    ASSERT_EQ(sbe::value::TypeTags::Object, resultTag);
-}
-
-TEST_F(ABTSBE, Lower7) {
-    PrefixId prefixId;
-
-    auto [tagArr, valArr] = sbe::value::makeNewArray();
-    auto arr = sbe::value::getArrayView(valArr);
-    arr->push_back(sbe::value::TypeTags::NumberInt64, 1);
-    arr->push_back(sbe::value::TypeTags::NumberInt64, 2);
-    arr->push_back(sbe::value::TypeTags::NumberInt64, 3);
-
-    auto [tagObj, valObj] = sbe::value::makeNewObject();
-    auto obj = sbe::value::getObjectView(valObj);
-    obj->push_back("fieldA", tagArr, valArr);
-
-    sbe::value::OwnedValueAccessor accessor;
-    auto slotId = bindAccessor(&accessor);
-    SlotVarMap map;
-    map["root"] = slotId;
-
-    accessor.reset(tagObj, valObj);
-    auto tree = make<EvalFilter>(
-        make<PathGet>("fieldA",
-                      make<PathTraverse>(make<PathCompare>(Operations::Eq, Constant::int64(2)))),
-        make<Variable>("root"));
-
-    auto env = VariableEnvironment::build(tree);
-
-    // Run rewriters while things change
-    bool changed = false;
-    do {
-        changed = false;
-        if (PathLowering{prefixId, env}.optimize(tree)) {
-            changed = true;
-        }
-        if (ConstEval{env}.optimize(tree)) {
-            changed = true;
-        }
-    } while (changed);
-
-    auto expr = SBEExpressionLowering{env, map}.optimize(tree);
-
-    ASSERT(expr);
-    auto compiledExpr = compileExpression(*expr);
-    auto result = runCompiledExpressionPredicate(compiledExpr.get());
-
-    ASSERT(result);
-}
-
-TEST_F(ABTSBE, LowerFunctionCallFail) {
+TEST_F(AbtToSbeExpression, LowerFunctionCallFail) {
     std::string errorMessage = "Error: Bad value 123456789!";
 
     auto tree =
@@ -247,8 +240,10 @@ TEST_F(ABTSBE, LowerFunctionCallFail) {
                                    Constant::str(errorMessage)));
     auto env = VariableEnvironment::build(tree);
     SlotVarMap map;
-
-    auto expr = SBEExpressionLowering{env, map}.optimize(tree);
+    sbe::InputParamToSlotMap inputParamToSlotMap;
+    auto expr =
+        SBEExpressionLowering{env, map, *runtimeEnv(), slotIdGenerator(), inputParamToSlotMap}
+            .optimize(tree);
     ASSERT(expr);
 
     auto compiledExpr = compileExpression(*expr);
@@ -266,7 +261,7 @@ TEST_F(ABTSBE, LowerFunctionCallFail) {
     ASSERT_EQ(status.reason(), errorMessage);
 }
 
-TEST_F(ABTSBE, LowerFunctionCallConvert) {
+TEST_F(AbtToSbeExpression, LowerFunctionCallConvert) {
     sbe::value::OwnedValueAccessor inputAccessor;
     auto slotId = bindAccessor(&inputAccessor);
     SlotVarMap map;
@@ -277,8 +272,10 @@ TEST_F(ABTSBE, LowerFunctionCallConvert) {
         makeSeq(make<Variable>("inputVar"),
                 Constant::int32(static_cast<int32_t>(sbe::value::TypeTags::NumberInt64))));
     auto env = VariableEnvironment::build(tree);
-
-    auto expr = SBEExpressionLowering{env, map}.optimize(tree);
+    sbe::InputParamToSlotMap inputParamToSlotMap;
+    auto expr =
+        SBEExpressionLowering{env, map, *runtimeEnv(), slotIdGenerator(), inputParamToSlotMap}
+            .optimize(tree);
     ASSERT(expr);
 
     auto compiledExpr = compileExpression(*expr);
@@ -302,7 +299,7 @@ TEST_F(ABTSBE, LowerFunctionCallConvert) {
     }
 }
 
-TEST_F(ABTSBE, LowerFunctionCallTypeMatch) {
+TEST_F(AbtToSbeExpression, LowerFunctionCallTypeMatch) {
     sbe::value::OwnedValueAccessor inputAccessor;
     auto slotId = bindAccessor(&inputAccessor);
     SlotVarMap map;
@@ -315,9 +312,12 @@ TEST_F(ABTSBE, LowerFunctionCallTypeMatch) {
                                 getBSONTypeMask(sbe::value::TypeTags::NumberInt64) |
                                 getBSONTypeMask(sbe::value::TypeTags::NumberDouble) |
                                 getBSONTypeMask(sbe::value::TypeTags::NumberDecimal))));
-    auto env = VariableEnvironment::build(tree);
 
-    auto expr = SBEExpressionLowering{env, map}.optimize(tree);
+    auto env = VariableEnvironment::build(tree);
+    sbe::InputParamToSlotMap inputParamToSlotMap;
+    auto expr =
+        SBEExpressionLowering{env, map, *runtimeEnv(), slotIdGenerator(), inputParamToSlotMap}
+            .optimize(tree);
     ASSERT(expr);
 
     auto compiledExpr = compileExpression(*expr);
@@ -337,75 +337,163 @@ TEST_F(ABTSBE, LowerFunctionCallTypeMatch) {
     }
 }
 
-TEST_F(NodeSBE, Lower1) {
-    PrefixId prefixId;
-    Metadata metadata{{}};
-
-    OperationContextNoop noop;
-    auto pipeline =
-        parsePipeline("[{$project:{'a.b.c.d':{$literal:'abc'}}}]", NamespaceString("test"), &noop);
-
-    const auto [tag, val] = sbe::value::makeNewArray();
-    {
-        // Create an array of array with one empty document.
-        auto outerArrayPtr = sbe::value::getArrayView(val);
-
-        const auto [tag1, val1] = sbe::value::makeNewArray();
-        auto innerArrayPtr = sbe::value::getArrayView(val1);
-
-        const auto [tag2, val2] = sbe::value::makeNewObject();
-        innerArrayPtr->push_back(tag2, val2);
-
-        outerArrayPtr->push_back(tag1, val1);
-    }
-    ABT tree = make<Constant>(tag, val);
-
-    const ProjectionName scanProjName = prefixId.getNextId("scan");
-    tree = translatePipelineToABT(
-        metadata,
-        *pipeline.get(),
-        scanProjName,
-        make<ValueScanNode>(ProjectionNameVector{scanProjName}, std::move(tree)),
-        prefixId);
-
-    OptPhaseManager phaseManager(
-        OptPhaseManager::getAllRewritesSet(), prefixId, {{}}, DebugInfo::kDefaultForTests);
-
-    ASSERT_TRUE(phaseManager.optimize(tree));
-    auto env = VariableEnvironment::build(tree);
+TEST_F(AbtToSbeExpression, LowerComparisonCollation) {
+    sbe::value::OwnedValueAccessor lhsAccessor;
+    sbe::value::OwnedValueAccessor rhsAccessor;
+    auto lhsSlotId = bindAccessor(&lhsAccessor);
+    auto rhsSlotId = bindAccessor(&rhsAccessor);
     SlotVarMap map;
-    sbe::value::SlotIdGenerator ids;
+    map["lhs"] = lhsSlotId;
+    map["rhs"] = rhsSlotId;
 
-    SBENodeLowering g{env,
-                      map,
-                      ids,
-                      phaseManager.getMetadata(),
-                      phaseManager.getNodeToGroupPropsMap(),
-                      phaseManager.getRIDProjections()};
+    sbe::InputParamToSlotMap inputParamToSlotMap;
 
-    auto sbePlan = g.optimize(tree);
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kToLowerString);
+    registerSlot("collator"_sd,
+                 sbe::value::TypeTags::collator,
+                 sbe::value::bitcastFrom<const CollatorInterface*>(&collator),
+                 false);
 
-    auto opCtx = makeOperationContext();
+    auto tree = make<BinaryOp>(Operations::Cmp3w, make<Variable>("lhs"), make<Variable>("rhs"));
+    auto env = VariableEnvironment::build(tree);
+    auto expr =
+        SBEExpressionLowering{env, map, *runtimeEnv(), slotIdGenerator(), inputParamToSlotMap}
+            .optimize(tree);
 
-    sbe::CompileCtx ctx(std::make_unique<sbe::RuntimeEnvironment>());
-    sbePlan->prepare(ctx);
+    ASSERT(expr);
+    auto compiledExpr = compileExpression(*expr);
 
-    std::vector<sbe::value::SlotAccessor*> accessors;
-    for (auto& [name, slot] : map) {
-        std::cout << name << " ";
-        accessors.emplace_back(sbePlan->getAccessor(ctx, slot));
-    }
-    std::cout << "\n";
-    sbePlan->attachToOperationContext(opCtx.get());
-    sbePlan->open(false);
-    while (sbePlan->getNext() != sbe::PlanState::IS_EOF) {
-        for (auto acc : accessors) {
-            std::cout << acc->getViewOfValue() << " ";
-        }
-        std::cout << "\n";
+    auto checkCmp3w = [&](StringData lhs, StringData rhs, int result) {
+        auto [lhsTag, lhsValue] = sbe::value::makeNewString(lhs);
+        lhsAccessor.reset(true, lhsTag, lhsValue);
+        auto [rhsTag, rhsValue] = sbe::value::makeNewString(rhs);
+        rhsAccessor.reset(true, rhsTag, rhsValue);
+
+        auto [tag, value] = runCompiledExpression(compiledExpr.get());
+        sbe::value::ValueGuard guard(tag, value);
+
+        ASSERT_EQ(sbe::value::TypeTags::NumberInt32, tag);
+        ASSERT_EQ(result, sbe::value::bitcastTo<int32_t>(value))
+            << "comparing string '" << lhs << "' and '" << rhs << "'";
     };
-    sbePlan->close();
+
+    checkCmp3w("ABC", "abc", 0);
+    checkCmp3w("aCC", "abb", 1);
+    checkCmp3w("AbX", "aBy", -1);
 }
 
+// The following nullability tests verify that ExpressionConstEval, which performs rewrites and
+// simplifications based on the nullability value of expressions, does not change the result of the
+// evaluation of And and Or. eval(E) == eval(ExpressionConstEval(E))
+
+TEST_F(AbtToSbeExpression, NonNullableLhsOrTrueConstFold) {
+    // E = non-nullable lhs (resolvable variable) || true
+    // eval(E) == eval(ExpressionConstEval(E))
+    auto tree = _binary("Or", _binary("Gt", "x"_var, "5"_cint32), _cbool(true))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var =
+        std::make_pair(ProjectionName{"x"_sd}, sbe::value::makeValue(mongo::Value((int32_t)1)));
+
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(AbtToSbeExpression, NonNullableLhsOrFalseConstFold) {
+    // E = non-nullable lhs (resolvable variable) || false
+    // eval(E) == eval(ExpressionConstEval(E))
+    auto tree = _binary("Or", _binary("Gt", "x"_var, "5"_cint32), _cbool(false))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var =
+        std::make_pair(ProjectionName{"x"_sd}, sbe::value::makeValue(mongo::Value((int32_t)1)));
+
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(AbtToSbeExpression, NullableLhsOrTrueConstFold) {
+    // E = nullable lhs (Nothing) || true
+    // eval(E) == eval(ExpressionConstEval(E))
+    auto tree = _binary("Or", _cnothing(), _cbool(true))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var = boost::none;
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(AbtToSbeExpression, NullableLhsOrFalseConstFold) {
+    // E = nullable lhs (Nothing) || false
+    // eval(E) == eval(ExpressionConstEval(E))
+    auto tree = _binary("Or", _cnothing(), _cbool(false))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var = boost::none;
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(AbtToSbeExpression, NonNullableLhsAndFalseConstFold) {
+    // E = non-nullable lhs (resolvable variable) && false
+    // eval(E) == eval(ExpressionConstEval(E))
+    auto tree = _binary("And", _binary("Gt", "x"_var, "5"_cint32), _cbool(false))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var =
+        std::make_pair(ProjectionName{"x"_sd}, sbe::value::makeValue(mongo::Value((int32_t)1)));
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(AbtToSbeExpression, NonNullableLhsAndTrueConstFold) {
+    // E = non-nullable lhs (resolvable variable) && true
+    // eval(E) == eval(ExpressionConstEval(E))
+    auto tree = _binary("And", _binary("Gt", "x"_var, "5"_cint32), _cbool(true))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var =
+        std::make_pair(ProjectionName{"x"_sd}, sbe::value::makeValue(mongo::Value((int32_t)1)));
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(AbtToSbeExpression, NullableLhsAndFalseConstFold) {
+    // E = nullable lhs (Nothing) && false
+    // eval(E) == eval(ExpressionConstEval(E))
+    auto tree = _binary("And", _cnothing(), _cbool(false))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var = boost::none;
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
+
+TEST_F(AbtToSbeExpression, NullableLhsAndTrueConstFold) {
+    // E = nullable lhs (Nothing) && true
+    // eval(E) == eval(ExpressionConstEval(E))
+    auto tree = _binary("And", _cnothing(), _cbool(true))._n;
+    auto treeConstFold = constFold(tree);
+
+    auto var = boost::none;
+    auto res = evalExpr(tree, var);
+    auto resConstFold = evalExpr(treeConstFold, var);
+
+    assertEqualValues(res, resConstFold);
+}
 }  // namespace
 }  // namespace mongo::optimizer

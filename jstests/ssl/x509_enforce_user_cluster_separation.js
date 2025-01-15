@@ -1,5 +1,6 @@
 // Check if this build supports the authenticationMechanisms startup parameter.
-load("jstests/libs/logv2_helpers.js");
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const SERVER_CERT = "jstests/libs/server.pem";
 const SERVER_SAN_CERT = "jstests/libs/server_SAN.pem";
@@ -78,9 +79,9 @@ function initUser(conn, user) {
 }
 
 const x509_options = {
-    sslMode: "requireSSL",
-    sslPEMKeyFile: SERVER_CERT,
-    sslCAFile: CA_CERT
+    tlsMode: "requireTLS",
+    tlsCertificateKeyFile: SERVER_CERT,
+    tlsCAFile: CA_CERT
 };
 
 const mongodOptions =
@@ -113,7 +114,7 @@ function runMongosTest(desc, func) {
             keyFile: 'jstests/libs/key1',
             configOptions: mongodOptions,
             mongosOptions: mongosOptions,
-            shardOptions: x509_options,
+            rsOptions: x509_options,
             useHostname: false
         }
     });
@@ -134,7 +135,7 @@ function runMongosFailTest(desc, options) {
             keyFile: 'jstests/libs/key1',
             configOptions: mongodOptions,
             mongosOptions: mongosOptions,
-            shardOptions: x509_options,
+            rsOptions: x509_options,
             useHostname: false
         }
     });

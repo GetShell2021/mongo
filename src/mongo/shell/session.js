@@ -97,6 +97,16 @@ var {
         this.toString = function toString() {
             return "SessionOptions(" + this.tojson() + ")";
         };
+
+        this.getRawOpts = function getRawOpts() {
+            return {
+                readPreference: _readPreference,
+                readConcern: _readConcern,
+                writeConcern: _writeConcern,
+                causalConsistency: _causalConsistency,
+                retryWrites: _retryWrites
+            };
+        };
     }
 
     const kWireVersionSupportingCausalConsistency = 6;
@@ -169,20 +179,12 @@ var {
 
             let cmdName = Object.keys(cmdObj)[0];
 
-            // If the command is in a wrapped form, then we look for the actual command name inside
-            // the query/$query object.
-            let cmdObjUnwrapped = cmdObj;
-            if (cmdName === "query" || cmdName === "$query") {
-                cmdObjUnwrapped = cmdObj[cmdName];
-                cmdName = Object.keys(cmdObjUnwrapped)[0];
-            }
-
             if (!kCommandsThatSupportReadConcern.has(cmdName)) {
                 return false;
             }
 
             if (cmdName === "explain") {
-                return kCommandsThatSupportReadConcern.has(Object.keys(cmdObjUnwrapped.explain)[0]);
+                return kCommandsThatSupportReadConcern.has(Object.keys(cmdObj.explain)[0]);
             }
 
             return true;
@@ -193,16 +195,8 @@ var {
 
             const cmdName = Object.keys(cmdObj)[0];
 
-            // If the command is in a wrapped form, then we look for the actual command object
-            // inside the query/$query object.
-            let cmdObjUnwrapped = cmdObj;
-            if (cmdName === "query" || cmdName === "$query") {
-                cmdObj[cmdName] = Object.assign({}, cmdObj[cmdName]);
-                cmdObjUnwrapped = cmdObj[cmdName];
-            }
-
-            if (!cmdObjUnwrapped.hasOwnProperty("$clusterTime")) {
-                cmdObjUnwrapped.$clusterTime = clusterTime;
+            if (!cmdObj.hasOwnProperty("$clusterTime")) {
+                cmdObj.$clusterTime = clusterTime;
             }
 
             return cmdObj;
@@ -221,19 +215,11 @@ var {
             cmdObj = Object.assign({}, cmdObj);
             let cmdName = Object.keys(cmdObj)[0];
 
-            // If the command is in a wrapped form, then we look for the actual command object
-            // inside the query/$query object.
+            // Explain read concerns are on the inner command.
             let cmdObjUnwrapped = cmdObj;
-            if (cmdName === "query" || cmdName === "$query") {
+            if (cmdName === "explain") {
                 cmdObj[cmdName] = Object.assign({}, cmdObj[cmdName]);
                 cmdObjUnwrapped = cmdObj[cmdName];
-            }
-
-            // Explain read concerns are on the inner command (possibly inside query/$query).
-            cmdName = Object.keys(cmdObjUnwrapped)[0];
-            if (cmdName === "explain") {
-                cmdObjUnwrapped[cmdName] = Object.assign({}, cmdObjUnwrapped[cmdName]);
-                cmdObjUnwrapped = cmdObjUnwrapped[cmdName];
             }
 
             // Transaction read concerns are handled later in assignTxnInfo().
@@ -334,19 +320,12 @@ var {
          */
         function isRetryableCode(code) {
             return ErrorCodes.isNetworkError(code) || ErrorCodes.isNotPrimaryError(code) ||
-                ErrorCodes.isShutdownError(code) || ErrorCodes.WriteConcernFailed === code;
+                ErrorCodes.isShutdownError(code) || ErrorCodes.WriteConcernTimeout === code;
         }
 
         function runClientFunctionWithRetries(
             driverSession, cmdObj, clientFunction, clientFunctionArguments) {
             let cmdName = Object.keys(cmdObj)[0];
-
-            // If the command is in a wrapped form, then we look for the actual command
-            // object inside the query/$query object.
-            if (cmdName === "query" || cmdName === "$query") {
-                cmdObj = cmdObj[cmdName];
-                cmdName = Object.keys(cmdObj)[0];
-            }
 
             // TODO SERVER-33921: Revisit how the mongo shell decides whether it should
             // retry a command or not.
@@ -390,6 +369,23 @@ var {
 
                     if (!serverSupportsRetryableWrites) {
                         throw e;
+                    }
+                }
+
+                // Handle ErrorCodes.Reauthentication first.
+                if (res !== undefined && res.code === ErrorCodes.ReauthenticationRequired) {
+                    try {
+                        const accessToken = client._refreshAccessToken();
+                        assert(client.getDB('$external').auth({
+                            oidcAccessToken: accessToken,
+                            mechanism: 'MONGODB-OIDC'
+                        }));
+                        continue;
+                    } catch (e) {
+                        // Could not automatically reauthenticate, return the error response
+                        // as-is.
+                        jsTest.log('Assertion thrown when performing refresh flow: ' + e);
+                        return res;
                     }
                 }
 
@@ -454,6 +450,18 @@ var {
                             client._markNodeAsFailed(res._mongo.host,
                                                      res.writeConcernError.code,
                                                      res.writeConcernError.errmsg);
+                        }
+                        continue;
+                    }
+
+                    if (res.hasOwnProperty("errorLabels") &&
+                        res.errorLabels.includes("RetryableWriteError")) {
+                        if (jsTest.options().logRetryAttempts) {
+                            jsTest.log(
+                                "Retrying " + cmdName +
+                                " with original command request: " + tojson(cmdObj) +
+                                " due to RetryableWriteError label, subsequent retries remaining: " +
+                                numRetries);
                         }
                         continue;
                     }
@@ -555,17 +563,9 @@ var {
 
             const cmdName = Object.keys(cmdObj)[0];
 
-            // If the command is in a wrapped form, then we look for the actual command object
-            // inside the query/$query object.
-            let cmdObjUnwrapped = cmdObj;
-            if (cmdName === "query" || cmdName === "$query") {
-                cmdObj[cmdName] = Object.assign({}, cmdObj[cmdName]);
-                cmdObjUnwrapped = cmdObj[cmdName];
-            }
-
-            if (!cmdObjUnwrapped.hasOwnProperty("lsid")) {
-                if (isAcknowledged(cmdObjUnwrapped)) {
-                    cmdObjUnwrapped.lsid = this.handle.getId();
+            if (!cmdObj.hasOwnProperty("lsid")) {
+                if (isAcknowledged(cmdObj)) {
+                    cmdObj.lsid = this.handle.getId();
                 }
 
                 // We consider the session to still be in use by the client any time the session id
@@ -581,17 +581,9 @@ var {
 
             const cmdName = Object.keys(cmdObj)[0];
 
-            // If the command is in a wrapped form, then we look for the actual command object
-            // inside the query/$query object.
-            let cmdObjUnwrapped = cmdObj;
-            if (cmdName === "query" || cmdName === "$query") {
-                cmdObj[cmdName] = Object.assign({}, cmdObj[cmdName]);
-                cmdObjUnwrapped = cmdObj[cmdName];
-            }
-
-            if (!cmdObjUnwrapped.hasOwnProperty("txnNumber")) {
+            if (!cmdObj.hasOwnProperty("txnNumber")) {
                 this.handle.incrementTxnNumber();
-                cmdObjUnwrapped.txnNumber = this.handle.getTxnNumber();
+                cmdObj.txnNumber = this.handle.getTxnNumber();
             }
 
             return cmdObj;
@@ -622,45 +614,37 @@ var {
 
             const cmdName = Object.keys(cmdObj)[0];
 
-            // If the command is in a wrapped form, then we look for the actual command object
-            // inside the query/$query object.
-            let cmdObjUnwrapped = cmdObj;
-            if (cmdName === "query" || cmdName === "$query") {
-                cmdObj[cmdName] = Object.assign({}, cmdObj[cmdName]);
-                cmdObjUnwrapped = cmdObj[cmdName];
-            }
-
-            if (!cmdObjUnwrapped.hasOwnProperty("txnNumber")) {
-                cmdObjUnwrapped.txnNumber = this.handle.getTxnNumber();
+            if (!cmdObj.hasOwnProperty("txnNumber")) {
+                cmdObj.txnNumber = this.handle.getTxnNumber();
             }
 
             // All operations of a multi-statement transaction must specify autocommit=false.
-            cmdObjUnwrapped.autocommit = false;
+            cmdObj.autocommit = false;
 
             // Statement Id is required on all transaction operations.
-            cmdObjUnwrapped.stmtId = new NumberInt(_nextStatementId);
+            cmdObj.stmtId = new NumberInt(_nextStatementId);
 
             // 'readConcern' and 'startTransaction' can only be specified on the first statement
             // in a transaction.
             if (_nextStatementId == 0) {
-                cmdObjUnwrapped.startTransaction = true;
+                cmdObj.startTransaction = true;
                 if (_txnOptions.getTxnReadConcern() !== undefined) {
                     // Override the readConcern with the one specified during startTransaction.
-                    cmdObjUnwrapped.readConcern = Object.assign(
-                        {}, cmdObjUnwrapped.readConcern, _txnOptions.getTxnReadConcern());
+                    cmdObj.readConcern =
+                        Object.assign({}, cmdObj.readConcern, _txnOptions.getTxnReadConcern());
                 }
             }
 
             // Reserve the statement ids for batch writes.
             switch (cmdName) {
                 case "insert":
-                    _nextStatementId += cmdObjUnwrapped.documents.length;
+                    _nextStatementId += cmdObj.documents.length;
                     break;
                 case "update":
-                    _nextStatementId += cmdObjUnwrapped.updates.length;
+                    _nextStatementId += cmdObj.updates.length;
                     break;
                 case "delete":
-                    _nextStatementId += cmdObjUnwrapped.deletes.length;
+                    _nextStatementId += cmdObj.deletes.length;
                     break;
                 default:
                     _nextStatementId += 1;
@@ -770,13 +754,6 @@ var {
     ServerSession.canRetryWrites = function canRetryWrites(cmdObj) {
         let cmdName = Object.keys(cmdObj)[0];
 
-        // If the command is in a wrapped form, then we look for the actual command name inside the
-        // query/$query object.
-        if (cmdName === "query" || cmdName === "$query") {
-            cmdObj = cmdObj[cmdName];
-            cmdName = Object.keys(cmdObj)[0];
-        }
-
         if (cmdObj.hasOwnProperty("autocommit")) {
             return false;
         }
@@ -839,6 +816,8 @@ var {
             return true;
         } else if (cmdName === "findAndModify" || cmdName === "findandmodify") {
             // Operations that modify a single document (e.g. findOneAndUpdate()) can be retried.
+            return true;
+        } else if (cmdName === "bulkWrite") {
             return true;
         }
 

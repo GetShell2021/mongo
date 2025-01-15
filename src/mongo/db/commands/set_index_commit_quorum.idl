@@ -34,15 +34,15 @@ global:
         - "mongo/db/write_concern_options.h"
 
 imports:
-    - "mongo/db/catalog/commit_quorum.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/index_builds/commit_quorum.idl"
+    - "mongo/db/basic_types.idl"
 
 commands:
     setIndexCommitQuorum:
         command_name: setIndexCommitQuorum
         cpp_name: SetIndexCommitQuorum
         description: "Resets the commitQuorum for an index build."
-        strict: false
+        strict: true
         namespace: concatenate_with_db
         api_version: ""
         fields:

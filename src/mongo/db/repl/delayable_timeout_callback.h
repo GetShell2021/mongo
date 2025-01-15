@@ -28,10 +28,16 @@
  */
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <string>
+#include <utility>
 
 #include "mongo/base/status.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -98,11 +104,11 @@ protected:
         return _executor;
     }
 
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("DelayableTimeoutCallback");
+    mutable stdx::mutex _mutex;
 
 private:
     void _handleTimeout(const executor::TaskExecutor::CallbackArgs& cbData);
-    Status _reschedule(WithLock);
+    Status _reschedule(WithLock, Date_t when);
 
     executor::TaskExecutor* _executor;
     executor::TaskExecutor::CallbackHandle _cbHandle;
@@ -134,7 +140,7 @@ private:
  */
 class DelayableTimeoutCallbackWithJitter : public DelayableTimeoutCallback {
 public:
-    using RandomSource = std::function<int64_t(int64_t)>;
+    using RandomSource = std::function<int64_t(WithLock, int64_t)>;
 
     DelayableTimeoutCallbackWithJitter(executor::TaskExecutor* executor,
                                        executor::TaskExecutor::CallbackFn callback,
@@ -145,7 +151,7 @@ public:
 
     Status scheduleAt(Date_t when);
     Status delayUntil(Date_t when);
-    Status delayUntilWithJitter(Date_t when, Milliseconds maxJitter);
+    Status delayUntilWithJitter(WithLock, Date_t when, Milliseconds maxJitter);
 
 private:
     void _resetRandomization(WithLock);

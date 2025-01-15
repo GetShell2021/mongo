@@ -29,10 +29,12 @@
 
 #pragma once
 
+#include "mongo/base/status_with.h"
 #include "mongo/db/change_stream_options_gen.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
 
 namespace mongo {
@@ -68,7 +70,7 @@ public:
     /**
      * Returns the change-streams options.
      */
-    const ChangeStreamOptions& getOptions(OperationContext* opCtx);
+    ChangeStreamOptions getOptions(OperationContext* opCtx) const;
 
     /**
      * Sets the provided change-streams options. Returns OK on success, otherwise appropriate error
@@ -87,7 +89,7 @@ public:
 private:
     ChangeStreamOptions _changeStreamOptions;
 
-    Mutex _mutex = MONGO_MAKE_LATCH("ChangeStreamOptionsManager::mutex");
+    mutable stdx::mutex _mutex;
 };
 
 }  // namespace mongo

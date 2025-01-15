@@ -7,17 +7,15 @@
  * ]
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const rangeDeleterBatchSize = 128;
 
 const st = new ShardingTest({
     shards: 2,
     other: {
-        shardOptions: {setParameter: {rangeDeleterBatchSize: rangeDeleterBatchSize}},
+        rsOptions: {setParameter: {rangeDeleterBatchSize: rangeDeleterBatchSize}},
     }
 });
 
@@ -75,4 +73,3 @@ for (let i = 0; i < numBatches; i++) {
 beforeDeletionFailpoint.off();
 
 st.stop();
-})();

@@ -58,6 +58,10 @@ class test_compat03(wttest.WiredTigerTestCase, suite_subprocess):
     compat_release = [
         ('future_rel', dict(rel=future_rel, log_rel=future_logv)),
         ('def_rel', dict(rel='none', log_rel=5)),
+        ('120_rel', dict(rel="12.0", log_rel=5)),
+        ('113_rel', dict(rel="11.3", log_rel=5)),
+        ('112_rel', dict(rel="11.2", log_rel=5)),
+        ('111_rel', dict(rel="11.1", log_rel=5)),
         ('110_rel', dict(rel="11.0", log_rel=5)),
         ('100_rel', dict(rel="10.0", log_rel=5)),
         ('33_rel', dict(rel="3.3", log_rel=4)),
@@ -73,11 +77,11 @@ class test_compat03(wttest.WiredTigerTestCase, suite_subprocess):
     # log_max=3 as such we don't need 3.1 in this list.
     # However the exemption to this rule is versions which include a patch
     # number as the patch number will get removed in the conn_reconfig.c
-    # This rule exemption applies to the minimum verison check as well.
+    # This rule exemption applies to the minimum version check as well.
     compat_max = [
         ('future_max', dict(max_req=future_rel, log_max=future_logv)),
         ('def_max', dict(max_req='none', log_max=5)),
-        ('110_max', dict(max_req="11.0", log_max=5)),
+        ('120_max', dict(max_req="12.0", log_max=5)),
         ('33_max', dict(max_req="3.3", log_max=4)),
         ('32_max', dict(max_req="3.2", log_max=3)),
         ('30_max', dict(max_req="3.0", log_max=2)),
@@ -141,6 +145,3 @@ class test_compat03(wttest.WiredTigerTestCase, suite_subprocess):
             self.pr("EXPECT SUCCESS")
             conn = self.wiredtiger_open(testdir, config_str)
             conn.close()
-
-if __name__ == '__main__':
-    wttest.run()

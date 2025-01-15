@@ -1,26 +1,11 @@
 // Tests for the $lookup stage with a sub-pipeline.
 
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");  // For assertErrorCode and anyEq.
-load("jstests/libs/discover_topology.js");    // For findNonConfigNodes.
-load("jstests/libs/fixture_helpers.js");      // For isSharded.
-
-const testName = "lookup_subpipeline";
+import {anyEq, assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.lookUp;
 const from = db.from;
 const thirdColl = db.thirdColl;
 const fourthColl = db.fourthColl;
-
-const getShardedLookupParam = db.adminCommand({getParameter: 1, featureFlagShardedLookup: 1});
-const isShardedLookupEnabled = getShardedLookupParam.hasOwnProperty("featureFlagShardedLookup") &&
-    getShardedLookupParam.featureFlagShardedLookup.value;
-
-if (FixtureHelpers.isSharded(from) && !isShardedLookupEnabled) {
-    return;
-}
 
 // Helper for testing that pipeline returns correct set of results.
 function testPipeline(pipeline, expectedResult, collection) {
@@ -588,4 +573,3 @@ assertErrorCode(
     coll, [{$lookup: {let : 1, pipeline: [], from: "from", as: "as"}}], ErrorCodes.FailedToParse);
 assertErrorCode(
     coll, [{$lookup: {let : [], pipeline: [], from: "from", as: "as"}}], ErrorCodes.FailedToParse);
-}());

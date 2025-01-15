@@ -27,16 +27,20 @@
  *    it in the license file.
  */
 
+#include <fmt/format.h>
+
+#include <boost/move/utility_core.hpp>
+
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/pipeline/document_source_merge_gen.h"
-#include "mongo/db/pipeline/expression_context.h"
-#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
-#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/client.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/timeseries/timeseries_update_delete_util.h"
-#include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -44,7 +48,7 @@ namespace {
 
 class TimeseriesUpdateDeleteUtilTest : public ServiceContextMongoDTest {
 protected:
-    void setUp() {
+    void setUp() override {
         ServiceContextMongoDTest::setUp();
         _opCtx = cc().makeOperationContext();
     }
@@ -58,8 +62,9 @@ protected:
     }
 
     BSONObj _translateUpdate(const BSONObj& update) const {
-        return timeseries::translateUpdate(
-                   write_ops::UpdateModification::parseFromClassicUpdate(update), _metaField)
+        return uassertStatusOK(
+                   timeseries::translateUpdate(
+                       write_ops::UpdateModification::parseFromClassicUpdate(update), _metaField))
             .getUpdateModifier();
     }
 
@@ -103,7 +108,8 @@ protected:
 
     ServiceContext::UniqueOperationContext _opCtx;
     StringData _metaField = "tag";
-    NamespaceString _ns{"timeseries_update_delete_util_test", "system.buckets.t"};
+    NamespaceString _ns = NamespaceString::createNamespaceString_forTest(
+        "timeseries_update_delete_util_test", "system.buckets.t");
 };
 
 TEST_F(TimeseriesUpdateDeleteUtilTest, TranslateQueryEmpty) {

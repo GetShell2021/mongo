@@ -30,16 +30,34 @@
 
 #include "mongo/db/timeseries/timeseries_commands_conversion_helper.h"
 
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds/commit_quorum_options.h"
 #include "mongo/db/index_names.h"
-#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
-#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/query/timeseries/bucket_spec.h"
 #include "mongo/db/timeseries/timeseries_constants.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
-#include "mongo/logv2/log.h"
 #include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
@@ -113,18 +131,8 @@ CreateIndexesCommand makeTimeseriesCreateIndexesCommand(OperationContext* opCtx,
 
         for (const auto& elem : origIndex) {
             if (elem.fieldNameStringData() == IndexDescriptor::kPartialFilterExprFieldName) {
-                if (feature_flags::gTimeseriesMetricIndexes.isEnabled(
-                        serverGlobalParams.featureCompatibility)) {
-                    includeOriginalSpec = true;
-                } else {
-                    uasserted(ErrorCodes::InvalidOptions,
-                              "Partial indexes are not supported on time-series collections");
-                }
+                includeOriginalSpec = true;
 
-                uassert(ErrorCodes::CannotCreateIndex,
-                        "Partial indexes on time-series collections require FCV 5.3",
-                        feature_flags::gTimeseriesMetricIndexes.isEnabled(
-                            serverGlobalParams.featureCompatibility));
                 BSONObj pred = elem.Obj();
 
                 // If the createIndexes command specifies a collation for this index, then that
@@ -138,16 +146,20 @@ CreateIndexesCommand makeTimeseriesCreateIndexesCommand(OperationContext* opCtx,
                 }
                 // Since no collation was specified in the command, we know the index collation will
                 // match the collection's collation.
-                auto collationMatchesDefault = ExpressionContext::CollationMatchesDefault::kYes;
+                auto collationMatchesDefault = ExpressionContextCollationMatchesDefault::kYes;
 
                 // Even though the index collation will match the collection's collation, we don't
                 // know whether or not that collation is simple. However, I think we can correctly
                 // rewrite the filter expression without knowing this... Looking up the correct
                 // value would require handling mongos and mongod separately.
-                std::unique_ptr<CollatorInterface> collator{nullptr};
-
-                auto expCtx = make_intrusive<ExpressionContext>(opCtx, std::move(collator), origNs);
-                expCtx->collationMatchesDefault = collationMatchesDefault;
+                auto expCtx = ExpressionContextBuilder{}
+                                  .opCtx(opCtx)
+                                  .ns(origNs)
+                                  .collationMatchesDefault(collationMatchesDefault)
+                                  .build();
+                // We can't know if there won't be extended range values in the collection, so
+                // assume there will be.
+                expCtx->setRequiresTimeseriesExtendedRangeSupport(true);
 
                 // partialFilterExpression is evaluated against a collection, so there are no
                 // computed fields.
@@ -162,15 +174,19 @@ CreateIndexesCommand makeTimeseriesCreateIndexesCommand(OperationContext* opCtx,
                 // planner, this will be true.
                 bool assumeNoMixedSchemaData = true;
 
+                // Fixed buckets is dependent on the time-series collection options not changing,
+                // this can change throughout the lifetime of the index.
+                bool fixedBuckets = false;
+
                 auto [hasMetricPred, bucketPred] =
                     BucketSpec::pushdownPredicate(expCtx,
                                                   options,
-                                                  collationMatchesDefault,
                                                   pred,
                                                   haveComputedMetaField,
                                                   includeMetaField,
                                                   assumeNoMixedSchemaData,
-                                                  BucketSpec::IneligiblePredicatePolicy::kError);
+                                                  BucketSpec::IneligiblePredicatePolicy::kError,
+                                                  fixedBuckets);
 
                 hasPartialFilterOnMetaField = !hasMetricPred;
 
@@ -225,7 +241,7 @@ CreateIndexesCommand makeTimeseriesCreateIndexesCommand(OperationContext* opCtx,
                                                                               originalKeyField);
                 uassert(ErrorCodes::CannotCreateIndex,
                         str::stream() << bucketsIndexSpecWithStatus.getStatus().toString()
-                                      << " Command request: " << redact(origCmd.toBSON({})),
+                                      << " Command request: " << redact(origCmd.toBSON()),
                         bucketsIndexSpecWithStatus.isOK());
 
                 if (timeseries::shouldIncludeOriginalSpec(
@@ -245,10 +261,6 @@ CreateIndexesCommand makeTimeseriesCreateIndexesCommand(OperationContext* opCtx,
 
         if (isTTLIndex) {
             uassert(ErrorCodes::InvalidOptions,
-                    "TTL indexes are not supported on time-series collections",
-                    feature_flags::gTimeseriesScalabilityImprovements.isEnabled(
-                        serverGlobalParams.featureCompatibility));
-            uassert(ErrorCodes::InvalidOptions,
                     "TTL indexes on time-series collections require a partialFilterExpression on "
                     "the metaField",
                     hasPartialFilterOnMetaField);
@@ -256,9 +268,7 @@ CreateIndexesCommand makeTimeseriesCreateIndexesCommand(OperationContext* opCtx,
         }
         builder.append(NewIndexSpec::kKeyFieldName, std::move(keyField));
 
-        if (feature_flags::gTimeseriesMetricIndexes.isEnabled(
-                serverGlobalParams.featureCompatibility) &&
-            includeOriginalSpec) {
+        if (includeOriginalSpec) {
             // Store the original user index definition on the transformed index definition for the
             // time-series buckets collection.
             builder.appendObject(IndexDescriptor::kOriginalSpecFieldName, origIndex.objdata());
@@ -272,6 +282,7 @@ CreateIndexesCommand makeTimeseriesCreateIndexesCommand(OperationContext* opCtx,
     cmd.setV(origCmd.getV());
     cmd.setIgnoreUnknownIndexOptions(origCmd.getIgnoreUnknownIndexOptions());
     cmd.setCommitQuorum(origCmd.getCommitQuorum());
+    cmd.setReturnOnStart(origCmd.getReturnOnStart());
 
     return cmd;
 }
@@ -283,13 +294,13 @@ DropIndexes makeTimeseriesDropIndexesCommand(OperationContext* opCtx,
     auto ns = makeTimeseriesBucketsNamespace(origNs);
 
     const auto& origIndex = origCmd.getIndex();
-    if (auto keyPtr = stdx::get_if<BSONObj>(&origIndex)) {
+    if (auto keyPtr = get_if<BSONObj>(&origIndex)) {
         auto bucketsIndexSpecWithStatus =
             timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(options, *keyPtr);
 
         uassert(ErrorCodes::IndexNotFound,
                 str::stream() << bucketsIndexSpecWithStatus.getStatus().toString()
-                              << " Command request: " << redact(origCmd.toBSON({})),
+                              << " Command request: " << redact(origCmd.toBSON()),
                 bucketsIndexSpecWithStatus.isOK());
 
         DropIndexes dropIndexCmd(ns);

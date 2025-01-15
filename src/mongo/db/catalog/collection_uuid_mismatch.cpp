@@ -29,28 +29,60 @@
 
 #include "mongo/db/catalog/collection_uuid_mismatch.h"
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/type_traits/decay.hpp>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_uuid_mismatch_info.h"
-#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
+
+void checkCollectionUUIDMismatch(OperationContext* opCtx,
+                                 const NamespaceString& ns,
+                                 const Collection* coll,
+                                 const boost::optional<UUID>& uuid) {
+    checkCollectionUUIDMismatch(opCtx, *CollectionCatalog::get(opCtx), ns, coll, uuid);
+}
+
 void checkCollectionUUIDMismatch(OperationContext* opCtx,
                                  const NamespaceString& ns,
                                  const CollectionPtr& coll,
+                                 const boost::optional<UUID>& uuid) {
+    checkCollectionUUIDMismatch(opCtx, *CollectionCatalog::get(opCtx), ns, coll.get(), uuid);
+}
+
+void checkCollectionUUIDMismatch(OperationContext* opCtx,
+                                 const CollectionCatalog& catalog,
+                                 const NamespaceString& ns,
+                                 const CollectionPtr& coll,
+                                 const boost::optional<UUID>& uuid) {
+    checkCollectionUUIDMismatch(opCtx, catalog, ns, coll.get(), uuid);
+}
+
+void checkCollectionUUIDMismatch(OperationContext* opCtx,
+                                 const CollectionCatalog& catalog,
+                                 const NamespaceString& ns,
+                                 const Collection* coll,
                                  const boost::optional<UUID>& uuid) {
     if (!uuid) {
         return;
     }
 
-    auto actualNamespace = CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, *uuid);
+    auto actualNamespace = catalog.lookupNSSByUUID(opCtx, *uuid);
     uassert(
-        (CollectionUUIDMismatchInfo{ns.db().toString(),
+        (CollectionUUIDMismatchInfo{ns.dbName(),
                                     *uuid,
                                     ns.coll().toString(),
-                                    actualNamespace && actualNamespace->db() == ns.db()
+                                    actualNamespace && actualNamespace->isEqualDb(ns)
                                         ? boost::make_optional(actualNamespace->coll().toString())
                                         : boost::none}),
         "Collection UUID does not match that specified",
         coll && coll->uuid() == *uuid);
 }
+
 }  // namespace mongo

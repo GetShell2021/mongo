@@ -29,11 +29,20 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <functional>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands/server_status_metric.h"
@@ -41,7 +50,10 @@
 #include "mongo/db/query/allowed_contexts.h"
 #include "mongo/db/read_concern_support_result.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -171,6 +183,21 @@ public:
     }
 
     /**
+     * Returns true if this is a write stage.
+     */
+    virtual bool isWriteStage() const {
+        return false;
+    }
+
+    /**
+     * Returns true if this stage is an initial source and should run just once on the entire
+     * cluster.
+     */
+    virtual bool generatesOwnDataOnce() const {
+        return false;
+    }
+
+    /**
      * Returns true if this stage does not require an input source.
      */
     virtual bool isInitialSource() const {
@@ -178,20 +205,32 @@ public:
     }
 
     /**
-     * Returns true if this stage may be forwarded from mongos unmodified.
+     * Returns true if this stage should make the aggregation command exempt from ingress admission
+     * control.
      */
-    virtual bool allowedToPassthroughFromMongos() const {
-        return true;
+    virtual bool isExemptFromIngressAdmissionControl() const {
+        return false;
     }
 
     /**
-     * Returns true if the involved namespace 'nss' is allowed to be sharded. The behavior is to
-     * allow by default and stages should opt-out if foreign collections are not allowed to be
-     * sharded.
+     * Returns true if this stage require knowledge of the collection default collation at parse
+     * time, false otherwise. This is useful to know as it could save a network request to discern
+     * the collation.
+     * TODO SERVER-81991: Delete this function once all unsharded collections are tracked in the
+     * sharding catalog as unsplittable along with their collation.
      */
-    virtual bool allowShardedForeignCollection(NamespaceString nss,
-                                               bool inMultiDocumentTransaction) const {
-        return true;
+    virtual bool requiresCollationForParsingUnshardedAggregate() const {
+        return false;
+    }
+
+    /**
+     * Returns Status::OK() if the involved namespace 'nss' is allowed to be sharded. The behavior
+     * is to allow by default. Stages should opt-out if foreign collections are not allowed to be
+     * sharded by returning a Status with a message explaining why.
+     */
+    virtual Status checkShardedForeignCollAllowed(const NamespaceString& nss,
+                                                  bool inMultiDocumentTransaction) const {
+        return Status::OK();
     }
 
     /**
@@ -281,6 +320,32 @@ public:
     }
 };
 
+class LiteParsedDocumentSourceInternal final : public LiteParsedDocumentSource {
+public:
+    /**
+     * Creates the default LiteParsedDocumentSource for internal document sources. This requires
+     * the privilege on 'internal' action. This should still be used with caution. Make sure your
+     * stage doesn't need to communicate any special behavior before registering a DocumentSource
+     * using this parser.
+     */
+    static std::unique_ptr<LiteParsedDocumentSourceInternal> parse(const NamespaceString& nss,
+                                                                   const BSONElement& spec) {
+        return std::make_unique<LiteParsedDocumentSourceInternal>(spec.fieldName());
+    }
+
+    LiteParsedDocumentSourceInternal(std::string parseTimeName)
+        : LiteParsedDocumentSource(std::move(parseTimeName)) {}
+
+    stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
+        return stdx::unordered_set<NamespaceString>();
+    }
+
+    PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const final {
+        return {Privilege(ResourcePattern::forClusterResource(boost::none),
+                          ActionSet{ActionType::internal})};
+    }
+};
+
 /**
  * Helper class for DocumentSources which reference a foreign collection.
  */
@@ -293,8 +358,8 @@ public:
         return {_foreignNss};
     }
 
-    virtual PrivilegeVector requiredPrivileges(bool isMongos,
-                                               bool bypassDocumentValidation) const = 0;
+    PrivilegeVector requiredPrivileges(bool isMongos,
+                                       bool bypassDocumentValidation) const override = 0;
 
 protected:
     NamespaceString _foreignNss;
@@ -313,14 +378,14 @@ public:
                                             boost::optional<NamespaceString> foreignNss,
                                             boost::optional<LiteParsedPipeline> pipeline);
 
-    stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final override;
+    stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final;
 
-    virtual void getForeignExecutionNamespaces(
-        stdx::unordered_set<NamespaceString>& nssSet) const override;
-    bool allowedToPassthroughFromMongos() const override;
+    void getForeignExecutionNamespaces(stdx::unordered_set<NamespaceString>& nssSet) const override;
 
-    bool allowShardedForeignCollection(NamespaceString nss,
-                                       bool inMultiDocumentTransaction) const override;
+    bool isExemptFromIngressAdmissionControl() const override;
+
+    Status checkShardedForeignCollAllowed(const NamespaceString& nss,
+                                          bool inMultiDocumentTransaction) const override;
 
     const std::vector<LiteParsedPipeline>& getSubPipelines() const override {
         return _pipelines;
@@ -334,6 +399,11 @@ public:
                                                  bool isImplicitDefault) const override;
 
 protected:
+    /**
+     * Simple implementation that only gets the privileges needed by children pipelines.
+     */
+    PrivilegeVector requiredPrivilegesBasic(bool isMongos, bool bypassDocumentValidation) const;
+
     boost::optional<NamespaceString> _foreignNss;
     std::vector<LiteParsedPipeline> _pipelines;
 };

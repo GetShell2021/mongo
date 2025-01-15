@@ -5,12 +5,9 @@
  * @tags: [requires_sharding]
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function runTest(conn) {
-    const authzErrorCode = 13;
-
     conn.getDB('admin').createUser({user: 'admin', pwd: 'pwd', roles: ['root']});
 
     const adminConn = new Mongo(conn.host);
@@ -200,4 +197,3 @@ jsTest.log('Test sharding');
 var st = new ShardingTest({shards: 2, config: 3, keyFile: 'jstests/libs/key1'});
 runTest(st.s);
 st.stop();
-})();

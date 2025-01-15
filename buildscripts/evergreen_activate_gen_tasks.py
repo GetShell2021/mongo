@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Activate an evergreen task in the existing build."""
+
 import os
 import sys
 
 import click
 import structlog
 from pydantic.main import BaseModel
-from evergreen.api import RetryingEvergreenApi, EvergreenApi
+
+from evergreen.api import EvergreenApi, RetryingEvergreenApi
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
 if __name__ == "__main__" and __package__ is None:
@@ -16,11 +18,15 @@ if __name__ == "__main__" and __package__ is None:
 from buildscripts.util.cmdutils import enable_logging
 from buildscripts.util.fileops import read_yaml_file
 from buildscripts.util.taskname import remove_gen_suffix
+
 # pylint: enable=wrong-import-position
 
 LOGGER = structlog.getLogger(__name__)
 
 EVG_CONFIG_FILE = "./.evergreen.yml"
+BURN_IN_TAGS = "burn_in_tags"
+BURN_IN_TESTS = "burn_in_tests"
+BURN_IN_VARIANT_SUFFIX = "generated-by-burn-in-tags"
 
 
 class EvgExpansions(BaseModel):
@@ -28,10 +34,12 @@ class EvgExpansions(BaseModel):
     Evergreen expansions file contents.
 
     build_id: ID of build being run.
+    version_id: ID of version being run.
     task_name: Name of task creating the generated configuration.
     """
 
     build_id: str
+    version_id: str
     task_name: str
 
     @classmethod
@@ -45,42 +53,75 @@ class EvgExpansions(BaseModel):
         return remove_gen_suffix(self.task_name)
 
 
-def activate_task(build_id: str, task_name: str, evg_api: EvergreenApi) -> None:
+def activate_task(expansions: EvgExpansions, evg_api: EvergreenApi) -> None:
     """
     Activate the given task in the specified build.
 
-    :param build_id: Build to activate task in.
-    :param task_name: Name of task to activate.
+    :param expansions: Evergreen expansions file contents.
     :param evg_api: Evergreen API client.
     """
-    build = evg_api.build_by_id(build_id)
-    task_list = build.get_tasks()
-    for task in task_list:
-        if task.display_name == task_name:
-            LOGGER.info("Activating task", task_id=task.task_id, task_name=task.display_name)
-            evg_api.configure_task(task.task_id, activated=True)
+    tasks_not_activated = []
+    if expansions.task == BURN_IN_TAGS:
+        version = evg_api.version_by_id(expansions.version_id)
+        burn_in_build_variants = [
+            variant
+            for variant in version.build_variants_map.keys()
+            if variant.endswith(BURN_IN_VARIANT_SUFFIX)
+        ]
+        for build_variant in burn_in_build_variants:
+            build_id = version.build_variants_map[build_variant]
+            task_list = evg_api.tasks_by_build(build_id)
 
-            # if any(ARCHIVE_DIST_TEST_TASK in dependency["id"] for dependency in task.depends_on):
-            #     _activate_archive_debug_symbols(evg_api, task_list)
+            for task in task_list:
+                if task.display_name == BURN_IN_TESTS:
+                    LOGGER.info(
+                        "Activating task", task_id=task.task_id, task_name=task.display_name
+                    )
+                    try:
+                        evg_api.configure_task(task.task_id, activated=True)
+                    except Exception:
+                        LOGGER.warning(
+                            "Could not activate task",
+                            task_id=task.task_id,
+                            task_name=task.display_name,
+                        )
+                        tasks_not_activated.append(task.task_id)
 
-
-# def _activate_archive_debug_symbols(evg_api: EvergreenApi, task_list):
-#     debug_iter = filter(lambda tsk: tsk.display_name == ACTIVATE_ARCHIVE_DIST_TEST_DEBUG_TASK,
-#                         task_list)
-#     activate_symbol_tasks = list(debug_iter)
-#
-#     if len(activate_symbol_tasks) == 1:
-#         activated_symbol_task = activate_symbol_tasks[0]
-#         if not activated_symbol_task.activated:
-#             LOGGER.info("Activating debug symbols archival", task_id=activated_symbol_task.task_id)
-#             evg_api.configure_task(activated_symbol_task.task_id, activated=True)
+    else:
+        task_list = evg_api.tasks_by_build(expansions.build_id)
+        for task in task_list:
+            if task.display_name == expansions.task:
+                LOGGER.info("Activating task", task_id=task.task_id, task_name=task.display_name)
+                try:
+                    evg_api.configure_task(task.task_id, activated=True)
+                except Exception:
+                    LOGGER.warning(
+                        "Could not activate task", task_id=task.task_id, task_name=task.display_name
+                    )
+                    tasks_not_activated.append(task.task_id)
+    if len(tasks_not_activated) > 0:
+        LOGGER.error(
+            "Some tasks were unable to be activated", unactivated_tasks=len(tasks_not_activated)
+        )
+        raise ValueError(
+            "Some tasks were unable to be activated, failing the task to let the author know. "
+            "This should not be a blocking issue but may mean that some tasks are missing from your patch."
+        )
 
 
 @click.command()
-@click.option("--expansion-file", type=str, required=True,
-              help="Location of expansions file generated by evergreen.")
-@click.option("--evergreen-config", type=str, default=EVG_CONFIG_FILE,
-              help="Location of evergreen configuration file.")
+@click.option(
+    "--expansion-file",
+    type=str,
+    required=True,
+    help="Location of expansions file generated by evergreen.",
+)
+@click.option(
+    "--evergreen-config",
+    type=str,
+    default=EVG_CONFIG_FILE,
+    help="Location of evergreen configuration file.",
+)
 @click.option("--verbose", is_flag=True, default=False, help="Enable verbose logging.")
 def main(expansion_file: str, evergreen_config: str, verbose: bool) -> None:
     """
@@ -96,7 +137,7 @@ def main(expansion_file: str, evergreen_config: str, verbose: bool) -> None:
     expansions = EvgExpansions.from_yaml_file(expansion_file)
     evg_api = RetryingEvergreenApi.get_api(config_file=evergreen_config)
 
-    activate_task(expansions.build_id, expansions.task, evg_api)
+    activate_task(expansions, evg_api)
 
 
 if __name__ == "__main__":

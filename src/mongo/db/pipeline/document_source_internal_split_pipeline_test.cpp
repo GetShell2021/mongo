@@ -27,16 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include <boost/intrusive_ptr.hpp>
-#include <string>
-#include <vector>
-
-#include "mongo/db/operation_context_noop.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_internal_split_pipeline.h"
 #include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -45,9 +42,9 @@ using DocumentSourceInternalSplitPipelineTest = AggregationContextFixture;
 TEST_F(DocumentSourceInternalSplitPipelineTest, NotAllowedInLookupIfMustRunOnMongos) {
     auto expCtx = getExpCtx();
     auto split = DocumentSourceInternalSplitPipeline::create(
-        expCtx, StageConstraints::HostTypeRequirement::kMongoS);
+        expCtx, StageConstraints::HostTypeRequirement::kRouter);
     ASSERT_FALSE(split->constraints().isAllowedInLookupPipeline());
-    ASSERT(split->constraints().hostRequirement == StageConstraints::HostTypeRequirement::kMongoS);
+    ASSERT(split->constraints().hostRequirement == StageConstraints::HostTypeRequirement::kRouter);
 }
 
 }  // namespace

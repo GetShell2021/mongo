@@ -18,7 +18,7 @@ if grep -q Microsoft /proc/version; then
 fi
 
 NAME=zstandard
-REVISION=1.5.2
+VERSION=1.5.5
 if grep -q Microsoft /proc/version; then
     SRC_ROOT=$(wslpath -u $(powershell.exe -Command "Get-ChildItem Env:TEMP | Get-Content | Write-Host"))
     SRC_ROOT+="$(mktemp -u /zstandard.XXXXXX)"
@@ -46,7 +46,7 @@ if [ ! -d $SRC ]; then
     $GIT_EXE clone https://github.com/facebook/zstd.git $CLONE_DEST
 
     pushd $SRC
-    $GIT_EXE checkout v$REVISION
+    $GIT_EXE checkout v$VERSION
     
     popd
 fi
@@ -108,6 +108,9 @@ env.Library(
         'init-no-global-side-effects',
     ],
 )
+
+if env.ToolchainIs('gcc'):
+    env.Append(CCFLAGS=["-Wno-stringop-overflow"])
 ___EOF___
 
 echo "Done"

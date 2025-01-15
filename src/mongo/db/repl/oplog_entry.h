@@ -29,29 +29,43 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <iosfwd>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/apply_ops_gen.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/util/visit_helper.h"
+#include "mongo/db/repl/optime_base_gen.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
-
-namespace variant_util {
-template <typename T>
-std::vector<T> toVector(boost::optional<stdx::variant<T, std::vector<T>>> optVals) {
-    if (!optVals) {
-        return {};
-    }
-    return stdx::visit(visit_helper::Overloaded{[](T val) { return std::vector<T>{val}; },
-                                                [](const std::vector<T>& vals) { return vals; }},
-                       *optVals);
-}
-}  // namespace variant_util
 
 /**
  * The first oplog entry is a no-op with this message in its "msg" field.
@@ -77,21 +91,31 @@ public:
 
         // The pre-image is recorded in the change stream pre-images collection.
         kPreImagesCollection,
-
-        // The pre-image is recorded in the oplog as a separate entry.
-        kOplog,
     };
 
-    static ReplOperation parse(const IDLParserErrorContext& ctxt, const BSONObj& bsonObject) {
+    static ReplOperation parse(const IDLParserContext& ctxt, const BSONObj& bsonObject) {
         ReplOperation o;
         o.parseProtected(ctxt, bsonObject);
         return o;
     }
-    const BSONObj& getPreImageDocumentKey() const {
-        return _preImageDocumentKey;
+
+    static ReplOperation parseOwned(const IDLParserContext& ctxt, const BSONObj&& bsonObject) {
+        ReplOperation o;
+        o.parseProtected(ctxt, bsonObject);
+        o.setAnchor(bsonObject);
+        return o;
     }
-    void setPreImageDocumentKey(BSONObj value) {
-        _preImageDocumentKey = std::move(value);
+
+    ReplOperation() = default;
+    explicit ReplOperation(DurableReplOperation durableReplOp)
+        : DurableReplOperation(std::move(durableReplOp)) {}
+
+    const BSONObj& getPostImageDocumentKey() const {
+        return _postImageDocumentKey;
+    }
+
+    void setPostImageDocumentKey(BSONObj value) {
+        _postImageDocumentKey = std::move(value);
     }
 
     const BSONObj& getPreImage() const {
@@ -137,15 +161,6 @@ public:
     }
 
     /**
-     * Returns true if the change stream pre-image is recorded in a dedicated oplog entry for this
-     * operation.
-     */
-    bool isChangeStreamPreImageRecordedInOplog() const {
-        return ReplOperation::ChangeStreamPreImageRecordingMode::kOplog ==
-            getChangeStreamPreImageRecordingMode();
-    }
-
-    /**
      * Returns true if the change stream pre-image is recorded in the change stream pre-images
      * collection for this operation.
      */
@@ -178,15 +193,11 @@ public:
         if (std::count(stmtIds.begin(), stmtIds.end(), kUninitializedStmtId) > 0) {
             return;
         }
-        if (stmtIds.size() > 1) {
-            DurableReplOperation::setStatementIds({{stmtIds}});
-        } else if (stmtIds.size() == 1) {
-            DurableReplOperation::setStatementIds({{stmtIds.front()}});
-        }
+        DurableReplOperation::setStatementIds(stmtIds);
     }
 
-    std::vector<StmtId> getStatementIds() const {
-        return variant_util::toVector<StmtId>(DurableReplOperation::getStatementIds());
+    const std::vector<StmtId>& getStatementIds() const {
+        return DurableReplOperation::getStatementIds();
     }
 
     void setFromMigrateIfTrue(bool value) & {
@@ -194,8 +205,36 @@ public:
             setFromMigrate(value);
     }
 
+    /**
+     * This function overrides the base class setTid() function for the sole purpose of satisfying
+     * the FCV checks.  Once these are deprecated, we should remove this overridden function
+     * entirely.
+     */
+    void setTid(boost::optional<mongo::TenantId> value) &;
+
+    /**
+     * Exports pre/post image information, if present, for writing to the image collection.
+     *
+     * Exported information includes both the image document and a flag to indicate if this
+     * is for a pre or post image.
+     * Does not fill in 'timestamp' - this will be filled in by OpObserverImpl after we have
+     * written the corresponding applyOps oplog entry.
+     *
+     * Accepts an output parameter that for the image information that we expect
+     * to be an uninitialized optional value. This output parameter may be set by a previous
+     * call to this function. In this case, if this ReplOperation has an image, this will
+     * result in an exception thrown.
+     */
+    using ImageBundle = struct {
+        repl::RetryImageEnum imageKind;
+        BSONObj imageDoc;
+        Timestamp timestamp;
+    };
+    void extractPrePostImageForTransaction(boost::optional<ImageBundle>* image) const;
+
 private:
-    BSONObj _preImageDocumentKey;
+    // Stores the post image _id + shard key values.
+    BSONObj _postImageDocumentKey;
 
     // Used for storing the pre-image and post-image for the operation in-memory regardless of where
     // the images should be persisted.
@@ -253,17 +292,11 @@ public:
     }
 
     void setStatementIds(const std::vector<StmtId>& stmtIds) & {
-        if (stmtIds.empty()) {
-            getDurableReplOperation().setStatementIds(boost::none);
-        } else if (stmtIds.size() == 1) {
-            getDurableReplOperation().setStatementIds({{stmtIds.front()}});
-        } else {
-            getDurableReplOperation().setStatementIds({{stmtIds}});
-        }
+        getDurableReplOperation().setStatementIds(stmtIds);
     }
 
-    std::vector<StmtId> getStatementIds() const {
-        return variant_util::toVector<StmtId>(OplogEntryBase::getStatementIds());
+    const std::vector<StmtId>& getStatementIds() const {
+        return getDurableReplOperation().getStatementIds();
     }
 
     void setTxnNumber(boost::optional<std::int64_t> value) & {
@@ -274,9 +307,7 @@ public:
         getDurableReplOperation().setOpType(std::move(value));
     }
 
-    void setTid(boost::optional<mongo::TenantId> value) & {
-        getDurableReplOperation().setTid(std::move(value));
-    }
+    void setTid(boost::optional<mongo::TenantId> value) &;
 
     void setNss(NamespaceString value) & {
         getDurableReplOperation().setNss(std::move(value));
@@ -292,6 +323,10 @@ public:
 
     void setObject2(boost::optional<BSONObj> value) & {
         getDurableReplOperation().setObject2(std::move(value));
+    }
+
+    void setRecordId(RecordId rid) & {
+        getDurableReplOperation().setRecordId(std::move(rid));
     }
 
     void setUpsert(boost::optional<bool> value) & {
@@ -348,6 +383,10 @@ public:
         getDurableReplOperation().setFromMigrate(value);
     }
 
+    void setCheckExistenceForDiffInsert() & {
+        getDurableReplOperation().setCheckExistenceForDiffInsert(true);
+    }
+
     /**
      * Same as setFromMigrate but only set when it is true.
      */
@@ -355,6 +394,28 @@ public:
         if (value)
             setFromMigrate(value);
     }
+
+    /**
+     * ReplOperation and MutableOplogEntry mostly hold the same data,
+     * but lack a common ancestor in C++. Due to the details of IDL,
+     * there is no generated C++ link between the two hierarchies.
+     *
+     * The primary difference between the two types is the OpTime
+     * stored in OplogEntryBase that is absent in DurableReplOperation.
+     *
+     * This type conversion is useful in contexts when the two type
+     * hierarchies should be interchangeable, like with internal tx's.
+     * See: logMutableOplogEntry() in op_observer_impl.cpp.
+     *
+     * OplogEntryBase<>-------DurableReplOperation
+     *        ^                       ^
+     *        |                       |
+     * MutableOplogEntry       ReplOperation
+     *        ^
+     *        |
+     * DurableOplogEntry
+     */
+    ReplOperation toReplOperation() const noexcept;
 };
 
 /**
@@ -365,11 +426,11 @@ class DurableOplogEntry : private MutableOplogEntry {
 public:
     // Make field names accessible.
     using MutableOplogEntry::k_idFieldName;
+    using MutableOplogEntry::kCheckExistenceForDiffInsertFieldName;
     using MutableOplogEntry::kDestinedRecipientFieldName;
     using MutableOplogEntry::kDurableReplOperationFieldName;
     using MutableOplogEntry::kFromMigrateFieldName;
-    using MutableOplogEntry::kFromTenantMigrationFieldName;
-    using MutableOplogEntry::kHashFieldName;
+    using MutableOplogEntry::kMultiOpTypeFieldName;
     using MutableOplogEntry::kNssFieldName;
     using MutableOplogEntry::kObject2FieldName;
     using MutableOplogEntry::kObjectFieldName;
@@ -392,11 +453,11 @@ public:
 
     // Make serialize() and getters accessible.
     using MutableOplogEntry::get_id;
+    using MutableOplogEntry::getCheckExistenceForDiffInsert;
     using MutableOplogEntry::getDestinedRecipient;
     using MutableOplogEntry::getDurableReplOperation;
     using MutableOplogEntry::getFromMigrate;
-    using MutableOplogEntry::getFromTenantMigration;
-    using MutableOplogEntry::getHash;
+    using MutableOplogEntry::getMultiOpType;
     using MutableOplogEntry::getNeedsRetryImage;
     using MutableOplogEntry::getNss;
     using MutableOplogEntry::getObject;
@@ -426,37 +487,17 @@ public:
     using MutableOplogEntry::makeInsertOperation;
     using MutableOplogEntry::makeUpdateOperation;
 
-    enum class CommandType {
-        kNotCommand,
-        kCreate,
-        kRenameCollection,
-        kDbCheck,
-        kDrop,
-        kCollMod,
-        kApplyOps,
-        kDropDatabase,
-        kEmptyCapped,
-        kCreateIndexes,
-        kStartIndexBuild,
-        kCommitIndexBuild,
-        kAbortIndexBuild,
-        kDropIndexes,
-        kCommitTransaction,
-        kAbortTransaction,
-        kImportCollection,
-    };
-
     // Get the in-memory size in bytes of a ReplOperation.
     static size_t getDurableReplOperationSize(const DurableReplOperation& op);
 
     static StatusWith<DurableOplogEntry> parse(const BSONObj& object);
 
     DurableOplogEntry(OpTime opTime,
-                      boost::optional<int64_t> hash,
                       OpTypeEnum opType,
                       const NamespaceString& nss,
                       const boost::optional<UUID>& uuid,
                       const boost::optional<bool>& fromMigrate,
+                      const boost::optional<bool>& checkExistenceForDiffInsert,
                       int version,
                       const BSONObj& oField,
                       const boost::optional<BSONObj>& o2Field,
@@ -482,12 +523,25 @@ public:
     bool isCommand() const;
 
     /**
+     * Returns if the applyOps oplog entry is linked through its prevOpTime field as part of a
+     * transaction, rather than as a retryable write or stand-alone applyOps.  Valid only for
+     * applyOps entries.
+     */
+    bool applyOpsIsLinkedTransactionally() const;
+
+    /**
+     * Returns if the oplog entry is part of a transaction, whether an applyOps, a prepare, or
+     * a commit.
+     */
+    bool isInTransaction() const;
+
+    /**
      * Returns if the oplog entry is part of a transaction that has not yet been prepared or
      * committed.  The actual "prepare" or "commit" oplog entries do not have a "partialTxn" field
      * and so this method will always return false for them.
      */
     bool isPartialTransaction() const {
-        if (getCommandType() != CommandType::kApplyOps) {
+        if (getCommandType() != CommandTypeEnum::kApplyOps) {
             return false;
         }
         return getObject()[ApplyOpsCommandInfoBase::kPartialTxnFieldName].booleanSafe();
@@ -502,7 +556,38 @@ public:
      * Returns if this is a prepared 'commitTransaction' oplog entry.
      */
     bool isPreparedCommit() const {
-        return getCommandType() == DurableOplogEntry::CommandType::kCommitTransaction;
+        return getCommandType() == CommandTypeEnum::kCommitTransaction;
+    }
+
+    /**
+     * Returns if this is a prepared 'abortTransaction' oplog entry.
+     */
+    bool isPreparedAbort() const {
+        // Normally an 'abortTransaction' oplog entry represents an aborted prepared transaction.
+        // However during stepup, if the secondary sees that it didn't replicate the full oplog
+        // chain of a large unprepared transcation, it will abort this transaction and write an
+        // 'abortTransaction' oplog entry, even though it is an unprepared transcation. In this
+        // case, the entry will have a null prevOpTime.
+        if (getCommandType() != CommandTypeEnum::kAbortTransaction) {
+            return false;
+        }
+        auto prevOptime = getPrevWriteOpTimeInTransaction();
+        return prevOptime && !prevOptime->isNull();
+    }
+
+    /**
+     * Returns if this is a prepared 'commitTransaction' or 'abortTransaction' oplog entry.
+     */
+    bool isPreparedCommitOrAbort() const {
+        return isPreparedCommit() || isPreparedAbort();
+    }
+
+    /**
+     * Returns if this is a prepared transaction command oplog entry, i.e. prepareTransaction,
+     * commitTransaction or abortTransaction.
+     */
+    bool isPreparedTransactionCommand() const {
+        return isCommand() && (isPreparedCommit() || isPreparedAbort() || shouldPrepare());
     }
 
     /**
@@ -511,8 +596,8 @@ public:
      * prepared transaction or a non-final applyOps in a transaction.
      */
     bool isTerminalApplyOps() const {
-        return getCommandType() == DurableOplogEntry::CommandType::kApplyOps && !shouldPrepare() &&
-            !isPartialTransaction() && !getObject().getBoolField("prepare");
+        return getCommandType() == CommandTypeEnum::kApplyOps && !shouldPrepare() &&
+            !isPartialTransaction();
     }
 
     /**
@@ -573,7 +658,7 @@ public:
     /**
      * Returns the type of command of the oplog entry. If it is not a command, returns kNotCommand.
      */
-    CommandType getCommandType() const;
+    CommandTypeEnum getCommandType() const;
 
     /**
      * Returns the size of the original document used to create this DurableOplogEntry.
@@ -598,26 +683,26 @@ public:
 
 private:
     BSONObj _raw;  // Owned.
-    CommandType _commandType = CommandType::kNotCommand;
+    CommandTypeEnum _commandType = CommandTypeEnum::kNotCommand;
 };
 
-DurableOplogEntry::CommandType parseCommandType(const BSONObj& objectField);
+CommandTypeEnum parseCommandType(const BSONObj& objectField);
 
 /**
  * Data structure that holds a DurableOplogEntry and other different run time state variables.
  */
 class OplogEntry {
 public:
-    using CommandType = DurableOplogEntry::CommandType;
+    using CommandType = CommandTypeEnum;
     static constexpr auto k_idFieldName = DurableOplogEntry::k_idFieldName;
     static constexpr auto kDestinedRecipientFieldName =
         DurableOplogEntry::kDestinedRecipientFieldName;
     static constexpr auto kDurableReplOperationFieldName =
         DurableOplogEntry::kDurableReplOperationFieldName;
     static constexpr auto kFromMigrateFieldName = DurableOplogEntry::kFromMigrateFieldName;
-    static constexpr auto kFromTenantMigrationFieldName =
-        DurableOplogEntry::kFromTenantMigrationFieldName;
-    static constexpr auto kHashFieldName = DurableOplogEntry::kHashFieldName;
+    static constexpr auto kCheckExistenceForDiffInsertFieldName =
+        DurableOplogEntry::kCheckExistenceForDiffInsertFieldName;
+    static constexpr auto kMultiOpTypeFieldName = DurableOplogEntry::kMultiOpTypeFieldName;
     static constexpr auto kTidFieldName = DurableOplogEntry::kTidFieldName;
     static constexpr auto kNssFieldName = DurableOplogEntry::kNssFieldName;
     static constexpr auto kObject2FieldName = DurableOplogEntry::kObject2FieldName;
@@ -654,6 +739,8 @@ public:
      */
     static StatusWith<OplogEntry> parse(const BSONObj& object);
 
+    static boost::optional<TenantId> parseTid(const BSONObj& object);
+
     bool isForCappedCollection() const;
     void setIsForCappedCollection(bool isForCappedCollection);
 
@@ -667,7 +754,7 @@ public:
 
     // Wrapper methods for DurableOplogEntry
     const boost::optional<mongo::Value>& get_id() const&;
-    std::vector<StmtId> getStatementIds() const&;
+    const std::vector<StmtId>& getStatementIds() const&;
     const OperationSessionInfo& getOperationSessionInfo() const;
     const boost::optional<mongo::LogicalSessionId>& getSessionId() const;
     boost::optional<std::int64_t> getTxnNumber() const;
@@ -684,21 +771,32 @@ public:
     const mongo::Timestamp& getTimestamp() const;
     boost::optional<std::int64_t> getTerm() const;
     const mongo::Date_t& getWallClockTime() const;
-    boost::optional<std::int64_t> getHash() const&;
     std::int64_t getVersion() const;
     boost::optional<bool> getFromMigrate() const&;
-    const boost::optional<mongo::UUID>& getFromTenantMigration() const&;
+    bool getCheckExistenceForDiffInsert() const&;
     const boost::optional<mongo::repl::OpTime>& getPrevWriteOpTimeInTransaction() const&;
     const boost::optional<mongo::repl::OpTime>& getPostImageOpTime() const&;
-    boost::optional<RetryImageEnum> getNeedsRetryImage() const;
+    boost::optional<MultiOplogEntryType> getMultiOpType() const&;
+
     OpTime getOpTime() const;
     bool isCommand() const;
+    bool applyOpsIsLinkedTransactionally() const;
+    bool isInTransaction() const;
     bool isPartialTransaction() const;
     bool isEndOfLargeTransaction() const;
     bool isPreparedCommit() const;
+    bool isPreparedAbort() const;
+    bool isPreparedCommitOrAbort() const;
+    bool isPreparedTransactionCommand() const;
     bool isTerminalApplyOps() const;
     bool isSingleOplogEntryTransaction() const;
     bool isSingleOplogEntryTransactionWithCommand() const;
+
+    /**
+     * Returns whether this oplog entry contains a DDL operation. Used to determine whether to
+     * log the entry.
+     */
+    bool shouldLogAsDDLOperation() const;
 
     /**
      * Returns an index of this operation in the "applyOps" entry, if the operation is packed in the
@@ -739,6 +837,18 @@ public:
      */
     mongo::Date_t getWallClockTimeForPreImage() const;
 
+    /**
+     * Overrides the needsRetryImage value from DurableOplogEntry with boost::none
+     */
+    void clearNeedsRetryImage();
+
+    /**
+     * Returns the retry image setting from the original DurableOplogEntry, unless it
+     * has been suppressed
+     */
+    boost::optional<RetryImageEnum> getNeedsRetryImage() const;
+
+
     bool isCrudOpType() const;
     bool isUpdateOrDelete() const;
     bool isIndexCommandType() const;
@@ -765,6 +875,43 @@ private:
     boost::optional<Date_t> _applyOpsWallClockTime{boost::none};
 
     bool _isForCappedCollection = false;
+
+    // We allow this to be suppressed during secondary oplog application.
+    boost::optional<RetryImageEnum> _needsRetryImage;
+};
+
+/**
+ * Oplog entry document parser. This parser can parse only the key fields. It parses fields on
+ * demand. This parser should be used only in cases when to be parsed oplog entry data structure
+ * version may not match the one that is used by the current server version (this can happen with
+ * past or future versions of oplog entries), otherwise 'OplogEntry::parse()' is supposed to be
+ * used.
+ */
+class OplogEntryParserNonStrict {
+public:
+    /**
+     * Constructs the parser with to be parsed oplog entry document 'oplogEntry'.
+     */
+    OplogEntryParserNonStrict(const BSONObj& oplogEntry);
+
+    /**
+     * Parses and returns "opTime" field.
+     */
+    repl::OpTime getOpTime() const;
+
+    /**
+     * Parses and returns the type of operation field.
+     */
+    repl::OpTypeEnum getOpType() const;
+
+    /**
+     * Parses and returns the "operation applied" field.
+     */
+    BSONObj getObject() const;
+
+private:
+    // Oplog entry as BSON object to be parsed.
+    const BSONObj _oplogEntryObject;
 };
 
 std::ostream& operator<<(std::ostream& s, const DurableOplogEntry& o);

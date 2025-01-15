@@ -10,12 +10,10 @@
 // 6. Unpause the thread performing the insert from step 1. If it continues to insert batches even
 //    though there was a rollback, those inserts will violate the {ordered: true} option.
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallelTester.js');
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 var name = "interrupted_batch_insert";
 var replTest = new ReplSetTest({name: name, nodes: 3, useBridge: true});
@@ -26,7 +24,9 @@ replTest.initiate({
     _id: name,
     members:
         [{_id: 0, host: nodes[0]}, {_id: 1, host: nodes[1]}, {_id: 2, host: nodes[2], priority: 0}]
-});
+},
+                  null,
+                  {initiateWithDefaultElectionTimeout: true});
 
 // The test starts with node 0 as the primary.
 replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY);
@@ -120,4 +120,3 @@ conns[1].reconnect(conns[2]);
 restartServerReplication(conns[1]);
 
 replTest.stopSet(15);
-}());

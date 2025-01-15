@@ -1,24 +1,18 @@
 // Test role restrictions when using security tokens.
-// @tags: [requires_replication]
+// @tags: [requires_replication, featureFlagSecurityToken]
 
-(function() {
-'use strict';
+import {runCommandWithSecurityToken} from "jstests/libs/multitenancy_utils.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const tenantID = ObjectId();
-const isMongoStoreEnabled = TestData.setParameters.featureFlagMongoStore;
-
-if (!isMongoStoreEnabled) {
-    assert.throws(() => MongoRunner.runMongod({
-        setParameter: "multitenancySupport=true",
-    }));
-    return;
-}
+const kVTSKey = 'secret';
 
 function runTest(conn, rst = undefined) {
     const admin = conn.getDB('admin');
     const external = conn.getDB('$external');
 
-    // Must be authenticated as a user with ActionType::useTenant in order to use $tenant
+    // Must be authenticated as a user with ActionType::useTenant in order to use unsigned security
+    // token.
     assert.commandWorked(admin.runCommand({createUser: 'admin', pwd: 'pwd', roles: ['root']}));
     assert(admin.auth('admin', 'pwd'));
 
@@ -28,9 +22,10 @@ function runTest(conn, rst = undefined) {
         readWriteUser: {roles: [{role: 'readWriteAnyDatabase', db: 'admin'}]},
         clusterAdminUser: {roles: [{role: 'clusterAdmin', db: 'admin'}], prohibited: true},
     };
+    const unsignedToken = _createTenantToken({tenant: tenantID});
     Object.keys(users).forEach(
-        (user) => assert.commandWorked(external.runCommand(
-            {createUser: user, '$tenant': tenantID, roles: users[user].roles})));
+        (user) => assert.commandWorked(runCommandWithSecurityToken(
+            unsignedToken, external, {createUser: user, roles: users[user].roles})));
     if (rst) {
         rst.awaitReplication();
     }
@@ -38,7 +33,7 @@ function runTest(conn, rst = undefined) {
     Object.keys(users).forEach(function(user) {
         const tokenConn = new Mongo(conn.host);
         tokenConn._setSecurityToken(
-            _createSecurityToken({user: user, db: '$external', tenant: tenantID}));
+            _createSecurityToken({user: user, db: '$external', tenant: tenantID}, kVTSKey));
         const tokenDB = tokenConn.getDB('test');
         if (users[user].prohibited) {
             assert.commandFailed(tokenDB.adminCommand({connectionStatus: 1}));
@@ -64,7 +59,10 @@ function runTest(conn, rst = undefined) {
 
 const opts = {
     auth: '',
-    setParameter: "multitenancySupport=true",
+    setParameter: {
+        multitenancySupport: true,
+        testOnlyValidatedTenancyScopeKey: kVTSKey,
+    },
 };
 {
     const standalone = MongoRunner.runMongod(opts);
@@ -73,13 +71,10 @@ const opts = {
     MongoRunner.stopMongod(standalone);
 }
 
-// TODO SERVER-66708 Run on replica sets as well. Currently the namespace from oplog entries
-// won't be deserialized including the tenantId.
-/*{
+{
     const rst = new ReplSetTest({nodes: 2, nodeOptions: opts});
     rst.startSet({keyFile: 'jstests/libs/key1'});
     rst.initiate();
     runTest(rst.getPrimary(), rst);
     rst.stopSet();
-}*/
-})();
+}

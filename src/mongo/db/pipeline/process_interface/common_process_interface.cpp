@@ -28,30 +28,49 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <cstddef>
+#include <mutex>
 
-#include "mongo/db/pipeline/process_interface/common_process_interface.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/bson/mutable/document.h"
-#include "mongo/config.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/user_name.h"
 #include "mongo/db/client.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/list_collections_gen.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/operation_time_tracker.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/process_interface/common_process_interface.h"
+#include "mongo/db/query/client_cursor/generic_cursor_gen.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/router_role.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/namespace_string_util.h"
 #include "mongo/util/net/socket_utils.h"
+#include "mongo/util/serialization_context.h"
+#include "mongo/util/str.h"
 
-#ifndef MONGO_CONFIG_USE_RAW_LATCHES
-#include "mongo/util/diagnostic_info.h"
-#endif
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -64,38 +83,76 @@ std::vector<BSONObj> CommonProcessInterface::getCurrentOps(
     CurrentOpSessionsMode sessionMode,
     CurrentOpUserMode userMode,
     CurrentOpTruncateMode truncateMode,
-    CurrentOpCursorMode cursorMode,
-    CurrentOpBacktraceMode backtraceMode) const {
-    OperationContext* opCtx = expCtx->opCtx;
+    CurrentOpCursorMode cursorMode) const {
+    OperationContext* opCtx = expCtx->getOperationContext();
     AuthorizationSession* ctxAuth = AuthorizationSession::get(opCtx->getClient());
 
     std::vector<BSONObj> ops;
 
-#ifndef MONGO_CONFIG_USE_RAW_LATCHES
-    auto blockedOpGuard = DiagnosticInfo::maybeMakeBlockedOpForTest(opCtx->getClient());
-#endif
+    auto reportCurrentOpForService = [&](Service* service) {
+        for (Service::LockedClientsCursor cursor(service); ClientLock lc = cursor.next();) {
+            Client* client = &*lc;
+            if (AuthorizationManager::get(opCtx->getService())->isAuthEnabled()) {
+                // If auth is disabled, ignore the allUsers parameter.
+                if (userMode == CurrentOpUserMode::kExcludeOthers &&
+                    !ctxAuth->isCoauthorizedWithClient(client, lc)) {
+                    continue;
+                }
 
-    for (ServiceContext::LockedClientsCursor cursor(opCtx->getClient()->getServiceContext());
-         Client* client = cursor.next();) {
-        invariant(client);
+                // If currOp is being run for a particular tenant, ignore any ops that don't belong
+                // to it.
+                if (auto expCtxTenantId = expCtx->getNamespaceString().tenantId()) {
+                    auto userName = AuthorizationSession::get(client)->getAuthenticatedUserName();
+                    if ((userName && userName->tenantId() &&
+                         userName->tenantId() != expCtxTenantId) ||
+                        (userName && !userName->tenantId() &&
+                         !CurOp::currentOpBelongsToTenant(client, *expCtxTenantId))) {
+                        continue;
+                    }
+                }
+            }
 
-        stdx::lock_guard<Client> lk(*client);
+            // Ignore inactive connections unless 'idleConnections' is true.
+            if (connMode == CurrentOpConnectionsMode::kExcludeIdle &&
+                !client->hasAnyActiveCurrentOp()) {
+                continue;
+            }
 
-        // If auth is disabled, ignore the allUsers parameter.
-        if (ctxAuth->getAuthorizationManager().isAuthEnabled() &&
-            userMode == CurrentOpUserMode::kExcludeOthers &&
-            !ctxAuth->isCoauthorizedWithClient(client, lk)) {
-            continue;
+            // Here, we first convert the operation managed by the client object into its BSON
+            // representation that will be returned to the caller. Although its still possible that
+            // this operation/client is filtered out based on the configured mode of this call,
+            // it guarantees that the properties (specifically the 'active' status in this case) of
+            // the operation will not change between checking them and including them the results.
+            // Remember that other concurrent processes are updating the state of the underlying
+            // operation while this function is executing. Even though the 'client' object is
+            // locked, it holds pointers to other objects that are being concurrently modified. Note
+            // that this specific 'copy, then check' flow here specifically for the 'active' status
+            // is not comprehensive to all possible race-conditions of this type, where the state of
+            // the operation changes between a check and then copy, as changing the current code
+            // structure to address all possibilities of this type is complex, and will require a
+            // broader initiative.
+            // TODO SERVER-97558: Examine the current op fetching logic, and look for race-condition
+            // bugs of this nature that result in incorrect results being returned.
+            //
+            // Delegate to the mongoD- or mongoS-specific implementation of
+            // _reportCurrentOpForClient.
+            BSONObj candidateOpBSON = _reportCurrentOpForClient(expCtx, client, truncateMode);
+            if (connMode == CurrentOpConnectionsMode::kExcludeIdle &&
+                !candidateOpBSON["active"].Bool()) {
+                continue;
+            }
+
+            ops.emplace_back(std::move(candidateOpBSON));
         }
+    };
 
-        // Ignore inactive connections unless 'idleConnections' is true.
-        if (connMode == CurrentOpConnectionsMode::kExcludeIdle &&
-            !client->hasAnyActiveCurrentOp()) {
-            continue;
-        }
-
-        // Delegate to the mongoD- or mongoS-specific implementation of _reportCurrentOpForClient.
-        ops.emplace_back(_reportCurrentOpForClient(opCtx, client, truncateMode, backtraceMode));
+    if (opCtx->routedByReplicaSetEndpoint()) {
+        // On the replica set endpoint, currentOp should report both router and shard operations.
+        auto serviceContext = opCtx->getServiceContext();
+        reportCurrentOpForService(serviceContext->getService(ClusterRole::RouterServer));
+        reportCurrentOpForService(serviceContext->getService(ClusterRole::ShardServer));
+    } else {
+        reportCurrentOpForService(opCtx->getService());
     }
 
     // If 'cursorMode' is set to include idle cursors, retrieve them and add them to ops.
@@ -104,10 +161,19 @@ std::vector<BSONObj> CommonProcessInterface::getCurrentOps(
         for (auto&& cursor : getIdleCursors(expCtx, userMode)) {
             BSONObjBuilder cursorObj;
             cursorObj.append("type", "idleCursor");
-            cursorObj.append("host", getHostNameCachedAndPort());
+            cursorObj.append("host", prettyHostNameAndPort(opCtx->getClient()->getLocalPort()));
             // First, extract fields which need to go at the top level out of the GenericCursor.
-            auto ns = cursor.getNs();
-            cursorObj.append("ns", ns->toString());
+            if (auto ns = cursor.getNs()) {
+                tassert(7663401,
+                        str::stream()
+                            << "SerializationContext on the expCtx should not be empty, with ns: "
+                            << ns->toStringForErrorMsg(),
+                        expCtx->getSerializationContext() != SerializationContext::stateDefault());
+                cursorObj.append(
+                    "ns", NamespaceStringUtil::serialize(*ns, expCtx->getSerializationContext()));
+            } else
+                cursorObj.append("ns", "");
+
             if (auto lsid = cursor.getLsid()) {
                 cursorObj.append("lsid", lsid->toBSON());
             }
@@ -118,7 +184,7 @@ std::vector<BSONObj> CommonProcessInterface::getCurrentOps(
             // Next, append the stripped-down version of the generic cursor. This will avoid
             // duplicating information reported at the top level.
             cursorObj.append("cursor",
-                             CurOp::truncateAndSerializeGenericCursor(&cursor, boost::none));
+                             CurOp::truncateAndSerializeGenericCursor(cursor, boost::none));
 
             ops.emplace_back(cursorObj.obj());
         }
@@ -129,12 +195,14 @@ std::vector<BSONObj> CommonProcessInterface::getCurrentOps(
         _reportCurrentOpsForIdleSessions(opCtx, userMode, &ops);
     }
 
-    if (!ctxAuth->getAuthorizationManager().isAuthEnabled() ||
+    if (!AuthorizationManager::get(opCtx->getService())->isAuthEnabled() ||
         userMode == CurrentOpUserMode::kIncludeAll) {
         _reportCurrentOpsForTransactionCoordinators(
             opCtx, sessionMode == MongoProcessInterface::CurrentOpSessionsMode::kIncludeIdle, &ops);
 
         _reportCurrentOpsForPrimaryOnlyServices(opCtx, connMode, sessionMode, &ops);
+
+        _reportCurrentOpsForQueryAnalysis(opCtx, &ops);
     }
 
     return ops;
@@ -142,10 +210,12 @@ std::vector<BSONObj> CommonProcessInterface::getCurrentOps(
 
 std::vector<FieldPath> CommonProcessInterface::collectDocumentKeyFieldsActingAsRouter(
     OperationContext* opCtx, const NamespaceString& nss) const {
-    const auto cm =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
-    if (cm.isSharded()) {
-        return _shardKeyToDocumentKeyFields(cm.getShardKeyPattern().getKeyPatternFields());
+    const auto criSW = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss);
+    if (criSW.isOK() && criSW.getValue().cm.isSharded()) {
+        return shardKeyToDocumentKeyFields(
+            criSW.getValue().cm.getShardKeyPattern().getKeyPatternFields());
+    } else if (!criSW.isOK() && criSW.getStatus().code() != ErrorCodes::NamespaceNotFound) {
+        uassertStatusOK(criSW);
     }
 
     // We have no evidence this collection is sharded, so the document key is just _id.
@@ -186,17 +256,8 @@ bool CommonProcessInterface::keyPatternNamesExactPaths(const BSONObj& keyPattern
     return nFieldsMatched == uniqueKeyPaths.size();
 }
 
-boost::optional<ChunkVersion> CommonProcessInterface::refreshAndGetCollectionVersion(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const NamespaceString& nss) const {
-    const auto cm = uassertStatusOK(Grid::get(expCtx->opCtx)
-                                        ->catalogCache()
-                                        ->getCollectionRoutingInfoWithRefresh(expCtx->opCtx, nss));
-
-    return cm.isSharded() ? boost::make_optional(cm.getVersion()) : boost::none;
-}
-
-std::vector<FieldPath> CommonProcessInterface::_shardKeyToDocumentKeyFields(
-    const std::vector<std::unique_ptr<FieldRef>>& keyPatternFields) const {
+std::vector<FieldPath> CommonProcessInterface::shardKeyToDocumentKeyFields(
+    const std::vector<std::unique_ptr<FieldRef>>& keyPatternFields) {
     std::vector<FieldPath> result;
     bool gotId = false;
     for (auto& field : keyPatternFields) {
@@ -209,8 +270,152 @@ std::vector<FieldPath> CommonProcessInterface::_shardKeyToDocumentKeyFields(
     return result;
 }
 
+boost::optional<ShardId> CommonProcessInterface::findOwningShard(OperationContext* opCtx,
+                                                                 const NamespaceString& nss) {
+    // Do not attempt to refresh the catalog cache when holding a lock.
+    if (shard_role_details::getLocker(opCtx)->isLocked()) {
+        return boost::none;
+    }
+    auto* grid = Grid::get(opCtx);
+    tassert(7958000, "Grid should be initialized", grid && grid->isInitialized());
+
+    return CommonProcessInterface::findOwningShard(opCtx, grid->catalogCache(), nss);
+}
+
+boost::optional<ShardId> CommonProcessInterface::findOwningShard(OperationContext* opCtx,
+                                                                 CatalogCache* catalogCache,
+                                                                 const NamespaceString& nss) {
+    tassert(7958001, "CatalogCache should be initialized", catalogCache);
+    auto swCRI = catalogCache->getCollectionRoutingInfo(opCtx, nss);
+    if (swCRI.getStatus().code() == ErrorCodes::NamespaceNotFound) {
+        return boost::none;
+    }
+    auto [cm, _] = uassertStatusOK(swCRI);
+
+    if (cm.hasRoutingTable()) {
+        if (cm.isUnsplittable()) {
+            return cm.getMinKeyShardIdWithSimpleCollation();
+        } else {
+            return boost::none;
+        }
+    } else {
+        return cm.dbPrimary();
+    }
+    return boost::none;
+}
+
 std::string CommonProcessInterface::getHostAndPort(OperationContext* opCtx) const {
-    return getHostNameCachedAndPort();
+    return prettyHostNameAndPort(opCtx->getClient()->getLocalPort());
+}
+
+std::vector<DatabaseName> CommonProcessInterface::_getAllDatabasesOnAShardedCluster(
+    OperationContext* opCtx, boost::optional<TenantId> tenantId) {
+    tassert(9525808, "This method can only run on a sharded cluster", Grid::get(opCtx));
+
+    const std::vector<DatabaseType> databaseTypes = Grid::get(opCtx)->catalogClient()->getAllDBs(
+        opCtx, repl::ReadConcernLevel::kSnapshotReadConcern);
+
+    std::vector<DatabaseName> databases;
+    databases.reserve(databaseTypes.size());
+
+    std::transform(databaseTypes.begin(),
+                   databaseTypes.end(),
+                   std::back_inserter(databases),
+                   [](const DatabaseType& dbType) -> DatabaseName { return dbType.getDbName(); });
+
+    // Add internal databases.
+    databases.push_back(DatabaseName::kAdmin);
+    databases.push_back(DatabaseName::kConfig);
+
+    return databases;
+}
+
+std::vector<BSONObj> CommonProcessInterface::_runListCollectionsCommandOnAShardedCluster(
+    OperationContext* opCtx, const NamespaceString& nss, bool appendPrimaryShardToTheResponse) {
+    tassert(9525809, "This method can only run on a sharded cluster", Grid::get(opCtx));
+
+    const bool isCollectionless = nss.coll().empty();
+
+    const auto appendPrimaryShardIfRequested =
+        [&appendPrimaryShardToTheResponse](const std::vector<BSONObj>& collections,
+                                           const ShardId& primary) {
+            if (!appendPrimaryShardToTheResponse) {
+                return collections;
+            }
+
+            std::vector<BSONObj> collectionsWithPrimaryShard;
+            collectionsWithPrimaryShard.reserve(collections.size());
+            for (const BSONObj& bsonObj : collections) {
+                BSONObjBuilder bob(bsonObj.getOwned());
+                bob.append("primary", primary);
+                collectionsWithPrimaryShard.emplace_back(bob.obj());
+            }
+            return collectionsWithPrimaryShard;
+        };
+
+    const auto runListCollectionsFunc = [&](OperationContext* opCtx,
+                                            const CachedDatabaseInfo& cdb) {
+        ListCollections listCollectionsCmd;
+        listCollectionsCmd.setDbName(nss.dbName());
+        if (!isCollectionless) {
+            listCollectionsCmd.setFilter(BSON("name" << nss.coll()));
+        }
+
+        listCollectionsCmd.setReadConcern(std::invoke([opCtx] {
+            const auto& readConcern = repl::ReadConcernArgs::get(opCtx);
+            tassert(9746001,
+                    str::stream() << "listCollections only allows 'local' read concern. Trying "
+                                     "to call it with '"
+                                  << repl::readConcernLevels::toString(readConcern.getLevel())
+                                  << "' read concern level.",
+                    readConcern.getLevel() == repl::ReadConcernLevel::kLocalReadConcern);
+            return readConcern;
+        }));
+
+        generic_argument_util::setDbVersionIfPresent(listCollectionsCmd, cdb->getVersion());
+
+        const auto shard =
+            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, cdb->getPrimary()));
+        Shard::QueryResponse resultCollections;
+
+        resultCollections = uassertStatusOK(shard->runExhaustiveCursorCommand(
+            opCtx,
+            ReadPreferenceSetting::get(opCtx),
+            nss.dbName(),
+            listCollectionsCmd.toBSON(),
+            opCtx->hasDeadline() ? opCtx->getRemainingMaxTimeMillis() : Milliseconds(-1)));
+
+        // Make sure we return a single object if the request isn't collectionless.
+        if (!isCollectionless) {
+            for (BSONObj& bsonObj : resultCollections.docs) {
+                // Return the entire 'listCollections' response for the first element which matches
+                // on name.
+                const BSONElement nameElement = bsonObj["name"];
+                if (!nameElement || nameElement.valueStringDataSafe() != nss.coll()) {
+                    continue;
+                }
+                return appendPrimaryShardIfRequested(std::vector<BSONObj>{bsonObj.getOwned()},
+                                                     cdb->getPrimary());
+            }
+            return std::vector<BSONObj>();
+        }
+
+        return appendPrimaryShardIfRequested(resultCollections.docs, cdb->getPrimary());
+    };
+
+    sharding::router::DBPrimaryRouter router(opCtx->getServiceContext(), nss.dbName());
+    try {
+        return router.route(
+            opCtx,
+            "CommonMongodProcessInterface::_runListCollectionsCommandOnAShardedCluster",
+            runListCollectionsFunc);
+    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        // The listCollections command returns a success status with an empty list when the given
+        // database doesn't exist. Therefore, we must replicate the same behavior here by ignoring
+        // the NamespaceNotFound error that may be thrown during the DBPrimaryRouter::route()
+        // initialization.
+        return std::vector<BSONObj>();
+    }
 }
 
 }  // namespace mongo

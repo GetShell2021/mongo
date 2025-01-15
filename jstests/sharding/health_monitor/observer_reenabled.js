@@ -2,10 +2,13 @@
  * Turning off health observer during transient fault removes the associated fault facet and
  * transitions back to Ok.
  *
- *  @tags: [multiversion_incompatible]
+ *  @tags: [
+ *    multiversion_incompatible,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const params = {
     setParameter: {
@@ -16,7 +19,6 @@ const params = {
                 {type: "dns", intensity: "off"}
             ]
         }),
-        featureFlagHealthMonitoring: true,
         logComponentVerbosity: tojson({processHealth: {verbosity: 4}})
     }
 };
@@ -69,4 +71,3 @@ waitForState("TransientFault");
 jsTestLog("Test was successful");
 
 st.stop();
-})();

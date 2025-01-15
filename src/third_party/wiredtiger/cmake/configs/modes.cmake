@@ -5,7 +5,7 @@ include(CheckCXXCompilerFlag)
 include(${CMAKE_SOURCE_DIR}/cmake/helpers.cmake)
 
 # Establish an internal cache variable to track our custom build modes.
-set(BUILD_MODES None Debug Release RelWithDebInfo CACHE INTERNAL "")
+set(BUILD_MODES Debug Release RelWithDebInfo CACHE INTERNAL "")
 
 if("${CMAKE_C_COMPILER_ID}" STREQUAL "MSVC")
     set(MSVC_C_COMPILER 1)
@@ -53,6 +53,14 @@ function(define_build_mode mode)
         set(CMAKE_REQUIRED_LIBRARIES "${DEFINE_BUILD_LIBS}")
         list(APPEND linker_flags "${DEFINE_BUILD_LIBS}")
     endif()
+
+    # FIXME-WT-13103 MSan reports false positives when using *stat functions, so we override 
+    # the wrap the functions with a custom implementation that suppresses the issue.
+    # Once the correction to MSan is available in LLVM 14 we can remove these flags.
+    if("${CMAKE_BUILD_TYPE}" MATCHES "^MSan$")
+        list(APPEND linker_flags "-Wl,--wrap=fstat, -Wl,--wrap=stat")
+    endif()
+
     # Check if the compiler flags are available to ensure its a valid build mode.
     if(DEFINE_BUILD_C_COMPILER_FLAGS)
         check_c_compiler_flag("${DEFINE_BUILD_C_COMPILER_FLAGS}" HAVE_BUILD_MODE_C_FLAGS)
@@ -130,8 +138,6 @@ else()
     endif()
 endif()
 
-# Sanitizer builds should have debug info available and optimization off
-set(san_debug_flags "-O1 -g ${no_omit_frame_flag}")
 
 # UBSAN build variant flags.
 set(ubsan_link_flags "-fsanitize=undefined")
@@ -140,8 +146,8 @@ set(ubsan_compiler_cxx_flag "-fsanitize=undefined")
 
 # MSAN build variant flags.
 set(msan_link_flags "-fsanitize=memory")
-set(msan_compiler_c_flag "-fsanitize=memory" "-fno-optimize-sibling-calls")
-set(msan_compiler_cxx_flag "-fsanitize=memory" "-fno-optimize-sibling-calls")
+set(msan_compiler_c_flag "-fsanitize=memory" "-fno-optimize-sibling-calls" "-fsanitize-memory-track-origins=2")
+set(msan_compiler_cxx_flag "-fsanitize=memory" "-fno-optimize-sibling-calls" "-fsanitize-memory-track-origins=2")
 
 # TSAN build variant flags.
 set(tsan_link_flags "-fsanitize=thread")
@@ -150,22 +156,22 @@ set(tsan_compiler_cxx_flag "-fsanitize=thread")
 
 # Define our custom build variants.
 define_build_mode(ASan
-    C_COMPILER_FLAGS ${asan_compiler_c_flag} ${san_debug_flags}
-    CXX_COMPILER_FLAGS ${asan_compiler_cxx_flag} ${san_debug_flags}
+    C_COMPILER_FLAGS ${asan_compiler_c_flag} ${no_omit_frame_flag}
+    CXX_COMPILER_FLAGS ${asan_compiler_cxx_flag} ${no_omit_frame_flag}
     LINK_FLAGS ${asan_link_flags}
     LIBS ${asan_lib_flags}
 )
 
 define_build_mode(UBSan
-    C_COMPILER_FLAGS ${ubsan_compiler_c_flag} ${san_debug_flags}
-    CXX_COMPILER_FLAGS ${ubsan_compiler_cxx_flag} ${san_debug_flags}
+    C_COMPILER_FLAGS ${ubsan_compiler_c_flag} ${no_omit_frame_flag}
+    CXX_COMPILER_FLAGS ${ubsan_compiler_cxx_flag} ${no_omit_frame_flag}
     LINK_FLAGS ${ubsan_link_flags}
     # Disable UBSan on MSVC compilers (unsupported).
     DEPENDS "NOT MSVC"
 )
 
 define_build_mode(MSan
-    C_COMPILER_FLAGS ${msan_compiler_c_flag} ${san_debug_flags}
+    C_COMPILER_FLAGS ${msan_compiler_c_flag} ${no_omit_frame_flag}
     CXX_COMPILER_FLAGS ${msan_compiler_cxx_flag}
     LINK_FLAGS ${msan_link_flags}
     # Disable MSan on MSVC and GNU compilers (unsupported).
@@ -173,7 +179,7 @@ define_build_mode(MSan
 )
 
 define_build_mode(TSan
-    C_COMPILER_FLAGS ${tsan_compiler_c_flag} ${san_debug_flags}
+    C_COMPILER_FLAGS ${tsan_compiler_c_flag} ${no_omit_frame_flag}
     CXX_COMPILER_FLAGS ${tsan_compiler_cxx_flag}
     LINK_FLAGS ${tsan_link_flags}
     # Disable TSan on MSVC compilers (unsupported).
@@ -181,18 +187,19 @@ define_build_mode(TSan
 )
 
 define_build_mode(Coverage
-    C_COMPILER_FLAGS "--coverage"
-    CXX_COMPILER_FLAGS "--coverage"
+    C_COMPILER_FLAGS "--coverage -fprofile-arcs"
+    CXX_COMPILER_FLAGS "--coverage -fprofile-arcs"
     LINK_FLAGS "--coverage"
     # Disable Coverage on MSVC compilers (unsupported).
     DEPENDS "NOT MSVC"
 )
 
-define_build_mode(None)
-
+# Set the WiredTiger default build type to Debug.
+# Primary users of the build are our developers, who want as much help diagnosing
+# issues as possible. Builds targeted for release to customers should switch to a "Release" setting.
 if(NOT CMAKE_BUILD_TYPE)
     string(REPLACE ";" " " build_modes_doc "${BUILD_MODES}")
-    set(CMAKE_BUILD_TYPE "None" CACHE STRING "Choose the type of build, options are: ${build_modes_doc}." FORCE)
+    set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Choose the type of build, options are: ${build_modes_doc}." FORCE)
 endif()
 
 if(CMAKE_BUILD_TYPE)
@@ -202,3 +209,25 @@ if(CMAKE_BUILD_TYPE)
 endif()
 
 set(CMAKE_CONFIGURATION_TYPES ${BUILD_MODES})
+
+# We want to use the optimization level from CC_OPTIMIZE_LEVEL and our DEBUG settings as well.
+# Remove the default values from Release and RelWithDebInfo.
+if("${WT_OS}" STREQUAL "windows")
+    string(REPLACE "/O3" "" CMAKE_C_FLAGS_RELEASE ${CMAKE_C_FLAGS_RELEASE})
+    string(REPLACE "/O3" "" CMAKE_CXX_FLAGS_RELEASE ${CMAKE_CXX_FLAGS_RELEASE})
+    string(REPLACE "/Z7" "" CMAKE_C_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+    string(REPLACE "/Z7" "" CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_CXX_FLAGS_RELWITHDEBINFO})
+    string(REPLACE "/O2" "" CMAKE_C_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+    string(REPLACE "/O2" "" CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_CXX_FLAGS_RELWITHDEBINFO})
+else()
+    string(REPLACE "-O3" "" CMAKE_C_FLAGS_RELEASE ${CMAKE_C_FLAGS_RELEASE})
+    string(REPLACE "-O3" "" CMAKE_CXX_FLAGS_RELEASE ${CMAKE_CXX_FLAGS_RELEASE})
+    string(REPLACE "-O2" "" CMAKE_C_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+    string(REPLACE "-O2" "" CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_CXX_FLAGS_RELWITHDEBINFO})
+    string(REPLACE "-g" "" CMAKE_C_FLAGS_RELWITHDEBINFO ${CMAKE_C_FLAGS_RELWITHDEBINFO})
+    string(REPLACE "-g" "" CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_CXX_FLAGS_RELWITHDEBINFO})
+endif()
+
+if(GNU_C_COMPILER OR GNU_CXX_COMPILER)
+    add_compile_options(-fno-strict-aliasing)
+endif()

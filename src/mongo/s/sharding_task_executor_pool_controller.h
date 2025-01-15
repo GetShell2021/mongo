@@ -30,13 +30,27 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/client/replica_set_change_notifier.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/executor/connection_pool.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/synchronized_value.h"
 
 namespace mongo {
 
@@ -115,12 +129,13 @@ public:
      * Validate that hostTimeoutMS is greater than the sum of pendingTimeoutMS and
      * toRefreshTimeoutMS
      */
-    static Status validateHostTimeout(const int& hostTimeoutMS);
+    static Status validateHostTimeout(const int& hostTimeoutMS, const boost::optional<TenantId>&);
 
     /**
      * Validate that pendingTimeoutMS is less than toRefreshTimeoutMS
      */
-    static Status validatePendingTimeout(const int& pendingTimeoutMS);
+    static Status validatePendingTimeout(const int& pendingTimeoutMS,
+                                         const boost::optional<TenantId>&);
 
     /**
      *  Matches the matching strategy string against a set of literals
@@ -222,7 +237,7 @@ private:
 
     std::shared_ptr<ReplicaSetChangeNotifier::Listener> _listener;
 
-    Mutex _mutex = MONGO_MAKE_LATCH("ShardingTaskExecutorPoolController::_mutex");
+    stdx::mutex _mutex;
 
     // Entires to _poolDatas are added by addHost() and removed by removeHost()
     stdx::unordered_map<PoolId, PoolData> _poolDatas;

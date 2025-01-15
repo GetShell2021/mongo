@@ -225,5 +225,4 @@ class test_hs07(wttest.WiredTigerTestCase):
         # Check that the new updates are only seen after the update timestamp
         self.check(bigvalue, uri, nrows, 300)
 
-if __name__ == '__main__':
-    wttest.run()
+        self.ignoreStdoutPatternIfExists('Eviction took more than 1 minute')

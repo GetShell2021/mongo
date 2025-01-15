@@ -27,6 +27,7 @@
  *    it in the license file.
  */
 
+#include "mongo/db/operation_context.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
 
 namespace mongo {
@@ -49,7 +50,6 @@ public:
     }
 
 private:
-    rpc::MaybeImpersonatedUserMetadata _oldImpersonationData;
     OperationContext* _opCtx;
     bool _active{false};
 };

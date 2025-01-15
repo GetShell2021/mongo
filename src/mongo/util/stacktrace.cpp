@@ -30,10 +30,21 @@
 
 #include "mongo/util/stacktrace.h"
 
+#include <algorithm>
+#include <iterator>
+
+#include <fmt/format.h>
+
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_options.h"
+#include "mongo/logv2/log_tag.h"
+#include "mongo/logv2/log_truncation.h"
 #include "mongo/util/ctype.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
@@ -119,3 +130,21 @@ void logBacktraceObject(const BSONObj& bt, StackTraceSink* sink, bool withHumanR
 }
 
 }  // namespace mongo::stack_trace_detail
+
+void mongo::StackTrace::log(bool withHumanReadable) const {
+    if (hasError()) {
+        LOGV2_ERROR(31430, "Error collecting stack trace", "error"_attr = _error);
+    }
+
+    StackTraceSink* logv2Sink = nullptr;
+    stack_trace_detail::logBacktraceObject(_stacktrace, logv2Sink, withHumanReadable);
+}
+
+void mongo::StackTrace::sink(StackTraceSink* sink, bool withHumanReadable) const {
+    using namespace fmt::literals;
+    if (hasError()) {
+        *sink << fmt::format(FMT_STRING("Error collecting stack trace: {}"), _error);
+    }
+
+    stack_trace_detail::logBacktraceObject(_stacktrace, sink, withHumanReadable);
+}

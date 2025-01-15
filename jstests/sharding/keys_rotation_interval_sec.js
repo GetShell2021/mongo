@@ -2,8 +2,8 @@
  * Test that the keys on config server are rotated according to the KeysRotationIntervalSec value
  */
 
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 const kRotationInterval = 30;
 let st = new ShardingTest({
     mongos: 1,
@@ -27,4 +27,3 @@ keys.toArray().forEach(function(key, i) {
                    "expiresAt value is greater than: " + tojson(maxExpireTime));
 });
 st.stop();
-})();

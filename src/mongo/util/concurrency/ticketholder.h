@@ -28,191 +28,234 @@
  */
 #pragma once
 
-#if defined(__linux__)
-#include <semaphore.h>
-#endif
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <limits>
 
-#include <queue>
-
-#include "mongo/db/operation_context.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/mutex.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/stdx/future.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/waitable_atomic.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/concurrency/admission_context.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/tick_source.h"
 #include "mongo/util/time_support.h"
+#include <boost/optional/optional.hpp>
 
 namespace mongo {
 
 class Ticket;
 
+/**
+ * Maintains and distributes tickets across operations from a limited pool of tickets. The ticketing
+ * mechanism is required for global lock acquisition to reduce contention on storage engine
+ * resources.
+ */
 class TicketHolder {
     friend class Ticket;
 
 public:
     /**
-     * Wait mode for ticket acquisition: interruptible or uninterruptible.
+     * Describes the algorithm used to update the TicketHolder when the size of the ticket pool
+     * changes.
+     *
+     * kImmediate: update the atomic value _tickets and call notifyMany on waiters if the
+     * number of available tickets becomes positive. Otherwise, no waiters are notified.
+     *
+     * kGradual: iteratively increment _tickets and notify a single waiter for each new
+     * available ticket. If the ticket pool shrinks, we iteratively retire the necessary number of
+     * tickets as operations finish running.
      */
-    enum WaitMode { kInterruptible, kUninterruptible };
-
-    TicketHolder(int num, ServiceContext* svcCtx) : _outof(num), _serviceContext(svcCtx){};
-
-    virtual ~TicketHolder() = 0;
+    enum class ResizePolicy { kGradual = 0, kImmediate };
 
     /**
-     * Attempts to acquire a ticket without blocking.
-     * Returns a boolean indicating whether the operation was successful or not.
+     * The default value for maxQueueDepth. It it set to the default max connection amount, which is
+     * practically infinite for the purpose of the ticket holder.
+     */
+    static constexpr auto kDefaultMaxQueueDepth = static_cast<std::int32_t>(DEFAULT_MAX_CONN);
+
+    TicketHolder(ServiceContext* serviceContext,
+                 int numTickets,
+                 bool trackPeakUsed,
+                 std::int32_t maxQueueDepth,
+                 ResizePolicy resizePolicy = ResizePolicy::kGradual);
+
+    /**
+     * Adjusts the total number of tickets allocated for the ticket pool to 'newSize'.
+     *
+     * Returns 'true' if the resize completed without reaching the 'deadline', and 'false'
+     * otherwise.
+     */
+    bool resize(OperationContext* opCtx, int32_t newSize, Date_t deadline = Date_t::max());
+
+    /**
+     * Adjusts the maximum number of threads waiting for a ticket. Will not affect threads already
+     * waiting
+     */
+    void setMaxQueueDepth(int32_t newSize);
+
+    /**
+     * Attempts to acquire a ticket without blocking. Returns a ticket if one is available,
+     * and boost::none otherwise.
+     *
+     * Operations exempt from ticketing get issued a new ticket immediately, while normal priority
+     * operations take a ticket from the pool if available.
      */
     boost::optional<Ticket> tryAcquire(AdmissionContext* admCtx);
 
     /**
-     * Attempts to acquire a ticket. Blocks until a ticket is acquired or the OperationContext
-     * 'opCtx' is killed, throwing an AssertionException.
+     * Attempts to acquire a ticket. Blocks until a ticket is acquired or the OperationContext is
+     * interrupted, throwing an AssertionException.
      */
-    Ticket waitForTicket(OperationContext* opCtx, AdmissionContext* admCtx, WaitMode waitMode);
+    Ticket waitForTicket(OperationContext* opCtx, AdmissionContext* admCtx);
 
     /**
      * Attempts to acquire a ticket within a deadline, 'until'. Returns 'true' if a ticket is
      * acquired and 'false' if the deadline is reached, but the operation is retryable. Throws an
-     * AssertionException if the OperationContext 'opCtx' is killed and no waits for tickets can
-     * proceed.
+     * AssertionException if the OperationContext is interrupted.
      */
     boost::optional<Ticket> waitForTicketUntil(OperationContext* opCtx,
                                                AdmissionContext* admCtx,
-                                               Date_t until,
-                                               WaitMode waitMode);
+                                               Date_t until);
 
-    Status resize(int newSize);
+    /**
+     * The same as `waitForTicketUntil` except the wait will be uninterruptible. Please
+     * make every effort to make your waiter interruptible, and try not to use this function! It
+     * only exists as a stepping stone until we can complete the work in SERVER-68868 to ensure all
+     * work in the server is interruptible.
+     *
+     * TODO(SERVER-68868): Remove this function completely
+     */
+    boost::optional<Ticket> waitForTicketUntilNoInterrupt_DO_NOT_USE(OperationContext* opCtx,
+                                                                     AdmissionContext* admCtx,
+                                                                     Date_t until);
 
-    virtual int available() const = 0;
-
-    virtual int used() const {
-        return outof() - available();
-    }
-
-    virtual int outof() const {
+    /**
+     * The total number of tickets allotted to the ticket pool.
+     */
+    int32_t outof() const {
         return _outof.loadRelaxed();
     }
 
-    virtual int queued() const {
-        auto removed = _totalRemovedQueue.loadRelaxed();
-        auto added = _totalAddedQueue.loadRelaxed();
-        return std::max(static_cast<int>(added - removed), 0);
+    /**
+     * Instantaneous number of tickets that are checked out by an operation.
+     */
+    int32_t used() const {
+        return outof() - available();
     }
 
+    /**
+     * Instantaneous number of operations waiting in queue for a ticket.
+     * TODO SERVER-74082: Consider changing this metric to int32_t.
+     */
+    int64_t queued() const;
+
+    /**
+     * Peak number of tickets checked out at once since the previous time this function was called.
+     * Invariants that 'trackPeakUsed' has been passed to the TicketHolder,
+     */
+    int32_t getAndResetPeakUsed();
+
+    /**
+     * Exposes the amount of waiting threads for testing purpose.
+     */
+    int32_t waiting_forTest() const;
+
+    /**
+     * Instantaneous number of tickets 'available' (not checked out by an operation) in the ticket
+     * pool.
+     */
+    int32_t available() const;
+
+    /**
+     * The total number of operations that acquired a ticket, completed their work, and released the
+     * ticket.
+     */
+    int64_t numFinishedProcessing() const;
+
+    void setNumFinishedProcessing_forTest(int32_t numFinishedProcessing);
+
+    void setPeakUsed_forTest(int32_t used);
+
+    /**
+     * Statistics for queueing mechanisms in the TicketHolder implementations. The term "Queue" is a
+     * loose abstraction for the way in which operations are queued when there are no available
+     * tickets.
+     */
+    struct QueueStats {
+        AtomicWord<std::int64_t> totalAddedQueue{0};
+        AtomicWord<std::int64_t> totalRemovedQueue{0};
+        AtomicWord<std::int64_t> totalFinishedProcessing{0};
+        AtomicWord<std::int64_t> totalNewAdmissions{0};
+        AtomicWord<std::int64_t> totalTimeProcessingMicros{0};
+        AtomicWord<std::int64_t> totalStartedProcessing{0};
+        AtomicWord<std::int64_t> totalCanceled{0};
+        AtomicWord<std::int64_t> totalTimeQueuedMicros{0};
+    };
+
+    /**
+     * Append TicketHolder statistics to the provided builder.
+     */
     void appendStats(BSONObjBuilder& b) const;
 
 private:
-    virtual boost::optional<Ticket> _tryAcquireImpl(AdmissionContext* admCtx) = 0;
+    /**
+     * Releases a ticket back into the ticket pool and updates queueing statistics. Tickets
+     * issued for exempt operations do not get deposited back to the pool.
+     */
+    void _releaseTicketUpdateStats(Ticket& ticket) noexcept;
 
-    virtual boost::optional<Ticket> _waitForTicketUntilImpl(OperationContext* opCtx,
-                                                            AdmissionContext* admCtx,
-                                                            Date_t until,
-                                                            WaitMode waitMode) = 0;
+    void _releaseNormalPriorityTicket(AdmissionContext* admCtx) noexcept;
 
-    virtual void _appendImplStats(BSONObjBuilder& b) const = 0;
+    boost::optional<Ticket> _tryAcquireNormalPriorityTicket(AdmissionContext* admCtx);
 
-    void _releaseAndUpdateMetrics(AdmissionContext* admCtx) noexcept;
+    boost::optional<Ticket> _waitForTicketUntilMaybeInterruptible(OperationContext* opCtx,
+                                                                  AdmissionContext* admCtx,
+                                                                  Date_t until,
+                                                                  bool interruptible);
+    boost::optional<Ticket> _performWaitForTicketUntil(OperationContext* opCtx,
+                                                       AdmissionContext* admCtx,
+                                                       Date_t until,
+                                                       bool interruptible);
 
-    virtual void _release(AdmissionContext* admCtx) noexcept = 0;
+    void _updatePeakUsed();
 
-    AtomicWord<std::int64_t> _totalAddedQueue{0};
-    AtomicWord<std::int64_t> _totalRemovedQueue{0};
-    AtomicWord<std::int64_t> _totalFinishedProcessing{0};
-    AtomicWord<std::int64_t> _totalNewAdmissions{0};
-    AtomicWord<std::int64_t> _totalTimeProcessingMicros{0};
-    AtomicWord<std::int64_t> _totalStartedProcessing{0};
-    AtomicWord<std::int64_t> _totalCanceled{0};
+    const bool _trackPeakUsed;
 
-    Mutex _resizeMutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(2), "TicketHolder::_resizeMutex");
-    AtomicWord<int> _outof;
+    void _updateQueueStatsOnRelease(TicketHolder::QueueStats& queueStats, const Ticket& ticket);
+    void _updateQueueStatsOnTicketAcquisition(AdmissionContext* admCtx,
+                                              TicketHolder::QueueStats& queueStats,
+                                              AdmissionContext::Priority priority);
 
-protected:
+    /**
+     * Appends the statistics stored in QueueStats to BSONObjBuilder b; We track statistics
+     * for normalPriority operations and operations that are exempt from queueing.
+     */
+    void _appendQueueStats(BSONObjBuilder& b, const QueueStats& stats) const;
+
+    void _immediateResize(WithLock, int32_t newSize);
+
+    /**
+     * Creates a ticket for a non-exempt admission.
+     */
+    Ticket _makeTicket(AdmissionContext* admCtx);
+
+    QueueStats _normalPriorityQueueStats;
+    QueueStats _exemptQueueStats;
+    ResizePolicy _resizePolicy;
     ServiceContext* _serviceContext;
-};
 
-class SemaphoreTicketHolder final : public TicketHolder {
-public:
-    explicit SemaphoreTicketHolder(int num, ServiceContext* serviceContext);
-    ~SemaphoreTicketHolder() override final;
-
-    int available() const override final;
-
-private:
-    boost::optional<Ticket> _waitForTicketUntilImpl(OperationContext* opCtx,
-                                                    AdmissionContext* admCtx,
-                                                    Date_t until,
-                                                    WaitMode waitMode) override final;
-
-    boost::optional<Ticket> _tryAcquireImpl(AdmissionContext* admCtx) override final;
-    void _release(AdmissionContext* admCtx) noexcept override final;
-
-    void _appendImplStats(BSONObjBuilder& b) const override final;
-
-#if defined(__linux__)
-    mutable sem_t _sem;
-
-#else
-    bool _tryAcquire();
-
-    int _num;
-    Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "SemaphoreTicketHolder::_mutex");
-    stdx::condition_variable _newTicket;
-#endif
-
-    // Implementation statistics.
-    AtomicWord<std::int64_t> _totalTimeQueuedMicros{0};
-};
-
-/**
- * A ticketholder implementation that uses a queue for pending operations.
- * Any change to the implementation should be paired with a change to the _ticketholder.tla_ file in
- * order to formally verify that the changes won't lead to a deadlock.
- */
-class FifoTicketHolder final : public TicketHolder {
-public:
-    explicit FifoTicketHolder(int num, ServiceContext* serviceContext);
-    ~FifoTicketHolder() override final;
-
-    int available() const override final;
-
-    int queued() const override final {
-        return _enqueuedElements.load();
-    }
-
-private:
-    boost::optional<Ticket> _waitForTicketUntilImpl(OperationContext* opCtx,
-                                                    AdmissionContext* admCtx,
-                                                    Date_t until,
-                                                    WaitMode waitMode) override final;
-
-    boost::optional<Ticket> _tryAcquireImpl(AdmissionContext* admCtx) override final;
-
-    void _appendImplStats(BSONObjBuilder& b) const override final;
-
-    void _release(AdmissionContext* admCtx) noexcept override final;
-
-    // Implementation statistics.
-    AtomicWord<std::int64_t> _totalTimeQueuedMicros{0};
-
-    enum class WaitingState { Waiting, Cancelled, Assigned };
-    struct WaitingElement {
-        stdx::condition_variable signaler;
-        Mutex modificationMutex = MONGO_MAKE_LATCH(
-            HierarchicalAcquisitionLevel(0), "FifoTicketHolder::WaitingElement::modificationMutex");
-        WaitingState state;
-    };
-    std::queue<std::shared_ptr<WaitingElement>> _queue;
-    // _queueMutex protects all modifications made to either the _queue, or the statistics of the
-    // queue.
-    Mutex _queueMutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(1), "FifoTicketHolder::_queueMutex");
-    AtomicWord<int> _enqueuedElements;
-    AtomicWord<int> _ticketsAvailable;
+    // Serializes updates to _outof to ensure only 1 thread can change the size of the ticket pool
+    // at a time. Reading _outof does not require holding the lock.
+    stdx::mutex _resizeMutex;
+    BasicWaitableAtomic<int32_t> _tickets;
+    Atomic<int32_t> _maxQueueDepth;
+    Atomic<int32_t> _waiterCount{0};
+    Atomic<int32_t> _outof;
+    Atomic<int32_t> _peakUsed;
 };
 
 /**
@@ -220,12 +263,17 @@ private:
  * released when going out of scope.
  */
 class Ticket {
+    Ticket(const Ticket&) = delete;
+    Ticket& operator=(const Ticket&) = delete;
+
     friend class TicketHolder;
-    friend class SemaphoreTicketHolder;
-    friend class FifoTicketHolder;
 
 public:
-    Ticket(Ticket&& t) : _ticketholder(t._ticketholder), _admissionContext(t._admissionContext) {
+    Ticket(Ticket&& t)
+        : _ticketholder(t._ticketholder),
+          _admissionContext(t._admissionContext),
+          _priority(t._priority),
+          _acquisitionTime(t._acquisitionTime) {
         t._ticketholder = nullptr;
         t._admissionContext = nullptr;
     }
@@ -234,17 +282,19 @@ public:
         if (&t == this) {
             return *this;
         }
+
         invariant(!valid(), "Attempting to overwrite a valid ticket with another one");
-        _ticketholder = t._ticketholder;
-        _admissionContext = t._admissionContext;
-        t._ticketholder = nullptr;
-        t._admissionContext = nullptr;
+        _ticketholder = std::exchange(t._ticketholder, nullptr);
+        _admissionContext = std::exchange(t._admissionContext, nullptr);
+        _priority = t._priority;
+        _acquisitionTime = t._acquisitionTime;
+
         return *this;
     };
 
     ~Ticket() {
         if (_ticketholder) {
-            _ticketholder->_releaseAndUpdateMetrics(_admissionContext);
+            _ticketholder->_releaseTicketUpdateStats(*this);
         }
     }
 
@@ -255,24 +305,39 @@ public:
         return _ticketholder != nullptr;
     }
 
+    /**
+     * Returns the ticket priority.
+     */
+    AdmissionContext::Priority getPriority() const {
+        return _priority;
+    }
+
 private:
     Ticket(TicketHolder* ticketHolder, AdmissionContext* admissionContext)
-        : _ticketholder(ticketHolder), _admissionContext(admissionContext) {}
+        : _ticketholder(ticketHolder), _admissionContext(admissionContext) {
+        _priority = admissionContext->getPriority();
+        _acquisitionTime = ticketHolder->_serviceContext->getTickSource()->getTicks();
+    }
 
     /**
      * Discards the ticket without releasing it back to the ticketholder.
      */
     void discard() {
+        _admissionContext->markTicketReleased();
         _ticketholder = nullptr;
         _admissionContext = nullptr;
     }
 
-    // No copy constructors.
-    Ticket(const Ticket&) = delete;
-    Ticket& operator=(const Ticket&) = delete;
-
     TicketHolder* _ticketholder;
     AdmissionContext* _admissionContext;
+    AdmissionContext::Priority _priority;
+    TickSource::Tick _acquisitionTime;
 };
+
+inline Ticket TicketHolder::_makeTicket(AdmissionContext* admCtx) {
+    // TODO(SERVER-92647): Move this to the Ticket constructor so it also applies to exempt tickets
+    admCtx->markTicketHeld();
+    return Ticket{this, admCtx};
+}
 
 }  // namespace mongo

@@ -27,14 +27,16 @@
  *    it in the license file.
  */
 
+#include <algorithm>
 #include <string>
 
-#include "mongo/base/error_codes.h"
-#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/str.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -90,6 +92,17 @@ TEST(Normal, SinglePart) {
     ASSERT_EQUALS(fieldRef.getPart(0), field);
     ASSERT_EQUALS(fieldRef.dottedField(), field);
 }
+
+DEATH_TEST_REGEX(Normal, Overflow, "Tripwire assertion.*1589700") {
+    std::string field = "a";
+    for (size_t s = 1; s <= BSONObjMaxInternalSize / 2; s++) {
+        field.append(".a");
+    }
+    ASSERT_GT(field.size(), BSONObjMaxInternalSize);
+    FieldRef fieldRef;
+    ASSERT_THROWS_CODE(fieldRef.parse(field), AssertionException, 1589700);
+}
+
 
 TEST(Normal, ParseTwice) {
     std::string field = "a";
@@ -934,6 +947,43 @@ TEST(RemoveFirstPart, RemovingFirstPartFromLongPathMultipleTimes) {
     ASSERT_EQ(path, FieldRef("fifth.sixth.seventh.eigth.ninth.tenth"));
     path.removeFirstPart();
     ASSERT_EQ(path, FieldRef("sixth.seventh.eigth.ninth.tenth"));
+}
+
+TEST(FieldRefCanonicalIndexField, CanonicalIndexField) {
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a")), FieldRef("a"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("aaa")), FieldRef("aaa"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.b")), FieldRef("a.b"_sd));
+
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.$")), FieldRef("a"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.0")), FieldRef("a"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.123")), FieldRef("a"_sd));
+
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.$.b")), FieldRef("a.b"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.0.b")), FieldRef("a.b"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.123.b")), FieldRef("a.b"_sd));
+
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.$ref")), FieldRef("a.$ref"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.$ref.b")), FieldRef("a.$ref.b"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.c$d.b")), FieldRef("a.c$d.b"_sd));
+
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.123a")), FieldRef("a.123a"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.a123")), FieldRef("a.a123"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.123a.b")), FieldRef("a.123a.b"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.a123.b")), FieldRef("a.a123.b"_sd));
+
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.")), FieldRef("a."_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("$")), FieldRef("$"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("$.a")), FieldRef("$.a"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.$")), FieldRef("a"_sd));
+}
+
+TEST(FieldRefCanonicalIndexField, CanonicalIndexFieldForNestedNumericFieldNames) {
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.0.0")), FieldRef("a"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.55.01")), FieldRef("a"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.0.0.b.1")), FieldRef("a"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.0b.1")), FieldRef("a.0b"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.0.b.1.2")), FieldRef("a.b"_sd));
+    ASSERT_EQ(FieldRef::getCanonicalIndexField(FieldRef("a.01.02.b.c")), FieldRef("a"_sd));
 }
 
 }  // namespace

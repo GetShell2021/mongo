@@ -14,10 +14,8 @@
  *   requires_persistence,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/rollback_test.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
 
 let rst = new ReplSetTest({
     name: "history_rollback_test",
@@ -31,7 +29,7 @@ config.members[2].priority = 0;
 config.settings = {
     chainingAllowed: false
 };
-rst.initiateWithHighElectionTimeout(config);
+rst.initiate(config);
 
 let rollbackTest = new RollbackTest("history_rollback_test", rst);
 let rollbackNode = rollbackTest.getPrimary();
@@ -61,4 +59,3 @@ pinnedTs = serverStatus["wiredTiger"]["snapshot-window-settings"]["min pinned ti
 assert.eq(maxTimestampValue, pinnedTs);
 
 rst.stopSet();
-})();

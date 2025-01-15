@@ -32,7 +32,8 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/s/resharding/common_types.idl"
 
 commands:
   abortReshardCollection:
@@ -51,6 +52,11 @@ commands:
     namespace: type
     api_version: ""
     type: namespacestring
+    fields:
+      provenance:
+        type: Provenance
+        description: "The source operation that called this resharding operation."
+        optional: true
 
   _shardsvrAbortReshardCollection:
     command_name: _shardsvrAbortReshardCollection
@@ -60,8 +66,25 @@ commands:
     namespace: type
     api_version: ""
     type: uuid
+    reply_type: OkReply
     fields:
       userCanceled:
         type: bool
         optional: false
         description: "Determines whether the resharding opertion was user aborted."
+
+  abortMoveCollection:
+    description: "The public command on mongos that aborts a moveCollection commmand."
+    command_name: abortMoveCollection
+    strict: false
+    namespace: type
+    api_version: ""
+    type: namespacestring 
+  
+  abortUnshardCollection:
+    description: "The public command on mongos that aborts a unshardCollection commmand."
+    command_name: abortUnshardCollection
+    strict: false
+    namespace: type
+    api_version: ""
+    type: namespacestring 

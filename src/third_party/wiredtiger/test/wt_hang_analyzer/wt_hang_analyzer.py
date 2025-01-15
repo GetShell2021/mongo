@@ -39,9 +39,9 @@ Currently only supports Linux. There are two issues with the MacOS and Windows i
 2. WT-6919 - Windows cannot find the debug symbols.
 """
 
-import csv, glob, itertools, logging, re, tempfile, traceback
-import os, sys, platform, signal, subprocess, threading, time
-from distutils import spawn
+import csv, glob, itertools, logging, tempfile, traceback
+import os, sys, platform, subprocess, threading
+import shutil
 from io import BytesIO, TextIOWrapper
 from optparse import OptionParser
 _IS_WINDOWS = (sys.platform == "win32")
@@ -152,7 +152,7 @@ def callo(args, logger):
 
 def find_program(prog, paths):
     """Find the specified program in env PATH, or tries a set of paths."""
-    loc = spawn.find_executable(prog)
+    loc = shutil.which(prog)
 
     if loc is not None:
         return loc
@@ -190,7 +190,7 @@ class WindowsDumper(object):
     def __find_debugger(logger, debugger):
         """Find the installed debugger."""
         # We are looking for c:\Program Files (x86)\Windows Kits\8.1\Debuggers\x64.
-        cdb = spawn.find_executable(debugger)
+        cdb = shutil.which(debugger)
         if cdb is not None:
             return cdb
         from win32com.shell import shell, shellcon
@@ -377,7 +377,7 @@ class GDBDumper(object):
     @staticmethod
     def __find_debugger(debugger):
         """Find the installed debugger."""
-        return find_program(debugger, ['/opt/mongodbtoolchain/v3/bin/gdb', '/usr/bin'])
+        return find_program(debugger, ['/opt/mongodbtoolchain/v4/bin/gdb', '/usr/bin'])
 
     def dump_info(self, root_logger, logger, pid, process_name, take_dump):
         """Dump info."""
@@ -536,7 +536,7 @@ def main():
         root_logger.warning("Cannot determine Unix Current Login, not supported on Windows")
 
     contain_processes = ["ex_", "intpack-test", "python", "test_"]
-    exact_processes = ["cursor_order", "packing-test", "t"]
+    exact_processes = ["cursor_order", "packing-test", "run", "t"]
     process_ids = []
 
     parser = OptionParser(description=__doc__)
@@ -614,15 +614,17 @@ def main():
         try:
             avoid_asan_dump(pid)
         except Exception as err:
-            root_logger.warn("Error encountered when removing ASAN mappings from core dump", err)
-            trapped_exceptions.append(traceback.format_exc())
+            root_logger.warning("Error encountered when removing ASAN mappings from core dump: %s", err)
+            # Ignore permission failures caused by processes we are not interested in
+            if 'Permission denied' not in str(err):
+                trapped_exceptions.append(traceback.format_exc())
 
         process_logger = get_process_logger(options.debugger_output, pid, process_name)
         try:
             dbg.dump_info(root_logger, process_logger, pid, process_name, options.dump_core
                           and check_dump_quota(max_dump_size_bytes, dbg.get_dump_ext()))
         except Exception as err:
-            root_logger.info("Error encountered when invoking debugger %s", err)
+            root_logger.info("Error encountered when invoking debugger: %s", err)
             trapped_exceptions.append(traceback.format_exc())
 
     root_logger.info("Done analyzing all processes for hangs")

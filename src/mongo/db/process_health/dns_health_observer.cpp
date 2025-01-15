@@ -29,14 +29,39 @@
 
 #include "mongo/db/process_health/dns_health_observer.h"
 
+#include <algorithm>
+#include <boost/smart_ptr.hpp>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/db/client.h"
+#include "mongo/db/process_health/health_observer.h"
 #include "mongo/db/process_health/health_observer_registration.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/dns_name.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/hostname_canonicalization.h"
-#include <algorithm>
-#include <random>
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kProcessHealth
 
@@ -70,7 +95,12 @@ Future<HealthCheckStatus> DnsHealthObserver::periodicCheckImpl(
     }
 
     if (!isFailPointActive) {
-        auto client = _svcCtx->makeClient("DNSHealthObserver");
+        // TODO(SERVER-74659): Please revisit if this thread could be made killable.
+        auto client = _svcCtx->getService(ClusterRole::RouterServer)
+                          ->makeClient("DNSHealthObserver",
+                                       Client::noSession(),
+                                       ClientOperationKillableByStepdown{false});
+
         auto opCtx = client->makeOperationContext();
         auto const shardRegistry = Grid::get(_svcCtx)->shardRegistry();
         auto shardIds = shardRegistry->getAllShardIds(opCtx.get());
@@ -78,8 +108,8 @@ Future<HealthCheckStatus> DnsHealthObserver::periodicCheckImpl(
         if (shardIds.size() == 0) {
             connString = shardRegistry->getConfigServerConnectionString();
         } else {
-            auto shardSW =
-                shardRegistry->getShard(opCtx.get(), shardIds.at(rand() % shardIds.size()));
+            auto shardSW = shardRegistry->getShard(opCtx.get(),
+                                                   shardIds.at(_random.nextInt32(shardIds.size())));
             auto shardSWStatus = shardSW.getStatus();
             if (shardSWStatus.isOK()) {
                 connString = shardSW.getValue()->getConnString();

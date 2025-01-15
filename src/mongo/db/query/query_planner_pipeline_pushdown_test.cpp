@@ -27,29 +27,45 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <list>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/json.h"
-#include "mongo/db/pipeline/document_source_group.h"
-#include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/inner_pipeline_stage_impl.h"
-#include "mongo/db/pipeline/inner_pipeline_stage_interface.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_planner_test_fixture.h"
 #include "mongo/db/query/query_planner_test_lib.h"
+#include "mongo/db/query/query_solution.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace {
 using namespace mongo;
 
 class QueryPlannerPipelinePushdownTest : public QueryPlannerTest {
 protected:
-    /**
-     * Makes a vector of InnerPipelineStageInterface that carries the input DocumentSources.
-     */
-    std::vector<std::unique_ptr<InnerPipelineStageInterface>> makeInnerPipelineStages(
+    QueryPlannerPipelinePushdownTest() : QueryPlannerTest() {
+        secondaryCollMap.emplace(kSecondaryNamespace, CollectionInfo());
+    }
+
+    std::vector<boost::intrusive_ptr<DocumentSource>> makeInnerPipelineStages(
         const Pipeline& pipeline) {
-        std::vector<std::unique_ptr<InnerPipelineStageInterface>> stages;
+        std::vector<boost::intrusive_ptr<DocumentSource>> stages;
         for (auto&& source : pipeline.getSources()) {
-            stages.emplace_back(std::make_unique<InnerPipelineStageImpl>(source));
+            stages.emplace_back(source);
         }
         return stages;
     }
@@ -63,9 +79,9 @@ protected:
         return Pipeline::parse(rawPipeline, expCtx);
     }
 
-    const NamespaceString kSecondaryNamespace{"test.other"};
-    const std::map<NamespaceString, SecondaryCollectionInfo> secondaryCollMap{
-        {kSecondaryNamespace, SecondaryCollectionInfo()}};
+    const NamespaceString kSecondaryNamespace =
+        NamespaceString::createNamespaceString_forTest("test.other");
+    std::map<NamespaceString, CollectionInfo> secondaryCollMap;
 };
 
 TEST_F(QueryPlannerPipelinePushdownTest, PushdownOfASingleGroup) {
@@ -83,7 +99,7 @@ TEST_F(QueryPlannerPipelinePushdownTest, PushdownOfASingleGroup) {
         << solns[0]->root()->toString();
 
     // Check the plan after lowering $group into the find subsystem.
-    ASSERT(!cq->pipeline().empty());
+    ASSERT(!cq->cqPipeline().empty());
     auto solution =
         QueryPlanner::extendWithAggPipeline(*cq, std::move(solns[0]), {} /* secondaryCollInfos */);
     ASSERT_OK(QueryPlannerTestLib::solutionMatches(
@@ -110,7 +126,7 @@ TEST_F(QueryPlannerPipelinePushdownTest, PushdownOfTwoGroups) {
         << solns[0]->root()->toString();
 
     // Check the plan after lowering $group into the find subsystem.
-    ASSERT(!cq->pipeline().empty());
+    ASSERT(!cq->cqPipeline().empty());
     auto solution =
         QueryPlanner::extendWithAggPipeline(*cq, std::move(solns[0]), {} /* secondaryCollInfos */);
     ASSERT_OK(QueryPlannerTestLib::solutionMatches(
@@ -138,7 +154,7 @@ TEST_F(QueryPlannerPipelinePushdownTest, PushdownOfOneGroupWithMultipleAccumulat
         << solns[0]->root()->toString();
 
     // Check the plan after lowering $group into the find subsystem.
-    ASSERT(!cq->pipeline().empty());
+    ASSERT(!cq->cqPipeline().empty());
     auto solution =
         QueryPlanner::extendWithAggPipeline(*cq, std::move(solns[0]), {} /* secondaryCollInfos */);
     ASSERT_OK(QueryPlannerTestLib::solutionMatches(
@@ -165,10 +181,10 @@ TEST_F(QueryPlannerPipelinePushdownTest, PushdownOfASingleLookup) {
         << solns[0]->root()->toString();
 
     // Check the plan after lowering $lookup into the find subsystem.
-    ASSERT(!cq->pipeline().empty());
+    ASSERT(!cq->cqPipeline().empty());
     auto solution = QueryPlanner::extendWithAggPipeline(*cq, std::move(solns[0]), secondaryCollMap);
     ASSERT_OK(QueryPlannerTestLib::solutionMatches(
-        "{eq_lookup: {foreignCollection: '" + kSecondaryNamespace.toString() +
+        "{eq_lookup: {foreignCollection: '" + kSecondaryNamespace.toString_forTest() +
             "', joinFieldLocal: 'x', joinFieldForeign: 'y', joinField: 'out', "
             "strategy: 'NestedLoopJoin', node: "
             "{cscan: {dir:1, filter: {x:1}}}}}",
@@ -194,14 +210,14 @@ TEST_F(QueryPlannerPipelinePushdownTest, PushdownOfTwoLookups) {
         << solns[0]->root()->toString();
 
     // Check the plan after lowering both $lookups into the find subsystem.
-    ASSERT(!cq->pipeline().empty());
+    ASSERT(!cq->cqPipeline().empty());
     auto solution = QueryPlanner::extendWithAggPipeline(*cq, std::move(solns[0]), secondaryCollMap);
     ASSERT_OK(QueryPlannerTestLib::solutionMatches(
-        "{eq_lookup: {foreignCollection: '" + kSecondaryNamespace.toString() +
+        "{eq_lookup: {foreignCollection: '" + kSecondaryNamespace.toString_forTest() +
             "', joinFieldLocal: 'a', joinFieldForeign: 'b', joinField: 'c', "
             "strategy: 'NestedLoopJoin', node: "
             "{eq_lookup: {foreignCollection: '" +
-            kSecondaryNamespace.toString() +
+            kSecondaryNamespace.toString_forTest() +
             "', joinFieldLocal: 'x', joinFieldForeign: 'y', joinField: 'out',"
             "strategy: 'NestedLoopJoin', node: {cscan: {dir:1, filter: {x:1}}}}}}}",
         solution->root()))
@@ -228,17 +244,17 @@ TEST_F(QueryPlannerPipelinePushdownTest, PushdownOfTwoLookupsAndTwoGroups) {
         << solns[0]->root()->toString();
 
     // Check the plan after lowering the $groups and $lookups into the find subsystem.
-    ASSERT(!cq->pipeline().empty());
+    ASSERT(!cq->cqPipeline().empty());
     auto solution = QueryPlanner::extendWithAggPipeline(*cq, std::move(solns[0]), secondaryCollMap);
     ASSERT_OK(QueryPlannerTestLib::solutionMatches(
         "{group: {key: {_id: '$c'}, accs: [{count: {$min: '$count'}}], node: "
         "{eq_lookup: {foreignCollection: '" +
-            kSecondaryNamespace.toString() +
+            kSecondaryNamespace.toString_forTest() +
             "', joinFieldLocal: 'a', joinFieldForeign: 'b', joinField: 'c', "
             "strategy: 'NestedLoopJoin', node: "
             "{group: {key: {_id: '$out'}, accs: [{count: {$sum: '$x'}}], node: "
             "{eq_lookup: {foreignCollection: '" +
-            kSecondaryNamespace.toString() +
+            kSecondaryNamespace.toString_forTest() +
             "', joinFieldLocal: 'x', joinFieldForeign: 'y', joinField: 'out',"
             "strategy: 'NestedLoopJoin', node: "
             "{cscan: {dir:1, filter: {x:1}}}}}}}}}}}",

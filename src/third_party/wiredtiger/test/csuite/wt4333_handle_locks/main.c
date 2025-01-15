@@ -29,7 +29,7 @@
 
 #include <signal.h>
 
-#define MAXKEY 10000
+#define MAXKEY (10 * WT_THOUSAND)
 #define PERIOD 60
 #define HOME_LEN 256
 
@@ -56,7 +56,7 @@ uri_init(void)
 
     for (i = 0; i < uris; ++i)
         if (uri_list[i] == NULL) {
-            testutil_check(__wt_snprintf(buf, sizeof(buf), "table:%u", i));
+            testutil_snprintf(buf, sizeof(buf), "table:%u", i);
             uri_list[i] = dstrdup(buf);
         }
 
@@ -64,12 +64,12 @@ uri_init(void)
 
     /* Initialize the file contents. */
     for (i = 0; i < uris; ++i) {
-        testutil_check(__wt_snprintf(
-          buf, sizeof(buf), "key_format=S,value_format=S,allocation_size=4K,leaf_page_max=32KB,"));
+        testutil_snprintf(
+          buf, sizeof(buf), "key_format=S,value_format=S,allocation_size=4K,leaf_page_max=32KB,");
         testutil_check(session->create(session, uri_list[i], buf));
         testutil_check(session->open_cursor(session, uri_list[i], NULL, NULL, &cursor));
         for (key = 1; key < MAXKEY; ++key) {
-            testutil_check(__wt_snprintf(buf, sizeof(buf), "key:%020u", key));
+            testutil_snprintf(buf, sizeof(buf), "key:%020u", key);
             cursor->set_key(cursor, buf);
             cursor->set_value(cursor, buf);
             testutil_check(cursor->insert(cursor));
@@ -134,7 +134,7 @@ op(WT_SESSION *session, WT_RAND_STATE *rnd, WT_CURSOR **cpp)
 
     /* Operate on some number of key/value pairs. */
     for (key = 1; !done && key < MAXKEY; key += __wt_random(rnd) % 37, __wt_yield()) {
-        testutil_check(__wt_snprintf(buf, sizeof(buf), "key:%020u", key));
+        testutil_snprintf(buf, sizeof(buf), "key:%020u", key);
         cursor->set_key(cursor, buf);
         if (readonly)
             testutil_check(cursor->search(cursor));
@@ -246,7 +246,7 @@ sweep_stats(void)
 {
     static const int list[] = {WT_STAT_CONN_CURSOR_SWEEP_BUCKETS, WT_STAT_CONN_CURSOR_SWEEP_CLOSED,
       WT_STAT_CONN_CURSOR_SWEEP_EXAMINED, WT_STAT_CONN_CURSOR_SWEEP, WT_STAT_CONN_DH_SWEEP_REF,
-      WT_STAT_CONN_DH_SWEEP_CLOSE, WT_STAT_CONN_DH_SWEEP_REMOVE, WT_STAT_CONN_DH_SWEEP_TOD,
+      WT_STAT_CONN_DH_SWEEP_DEAD_CLOSE, WT_STAT_CONN_DH_SWEEP_REMOVE, WT_STAT_CONN_DH_SWEEP_TOD,
       WT_STAT_CONN_DH_SWEEPS, WT_STAT_CONN_DH_SESSION_SWEEPS, -1};
     WT_SESSION *session;
     WT_CURSOR *cursor;
@@ -282,9 +282,9 @@ runone(bool config_cache)
 
     done = false;
 
-    testutil_make_work_dir(home);
+    testutil_recreate_dir(home);
 
-    testutil_check(__wt_snprintf(buf, sizeof(buf),
+    testutil_snprintf(buf, sizeof(buf),
       "create"
       ", cache_cursors=%s"
       ", cache_size=1GB"
@@ -294,8 +294,9 @@ runone(bool config_cache)
       "close_handle_minimum=1,close_idle_time=1,close_scan_interval=1)"
       ", mmap=true"
       ", session_max=%u"
-      ", statistics=(all)",
-      config_cache ? "true" : "false", workers + 100));
+      ", statistics=(all)"
+      ", statistics_log=(json,on_close,wait=1)",
+      config_cache ? "true" : "false", workers + 100);
     testutil_check(wiredtiger_open(home, NULL, buf, &conn));
 
     printf("%s: %d seconds, cache_cursors=%s, %u workers, %u files\n", progname, PERIOD,
@@ -394,7 +395,7 @@ run(int argc, char *argv[])
     uri_teardown();
 
     if (!preserve)
-        testutil_clean_work_dir(home);
+        testutil_remove(home);
     return (EXIT_SUCCESS);
 }
 

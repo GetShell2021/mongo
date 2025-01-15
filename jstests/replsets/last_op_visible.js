@@ -4,12 +4,10 @@
 // We then confirm that a writeConcern majority write will be seen as the lastVisibleOp by a
 // majority read.
 // @tags: [requires_majority_read_concern]
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var name = 'lastOpVisible';
-var replTest = new ReplSetTest(
-    {name: name, nodes: 3, nodeOptions: {enableMajorityReadConcern: ''}, waitForKeys: true});
+var replTest = new ReplSetTest({name: name, nodes: 3, waitForKeys: true});
 replTest.startSet();
 replTest.initiate();
 
@@ -43,4 +41,3 @@ res = primary.getDB(name).runCommand({find: name, readConcern: {level: "majority
 assert.commandWorked(res);
 assert.eq(last_op_visible, res["$replData"].lastOpVisible);
 replTest.stopSet();
-}());

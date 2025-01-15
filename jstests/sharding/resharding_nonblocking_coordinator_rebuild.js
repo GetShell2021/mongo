@@ -1,12 +1,21 @@
 /**
  * Tests that resharding participants do not block replication while waiting for the
  * ReshardingCoordinatorService to be rebuilt.
+ *
+ * @tags: [
+ *  # Incompatible because it uses a fail point to block all primary only services
+ *  # from being rebuilt on the config server, and if the config server is the first shard,
+ *  # this prevents the test from making progress.
+ *  # This tests logic that shouldn't be different on a config server,
+ *  # so there's no need to run it with a config shard.
+ *  config_shard_incompatible,
+ *  # TODO SERVER-97257: Re-enable this test on embedded router suites.
+ *  embedded_router_incompatible,
+ *  ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/discover_topology.js");
-load("jstests/sharding/libs/resharding_test_fixture.js");
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const reshardingTest = new ReshardingTest({numDonors: 2, enableElections: true});
 reshardingTest.setup();
@@ -109,20 +118,7 @@ reshardingTest.withReshardingInBackground(
         }
     },
     {
-        // As a result of the elections intentionally triggered on the config server replica sets,
-        // the primary shard of the database may retry the _configsvrReshardCollection command. It
-        // is possible for the resharding operation from the first _configsvrReshardCollection
-        // command to have entirely finished executing to the point of removing the coordinator
-        // state document. A retry of the _configsvrReshardCollection command in this situation will
-        // lead to a second resharding operation to run. The second resharding operation will have
-        // the duplicate documents cloned by the ReshardingCollectionCloner rather than applied by
-        // the ReshardingOplogApplier as intended. This results in the reshardCollection command
-        // failing with a DuplicateKey error rather than the error code for the stash collections
-        // being non-empty. The recipient must have been able to successfully update its state to
-        // "applying" in the first resharding operation even when the ReshardingCoordinatorService
-        // had yet to be rebuilt so we accept DuplicateKey as an error too.
-        expectedErrorCode: [5356800, ErrorCodes.DuplicateKey],
+        expectedErrorCode: 5356800,
     });
 
 reshardingTest.teardown();
-})();

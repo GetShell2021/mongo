@@ -28,19 +28,46 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <utility>
 
-#include "mongo/db/s/resharding/resharding_oplog_applier.h"
-
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
 #include "mongo/db/s/resharding/resharding_future_util.h"
+#include "mongo/db/s/resharding/resharding_oplog_applier.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/future_util.h"
+#include "mongo/util/timer.h"
 #include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
@@ -54,22 +81,27 @@ MONGO_FAIL_POINT_DEFINE(reshardingApplyOplogBatchTwice);
 
 ReshardingOplogApplier::ReshardingOplogApplier(
     std::unique_ptr<Env> env,
+    std::size_t oplogBatchTaskCount,
     ReshardingSourceId sourceId,
     NamespaceString oplogBufferNss,
     NamespaceString outputNss,
     std::vector<NamespaceString> allStashNss,
     size_t myStashIdx,
     ChunkManager sourceChunkMgr,
-    std::unique_ptr<ReshardingDonorOplogIteratorInterface> oplogIterator)
+    std::unique_ptr<ReshardingDonorOplogIteratorInterface> oplogIterator,
+    bool isCapped)
     : _env(std::move(env)),
       _sourceId(std::move(sourceId)),
-      _batchPreparer{CollatorInterface::cloneCollator(sourceChunkMgr.getDefaultCollator())},
+      _batchPreparer{oplogBatchTaskCount,
+                     CollatorInterface::cloneCollator(sourceChunkMgr.getDefaultCollator()),
+                     isCapped},
       _crudApplication{std::move(outputNss),
                        std::move(allStashNss),
                        myStashIdx,
                        _sourceId.getShardId(),
                        std::move(sourceChunkMgr),
-                       _env->applierMetrics()},
+                       _env->applierMetrics(),
+                       isCapped},
       _sessionApplication{std::move(oplogBufferNss)},
       _batchApplier{_crudApplication, _sessionApplication},
       _oplogIter(std::move(oplogIterator)) {}
@@ -194,8 +226,13 @@ SemiFuture<void> ReshardingOplogApplier::run(
             if (chainCtx->oplogIter) {
                 // Use a separate Client to make a better effort of calling dispose() even when the
                 // CancellationToken has been canceled.
-                auto client =
-                    cc().getServiceContext()->makeClient("ReshardingOplogApplierCleanupClient");
+                //
+                // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+                auto client = cc().getServiceContext()
+                                  ->getService(ClusterRole::ShardServer)
+                                  ->makeClient("ReshardingOplogApplierCleanupClient",
+                                               Client::noSession(),
+                                               ClientOperationKillableByStepdown{false});
 
                 AlternativeClientRegion acr(client);
                 auto opCtx = cc().makeOperationContext();
@@ -220,16 +257,16 @@ boost::optional<ReshardingOplogApplierProgress> ReshardingOplogApplier::checkSto
         return boost::none;
     }
 
-    IDLParserErrorContext ctx("ReshardingOplogApplierProgress");
+    IDLParserContext ctx("ReshardingOplogApplierProgress");
     return ReshardingOplogApplierProgress::parse(ctx, doc);
 }
 
 void ReshardingOplogApplier::_clearAppliedOpsAndStoreProgress(OperationContext* opCtx) {
     const auto& lastOplog = _currentBatchToApply.back();
 
-    auto oplogId =
-        ReshardingDonorOplogId::parse({"ReshardingOplogApplier::_clearAppliedOpsAndStoreProgress"},
-                                      lastOplog.get_id()->getDocument().toBson());
+    auto oplogId = ReshardingDonorOplogId::parse(
+        IDLParserContext{"ReshardingOplogApplier::_clearAppliedOpsAndStoreProgress"},
+        lastOplog.get_id()->getDocument().toBson());
 
     PersistentTaskStore<ReshardingOplogApplierProgress> store(
         NamespaceString::kReshardingApplierProgressNamespace);
@@ -257,7 +294,8 @@ void ReshardingOplogApplier::_clearAppliedOpsAndStoreProgress(OperationContext* 
     store.upsert(
         opCtx,
         BSON(ReshardingOplogApplierProgress::kOplogSourceIdFieldName << _sourceId.toBSON()),
-        builder.obj());
+        builder.obj(),
+        WriteConcerns::kLocalWriteConcern);
 
     _env->applierMetrics()->onOplogEntriesApplied(_currentBatchToApply.size());
 

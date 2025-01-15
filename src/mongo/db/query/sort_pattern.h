@@ -28,11 +28,28 @@
  */
 #pragma once
 
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <set>
+#include <utility>
 #include <vector>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 class SortPattern {
@@ -64,15 +81,21 @@ public:
 
     SortPattern(std::vector<SortPatternPart> patterns) : _sortPattern(std::move(patterns)) {
         for (auto&& patternPart : _sortPattern) {
-            if (patternPart.fieldPath)
-                _paths.insert(patternPart.fieldPath->fullPath());
+            if (patternPart.fieldPath) {
+                const auto [_, inserted] = _paths.insert(patternPart.fieldPath->fullPath());
+                uassert(7472501,
+                        str::stream() << "$sort key must not contain duplicate keys (field: '"
+                                      << patternPart.fieldPath->fullPath() << "')",
+                        inserted);
+            }
         }
     }
 
     /**
      * Write out a Document whose contents are the sort key pattern.
      */
-    Document serialize(SortKeySerialization) const;
+    Document serialize(SortKeySerialization serializationMode,
+                       const SerializationOptions& options = {}) const;
 
     /**
      * Serializes the document to BSON, only keeping the paths specified in the sort pattern.
@@ -147,6 +170,19 @@ private:
     std::vector<SortPatternPart> _sortPattern;
 
     // The set of paths on which we're sorting.
-    std::set<std::string> _paths;
+    OrderedPathSet _paths;
 };
+
+/**
+ * Returns true if 'sortPattern' represents a sort pattern on a single metadata field like:
+ * {score: {$meta: "searchScore"}}.
+ *
+ * Sort clause must only be on a single field, i.e. {score: {$meta: "searchScore"}, _id: 1} will
+ * return false.
+ *
+ * The 'metadataToConsider' field represents a bitset of all possible metadata fields to consider
+ * the sort is on. If the bitset is empty, any metadata will be considered.
+ */
+bool isSortOnSingleMetaField(const SortPattern& sortPattern,
+                             QueryMetadataBitSet metadataToConsider = QueryMetadataBitSet{});
 }  // namespace mongo

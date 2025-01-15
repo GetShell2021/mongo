@@ -28,11 +28,18 @@
  */
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/str.h"
 
@@ -119,7 +126,7 @@ public:
     // Define valid transitions.
     // Must be called prior to starting the state machine.
     void validTransitions(const TransitionsContainer& transitions) noexcept {
-        for (auto [from, toStates] : transitions) {
+        for (const auto& [from, toStates] : transitions) {
             for (auto to : toStates) {
                 validTransition(from, to);
             }
@@ -182,7 +189,7 @@ public:
             return _state;
         }
 
-        StateEventRegistryPtr enter(StateCallback&& cb) {
+        StateEventRegistryPtr enter(StateCallback&& cb) override {
             _onEnter.push_back(std::move(cb));
             return this;
         }
@@ -192,7 +199,7 @@ public:
                 cb(previous, _state, m);
         }
 
-        StateEventRegistryPtr exit(StateCallback&& cb) {
+        StateEventRegistryPtr exit(StateCallback&& cb) override {
             _onExit.push_back(std::move(cb));
             return this;
         }
@@ -266,6 +273,7 @@ protected:
     using StateContexts = stdx::unordered_map<State, StateContext>;
 
     void setState(State s, const OptionalMessageType& message) {
+        stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
         tassertStarted();
 
         invariant(_current);

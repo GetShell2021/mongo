@@ -4,9 +4,9 @@
  * @tags: [requires_fcv_53]
  */
 
-function multiple_arbiters(multiple_arbiters_allowed) {
-    "use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
+function multiple_arbiters(multiple_arbiters_allowed) {
     jsTestLog("multiple_arbiters(" + multiple_arbiters_allowed + ")");
 
     const name = "disable_multiple_arbiters";

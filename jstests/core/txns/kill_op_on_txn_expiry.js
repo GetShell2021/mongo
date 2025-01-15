@@ -1,11 +1,13 @@
 // Test that ongoing operations in a transaction are interrupted when the transaction expires.
-// @tags: [uses_transactions]
-(function() {
-"use strict";
+//
+// @tags: [
+//   # The test runs commands that are not allowed with security token: endSession, setParameter.
+//   not_allowed_with_signed_security_token,
+//   uses_transactions
+// ]
 
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallelTester.js');
-load("jstests/libs/logv2_helpers.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
 
 const dbName = "test";
 const collName = "kill_op_on_txn_expiry";
@@ -24,7 +26,7 @@ const sessionColl = sessionDb[collName];
 
 // Need the original 'transactionLifetimeLimitSeconds' value so that we can reset it back at the
 // end of the test.
-const res =
+let res =
     assert.commandWorked(db.adminCommand({getParameter: 1, transactionLifetimeLimitSeconds: 1}));
 const originalTransactionLifetimeLimitSeconds = res.transactionLifetimeLimitSeconds;
 
@@ -32,6 +34,20 @@ const originalTransactionLifetimeLimitSeconds = res.transactionLifetimeLimitSeco
 jsTest.log("Decrease transactionLifetimeLimitSeconds from " +
            originalTransactionLifetimeLimitSeconds + " to 30 seconds.");
 assert.commandWorked(db.adminCommand({setParameter: 1, transactionLifetimeLimitSeconds: 30}));
+
+res = assert.commandWorked(
+    db.adminCommand({getParameter: 1, AbortExpiredTransactionsSessionCheckoutTimeout: 1}));
+const originalAbortExpiredTransactionsSessionCheckoutTimeout =
+    res.AbortExpiredTransactionsSessionCheckoutTimeout;
+
+// Increase the AbortExpiredTransactionsSessionCheckoutTimeout to prevent it from conflicting with
+// the abortExpiredTransactions job on slower machines. This ensures that the
+// abortExpiredTransactions job is responsible for aborting the transaction, even if it takes
+// longer, allowing the test to function as intended.
+jsTest.log("Increase AbortExpiredTransactionsSessionCheckoutTimeout from " +
+           originalAbortExpiredTransactionsSessionCheckoutTimeout + " ms to 5 minutes.");
+assert.commandWorked(db.adminCommand(
+    {setParameter: 1, AbortExpiredTransactionsSessionCheckoutTimeout: 5 * 60 * 1000}));
 
 try {
     jsTestLog("Starting transaction");
@@ -73,15 +89,11 @@ try {
     failPoint.wait();
 
     jsTestLog("Wait for the transaction to expire");
-    if (isJsonLog(db.getMongo())) {
-        checkLog.contains(
-            db.getMongo(),
-            new RegExp(
-                "Aborting transaction because it has been running for longer than 'transactionLifetimeLimitSeconds'.*\"txnNumber\":" +
-                txnNumber));
-    } else {
-        checkLog.contains(db.getMongo(), "Aborting transaction with txnNumber " + txnNumber);
-    }
+    checkLog.contains(
+        db.getMongo(),
+        new RegExp(
+            "Aborting transaction because it has been running for longer than 'transactionLifetimeLimitSeconds'.*\"txnNumber\":" +
+            txnNumber));
 
     jsTestLog("Disabling fail point to enable insert to proceed and detect that the session " +
               "has been killed");
@@ -90,13 +102,18 @@ try {
     workerThread.join();
     assert(!workerThread.hasFailed());
 } finally {
-    // Must ensure that the transactionLifetimeLimitSeconds is reset so that it does not impact
-    // other tests in the suite.
+    // Must ensure that the transactionLifetimeLimitSeconds and
+    // AbortExpiredTransactionsSessionCheckoutTimeout are reset so that it does not impact other
+    // tests in the suite.
     assert.commandWorked(db.adminCommand({
         setParameter: 1,
         transactionLifetimeLimitSeconds: originalTransactionLifetimeLimitSeconds
     }));
+    assert.commandWorked(db.adminCommand({
+        setParameter: 1,
+        AbortExpiredTransactionsSessionCheckoutTimeout:
+            originalAbortExpiredTransactionsSessionCheckoutTimeout
+    }));
 }
 
 session.endSession();
-}());

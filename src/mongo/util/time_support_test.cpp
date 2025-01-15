@@ -31,11 +31,21 @@
 #include <cstdlib>
 #include <ctime>
 #include <fmt/format.h>
+#include <memory>
+#include <ostream>
 #include <string>
+#include <system_error>
+#include <vector>
 
-#include "mongo/base/init.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/errno_util.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -419,6 +429,22 @@ TEST(TimeParsing, InvalidDates) {
     for (const char* s : badDates) {
         ASSERT_NOT_OK(dateFromISOString(s)) << s;
     }
+}
+
+TEST(TimeParsing, InvalidTimeT) {
+    // This value of time_t is too large to be processed by gmtime_r
+    time_t f = LLONG_MAX;
+    struct tm t;
+
+    ASSERT_THROWS(time_t_to_Struct(f, &t, true), DBException);
+    ASSERT_THROWS(time_t_to_Struct(f, &t, false), DBException);
+}
+
+TEST(TimeParsing, InvalidDateT) {
+    // This value of Date_t is too large to be processed by ctime_r
+    Date_t f = Date_t::fromMillisSinceEpoch(LLONG_MAX);
+
+    ASSERT_THROWS(dateToCtimeString(f), DBException);
 }
 
 TEST(TimeParsing, LeapYears) {

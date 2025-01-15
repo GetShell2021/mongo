@@ -31,23 +31,34 @@
 
 #include <fmt/format.h>
 
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/feature_flag.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/query/allowed_contexts.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
-#include "mongo/util/version/releases.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
-REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(listCatalog,
-                                          DocumentSourceListCatalog::LiteParsed::parse,
-                                          DocumentSourceListCatalog::createFromBson,
-                                          AllowedWithApiStrict::kNeverInVersion1,
-                                          multiversion::FeatureCompatibilityVersion::kVersion_6_0);
+REGISTER_DOCUMENT_SOURCE(listCatalog,
+                         DocumentSourceListCatalog::LiteParsed::parse,
+                         DocumentSourceListCatalog::createFromBson,
+                         AllowedWithApiStrict::kNeverInVersion1);
 
 const char* DocumentSourceListCatalog::getSourceName() const {
     return kStageName.rawData();
@@ -60,25 +71,30 @@ PrivilegeVector DocumentSourceListCatalog::LiteParsed::requiredPrivileges(
     // See builtin_roles.cpp.
     ActionSet listCollectionsAndIndexesActions{ActionType::listCollections,
                                                ActionType::listIndexes};
-    return _ns.isCollectionlessAggregateNS()
-        ? PrivilegeVector{Privilege(ResourcePattern::forClusterResource(),
-                                    ActionType::listDatabases),
-                          Privilege(ResourcePattern::forAnyNormalResource(),
-                                    listCollectionsAndIndexesActions),
-                          Privilege(ResourcePattern::forCollectionName("system.js"),
-                                    listCollectionsAndIndexesActions),
-                          Privilege(ResourcePattern::forAnySystemBuckets(),
-                                    listCollectionsAndIndexesActions)}
-        : PrivilegeVector{
-              Privilege(ResourcePattern::forExactNamespace(_ns), listCollectionsAndIndexesActions)};
+    if (_ns.isCollectionlessAggregateNS()) {
+        const auto& tenantId = _ns.tenantId();
+        return {Privilege(ResourcePattern::forClusterResource(tenantId), ActionType::listDatabases),
+                Privilege(ResourcePattern::forAnyNormalResource(tenantId),
+                          listCollectionsAndIndexesActions),
+                Privilege(ResourcePattern::forCollectionName(tenantId, "system.js"_sd),
+                          listCollectionsAndIndexesActions),
+                Privilege(ResourcePattern::forAnySystemBuckets(tenantId),
+                          listCollectionsAndIndexesActions)};
+    } else {
+        return {
+            Privilege(ResourcePattern::forExactNamespace(_ns), listCollectionsAndIndexesActions)};
+    }
 }
 
 DocumentSource::GetNextResult DocumentSourceListCatalog::doGetNext() {
     if (!_catalogDocs) {
-        if (pExpCtx->ns.isCollectionlessAggregateNS()) {
-            _catalogDocs = pExpCtx->mongoProcessInterface->listCatalog(pExpCtx->opCtx);
-        } else if (auto catalogDoc = pExpCtx->mongoProcessInterface->getCatalogEntry(pExpCtx->opCtx,
-                                                                                     pExpCtx->ns)) {
+        if (pExpCtx->getNamespaceString().isCollectionlessAggregateNS()) {
+            _catalogDocs =
+                pExpCtx->getMongoProcessInterface()->listCatalog(pExpCtx->getOperationContext());
+        } else if (auto catalogDoc = pExpCtx->getMongoProcessInterface()->getCatalogEntry(
+                       pExpCtx->getOperationContext(),
+                       pExpCtx->getNamespaceString(),
+                       pExpCtx->getUUID())) {
             _catalogDocs = {{std::move(*catalogDoc)}};
         } else {
             _catalogDocs.emplace();
@@ -86,7 +102,7 @@ DocumentSource::GetNextResult DocumentSourceListCatalog::doGetNext() {
     }
 
     if (!_catalogDocs->empty()) {
-        Document doc{std::move(_catalogDocs->front())};
+        Document doc{_catalogDocs->front()};
         _catalogDocs->pop_front();
         return doc;
     }
@@ -104,37 +120,22 @@ intrusive_ptr<DocumentSource> DocumentSourceListCatalog::createFromBson(
             "The $listCatalog stage specification must be an empty object",
             elem.type() == Object && elem.Obj().isEmpty());
 
-    const NamespaceString& nss = pExpCtx->ns;
+    const NamespaceString& nss = pExpCtx->getNamespaceString();
 
     uassert(
         ErrorCodes::InvalidNamespace,
         "Collectionless $listCatalog must be run against the 'admin' database with {aggregate: 1}",
-        nss.db() == NamespaceString::kAdminDb || !nss.isCollectionlessAggregateNS());
+        nss.isAdminDB() || !nss.isCollectionlessAggregateNS());
 
     uassert(ErrorCodes::QueryFeatureNotAllowed,
             fmt::format("The {} aggregation stage is not enabled", kStageName),
             feature_flags::gDocumentSourceListCatalog.isEnabled(
-                serverGlobalParams.featureCompatibility));
-
-    // We declare this stage with a min version but the base class DocumentSource checks the
-    // minimum version only if pExpCtx->maxFeatureCompatibilityVersion is provided.
-    if (!pExpCtx->maxFeatureCompatibilityVersion) {
-        const auto& globalFcv = serverGlobalParams.featureCompatibility;
-        using FCV = multiversion::FeatureCompatibilityVersion;
-        uassert(ErrorCodes::QueryFeatureNotAllowed,
-                fmt::format("The {} aggregation stage is not allowed in the current feature "
-                            "compatibility version. See {} for more information.",
-                            kStageName,
-                            feature_compatibility_version_documentation::kCompatibilityLink),
-                !globalFcv.isVersionInitialized() ||
-                    globalFcv.isGreaterThanOrEqualTo(FCV::kVersion_5_3));
-    }
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
 
     return new DocumentSourceListCatalog(pExpCtx);
 }
 
-Value DocumentSourceListCatalog::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceListCatalog::serialize(const SerializationOptions& opts) const {
     return Value(DOC(getSourceName() << Document()));
 }
 }  // namespace mongo

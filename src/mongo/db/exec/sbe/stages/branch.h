@@ -29,9 +29,20 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
 /**
@@ -67,6 +78,11 @@ public:
     const SpecificStats* getSpecificStats() const final;
     std::vector<DebugPrinter::Block> debugPrint() const final;
     size_t estimateCompileTimeSize() const final;
+
+protected:
+    bool shouldOptimizeSaveState(size_t idx) const final {
+        return _activeBranch && (static_cast<size_t>(*_activeBranch) == idx);
+    }
 
 private:
     const std::unique_ptr<EExpression> _filter;

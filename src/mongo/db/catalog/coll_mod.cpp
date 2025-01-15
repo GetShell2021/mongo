@@ -27,73 +27,113 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/coll_mod.h"
 
 #include <boost/optional.hpp>
+#include <cstdint>
+#include <fmt/format.h>
+#include <list>
 #include <memory>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
-#include "mongo/db/catalog/clustered_collection_util.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
 #include "mongo/db/catalog/coll_mod_index.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/collection_options_gen.h"
 #include "mongo/db/catalog/collection_uuid_mismatch.h"
-#include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/coll_mod_gen.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/feature_flag.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/pipeline/change_stream_pre_and_post_images_options_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
+#include "mongo/db/s/scoped_collection_metadata.h"
+#include "mongo/db/s/shard_key_index_util.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/db/timeseries/timeseries_options.h"
-#include "mongo/db/ttl_collection_cache.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/ttl/ttl_collection_cache.h"
+#include "mongo/db/views/view.h"
 #include "mongo/db/views/view_catalog_helpers.h"
-#include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
 #include "mongo/util/version/releases.h"
-#include "mongo/util/visit_helper.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-
 namespace mongo {
-
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(hangAfterDatabaseLock);
 MONGO_FAIL_POINT_DEFINE(hangAfterCollModIndexUniqueFullIndexScan);
 MONGO_FAIL_POINT_DEFINE(hangAfterCollModIndexUniqueReleaseIXLock);
 
-void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const& nss) {
-    auto dss = DatabaseShardingState::get(opCtx, nss.db().toString());
-    if (!dss) {
-        return;
-    }
-
-    auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
+void assertNoMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const& nss) {
     try {
-        const auto collDesc =
-            CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx);
-        if (!collDesc.isSharded()) {
-            auto mpsm = dss->getMovePrimarySourceManager(dssLock);
+        const auto scopedDss =
+            DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx, nss.dbName());
+        auto scopedCss = CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, nss);
 
-            if (mpsm) {
-                LOGV2(4945200, "assertMovePrimaryInProgress", "namespace"_attr = nss.toString());
+        auto collDesc = scopedCss->getCollectionDescription(opCtx);
+        // Only collections that are not registered in the sharding catalog are affected by
+        // movePrimary
+        if (!collDesc.hasRoutingTable()) {
+            if (scopedDss->isMovePrimaryInProgress()) {
+                LOGV2(4945200, "assertNoMovePrimaryInProgress", logAttrs(nss));
 
                 uasserted(ErrorCodes::MovePrimaryInProgress,
-                          "movePrimary is in progress for namespace " + nss.toString());
+                          "movePrimary is in progress for namespace " + nss.toStringForErrorMsg());
             }
         }
     } catch (const DBException& ex) {
@@ -111,12 +151,13 @@ struct ParsedCollModRequest {
     boost::optional<Collection::Validator> collValidator;
     boost::optional<ValidationActionEnum> collValidationAction;
     boost::optional<ValidationLevelEnum> collValidationLevel;
-    bool recordPreImages = false;
     boost::optional<ChangeStreamPreAndPostImagesOptions> changeStreamPreAndPostImagesOptions;
     int numModifications = 0;
     bool dryRun = false;
     boost::optional<long long> cappedSize;
     boost::optional<long long> cappedMax;
+    boost::optional<bool> timeseriesBucketsMayHaveMixedSchemaData;
+    boost::optional<bool> recordIdsReplicated;
 };
 
 Status getNotSupportedOnViewError(StringData fieldName) {
@@ -139,10 +180,37 @@ Status getOnlySupportedOnTimeseriesError(StringData fieldName) {
             str::stream() << "option only supported on a time-series collection: " << fieldName};
 }
 
-StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(OperationContext* opCtx,
-                                                                         const NamespaceString& nss,
-                                                                         const CollectionPtr& coll,
-                                                                         const CollMod& cmd) {
+boost::optional<ShardKeyPattern> getShardKeyPatternIfSharded(OperationContext* opCtx,
+                                                             const NamespaceStringOrUUID& nsOrUUID,
+                                                             const CollMod& cmd) {
+    if (!Grid::get(opCtx)->isInitialized()) {
+        return boost::none;
+    }
+
+    try {
+        const NamespaceString nss =
+            CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(opCtx, nsOrUUID);
+        if (auto catalogClient = Grid::get(opCtx)->catalogClient()) {
+            auto coll = catalogClient->getCollection(opCtx, nss);
+            if (coll.getUnsplittable()) {
+                return boost::none;
+            } else {
+                return ShardKeyPattern(coll.getKeyPattern());
+            }
+        }
+    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        // The collection is unsharded or doesn't exist.
+    }
+
+    return boost::none;
+}
+
+StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CollectionPtr& coll,
+    const CollMod& cmd,
+    const boost::optional<ShardKeyPattern>& shardKeyPattern) {
 
     bool isView = !coll;
     bool isTimeseries = coll && coll->getTimeseriesOptions() != boost::none;
@@ -159,13 +227,7 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
     }
 
     if (cmr.getCappedSize() || cmr.getCappedMax()) {
-        // TODO (SERVER-64042): Remove FCV check once 6.1 is released.
-        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.isLessThan(
-                multiversion::FeatureCompatibilityVersion::kVersion_6_0)) {
-            return {ErrorCodes::InvalidOptions,
-                    "Cannot change the size limits of a capped collection."};
-        } else if (!coll->isCapped()) {
+        if (!coll->isCapped()) {
             return {ErrorCodes::InvalidOptions, "Collection must be capped."};
         } else if (coll->ns().isOplog()) {
             return {ErrorCodes::InvalidOptions,
@@ -225,15 +287,6 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
         }
 
         auto cmrIndex = &parsed.indexRequest;
-
-        if ((cmdIndex.getUnique() || cmdIndex.getPrepareUnique()) &&
-            !feature_flags::gCollModIndexUnique.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
-            return {ErrorCodes::InvalidOptions,
-                    "collMod does not support converting an index to 'unique' or to "
-                    "'prepareUnique' mode"};
-        }
-
         if (cmdIndex.getUnique() && cmdIndex.getForceNonUnique()) {
             return {ErrorCodes::InvalidOptions,
                     "collMod does not support 'unique' and 'forceNonUnique' options at the "
@@ -247,12 +300,9 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                         "Please refer to the documentation and use the top-level "
                         "'expireAfterSeconds' option instead"};
             }
-            if (coll->isCapped()) {
-                return {ErrorCodes::InvalidOptions,
-                        "TTL indexes are not supported for capped collections."};
-            }
             if (auto status = index_key_validate::validateExpireAfterSeconds(
-                    *cmdIndex.getExpireAfterSeconds());
+                    *cmdIndex.getExpireAfterSeconds(),
+                    index_key_validate::ValidateExpireAfterSecondsMode::kSecondaryTTLIndex);
                 !status.isOK()) {
                 return {ErrorCodes::InvalidOptions, status.reason()};
             }
@@ -271,7 +321,7 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                     "for the collection's clusteredIndex",
                     indexSpec.getName());
 
-            if ((!indexName.empty() && indexName == StringData(indexSpec.getName().get())) ||
+            if ((!indexName.empty() && indexName == StringData(indexSpec.getName().value())) ||
                 keyPattern.woCompare(indexSpec.getKey()) == 0) {
                 // The indexName or keyPattern match the collection's clusteredIndex.
                 return {ErrorCodes::Error(6011800),
@@ -282,7 +332,8 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
             cmrIndex->idx = coll->getIndexCatalog()->findIndexByName(opCtx, indexName);
             if (!cmrIndex->idx) {
                 return {ErrorCodes::IndexNotFound,
-                        str::stream() << "cannot find index " << indexName << " for ns " << nss};
+                        str::stream() << "cannot find index " << indexName << " for ns "
+                                      << nss.toStringForErrorMsg()};
             }
         } else {
             std::vector<const IndexDescriptor*> indexes;
@@ -298,7 +349,8 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                                       << indexes[1]->infoObj()};
             } else if (indexes.empty()) {
                 return {ErrorCodes::IndexNotFound,
-                        str::stream() << "cannot find index " << keyPattern << " for ns " << nss};
+                        str::stream() << "cannot find index " << keyPattern << " for ns "
+                                      << nss.toStringForErrorMsg()};
             }
 
             cmrIndex->idx = indexes[0];
@@ -340,7 +392,7 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
             if (cmrIndex->idx->unique()) {
                 indexForOplog->setUnique(boost::none);
             } else {
-                // Disallow one-step unique convertion. The user has to set
+                // Disallow one-step unique conversion. The user has to set
                 // 'prepareUnique' to true first.
                 if (!cmrIndex->idx->prepareUnique()) {
                     return Status(ErrorCodes::InvalidOptions,
@@ -366,6 +418,19 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                 return {ErrorCodes::BadValue, "can't hide _id index"};
             }
 
+            // If the index is not hidden and we are trying to hide it, check if it is possible
+            // to drop the shard key index, so it could be possible to hide it.
+            if (!cmrIndex->idx->hidden() && *cmdIndex.getHidden()) {
+                if (shardKeyPattern) {
+                    if (isLastNonHiddenRangedShardKeyIndex(
+                            opCtx, coll, cmrIndex->idx->indexName(), shardKeyPattern->toBSON())) {
+                        return {ErrorCodes::InvalidOptions,
+                                "Can't hide the only compatible index for this collection's "
+                                "shard key"};
+                    }
+                }
+            }
+
             // Hiding a hidden index or unhiding a visible index should be treated as a no-op.
             if (cmrIndex->idx->hidden() == *cmdIndex.getHidden()) {
                 indexForOplog->setHidden(boost::none);
@@ -375,12 +440,29 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
         }
 
         if (cmdIndex.getPrepareUnique()) {
+            // Check if prepareUnique is being set on a time-series collection index.
+            if (isTimeseries) {
+                return {ErrorCodes::InvalidOptions,
+                        "cannot set 'prepareUnique' for indexes of a time-series collection."};
+            }
             parsed.numModifications++;
             // Attempting to modify with the same value should be treated as a no-op.
             if (cmrIndex->idx->prepareUnique() == *cmdIndex.getPrepareUnique() ||
                 cmrIndex->idx->unique()) {
                 indexForOplog->setPrepareUnique(boost::none);
             } else {
+                // Checks if the index key pattern conflicts with the shard key pattern.
+                if (shardKeyPattern) {
+                    if (!shardKeyPattern->isIndexUniquenessCompatible(
+                            cmrIndex->idx->keyPattern())) {
+                        return {
+                            ErrorCodes::InvalidOptions,
+                            fmt::format("cannot set 'prepareUnique' for index {} with shard key "
+                                        "pattern {}",
+                                        cmrIndex->idx->keyPattern().toString(),
+                                        shardKeyPattern->toBSON().toString())};
+                    }
+                }
                 cmrIndex->indexPrepareUnique = cmdIndex.getPrepareUnique();
             }
         }
@@ -424,8 +506,8 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
         // (Generic FCV reference): This FCV check should exist across LTS binary versions.
         multiversion::FeatureCompatibilityVersion fcv;
         if (serverGlobalParams.validateFeaturesAsPrimary.load() &&
-            serverGlobalParams.featureCompatibility.isLessThan(multiversion::GenericFCV::kLatest,
-                                                               &fcv)) {
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot().isLessThan(
+                multiversion::GenericFCV::kLatest, &fcv)) {
             maxFeatureCompatibilityVersion = fcv;
         }
         auto validatorObj = *validator;
@@ -433,6 +515,11 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                                                     validatorObj.getOwned(),
                                                     MatchExpressionParser::kDefaultSpecialFeatures,
                                                     maxFeatureCompatibilityVersion);
+
+        // Increment counters to track the usage of schema validators.
+        validatorCounters.incrementCounters(
+            cmd.kCommandName, parsed.collValidator->validatorDoc, parsed.collValidator->isOK());
+
         if (!parsed.collValidator->isOK()) {
             return parsed.collValidator->getStatus();
         }
@@ -482,18 +569,6 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
         oplogEntryBuilder.append(CollMod::kViewOnFieldName, *viewOn);
     }
 
-    if (const auto& recordPreImages = cmr.getRecordPreImages()) {
-        if (isView) {
-            return getNotSupportedOnViewError(CollMod::kRecordPreImagesFieldName);
-        }
-        if (isTimeseries) {
-            return getNotSupportedOnTimeseriesError(CollMod::kRecordPreImagesFieldName);
-        }
-        parsed.numModifications++;
-        parsed.recordPreImages = *recordPreImages;
-        oplogEntryBuilder.append(CollMod::kRecordPreImagesFieldName, *recordPreImages);
-    }
-
     if (auto& changeStreamPreAndPostImages = cmr.getChangeStreamPreAndPostImages()) {
         if (isView) {
             return getNotSupportedOnViewError(CollMod::kChangeStreamPreAndPostImagesFieldName);
@@ -521,8 +596,8 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                                   << "' option is only supported on collections clustered by _id"};
         }
 
-        auto status = stdx::visit(
-            visit_helper::Overloaded{
+        auto status = visit(
+            OverloadedVisitor{
                 [&oplogEntryBuilder](const std::string& value) -> Status {
                     if (value != "off") {
                         return {ErrorCodes::InvalidOptions,
@@ -536,7 +611,9 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
                 },
                 [&oplogEntryBuilder](std::int64_t value) {
                     oplogEntryBuilder.append(CollMod::kExpireAfterSecondsFieldName, value);
-                    return index_key_validate::validateExpireAfterSeconds(value);
+                    return index_key_validate::validateExpireAfterSeconds(
+                        value,
+                        index_key_validate::ValidateExpireAfterSecondsMode::kClusteredTTLIndex);
                 },
             },
             *expireAfterSeconds);
@@ -548,11 +625,31 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
     if (auto& timeseries = cmr.getTimeseries()) {
         parsed.numModifications++;
         if (!isTimeseries) {
-            return getOnlySupportedOnTimeseriesError(CollMod::kIsTimeseriesNamespaceFieldName);
+            return getOnlySupportedOnTimeseriesError(CollMod::kTimeseriesFieldName);
         }
 
         BSONObjBuilder subObjBuilder(oplogEntryBuilder.subobjStart(CollMod::kTimeseriesFieldName));
         timeseries->serialize(&subObjBuilder);
+    }
+
+    if (auto mixedSchema = cmr.getTimeseriesBucketsMayHaveMixedSchemaData()) {
+        if (!isTimeseries) {
+            return getOnlySupportedOnTimeseriesError(
+                CollMod::kTimeseriesBucketsMayHaveMixedSchemaDataFieldName);
+        }
+
+        parsed.timeseriesBucketsMayHaveMixedSchemaData = mixedSchema;
+        oplogEntryBuilder.append(CollMod::kTimeseriesBucketsMayHaveMixedSchemaDataFieldName,
+                                 *mixedSchema);
+    }
+
+    if (auto recordIdsReplicated = cmr.getRecordIdsReplicated()) {
+        if (*recordIdsReplicated) {
+            return {ErrorCodes::InvalidOptions, "Cannot set recordIdsReplicated to true"};
+        }
+
+        parsed.recordIdsReplicated = recordIdsReplicated;
+        oplogEntryBuilder.append(CollMod::kRecordIdsReplicatedFieldName, false);
     }
 
     if (const auto& dryRun = cmr.getDryRun()) {
@@ -573,45 +670,50 @@ void _setClusteredExpireAfterSeconds(
     OperationContext* opCtx,
     const CollectionOptions& oldCollOptions,
     Collection* coll,
-    const stdx::variant<std::string, std::int64_t>& clusteredIndexExpireAfterSeconds) {
+    const std::variant<std::string, std::int64_t>& clusteredIndexExpireAfterSeconds) {
     invariant(oldCollOptions.clusteredIndex);
 
     boost::optional<int64_t> oldExpireAfterSeconds = oldCollOptions.expireAfterSeconds;
 
-    stdx::visit(
-        visit_helper::Overloaded{
-            [&](const std::string& newExpireAfterSeconds) {
-                invariant(newExpireAfterSeconds == "off");
-                if (!oldExpireAfterSeconds) {
-                    // expireAfterSeconds is already disabled on the clustered index.
-                    return;
-                }
+    visit(OverloadedVisitor{
+              [&](const std::string& newExpireAfterSeconds) {
+                  invariant(newExpireAfterSeconds == "off");
+                  if (!oldExpireAfterSeconds) {
+                      // expireAfterSeconds is already disabled on the clustered index.
+                      return;
+                  }
 
-                coll->updateClusteredIndexTTLSetting(opCtx, boost::none);
-            },
-            [&](std::int64_t newExpireAfterSeconds) {
-                if (oldExpireAfterSeconds && *oldExpireAfterSeconds == newExpireAfterSeconds) {
-                    // expireAfterSeconds is already the requested value on the clustered index.
-                    return;
-                }
+                  coll->updateClusteredIndexTTLSetting(opCtx, boost::none);
+              },
+              [&](std::int64_t newExpireAfterSeconds) {
+                  if (oldExpireAfterSeconds && *oldExpireAfterSeconds == newExpireAfterSeconds) {
+                      // expireAfterSeconds is already the requested value on the clustered index.
+                      return;
+                  }
 
-                // If this collection was not previously TTL, inform the TTL monitor when we commit.
-                if (!oldExpireAfterSeconds) {
-                    auto ttlCache = &TTLCollectionCache::get(opCtx->getServiceContext());
-                    opCtx->recoveryUnit()->onCommit([ttlCache, uuid = coll->uuid()](auto _) {
-                        ttlCache->registerTTLInfo(uuid, TTLCollectionCache::ClusteredId());
-                    });
-                }
+                  // If this collection was not previously TTL, inform the TTL monitor when we
+                  // commit.
+                  if (!oldExpireAfterSeconds) {
+                      auto ttlCache = &TTLCollectionCache::get(opCtx->getServiceContext());
+                      shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+                          [ttlCache, uuid = coll->uuid()](OperationContext*,
+                                                          boost::optional<Timestamp>) {
+                              ttlCache->registerTTLInfo(
+                                  uuid,
+                                  TTLCollectionCache::Info{TTLCollectionCache::ClusteredId{}});
+                          });
+                  }
 
-                invariant(newExpireAfterSeconds >= 0);
-                coll->updateClusteredIndexTTLSetting(opCtx, newExpireAfterSeconds);
-            }},
-        clusteredIndexExpireAfterSeconds);
+                  invariant(newExpireAfterSeconds >= 0);
+                  coll->updateClusteredIndexTTLSetting(opCtx, newExpireAfterSeconds);
+              }},
+          clusteredIndexExpireAfterSeconds);
 }
 
 Status _processCollModDryRunMode(OperationContext* opCtx,
                                  const NamespaceStringOrUUID& nsOrUUID,
                                  const CollMod& cmd,
+                                 const boost::optional<ShardKeyPattern>& shardKeyPattern,
                                  BSONObjBuilder* result,
                                  boost::optional<repl::OplogApplication::Mode> mode) {
     // Ensure that the unique option is specified before validation the rest of the request
@@ -636,7 +738,8 @@ Status _processCollModDryRunMode(OperationContext* opCtx,
     const auto& collection = coll.getCollection();
 
     // Validate collMod request and look up index descriptor for checking duplicates.
-    auto statusW = parseCollModRequest(opCtx, nss, collection, cmd);
+    auto statusW = parseCollModRequest(opCtx, nss, collection, cmd, shardKeyPattern);
+
     if (!statusW.isOK()) {
         return statusW.getStatus();
     }
@@ -650,17 +753,19 @@ Status _processCollModDryRunMode(OperationContext* opCtx,
     }
 
     // Throws exception if index contains duplicates.
-    auto violatingRecordsList = scanIndexForDuplicates(opCtx, collection, cmr.indexRequest.idx);
-    if (!violatingRecordsList.empty()) {
-        uassertStatusOK(buildConvertUniqueErrorStatus(opCtx, collection, violatingRecordsList));
+    auto violatingRecords = scanIndexForDuplicates(opCtx, cmr.indexRequest.idx);
+    if (!violatingRecords.empty()) {
+        uassertStatusOK(buildConvertUniqueErrorStatus(opCtx, collection.get(), violatingRecords));
     }
 
     return Status::OK();
 }
 
-StatusWith<const IndexDescriptor*> _setUpCollModIndexUnique(OperationContext* opCtx,
-                                                            const NamespaceStringOrUUID& nsOrUUID,
-                                                            const CollMod& cmd) {
+StatusWith<const IndexDescriptor*> _setUpCollModIndexUnique(
+    OperationContext* opCtx,
+    const NamespaceStringOrUUID& nsOrUUID,
+    const CollMod& cmd,
+    const boost::optional<ShardKeyPattern>& shardKeyPattern) {
     // Acquires the MODE_IX lock with the intent to write to the collection later in the collMod
     // operation while still allowing concurrent writes. This also makes sure the operation is
     // killed during a stepdown.
@@ -669,28 +774,31 @@ StatusWith<const IndexDescriptor*> _setUpCollModIndexUnique(OperationContext* op
 
     const auto& collection = coll.getCollection();
     if (!collection) {
-        checkCollectionUUIDMismatch(opCtx, nss, nullptr, cmd.getCollectionUUID());
+        checkCollectionUUIDMismatch(opCtx, nss, CollectionPtr(), cmd.getCollectionUUID());
         return Status(ErrorCodes::NamespaceNotFound,
-                      str::stream() << "ns does not exist for unique index conversion: " << nss);
+                      str::stream() << "ns does not exist for unique index conversion: "
+                                    << nss.toStringForErrorMsg());
     }
 
     // Scan index for duplicates without exclusive access.
-    auto statusW = parseCollModRequest(opCtx, nss, collection, cmd);
+    auto statusW = parseCollModRequest(opCtx, nss, collection, cmd, shardKeyPattern);
+
     if (!statusW.isOK()) {
         return statusW.getStatus();
     }
     const auto& cmr = statusW.getValue().first;
     auto idx = cmr.indexRequest.idx;
-    auto violatingRecordsList = scanIndexForDuplicates(opCtx, collection, idx);
+    auto violatingRecords = scanIndexForDuplicates(opCtx, idx);
 
-    CurOpFailpointHelpers::waitWhileFailPointEnabled(&hangAfterCollModIndexUniqueFullIndexScan,
-                                                     opCtx,
-                                                     "hangAfterCollModIndexUniqueFullIndexScan",
-                                                     []() {},
-                                                     nss);
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangAfterCollModIndexUniqueFullIndexScan,
+        opCtx,
+        "hangAfterCollModIndexUniqueFullIndexScan",
+        []() {},
+        nss);
 
-    if (!violatingRecordsList.empty()) {
-        uassertStatusOK(buildConvertUniqueErrorStatus(opCtx, collection, violatingRecordsList));
+    if (!violatingRecords.empty()) {
+        uassertStatusOK(buildConvertUniqueErrorStatus(opCtx, collection.get(), violatingRecords));
     }
 
     return idx;
@@ -699,10 +807,20 @@ StatusWith<const IndexDescriptor*> _setUpCollModIndexUnique(OperationContext* op
 Status _collModInternal(OperationContext* opCtx,
                         const NamespaceStringOrUUID& nsOrUUID,
                         const CollMod& cmd,
+                        const CollectionAcquisition* acquisition,
                         BSONObjBuilder* result,
                         boost::optional<repl::OplogApplication::Mode> mode) {
+    // Get key pattern from the config server if we may need it for parsing checks if on the primary
+    // before taking any locks. The ddl lock will prevent the key pattern from changing.
+    boost::optional<ShardKeyPattern> shardKeyPattern;
+    bool mayNeedKeyPatternForParsing =
+        cmd.getIndex() && (cmd.getIndex()->getHidden() || cmd.getIndex()->getPrepareUnique());
+    if (!mode && mayNeedKeyPatternForParsing) {
+        shardKeyPattern = getShardKeyPatternIfSharded(opCtx, nsOrUUID, cmd);
+    }
+
     if (cmd.getDryRun().value_or(false)) {
-        return _processCollModDryRunMode(opCtx, nsOrUUID, cmd, result, mode);
+        return _processCollModDryRunMode(opCtx, nsOrUUID, cmd, shardKeyPattern, result, mode);
     }
 
     // Before acquiring exclusive access to the collection for unique index conversion, we will
@@ -711,7 +829,7 @@ Status _collModInternal(OperationContext* opCtx,
     // the catalog.
     const IndexDescriptor* idx_first = nullptr;
     if (cmd.getIndex() && cmd.getIndex()->getUnique().value_or(false) && !mode) {
-        auto statusW = _setUpCollModIndexUnique(opCtx, nsOrUUID, cmd);
+        auto statusW = _setUpCollModIndexUnique(opCtx, nsOrUUID, cmd, shardKeyPattern);
         if (!statusW.isOK()) {
             return statusW.getStatus();
         }
@@ -724,13 +842,19 @@ Status _collModInternal(OperationContext* opCtx,
             return cmd.getIndex() && cmd.getIndex()->getUnique().value_or(false) && !mode;
         });
 
-    AutoGetCollection coll(opCtx, nsOrUUID, MODE_X, AutoGetCollectionViewMode::kViewsPermitted);
-    auto nss = coll.getNss();
-    StringData dbName = nss.db();
+    boost::optional<AutoGetCollection> autoget;
+    if (!acquisition) {
+        autoget.emplace(
+            opCtx,
+            nsOrUUID,
+            MODE_X,
+            AutoGetCollection::Options{}.viewMode(auto_get_collection::ViewMode::kViewsPermitted));
+    }
+    auto nss = acquisition ? acquisition->nss() : autoget->getNss();
+    auto& coll = acquisition ? acquisition->getCollectionPtr() : autoget->getCollection();
+    auto dbName = nss.dbName();
     Lock::CollectionLock systemViewsLock(
-        opCtx, NamespaceString(dbName, NamespaceString::kSystemDotViewsCollectionName), MODE_X);
-
-    Database* const db = coll.getDb();
+        opCtx, NamespaceString::makeSystemDotViewsNamespace(dbName), MODE_X);
 
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &hangAfterDatabaseLock, opCtx, "hangAfterDatabaseLock", []() {}, nss);
@@ -748,39 +872,36 @@ Status _collModInternal(OperationContext* opCtx,
     // This can kill all cursors so don't allow running it while a background operation is in
     // progress.
     if (coll) {
-        assertMovePrimaryInProgress(opCtx, nss);
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(coll->uuid());
-        CollectionShardingState::get(opCtx, nss)
-            ->getCollectionDescription(opCtx)
-            .throwIfReshardingInProgress(nss);
     }
 
-
-    // If db/collection/view does not exist, short circuit and return.
-    if (!db || (!coll && !view)) {
+    // If collection/view does not exist, short circuit and return.
+    if (!coll && !view) {
         if (nss.isTimeseriesBucketsCollection()) {
             // If a sharded time-series collection is dropped, it's possible that a stale mongos
             // sends the request on the buckets namespace instead of the view namespace. Ensure that
             // the shardVersion is upto date before throwing an error.
-            CollectionShardingState::get(opCtx, nss)->checkShardVersionOrThrow(opCtx);
+            CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, nss)
+                ->checkShardVersionOrThrow(opCtx);
         }
-        checkCollectionUUIDMismatch(opCtx, nss, nullptr, cmd.getCollectionUUID());
+        checkCollectionUUIDMismatch(opCtx, nss, CollectionPtr(), cmd.getCollectionUUID());
         return Status(ErrorCodes::NamespaceNotFound, "ns does not exist");
     }
 
     // This is necessary to set up CurOp, update the Top stats, and check shard version if the
     // operation is not on a view.
-    OldClientContext ctx(opCtx, nss.ns(), !view);
+    OldClientContext ctx(opCtx, nss, !view);
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss);
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::NotWritablePrimary,
-                      str::stream() << "Not primary while setting collection options on " << nss);
+                      str::stream() << "Not primary while setting collection options on "
+                                    << nss.toStringForErrorMsg());
     }
 
-    auto statusW = parseCollModRequest(opCtx, nss, coll.getCollection(), cmd);
+    auto statusW = parseCollModRequest(opCtx, nss, coll, cmd, shardKeyPattern);
     if (!statusW.isOK()) {
         return statusW.getStatus();
     }
@@ -798,10 +919,10 @@ Status _collModInternal(OperationContext* opCtx,
     auto ts = cmd.getTimeseries();
 
     if (!serverGlobalParams.quiet.load()) {
-        LOGV2(5324200, "CMD: collMod", "cmdObj"_attr = cmd.toBSON(BSONObj()));
+        LOGV2(5324200, "CMD: collMod", "cmdObj"_attr = cmd.toBSON());
     }
 
-    return writeConflictRetry(opCtx, "collMod", nss.ns(), [&] {
+    return writeConflictRetry(opCtx, "collMod", nss, [&] {
         WriteUnitOfWork wunit(opCtx);
 
         // Handle collMod on a view and return early. The CollectionCatalog handles the creation of
@@ -811,7 +932,7 @@ Status _collModInternal(OperationContext* opCtx,
                 view->setPipeline(*cmd.getPipeline());
 
             if (!viewOn.empty())
-                view->setViewOn(NamespaceString(dbName, viewOn));
+                view->setViewOn(NamespaceStringUtil::deserialize(dbName, viewOn));
 
             BSONArrayBuilder pipeline;
             for (auto& item : view->pipeline()) {
@@ -838,72 +959,63 @@ Status _collModInternal(OperationContext* opCtx,
 
         const CollectionOptions& oldCollOptions = coll->getCollectionOptions();
 
-        // TODO SERVER-58584: remove the feature flag.
-        if (feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
-            // If 'changeStreamPreAndPostImagesOptions' are enabled, 'recordPreImages' must be set
-            // to false. If 'recordPreImages' is set to true, 'changeStreamPreAndPostImagesOptions'
-            // must be disabled.
-            if (cmrNew.changeStreamPreAndPostImagesOptions &&
-                cmrNew.changeStreamPreAndPostImagesOptions->getEnabled()) {
-                cmrNew.recordPreImages = false;
-            }
-
-            if (cmrNew.recordPreImages) {
-                cmrNew.changeStreamPreAndPostImagesOptions =
-                    ChangeStreamPreAndPostImagesOptions(false);
-            }
-        } else {
-            // If the FCV has changed while executing the command to the version, where the feature
-            // flag is disabled, specifying changeStreamPreAndPostImagesOptions is not allowed.
-            if (cmrNew.changeStreamPreAndPostImagesOptions) {
-                return Status(ErrorCodes::InvalidOptions,
-                              "The 'changeStreamPreAndPostImages' is an unknown field.");
-            }
-        }
+        Collection* writableColl = acquisition
+            ? CollectionCatalog::get(opCtx)->lookupCollectionByUUIDForMetadataWrite(opCtx,
+                                                                                    coll->uuid())
+            : autoget->getWritableCollection(opCtx);
 
         if (cmrNew.cappedSize || cmrNew.cappedMax) {
             // If the current capped collection size exceeds the newly set limits, future document
             // inserts will prompt document deletion.
-            uassertStatusOK(coll.getWritableCollection(opCtx)->updateCappedSize(
-                opCtx, cmrNew.cappedSize, cmrNew.cappedMax));
+            uassertStatusOK(
+                writableColl->updateCappedSize(opCtx, cmrNew.cappedSize, cmrNew.cappedMax));
         }
 
         boost::optional<IndexCollModInfo> indexCollModInfo;
 
         // Handle collMod operation type appropriately.
         if (cmd.getExpireAfterSeconds()) {
-            _setClusteredExpireAfterSeconds(opCtx,
-                                            oldCollOptions,
-                                            coll.getWritableCollection(opCtx),
-                                            *cmd.getExpireAfterSeconds());
+            _setClusteredExpireAfterSeconds(
+                opCtx, oldCollOptions, writableColl, *cmd.getExpireAfterSeconds());
+        }
+
+        if (auto mixedSchema = cmrNew.timeseriesBucketsMayHaveMixedSchemaData) {
+            writableColl->setTimeseriesBucketsMayHaveMixedSchemaData(opCtx, mixedSchema);
+        }
+
+        if (auto recordIdsReplicated = cmrNew.recordIdsReplicated) {
+            // Must be false if present.
+            invariant(
+                !(*recordIdsReplicated),
+                fmt::format(
+                    "Unexpected true value for 'recordIdsReplicated' in collMod options for {}: {}",
+                    nss.toStringForErrorMsg(),
+                    cmd.toBSON().toString()));
+
+            writableColl->unsetRecordIdsReplicated(opCtx);
         }
 
         // Handle index modifications.
         processCollModIndexRequest(
-            opCtx, &coll, cmrNew.indexRequest, &indexCollModInfo, result, mode);
+            opCtx, writableColl, cmrNew.indexRequest, &indexCollModInfo, result, mode);
 
         if (cmrNew.collValidator) {
-            coll.getWritableCollection(opCtx)->setValidator(opCtx, *cmrNew.collValidator);
+            writableColl->setValidator(opCtx, *cmrNew.collValidator);
         }
         if (cmrNew.collValidationAction)
-            uassertStatusOKWithContext(coll.getWritableCollection(opCtx)->setValidationAction(
-                                           opCtx, *cmrNew.collValidationAction),
-                                       "Failed to set validationAction");
+            uassertStatusOKWithContext(
+                writableColl->setValidationAction(opCtx, *cmrNew.collValidationAction),
+                "Failed to set validationAction");
         if (cmrNew.collValidationLevel) {
-            uassertStatusOKWithContext(coll.getWritableCollection(opCtx)->setValidationLevel(
-                                           opCtx, *cmrNew.collValidationLevel),
-                                       "Failed to set validationLevel");
-        }
-
-        if (cmrNew.recordPreImages != oldCollOptions.recordPreImages) {
-            coll.getWritableCollection(opCtx)->setRecordPreImages(opCtx, cmrNew.recordPreImages);
+            uassertStatusOKWithContext(
+                writableColl->setValidationLevel(opCtx, *cmrNew.collValidationLevel),
+                "Failed to set validationLevel");
         }
 
         if (cmrNew.changeStreamPreAndPostImagesOptions.has_value() &&
             *cmrNew.changeStreamPreAndPostImagesOptions !=
                 oldCollOptions.changeStreamPreAndPostImagesOptions) {
-            coll.getWritableCollection(opCtx)->setChangeStreamPreAndPostImages(
+            writableColl->setChangeStreamPreAndPostImages(
                 opCtx, *cmrNew.changeStreamPreAndPostImagesOptions);
         }
 
@@ -913,21 +1025,38 @@ Status _collModInternal(OperationContext* opCtx,
             uassertStatusOK(res);
             auto [newOptions, changed] = res.getValue();
             if (changed) {
-                coll.getWritableCollection(opCtx)->setTimeseriesOptions(opCtx, newOptions);
+                writableColl->setTimeseriesOptions(opCtx, newOptions);
+                if (feature_flags::gTSBucketingParametersUnchanged.isEnabled(
+                        serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+                    writableColl->setTimeseriesBucketingParametersChanged(opCtx, true);
+                };
             }
+        }
+
+        // We involve an empty collMod command during a setFCV downgrade to clean timeseries
+        // bucketing parameters in the catalog. So if the FCV is in downgrading or downgraded stage,
+        // remove time-series bucketing parameters flag, as nodes older than 7.1 cannot understand
+        // this flag.
+        // (Generic FCV reference): This FCV check should exist across LTS binary versions.
+        // TODO SERVER-80003 remove special version handling when LTS becomes 8.0.
+        if (const auto version =
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot().getVersion();
+            cmrNew.numModifications == 0 && coll->timeseriesBucketingParametersHaveChanged() &&
+            version == multiversion::GenericFCV::kDowngradingFromLatestToLastLTS) {
+            writableColl->setTimeseriesBucketingParametersChanged(opCtx, boost::none);
         }
 
         // Fix any invalid index options for indexes belonging to this collection.
         std::vector<std::string> indexesWithInvalidOptions =
-            coll.getWritableCollection(opCtx)->repairInvalidIndexOptions(opCtx);
+            writableColl->repairInvalidIndexOptions(opCtx);
         for (const auto& indexWithInvalidOptions : indexesWithInvalidOptions) {
             const IndexDescriptor* desc =
-                coll->getIndexCatalog()->findIndexByName(opCtx, indexWithInvalidOptions);
+                writableColl->getIndexCatalog()->findIndexByName(opCtx, indexWithInvalidOptions);
             invariant(desc);
 
             // Notify the index catalog that the definition of this index changed.
-            coll.getWritableCollection(opCtx)->getIndexCatalog()->refreshEntry(
-                opCtx, coll.getWritableCollection(opCtx), desc, CreateIndexEntryFlags::kIsReady);
+            writableColl->getIndexCatalog()->refreshEntry(
+                opCtx, writableColl, desc, CreateIndexEntryFlags::kIsReady);
         }
 
         // Only observe non-view collMods, as view operations are observed as operations on the
@@ -943,11 +1072,45 @@ Status _collModInternal(OperationContext* opCtx,
 
 }  // namespace
 
+bool isCollModIndexUniqueConversion(const CollModRequest& request) {
+    auto index = request.getIndex();
+    if (!index) {
+        return false;
+    }
+    if (auto indexUnique = index->getUnique(); !indexUnique) {
+        return false;
+    }
+    // Checks if the request is an actual unique conversion instead of a dry run.
+    if (auto dryRun = request.getDryRun(); dryRun && *dryRun) {
+        return false;
+    }
+    return true;
+}
+
+CollModRequest makeCollModDryRunRequest(const CollModRequest& request) {
+    CollModRequest dryRunRequest;
+    CollModIndex dryRunIndex;
+    const auto& requestIndex = request.getIndex();
+    dryRunIndex.setUnique(true);
+    if (auto keyPattern = requestIndex->getKeyPattern()) {
+        dryRunIndex.setKeyPattern(keyPattern);
+    } else if (auto name = requestIndex->getName()) {
+        dryRunIndex.setName(name);
+    }
+    if (auto uuid = request.getCollectionUUID()) {
+        dryRunRequest.setCollectionUUID(uuid);
+    }
+    dryRunRequest.setIndex(dryRunIndex);
+    dryRunRequest.setDryRun(true);
+    return dryRunRequest;
+}
+
 Status processCollModCommand(OperationContext* opCtx,
                              const NamespaceStringOrUUID& nsOrUUID,
                              const CollMod& cmd,
+                             const CollectionAcquisition* acquisition,
                              BSONObjBuilder* result) {
-    return _collModInternal(opCtx, nsOrUUID, cmd, result, boost::none);
+    return _collModInternal(opCtx, nsOrUUID, cmd, acquisition, result, boost::none);
 }
 
 Status processCollModCommandForApplyOps(OperationContext* opCtx,
@@ -955,7 +1118,7 @@ Status processCollModCommandForApplyOps(OperationContext* opCtx,
                                         const CollMod& cmd,
                                         repl::OplogApplication::Mode mode) {
     BSONObjBuilder resultWeDontCareAbout;
-    return _collModInternal(opCtx, nsOrUUID, cmd, &resultWeDontCareAbout, mode);
+    return _collModInternal(opCtx, nsOrUUID, cmd, nullptr, &resultWeDontCareAbout, mode);
 }
 
 }  // namespace mongo

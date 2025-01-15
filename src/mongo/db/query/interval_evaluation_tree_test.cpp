@@ -27,10 +27,29 @@
  *    it in the license file.
  */
 
+#include <cstddef>
+#include <memory>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/interval_evaluation_tree.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 class IntervalEvaluationTreeTest : public unittest::Test {
@@ -45,7 +64,24 @@ public:
     void assertMany(const std::vector<std::pair<BSONObj, std::string>>& testCases) {
         for (const auto& [predicate, result] : testCases) {
             assertOne(predicate, result);
+            // Test on equality of the tree.
+            auto actualResultLhs = createIET(predicate);
+            auto actualResultRhs = createIET(predicate);
+
+            ASSERT_EQ(actualResultRhs, actualResultLhs);
         }
+    }
+
+    /**
+     * Creates an IET based on the predicate.
+     */
+    interval_evaluation_tree::IET createIET(const BSONObj& predicate) {
+        BSONObj obj = BSON("a" << predicate);
+        auto expr = parseMatchExpression(obj);
+        expr = MatchExpression::normalize(std::move(expr));
+        auto inputParamIdMap = MatchExpression::parameterize(expr.get());
+        BSONElement elt = obj.firstElement();
+        return build(expr.get(), elt, inputParamIdMap);
     }
 
     /**
@@ -59,7 +95,7 @@ public:
         auto inputParamIdMap = MatchExpression::parameterize(expr.get());
         BSONElement elt = obj.firstElement();
 
-        std::string actualResult = build(expr.get(), elt, inputParamIdMap);
+        std::string actualResult = buildStr(expr.get(), elt, inputParamIdMap);
 
         ASSERT_EQ(expectedResult, actualResult);
     }
@@ -67,11 +103,12 @@ public:
     /**
      * Takes a predicate represented in a match expression and builds an Interval Evaluation Tree.
      *
-     * Returns the built IET serialised as a string
+     * Returns the built IET.
      */
-    std::string build(const MatchExpression* expr,
-                      BSONElement elt,
-                      const std::vector<const MatchExpression*>& inputParamIdMap) const {
+    interval_evaluation_tree::IET build(
+        const MatchExpression* expr,
+        BSONElement elt,
+        const std::vector<const MatchExpression*>& inputParamIdMap) const {
         if (expr->matchType() == MatchExpression::AND) {
             return buildIntersect(
                 checked_cast<const AndMatchExpression*>(expr), elt, inputParamIdMap);
@@ -81,14 +118,26 @@ public:
     }
 
     /**
+     * Takes a predicate represented in a match expression and builds an Interval Evaluation Tree.
+     *
+     * Returns the built IET serialised as a string.
+     */
+    std::string buildStr(const MatchExpression* expr,
+                         BSONElement elt,
+                         const std::vector<const MatchExpression*>& inputParamIdMap) const {
+        return ietToString(build(expr, elt, inputParamIdMap));
+    }
+
+    /**
      * Takes a list of intersected predicates represented in an AND expression and builds an
      * Interval Evaluation Tree.
      *
-     * Returns the built IET serialised as a string
+     * Returns the built IET.
      */
-    std::string buildIntersect(const AndMatchExpression* expr,
-                               BSONElement elt,
-                               const std::vector<const MatchExpression*>& inputParamIdMap) const {
+    interval_evaluation_tree::IET buildIntersect(
+        const AndMatchExpression* expr,
+        BSONElement elt,
+        const std::vector<const MatchExpression*>& inputParamIdMap) const {
         OrderedIntervalList oil;
         IndexBoundsBuilder::BoundsTightness tightness;
         interval_evaluation_tree::Builder ietBuilder{};
@@ -103,39 +152,38 @@ public:
             }
         }
 
-        auto iet = ietBuilder.done();
-        ASSERT_TRUE(iet);
+        auto iet = ietBuilder.done().get();
 
         auto restoredOil =
-            interval_evaluation_tree::evaluateIntervals(*iet, inputParamIdMap, elt, _index);
+            interval_evaluation_tree::evaluateIntervals(iet, inputParamIdMap, elt, _index);
         ASSERT(oil == restoredOil);
 
-        return ietToString(*iet);
+        return iet;
     }
 
     /**
      * Takes a simple predicate represented in a match expression and builds an Interval Evaluation
      * Tree.
      *
-     * Returns the built IET serialised as a string
+     * Returns the built IET serialised as a string.
      */
-    std::string buildPredicate(const MatchExpression* expr,
-                               BSONElement elt,
-                               const std::vector<const MatchExpression*>& inputParamIdMap) const {
+    interval_evaluation_tree::IET buildPredicate(
+        const MatchExpression* expr,
+        BSONElement elt,
+        const std::vector<const MatchExpression*>& inputParamIdMap) const {
         OrderedIntervalList oil;
         IndexBoundsBuilder::BoundsTightness tightness;
         interval_evaluation_tree::Builder ietBuilder{};
 
         IndexBoundsBuilder::translate(expr, elt, _index, &oil, &tightness, &ietBuilder);
 
-        auto iet = ietBuilder.done();
-        ASSERT_TRUE(iet);
+        auto iet = ietBuilder.done().get();
 
         auto restoredOil =
-            interval_evaluation_tree::evaluateIntervals(*iet, inputParamIdMap, elt, _index);
+            interval_evaluation_tree::evaluateIntervals(iet, inputParamIdMap, elt, _index);
         ASSERT(oil == restoredOil);
 
-        return ietToString(*iet);
+        return iet;
     }
 
     static IndexEntry buildSimpleIndexEntry(const BSONObj& kp) {
@@ -200,9 +248,8 @@ TEST_F(IntervalEvaluationTreeTest, TranslateToConst) {
         {BSON("$in" << BSON_ARRAY(5 << 10 << BSON_ARRAY(11))),
          "(const [5, 5] [10, 10] [11, 11] [[ 11 ], [ 11 ]])"},
         {fromjson("{$in: [/alpha/i, 101]}"), "(const [101, 101] [\"\", {}) [/alpha/i, /alpha/i])"},
-        {BSON("$eq" << BSONNULL), "(const [undefined, undefined] [null, null])"},
-        {fromjson("{$not: {$in: [null, []]}}"),
-         "(const [MinKey, undefined) (null, []) ([], MaxKey])"},
+        {BSON("$eq" << BSONNULL), "(const [null, null])"},
+        {fromjson("{$not: {$in: [null, []]}}"), "(const [MinKey, null) (null, []) ([], MaxKey])"},
         {BSON("$type"
               << "array"),
          "(const [MinKey, MaxKey])"},
@@ -234,5 +281,22 @@ TEST_F(IntervalEvaluationTreeTest, Intersect) {
     };
 
     assertMany(testCases);
+}
+
+TEST_F(IntervalEvaluationTreeTest, InEquality) {
+    // Simple test.
+    auto actualResultLhs = createIET(BSON("$not" << BSON("$lt" << 10)));
+    auto actualResultRhs = createIET(BSON("$not" << BSON("$gt" << 11)));
+    ASSERT_NOT_EQUALS(actualResultLhs, actualResultRhs);
+
+    // Different operators.
+    actualResultLhs = createIET(BSON("$in" << BSON_ARRAY(5 << 10 << BSON_ARRAY(11))));
+    actualResultRhs = createIET(BSON("$mod" << BSON_ARRAY(2 << 3)));
+    ASSERT_NOT_EQUALS(actualResultRhs, actualResultLhs);
+
+    // Difference in the interval
+    actualResultLhs = createIET(BSON("$_internalExprEq" << 4));
+    actualResultRhs = createIET(BSON("$_internalExprGt" << 4));
+    ASSERT_NOT_EQUALS(actualResultRhs, actualResultLhs);
 }
 }  // namespace mongo

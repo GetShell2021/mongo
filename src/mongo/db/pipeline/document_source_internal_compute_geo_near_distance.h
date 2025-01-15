@@ -29,8 +29,28 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <s2cellid.h>
+#include <set>
+#include <string>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/geo/geometry_container.h"
+#include "mongo/db/geo/shapes.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 
@@ -60,6 +80,10 @@ public:
         return kStageName.rawData();
     }
 
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kInternalGeoNearDistance;
+    }
+
     StageConstraints constraints(Pipeline::SplitState pipeState) const override {
         StageConstraints result = {
             StreamType::kStreaming,
@@ -76,18 +100,17 @@ public:
     }
 
     DocumentSource::GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet,
-                std::set<std::string>{_distanceField.fullPath()},
-                {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{_distanceField.fullPath()}, {}};
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() override {
         return boost::none;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
 private:
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     GetNextResult doGetNext() override;
 

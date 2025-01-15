@@ -43,7 +43,6 @@ class test_timestamp06(wttest.WiredTigerTestCase, suite_subprocess):
     types = [
         ('col_fix', dict(empty=1, extra_config=',key_format=r,value_format=8t')),
         ('col_var', dict(empty=0, extra_config=',key_format=r')),
-        ('lsm', dict(empty=0, extra_config=',type=lsm')),
         ('row', dict(empty=0, extra_config='',)),
     ]
     ckpt = [
@@ -213,6 +212,3 @@ class test_timestamp06(wttest.WiredTigerTestCase, suite_subprocess):
         # stable timestamp with timestamped checkpoints.
         self.check(self.session, "", self.table_ts_log, dict((k, 3) for k in orig_keys))
         self.check(self.session, "", self.table_ts_nolog, dict((k, 2) for k in orig_keys))
-
-if __name__ == '__main__':
-    wttest.run()

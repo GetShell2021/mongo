@@ -29,10 +29,20 @@
 
 #include "mongo/s/transaction_router_resource_yielder.h"
 
-#include "mongo/db/session_catalog.h"
-#include "mongo/s/is_mongos.h"
+#include <string>
+
+
+#include "mongo/db/session/session.h"
+#include "mongo/db/session/session_catalog.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/s/session_catalog_router.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 namespace mongo {
 
@@ -47,7 +57,7 @@ TransactionRouterResourceYielder::makeForLocalHandoff() {
 
 std::unique_ptr<TransactionRouterResourceYielder>
 TransactionRouterResourceYielder::makeForRemoteCommand() {
-    if (isMongos()) {
+    if (serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer)) {
         // Mongos cannot target itself so it does not need to yield for remote commands.
         return nullptr;
     }
@@ -57,6 +67,11 @@ TransactionRouterResourceYielder::makeForRemoteCommand() {
 void TransactionRouterResourceYielder::yield(OperationContext* opCtx) {
     Session* const session = OperationContextSession::get(opCtx);
     if (session) {
+        LOGV2_DEBUG(6753700,
+                    5,
+                    "TransactionRouterResourceYielder yielding",
+                    "lsid"_attr = opCtx->getLogicalSessionId(),
+                    "txnNumber"_attr = opCtx->getTxnNumber());
         RouterOperationContextSession::checkIn(opCtx,
                                                OperationContextSession::CheckInReason::kYield);
     }
@@ -66,6 +81,11 @@ void TransactionRouterResourceYielder::yield(OperationContext* opCtx) {
 void TransactionRouterResourceYielder::unyield(OperationContext* opCtx) {
     if (_yielded) {
         hangBeforeUnyieldingTransactionRouter.pauseWhileSet();
+        LOGV2_DEBUG(6753701,
+                    5,
+                    "TransactionRouterResourceYielder unyielding",
+                    "lsid"_attr = opCtx->getLogicalSessionId(),
+                    "txnNumber"_attr = opCtx->getTxnNumber());
 
         // Code that uses the TransactionRouter assumes it will only run with it, so check back out
         // the session ignoring interruptions, except at global shutdown to prevent stalling

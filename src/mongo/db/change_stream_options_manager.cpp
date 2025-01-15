@@ -28,11 +28,33 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <variant>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/change_stream_options_manager.h"
 #include "mongo/db/change_stream_options_parameter_gen.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/change_stream_serverless_helpers.h"
+#include "mongo/db/client.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -56,38 +78,35 @@ void ChangeStreamOptionsManager::create(ServiceContext* service) {
     getChangeStreamOptionsManager(service).emplace(service);
 }
 
-const ChangeStreamOptions& ChangeStreamOptionsManager::getOptions(OperationContext* opCtx) {
-    stdx::lock_guard<Latch> L(_mutex);
+ChangeStreamOptions ChangeStreamOptionsManager::getOptions(OperationContext* opCtx) const {
+    stdx::lock_guard<stdx::mutex> L(_mutex);
     return _changeStreamOptions;
 }
 
 StatusWith<ChangeStreamOptions> ChangeStreamOptionsManager::setOptions(
     OperationContext* opCtx, ChangeStreamOptions optionsToSet) {
-    stdx::lock_guard<Latch> L(_mutex);
+    stdx::lock_guard<stdx::mutex> L(_mutex);
     _changeStreamOptions = std::move(optionsToSet);
     return _changeStreamOptions;
 }
 
 void ChangeStreamOptionsParameter::append(OperationContext* opCtx,
-                                          BSONObjBuilder& bob,
-                                          const std::string& name) {
+                                          BSONObjBuilder* bob,
+                                          StringData name,
+                                          const boost::optional<TenantId>& tenantId) {
     ChangeStreamOptionsManager& changeStreamOptionsManager =
         ChangeStreamOptionsManager::get(getGlobalServiceContext());
-    bob.append("_id"_sd, name);
-    bob.appendElementsUnique(changeStreamOptionsManager.getOptions(opCtx).toBSON());
+    bob->append("_id"_sd, name);
+    bob->appendElementsUnique(changeStreamOptionsManager.getOptions(opCtx).toBSON());
 }
 
-Status ChangeStreamOptionsParameter::set(const BSONElement& newValueElement) {
+Status ChangeStreamOptionsParameter::set(const BSONElement& newValueElement,
+                                         const boost::optional<TenantId>& tenantId) {
     try {
-        Status validateStatus = validate(newValueElement);
-        if (!validateStatus.isOK()) {
-            return validateStatus;
-        }
-
         ChangeStreamOptionsManager& changeStreamOptionsManager =
             ChangeStreamOptionsManager::get(getGlobalServiceContext());
         ChangeStreamOptions newOptions = ChangeStreamOptions::parse(
-            IDLParserErrorContext("changeStreamOptions"), newValueElement.Obj());
+            IDLParserContext("changeStreamOptions"), newValueElement.Obj());
 
         return changeStreamOptionsManager
             .setOptions(Client::getCurrent()->getOperationContext(), newOptions)
@@ -97,7 +116,8 @@ Status ChangeStreamOptionsParameter::set(const BSONElement& newValueElement) {
     }
 }
 
-Status ChangeStreamOptionsParameter::validate(const BSONElement& newValueElement) const {
+Status ChangeStreamOptionsParameter::validate(const BSONElement& newValueElement,
+                                              const boost::optional<TenantId>& tenantId) const {
     try {
         BSONObj changeStreamOptionsObj = newValueElement.Obj();
         Status validateStatus = Status::OK();
@@ -106,7 +126,7 @@ Status ChangeStreamOptionsParameter::validate(const BSONElement& newValueElement
         // default- initialized to 'off'. This is useful for parameter initialization at startup but
         // causes the IDL parser to not enforce the presence of `expireAfterSeconds` in BSON
         // representations. We assert that and the existence of PreAndPostImages here.
-        IDLParserErrorContext ctxt = IDLParserErrorContext("changeStreamOptions"_sd);
+        IDLParserContext ctxt = IDLParserContext("changeStreamOptions"_sd);
         if (auto preAndPostImagesObj = changeStreamOptionsObj["preAndPostImages"_sd];
             !preAndPostImagesObj.eoo()) {
             if (preAndPostImagesObj["expireAfterSeconds"_sd].eoo()) {
@@ -118,24 +138,31 @@ Status ChangeStreamOptionsParameter::validate(const BSONElement& newValueElement
 
         ChangeStreamOptions newOptions = ChangeStreamOptions::parse(ctxt, changeStreamOptionsObj);
         auto preAndPostImages = newOptions.getPreAndPostImages();
-        stdx::visit(
-            visit_helper::Overloaded{
-                [&](const std::string& expireAfterSeconds) {
-                    if (expireAfterSeconds != "off"_sd) {
-                        validateStatus = {
-                            ErrorCodes::BadValue,
-                            "Non-numeric value of 'expireAfterSeconds' should be 'off'"};
-                    }
-                },
-                [&](const std::int64_t& expireAfterSeconds) {
-                    if (expireAfterSeconds <= 0) {
-                        validateStatus = {
-                            ErrorCodes::BadValue,
-                            "Numeric value of 'expireAfterSeconds' should be positive"};
-                    }
-                },
-            },
-            preAndPostImages.getExpireAfterSeconds());
+        visit(OverloadedVisitor{
+                  [&](const std::string& expireAfterSeconds) {
+                      if (expireAfterSeconds != "off"_sd) {
+                          validateStatus = {
+                              ErrorCodes::BadValue,
+                              "Non-numeric value of 'expireAfterSeconds' should be 'off'"};
+                      }
+                  },
+                  [&](const std::int64_t& expireAfterSeconds) {
+                      if (change_stream_serverless_helpers::isServerlessEnvironment()) {
+                          validateStatus = {
+                              ErrorCodes::CommandNotSupported,
+                              "The 'changeStreamOptions.preAndPostImages.expireAfterSeconds' is "
+                              "unsupported in serverless, consider using "
+                              "'changeStreams.expireAfterSeconds' instead."};
+                          return;
+                      }
+                      if (expireAfterSeconds <= 0) {
+                          validateStatus = {
+                              ErrorCodes::BadValue,
+                              "Numeric value of 'expireAfterSeconds' should be positive"};
+                      }
+                  },
+              },
+              preAndPostImages.getExpireAfterSeconds());
 
         return validateStatus;
     } catch (const AssertionException& ex) {
@@ -144,7 +171,7 @@ Status ChangeStreamOptionsParameter::validate(const BSONElement& newValueElement
     }
 }
 
-Status ChangeStreamOptionsParameter::reset() {
+Status ChangeStreamOptionsParameter::reset(const boost::optional<TenantId>& tenantId) {
     // Replace the current changeStreamOptions with a default-constructed one, which should
     // automatically set preAndPostImages.expirationSeconds to 'off' by default.
     ChangeStreamOptionsManager& changeStreamOptionsManager =
@@ -154,7 +181,8 @@ Status ChangeStreamOptionsParameter::reset() {
         .getStatus();
 }
 
-LogicalTime ChangeStreamOptionsParameter::getClusterParameterTime() const {
+LogicalTime ChangeStreamOptionsParameter::getClusterParameterTime(
+    const boost::optional<TenantId>& tenantId) const {
     ChangeStreamOptionsManager& changeStreamOptionsManager =
         ChangeStreamOptionsManager::get(getGlobalServiceContext());
     return changeStreamOptionsManager.getClusterParameterTime();

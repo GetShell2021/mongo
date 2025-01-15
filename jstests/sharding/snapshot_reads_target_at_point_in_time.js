@@ -6,11 +6,8 @@
 //   uses_multi_shard_transaction,
 //   uses_transactions,
 // ]
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 function expectChunks(st, ns, chunks) {
     for (let i = 0; i < chunks.length; i++) {
@@ -28,7 +25,6 @@ const ns = dbName + '.' + collName;
 const st = new ShardingTest({
     shards: 3,
     mongos: 1,
-    config: 1,
     other: {
         rs0: {nodes: 2},
         rs1: {nodes: 2},
@@ -47,14 +43,12 @@ const st = new ShardingTest({
 });
 
 // Set up one sharded collection with 2 chunks, both on the primary shard.
-
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(
     st.s.getDB(dbName)[collName].insert({_id: -5}, {writeConcern: {w: "majority"}}));
 assert.commandWorked(
     st.s.getDB(dbName)[collName].insert({_id: 5}, {writeConcern: {w: "majority"}}));
-
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
@@ -120,11 +114,12 @@ function runTest(testCase, testMode, readPreferenceMode) {
             db = st.s.getDB(dbName);
             targetChunk1Cmd.readConcern = targetChunk2Cmd.readConcern = {level: "snapshot"};
             break;
-        case TestMode.SNAPSHOT_AT_CLUSTER_TIME:
+        case TestMode.SNAPSHOT_AT_CLUSTER_TIME: {
             db = st.s.getDB(dbName);
             const opTime = st.s.getDB(dbName).runCommand({ping: 1}).operationTime;
             targetChunk1Cmd.readConcern = {level: "snapshot", atClusterTime: opTime};
             break;
+        }
     }
 
     // Establish a read timestamp.
@@ -206,4 +201,3 @@ for (let testCase of kCommandTestCases) {
     }
 }
 st.stop();
-})();

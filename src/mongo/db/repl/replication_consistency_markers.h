@@ -29,11 +29,17 @@
 
 #pragma once
 
-#include "mongo/db/namespace_string.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/repl/optime.h"
 
 namespace mongo {
 
 class BSONObj;
+
 class OperationContext;
 class Timestamp;
 
@@ -121,34 +127,6 @@ public:
      * journaling/checkpointing).
      */
     virtual void clearInitialSyncFlag(OperationContext* opCtx) = 0;
-
-    // -------- MinValid ----------
-
-    /**
-     * The minValid value is the earliest (minimum) OpTime that must be applied in order to
-     * consider the dataset consistent.
-     *   - This is set to the end of a batch before we begin applying a batch of oplog entries
-     *     since the oplog entries can be applied out of order.
-     *   - This is also set during rollback so we do not exit RECOVERING until we are consistent.
-     * If we crash while applying a batch, we apply from appliedThrough to minValid in order
-     * to be consistent. We may re-apply operations, but this is safe.
-     *
-     * Returns the minValid OpTime.
-     */
-    virtual OpTime getMinValid(OperationContext* opCtx) const = 0;
-
-    /**
-     * Sets the minValid OpTime to 'minValid'. This can set minValid backwards, which is necessary
-     * in rollback when the OpTimes in the oplog may move backwards. We usually only call this
-     * function in rollback via refetch, so we need to check the storage engine's rollback method to
-     * enforce that via an invariant. However, there are exceptions where we need to set the
-     * minValid document outside of rollback with an untimestamped write. In that case, we can
-     * ignore the storage engine's rollback method by setting the 'alwaysAllowUntimestampedWrite'
-     * parameter to true.
-     */
-    virtual void setMinValid(OperationContext* opCtx,
-                             const OpTime& minValid,
-                             bool alwaysAllowUntimestampedWrite = false) = 0;
 
     // -------- Oplog Truncate After Point ----------
 

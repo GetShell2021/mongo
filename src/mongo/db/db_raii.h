@@ -29,10 +29,33 @@
 
 #pragma once
 
+#include <absl/container/inlined_vector.h>
+#include <boost/container/flat_set.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <set>
 #include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/collection_type.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/stats/top.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/views/view.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
+#include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -70,7 +93,10 @@ public:
                      LogMode logMode,
                      int dbProfilingLevel,
                      Date_t deadline = Date_t::max(),
-                     const std::vector<NamespaceStringOrUUID>& secondaryNssVector = {});
+                     boost::optional<std::vector<NamespaceStringOrUUID>::const_iterator>
+                         secondaryNssVectorBegin = boost::none,
+                     boost::optional<std::vector<NamespaceStringOrUUID>::const_iterator>
+                         secondaryNssVectorEnd = boost::none);
 
     /**
      * Records stats about the current operation via Top, if 'logMode' is 'kUpdateTop' or
@@ -82,135 +108,29 @@ private:
     OperationContext* _opCtx;
     Top::LockType _lockType;
     const LogMode _logMode;
-    std::set<NamespaceString> _nssSet;
+    boost::container::flat_set<NamespaceString,
+                               std::less<NamespaceString>,
+                               absl::InlinedVector<NamespaceString, 1>>
+        _nssSet;
 };
 
 /**
- * Shared base class for AutoGetCollectionForRead and AutoGetCollectionForReadLockFree.
- * Do not use directly.
- */
-template <typename AutoGetCollectionType, typename EmplaceAutoGetCollectionFunc>
-class AutoGetCollectionForReadBase {
-    AutoGetCollectionForReadBase(const AutoGetCollectionForReadBase&) = delete;
-    AutoGetCollectionForReadBase& operator=(const AutoGetCollectionForReadBase&) = delete;
-
-public:
-    AutoGetCollectionForReadBase(OperationContext* opCtx,
-                                 const EmplaceAutoGetCollectionFunc& emplaceAutoColl,
-                                 bool isLockFreeReadSubOperation = false);
-
-    explicit operator bool() const {
-        return static_cast<bool>(getCollection());
-    }
-
-    const Collection* operator->() const {
-        return getCollection().get();
-    }
-
-    const CollectionPtr& operator*() const {
-        return getCollection();
-    }
-
-    const CollectionPtr& getCollection() const {
-        return _autoColl->getCollection();
-    }
-
-    const ViewDefinition* getView() const {
-        return _autoColl->getView();
-    }
-
-    const NamespaceString& getNss() const {
-        return _autoColl->getNss();
-    }
-
-protected:
-    // If this field is set, the reader will not take the ParallelBatchWriterMode lock and conflict
-    // with secondary batch application. This stays in scope with the _autoColl so that locks are
-    // taken and released in the right order.
-    boost::optional<ShouldNotConflictWithSecondaryBatchApplicationBlock>
-        _shouldNotConflictWithSecondaryBatchApplicationBlock;
-
-    // This field is optional, because the code to wait for majority committed snapshot needs to
-    // release locks in order to block waiting
-    boost::optional<AutoGetCollectionType> _autoColl;
-};
-
-/**
- * Helper for AutoGetCollectionForRead below. Contains implementation on how contained
- * AutoGetCollection is instantiated by AutoGetCollectionForReadBase.
- */
-class EmplaceAutoGetCollectionForRead {
-public:
-    EmplaceAutoGetCollectionForRead(OperationContext* opCtx,
-                                    const NamespaceStringOrUUID& nsOrUUID,
-                                    AutoGetCollectionViewMode viewMode,
-                                    Date_t deadline,
-                                    const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs);
-
-    void emplace(boost::optional<AutoGetCollection>& autoColl) const;
-
-private:
-    OperationContext* _opCtx;
-    const NamespaceStringOrUUID& _nsOrUUID;
-    AutoGetCollectionViewMode _viewMode;
-    Date_t _deadline;
-    LockMode _collectionLockMode;
-    const std::vector<NamespaceStringOrUUID> _secondaryNssOrUUIDs;
-};
-
-/**
- * Same as calling AutoGetCollection with MODE_IS, but in addition ensures that the read will be
- * performed against an appropriately committed snapshot if the operation is using a readConcern of
- * 'majority'.
+ * Locked version of AutoGetCollectionForRead for setting up an operation for read that ensured that
+ * the read will be performed against an appropriately committed snapshot if the operation is using
+ * a readConcern of 'majority'.
  *
  * Use this when you want to read the contents of a collection, but you are not at the top-level of
  * some command. This will ensure your reads obey any requested readConcern, but will not update the
  * status of CurrentOp, or add a Top entry.
  *
- * Any collections specified in 'secondaryNssOrUUIDs' will be checked that their minimum visible
- * timestamp supports read concern, throwing a SnapshotUnavailable on error. Additional collection
- * and/or database locks will be acquired for 'secondaryNssOrUUIDs' namespaces.
- *
- * NOTE: Must not be used with any locks held, because it needs to block waiting on the committed
- * snapshot to become available, and can potentially release and reacquire locks.
+ * Additional collection and/or database locks will be acquired for 'secondaryNssOrUUIDs'
+ * namespaces.
  */
-class AutoGetCollectionForRead
-    : public AutoGetCollectionForReadBase<AutoGetCollection, EmplaceAutoGetCollectionForRead> {
+class AutoGetCollectionForRead {
 public:
-    AutoGetCollectionForRead(
-        OperationContext* opCtx,
-        const NamespaceStringOrUUID& nsOrUUID,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max(),
-        const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs = {});
-
-    /**
-     * Indicates whether any namespace in 'secondaryNssOrUUIDs' is a view or sharded.
-     *
-     * The secondary namespaces won't be checked if getCollection() returns nullptr.
-     */
-    bool isAnySecondaryNamespaceAViewOrSharded() const {
-        return _secondaryNssIsAViewOrSharded;
-    }
-
-private:
-    // Tracks whether any secondary collection namespaces is a view or sharded.
-    bool _secondaryNssIsAViewOrSharded = false;
-};
-
-/**
- * Same as AutoGetCollectionForRead above except does not take collection, database or rstl locks.
- * Takes the global lock and may take the PBWM, same as AutoGetCollectionForRead. Ensures a
- * consistent in-memory and on-disk view of the storage catalog.
- */
-class AutoGetCollectionForReadLockFree {
-public:
-    AutoGetCollectionForReadLockFree(
-        OperationContext* opCtx,
-        const NamespaceStringOrUUID& nsOrUUID,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max(),
-        const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs = {});
+    AutoGetCollectionForRead(OperationContext* opCtx,
+                             const NamespaceStringOrUUID& nsOrUUID,
+                             const AutoGetCollection::Options& = {});
 
     explicit operator bool() const {
         return static_cast<bool>(getCollection());
@@ -224,63 +144,107 @@ public:
         return getCollection();
     }
 
-    const CollectionPtr& getCollection() const {
-        return _autoGetCollectionForReadBase->getCollection();
-    }
+    const CollectionPtr& getCollection() const;
+    const ViewDefinition* getView() const;
+    const NamespaceString& getNss() const;
 
-    const ViewDefinition* getView() const {
-        return _autoGetCollectionForReadBase->getView();
-    }
-
-    const NamespaceString& getNss() const {
-        return _autoGetCollectionForReadBase->getNss();
-    }
-
-    /**
-     * Indicates whether any namespace in 'secondaryNssOrUUIDs' is a view or sharded.
-     *
-     * The secondary namespaces won't be checked if getCollection() returns nullptr.
-     */
-    bool isAnySecondaryNamespaceAViewOrSharded() const {
-        return _secondaryNssIsAViewOrSharded;
+    bool isAnySecondaryNamespaceAView() const {
+        return _isAnySecondaryNamespaceAView;
     }
 
 private:
-    /**
-     * Helper for how AutoGetCollectionForReadBase instantiates its owned AutoGetCollectionLockFree.
-     */
-    class EmplaceHelper {
-    public:
-        EmplaceHelper(OperationContext* opCtx,
-                      CollectionCatalogStasher& catalogStasher,
-                      const NamespaceStringOrUUID& nsOrUUID,
-                      AutoGetCollectionViewMode viewMode,
-                      Date_t deadline,
-                      bool isLockFreeReadSubOperation);
+    // Ordering matters, the _collLocks should destruct before the _autoGetDb releases the
+    // rstl/global/database locks.
+    AutoGetDb _autoDb;
+    std::vector<CollectionNamespaceOrUUIDLock> _collLocks;
 
-        void emplace(boost::optional<AutoGetCollectionLockFree>& autoColl) const;
+    CollectionPtr _coll;
+    std::shared_ptr<const ViewDefinition> _view;
 
-    private:
-        OperationContext* _opCtx;
-        CollectionCatalogStasher& _catalogStasher;
-        const NamespaceStringOrUUID& _nsOrUUID;
-        AutoGetCollectionViewMode _viewMode;
-        Date_t _deadline;
+    // If the object was instantiated with a UUID, contains the resolved namespace, otherwise it is
+    // the same as the input namespace string
+    NamespaceString _resolvedNss;
 
-        // Set to true if the lock helper using this EmplaceHelper is nested under another lock-free
-        // helper.
-        bool _isLockFreeReadSubOperation;
-    };
+    // Tracks whether any secondary collection namespaces is a view.
+    bool _isAnySecondaryNamespaceAView = false;
+};
 
-    // Tracks whether any secondary collection namespaces is a view or sharded.
-    bool _secondaryNssIsAViewOrSharded = false;
+/**
+ * Same as AutoGetCollectionForRead above except does not take collection, database or rstl locks.
+ * Takes the global lock, same as AutoGetCollectionForRead. Ensures a consistent in-memory and
+ * on-disk view of the storage catalog.
+ *
+ * This implementation uses the point-in-time (PIT) catalog.
+ */
+class AutoGetCollectionForReadLockFree final {
+public:
+    AutoGetCollectionForReadLockFree(OperationContext* opCtx,
+                                     NamespaceStringOrUUID nsOrUUID,
+                                     AutoGetCollection::Options options = {});
 
-    // The CollectionCatalogStasher must outlive the LockFreeReadsBlock in the AutoGet* below.
-    // ~LockFreeReadsBlock clears a flag that the ~CollectionCatalogStasher checks.
-    CollectionCatalogStasher _catalogStash;
+    const CollectionPtr& getCollection() const {
+        return _collectionPtr;
+    }
 
-    boost::optional<AutoGetCollectionForReadBase<AutoGetCollectionLockFree, EmplaceHelper>>
-        _autoGetCollectionForReadBase;
+    const ViewDefinition* getView() const {
+        return _view.get();
+    }
+
+    const NamespaceString& getNss() const {
+        return _resolvedNss;
+    }
+
+    bool isAnySecondaryNamespaceAView() const {
+        return _isAnySecondaryNamespaceAView;
+    }
+
+private:
+    const Collection* _restoreFromYield(OperationContext* opCtx,
+                                        boost::optional<UUID> optUuid,
+                                        bool hasSecondaryNamespaces);
+
+    // Whether or not this AutoGetCollectionForReadLockFree is being constructed while
+    // there's already a lock-free read in progress.
+    bool _isLockFreeReadSubOperation;
+
+    // Increments a counter on the OperationContext for the number of lock-free reads when
+    // constructed, and decrements on destruction.
+    //
+    // Doesn't change after construction, but only set if it's a collection and not a view.
+    boost::optional<LockFreeReadsBlock> _lockFreeReadsBlock;
+
+    // This must be constructed after LockFreeReadsBlock since LockFreeReadsBlock sets a flag that
+    // GlobalLock uses in its constructor.
+    Lock::GlobalLock _globalLock;
+
+    // Holds the collection that was acquired from the catalog and logic for refetching the
+    // collection state from the catalog when restoring from yield.
+    //
+    // Doesn't change after construction.
+    CollectionPtr _collectionPtr;
+
+    // Tracks whether any secondary collection namespace is a view. Note that this should not change
+    // after construction because even during a yield, it is not possible for a regular collection
+    // to become a view.
+    bool _isAnySecondaryNamespaceAView{false};
+
+    // If the object was instantiated with a UUID, contains the resolved namespace, otherwise it is
+    // the same as the input namespace string.
+    //
+    // May change after construction, when restoring from yield.
+    NamespaceString _resolvedNss;
+
+    // Holds a copy of '_resolvedNss.dbName()'. Unlike '_resolvedNss', this field does _not_ change
+    // after construction.
+    DatabaseName _resolvedDbName;
+
+    // Only set if _collectionPtr does not contain a nullptr and if the requested namespace is a
+    // view.
+    //
+    // May change after construction, when restoring from yield.
+    std::shared_ptr<const ViewDefinition> _view;
+
+    AutoGetCollection::Options _options;
 };
 
 /**
@@ -289,12 +253,9 @@ private:
  */
 class AutoGetCollectionForReadMaybeLockFree {
 public:
-    AutoGetCollectionForReadMaybeLockFree(
-        OperationContext* opCtx,
-        const NamespaceStringOrUUID& nsOrUUID,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max(),
-        const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs = {});
+    AutoGetCollectionForReadMaybeLockFree(OperationContext* opCtx,
+                                          const NamespaceStringOrUUID& nsOrUUID,
+                                          AutoGetCollection::Options options = {});
 
     /**
      * Passthrough functions to either _autoGet or _autoGetLockFree.
@@ -311,7 +272,7 @@ public:
     const CollectionPtr& getCollection() const;
     const ViewDefinition* getView() const;
     const NamespaceString& getNss() const;
-    bool isAnySecondaryNamespaceAViewOrSharded() const;
+    bool isAnySecondaryNamespaceAView() const;
 
 private:
     boost::optional<AutoGetCollectionForRead> _autoGet;
@@ -332,10 +293,8 @@ public:
     AutoGetCollectionForReadCommandBase(
         OperationContext* opCtx,
         const NamespaceStringOrUUID& nsOrUUID,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max(),
-        AutoStatsTracker::LogMode logMode = AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-        const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs = {});
+        const AutoGetCollection::Options& options = {},
+        AutoStatsTracker::LogMode logMode = AutoStatsTracker::LogMode::kUpdateTopAndCurOp);
 
     explicit operator bool() const {
         return static_cast<bool>(getCollection());
@@ -361,13 +320,13 @@ public:
         return _autoCollForRead.getNss();
     }
 
-    bool isAnySecondaryNamespaceAViewOrSharded() const {
-        return _autoCollForRead.isAnySecondaryNamespaceAViewOrSharded();
+    bool isAnySecondaryNamespaceAView() const {
+        return _autoCollForRead.isAnySecondaryNamespaceAView();
     }
 
 protected:
+    boost::optional<AutoStatsTracker> _statsTracker;
     AutoGetCollectionForReadType _autoCollForRead;
-    AutoStatsTracker _statsTracker;
 };
 
 /**
@@ -380,26 +339,23 @@ public:
     AutoGetCollectionForReadCommand(
         OperationContext* opCtx,
         const NamespaceStringOrUUID& nsOrUUID,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max(),
-        AutoStatsTracker::LogMode logMode = AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-        const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs = {})
-        : AutoGetCollectionForReadCommandBase(
-              opCtx, nsOrUUID, viewMode, deadline, logMode, secondaryNssOrUUIDs) {}
+        AutoGetCollection::Options options = {},
+        AutoStatsTracker::LogMode logMode = AutoStatsTracker::LogMode::kUpdateTopAndCurOp)
+        : AutoGetCollectionForReadCommandBase(opCtx, nsOrUUID, std::move(options), logMode) {}
 };
 
 /**
  * Same as AutoGetCollectionForReadCommand except no collection, database or RSTL lock is taken.
  */
-class AutoGetCollectionForReadCommandLockFree {
+class AutoGetCollectionForReadCommandLockFree
+    : public AutoGetCollectionForReadCommandBase<AutoGetCollectionForReadLockFree> {
 public:
     AutoGetCollectionForReadCommandLockFree(
         OperationContext* opCtx,
         const NamespaceStringOrUUID& nsOrUUID,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max(),
-        AutoStatsTracker::LogMode logMode = AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-        const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs = {});
+        AutoGetCollection::Options options = {},
+        AutoStatsTracker::LogMode logMode = AutoStatsTracker::LogMode::kUpdateTopAndCurOp)
+        : AutoGetCollectionForReadCommandBase(opCtx, nsOrUUID, options, logMode) {}
 
     explicit operator bool() const {
         return static_cast<bool>(getCollection());
@@ -412,26 +368,6 @@ public:
     const CollectionPtr& operator*() const {
         return getCollection();
     }
-
-    const CollectionPtr& getCollection() const {
-        return _autoCollForReadCommandBase->getCollection();
-    }
-
-    const ViewDefinition* getView() const {
-        return _autoCollForReadCommandBase->getView();
-    }
-
-    const NamespaceString& getNss() const {
-        return _autoCollForReadCommandBase->getNss();
-    }
-
-    bool isAnySecondaryNamespaceAViewOrSharded() const {
-        return _autoCollForReadCommandBase->isAnySecondaryNamespaceAViewOrSharded();
-    }
-
-private:
-    boost::optional<AutoGetCollectionForReadCommandBase<AutoGetCollectionForReadLockFree>>
-        _autoCollForReadCommandBase;
 };
 
 /**
@@ -444,10 +380,8 @@ public:
     AutoGetCollectionForReadCommandMaybeLockFree(
         OperationContext* opCtx,
         const NamespaceStringOrUUID& nsOrUUID,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max(),
-        AutoStatsTracker::LogMode logMode = AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-        const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs = {});
+        AutoGetCollection::Options options = {},
+        AutoStatsTracker::LogMode logMode = AutoStatsTracker::LogMode::kUpdateTopAndCurOp);
 
     /**
      * Passthrough function to either _autoGet or _autoGetLockFree.
@@ -462,9 +396,10 @@ public:
         return getCollection();
     }
     const CollectionPtr& getCollection() const;
+    query_shape::CollectionType getCollectionType() const;
     const ViewDefinition* getView() const;
     const NamespaceString& getNss() const;
-    bool isAnySecondaryNamespaceAViewOrSharded() const;
+    bool isAnySecondaryNamespaceAView() const;
 
 private:
     boost::optional<AutoGetCollectionForReadCommand> _autoGet;
@@ -480,10 +415,6 @@ public:
     AutoReadLockFree(OperationContext* opCtx, Date_t deadline = Date_t::max());
 
 private:
-    // The CollectionCatalogStasher must outlive the LockFreeReadsBlock below. ~LockFreeReadsBlock
-    // clears a flag that the ~CollectionCatalogStasher checks.
-    CollectionCatalogStasher _catalogStash;
-
     // Sets a flag on the opCtx to inform subsequent code that the operation is running lock-free.
     LockFreeReadsBlock _lockFreeReadsBlock;
 
@@ -503,14 +434,10 @@ private:
 class AutoGetDbForReadLockFree {
 public:
     AutoGetDbForReadLockFree(OperationContext* opCtx,
-                             StringData dbName,
+                             const DatabaseName& dbName,
                              Date_t deadline = Date_t::max());
 
 private:
-    // The CollectionCatalogStasher must outlive the LockFreeReadsBlock below. ~LockFreeReadsBlock
-    // clears a flag that the ~CollectionCatalogStasher checks.
-    CollectionCatalogStasher _catalogStash;
-
     // Sets a flag on the opCtx to inform subsequent code that the operation is running lock-free.
     LockFreeReadsBlock _lockFreeReadsBlock;
 
@@ -524,7 +451,7 @@ private:
 class AutoGetDbForReadMaybeLockFree {
 public:
     AutoGetDbForReadMaybeLockFree(OperationContext* opCtx,
-                                  StringData dbName,
+                                  const DatabaseName& dbName,
                                   Date_t deadline = Date_t::max());
 
 private:
@@ -541,7 +468,7 @@ class OldClientContext {
     OldClientContext& operator=(const OldClientContext&) = delete;
 
 public:
-    OldClientContext(OperationContext* opCtx, const std::string& ns, bool doVersion = true);
+    OldClientContext(OperationContext* opCtx, const NamespaceString& nss, bool doVersion = true);
     ~OldClientContext();
 
     Database* db() const {
@@ -569,7 +496,7 @@ private:
  * lock otherwise. MODE_IX acquisition will allow a read to participate in two-phase locking.
  * Throws an exception if 'system.views' is being queried within a transaction.
  */
-LockMode getLockModeForQuery(OperationContext* opCtx, const boost::optional<NamespaceString>& nss);
+LockMode getLockModeForQuery(OperationContext* opCtx, const NamespaceStringOrUUID& nssOrUUID);
 
 /**
  * When in scope, enforces prepare conflicts in the storage engine. Reads and writes in this scope
@@ -579,11 +506,13 @@ LockMode getLockModeForQuery(OperationContext* opCtx, const boost::optional<Name
 class EnforcePrepareConflictsBlock {
 public:
     explicit EnforcePrepareConflictsBlock(OperationContext* opCtx)
-        : _opCtx(opCtx), _originalValue(opCtx->recoveryUnit()->getPrepareConflictBehavior()) {
+        : _opCtx(opCtx),
+          _originalValue(shard_role_details::getRecoveryUnit(opCtx)->getPrepareConflictBehavior()) {
         // It is illegal to call setPrepareConflictBehavior() while any storage transaction is
         // active. setPrepareConflictBehavior() invariants that there is no active storage
         // transaction.
-        _opCtx->recoveryUnit()->setPrepareConflictBehavior(PrepareConflictBehavior::kEnforce);
+        shard_role_details::getRecoveryUnit(_opCtx)->setPrepareConflictBehavior(
+            PrepareConflictBehavior::kEnforce);
     }
 
     ~EnforcePrepareConflictsBlock() {
@@ -593,14 +522,14 @@ public:
         // to call abandonSnapshot() to close any open transactions on destruction. Any reads or
         // writes should have already completed as we are exiting the scope. Therefore, this call is
         // safe.
-        if (_opCtx->lockState()->isLocked()) {
-            _opCtx->recoveryUnit()->abandonSnapshot();
+        if (shard_role_details::getLocker(_opCtx)->isLocked()) {
+            shard_role_details::getRecoveryUnit(_opCtx)->abandonSnapshot();
         }
         // It is illegal to call setPrepareConflictBehavior() while any storage transaction is
         // active. There should not be any active transaction if we are not holding locks. If locks
         // are still being held, the above abandonSnapshot() call should have already closed all
         // storage transactions.
-        _opCtx->recoveryUnit()->setPrepareConflictBehavior(_originalValue);
+        shard_role_details::getRecoveryUnit(_opCtx)->setPrepareConflictBehavior(_originalValue);
     }
 
 private:
@@ -608,19 +537,9 @@ private:
     PrepareConflictBehavior _originalValue;
 };
 
-/**
- * TODO: SERVER-44105 remove
- * RAII type for letting secondary reads to block behind the PBW lock.
- * Note: Do not add additional usage. This is only temporary for ease of backport.
- */
-struct BlockSecondaryReadsDuringBatchApplication_DONT_USE {
-public:
-    BlockSecondaryReadsDuringBatchApplication_DONT_USE(OperationContext* opCtx);
-    ~BlockSecondaryReadsDuringBatchApplication_DONT_USE();
-
-private:
-    OperationContext* _opCtx{nullptr};
-    boost::optional<bool> _originalSettings;
-};
-
+// Asserts whether the read concern is supported for the given collection with the specified read
+// source.
+void assertReadConcernSupported(const CollectionPtr& coll,
+                                const repl::ReadConcernArgs& readConcernArgs,
+                                const RecoveryUnit::ReadSource& readSource);
 }  // namespace mongo

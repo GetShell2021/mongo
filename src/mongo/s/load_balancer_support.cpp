@@ -28,23 +28,32 @@
  */
 #include "mongo/s/load_balancer_support.h"
 
+#include <boost/move/utility_core.hpp>
 #include <memory>
+#include <string>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/hello_gen.h"
 #include "mongo/db/service_context.h"
-#include "mongo/s/load_balancer_feature_flag_gen.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/s/mongos_server_parameters_gen.h"
+#include "mongo/transport/session.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo::load_balancer_support {
 namespace {
 
-MONGO_FAIL_POINT_DEFINE(clientIsFromLoadBalancer);
+MONGO_FAIL_POINT_DEFINE(loadBalancerSupportClientIsFromLoadBalancer);
 
 struct PerService {
     /**
@@ -58,10 +67,6 @@ struct PerService {
 class PerClient {
 public:
     bool isFromLoadBalancer() const;
-
-    void setIsFromLoadBalancer() {
-        _isFromLoadBalancer = true;
-    }
 
     bool didHello() const {
         return _didHello;
@@ -80,9 +85,6 @@ public:
     }
 
 private:
-    /** True if the connection was established through a load balancer. */
-    bool _isFromLoadBalancer = false;
-
     /** True after we send this client a hello reply. */
     bool _didHello = false;
 
@@ -94,10 +96,7 @@ const auto getPerServiceState = ServiceContext::declareDecoration<PerService>();
 const auto getPerClientState = Client::declareDecoration<PerClient>();
 
 bool PerClient::isFromLoadBalancer() const {
-    if (!isEnabled()) {
-        return false;
-    }
-    if (MONGO_unlikely(clientIsFromLoadBalancer.shouldFail())) {
+    if (MONGO_unlikely(loadBalancerSupportClientIsFromLoadBalancer.shouldFail())) {
         return true;
     }
     const auto& session = getPerClientState.owner(this)->session();
@@ -108,22 +107,18 @@ bool PerClient::isFromLoadBalancer() const {
 }  // namespace
 
 bool isEnabled() {
-    return feature_flags::gFeatureFlagLoadBalancer.isEnabled(
-        serverGlobalParams.featureCompatibility);
+    const auto val = loadBalancerPort.load();
+    return val != 0 || MONGO_unlikely(loadBalancerSupportClientIsFromLoadBalancer.shouldFail());
 }
 
 boost::optional<int> getLoadBalancerPort() {
-    if (isEnabled()) {
-        auto val = loadBalancerPort.load();
-        if (val != 0)
-            return val;
-    }
+    auto val = loadBalancerPort.load();
+    if (val != 0)
+        return val;
     return {};
 }
 
 void handleHello(OperationContext* opCtx, BSONObjBuilder* result, bool helloHasLoadBalancedOption) {
-    if (!isEnabled())
-        return;
     auto& perClient = getPerClientState(opCtx->getClient());
     if (perClient.didHello() || !perClient.isFromLoadBalancer())
         return;
@@ -138,9 +133,6 @@ void handleHello(OperationContext* opCtx, BSONObjBuilder* result, bool helloHasL
 }
 
 bool isFromLoadBalancer(Client* client) {
-    if (!isEnabled()) {
-        return false;
-    }
     return getPerClientState(client).isFromLoadBalancer();
 }
 

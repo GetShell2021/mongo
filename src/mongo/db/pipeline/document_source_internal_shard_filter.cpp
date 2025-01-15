@@ -28,12 +28,23 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <iterator>
+#include <list>
+#include <utility>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/db/pipeline/document_source_internal_shard_filter.h"
 
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/shard_filterer_impl.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util_core.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -44,6 +55,24 @@ namespace mongo {
 // This DocumentSource is not registered and can only be created as part of expansions for other
 // DocumentSources.
 //
+
+boost::intrusive_ptr<DocumentSourceInternalShardFilter>
+DocumentSourceInternalShardFilter::buildIfNecessary(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    auto opCtx = expCtx->getOperationContext();
+    // We can only rely on the ownership filter if the operation is coming from the router
+    // (i.e. it is versioned).
+    if (!OperationShardingState::isComingFromRouter(opCtx)) {
+        return nullptr;
+    }
+    static const auto orphanPolicy =
+        CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup;
+    return make_intrusive<DocumentSourceInternalShardFilter>(
+        expCtx,
+        std::make_unique<ShardFiltererImpl>(
+            CollectionShardingState::acquire(opCtx, expCtx->getNamespaceString())
+                ->getOwnershipFilter(opCtx, orphanPolicy)));
+}
 
 DocumentSourceInternalShardFilter::DocumentSourceInternalShardFilter(
     const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
@@ -97,8 +126,7 @@ Pipeline::SourceContainer::iterator DocumentSourceInternalShardFilter::doOptimiz
     return ret;
 }
 
-Value DocumentSourceInternalShardFilter::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceInternalShardFilter::serialize(const SerializationOptions& opts) const {
     return Value(DOC(getSourceName() << Document()));
 }
 

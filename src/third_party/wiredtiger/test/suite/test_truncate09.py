@@ -30,10 +30,11 @@
 #   Check for fast-truncate rollback-to-stable timestamps.
 
 import wttest
-from helper import copy_wiredtiger_home, simulate_crash_restart
+from helper import simulate_crash_restart
 from wtdataset import simple_key, simple_value
 from wtscenario import make_scenarios
 
+@wttest.skip_for_hook("nonstandalone", "timestamped truncate not supported for nonstandalone")
 class test_truncate09(wttest.WiredTigerTestCase):
     # We don't test FLCS, missing records return as 0 values.
     format_values = [
@@ -100,7 +101,6 @@ class test_truncate09(wttest.WiredTigerTestCase):
         self.session.checkpoint()
 
         # Restart, testing RTS on the copy.
-        copy_wiredtiger_home(self, ".", "RESTART")
         simulate_crash_restart(self, ".", "RESTART")
 
         # Search for a key in the truncated range which is stabilised, hence should not find it.
@@ -115,6 +115,3 @@ class test_truncate09(wttest.WiredTigerTestCase):
         # Search for a removed key which is not stabilised, hence should find it.
         cursor.set_key(simple_key(cursor, 75000))
         self.assertEqual(cursor.search(), 0)
-
-if __name__ == '__main__':
-    wttest.run()

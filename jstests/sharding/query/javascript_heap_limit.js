@@ -1,7 +1,12 @@
+/**
+ * @tags: [
+ *   requires_scripting
+ * ]
+ */
+
 // Confirms that JavaScript heap limits are respected in aggregation. Includes testing for mapReduce
 // and $where which use aggregation for execution.
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 2});
 const mongos = st.s;
@@ -20,10 +25,21 @@ assert.commandWorked(mongosColl.insert([{x: 0}, {x: 2}]));
 const tooSmallHeapSizeMB = 10;
 const sufficentHeapSizeMB = 100;
 
-function setHeapSizeLimitMB({db, queryLimit, globalLimit}) {
+function setHeapSizeLimitMBOneNode({db, queryLimit, globalLimit}) {
     assert.commandWorked(
         db.adminCommand({setParameter: 1, internalQueryJavaScriptHeapSizeLimitMB: queryLimit}));
     assert.commandWorked(db.adminCommand({setParameter: 1, jsHeapLimitMB: globalLimit}));
+}
+
+function setHeapSizeLimitMB({queryLimit, globalLimit}) {
+    st.forEachMongos((conn) => {
+        setHeapSizeLimitMBOneNode(
+            {db: conn.getDB("test"), queryLimit: queryLimit, globalLimit: globalLimit});
+    });
+    st.forEachConnection((conn) => {
+        setHeapSizeLimitMBOneNode(
+            {db: conn.getDB("test"), queryLimit: queryLimit, globalLimit: globalLimit});
+    });
 }
 
 function allocateLargeString() {
@@ -170,4 +186,3 @@ runCommonTests(shardDB);
 runShardTests(shardDB);
 
 st.stop();
-}());

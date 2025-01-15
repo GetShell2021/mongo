@@ -29,8 +29,15 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
+
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/api_parameters.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -60,6 +67,14 @@ enum class AllowedWithClientType {
     // The stage can be specified in the command request of an internal client only.
     kInternal,
 };
+
+// Helper function to get whether a client is internal.
+bool isInternalClient(Client* client);
+
+// Use to assert that a feature is allowed only if it is used internally.
+void assertAllowedInternalIfRequired(const OperationContext* opCtx,
+                                     StringData operatorName,
+                                     AllowedWithClientType allowedWithClientType);
 
 /**
  * Asserts that the API parameters in 'apiParameters' are compatible with the restrictions on

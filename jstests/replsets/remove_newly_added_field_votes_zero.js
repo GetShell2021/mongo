@@ -6,11 +6,13 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load('jstests/replsets/rslib.js');
-load("jstests/libs/fail_point_util.js");
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    assertVoteCount,
+    isMemberNewlyAdded,
+    waitForNewlyAddedRemovalForNodeToBeCommitted,
+} from "jstests/replsets/rslib.js";
 
 const testName = jsTestName();
 const dbName = "testdb";
@@ -18,7 +20,7 @@ const collName = "testcoll";
 
 const rst = new ReplSetTest({name: testName, nodes: 1});
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const primary = rst.getPrimary();
 const primaryDb = primary.getDB(dbName);
@@ -56,7 +58,7 @@ assertVoteCount(primary, {
 jsTestLog("Waiting for initial sync to complete");
 assert.commandWorked(
     secondary0.adminCommand({configureFailPoint: "initialSyncHangBeforeFinish", mode: "off"}));
-rst.waitForState(secondary0, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [secondary0]);
 
 jsTestLog("Checking that 'newlyAdded' field is still not set");
 assert(!isMemberNewlyAdded(primary, 1));
@@ -123,7 +125,7 @@ assertVoteCount(primary, {
 jsTestLog("Waiting for second initial sync to complete");
 assert.commandWorked(
     secondary1.adminCommand({configureFailPoint: "initialSyncHangBeforeFinish", mode: "off"}));
-rst.waitForState(secondary1, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [secondary1]);
 
 jsTestLog("Checking that 'newlyAdded' field was removed");
 waitForNewlyAddedRemovalForNodeToBeCommitted(primary, 2);
@@ -142,4 +144,3 @@ jsTestLog("Making sure the set can accept w:3 writes");
 assert.commandWorked(primaryColl.insert({a: 3}, {writeConcern: {w: 3}}));
 
 rst.stopSet();
-})();

@@ -44,58 +44,13 @@ class Let;
 class LambdaAbstraction;
 class LambdaApplication;
 class FunctionCall;
-class EvalPath;
-class EvalFilter;
 class Source;
-
-/**
- * Path elements
- */
-class PathConstant;
-class PathLambda;
-class PathIdentity;
-class PathDefault;
-class PathCompare;
-class PathDrop;
-class PathKeep;
-class PathObj;
-class PathArr;
-class PathTraverse;
-class PathField;
-class PathGet;
-class PathComposeM;
-class PathComposeA;
-
-/**
- * Nodes
- */
-class ScanNode;
-class PhysicalScanNode;
-class ValueScanNode;
-class CoScanNode;
-class IndexScanNode;
-class SeekNode;
-class MemoLogicalDelegatorNode;
-class MemoPhysicalDelegatorNode;
-class FilterNode;
-class EvaluationNode;
-class SargableNode;
-class RIDIntersectNode;
-class BinaryJoinNode;
-class HashJoinNode;
-class MergeJoinNode;
-class UnionNode;
-class GroupByNode;
-class UnwindNode;
-class UniqueNode;
-class CollationNode;
-class LimitSkipNode;
-class ExchangeNode;
-class RootNode;
 
 /**
  * Utility
  */
 class References;
 class ExpressionBinder;
+
+class ExpressionSyntaxSort;
 }  // namespace mongo::optimizer

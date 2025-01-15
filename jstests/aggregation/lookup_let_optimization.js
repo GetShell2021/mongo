@@ -1,14 +1,14 @@
 /**
  * This test ensures that stages dependent on a let variable optimizing to a constant in a $lookup
  * pipeline are evaluated correctly.
- * @tags: [requires_pipeline_optimization]
+ * @tags: [
+ *   requires_pipeline_optimization,
+ *   not_allowed_with_signed_security_token,
+ * ]
  */
 
-load('jstests/aggregation/extras/utils.js');  // For assertArrayEq.
-load("jstests/libs/fixture_helpers.js");      // For FixtureHelpers.
-
-(function() {
-"use strict";
+import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const collName = "lookup_let_redact";
 const coll = db[collName];
@@ -57,7 +57,7 @@ verifyAggregationForBothPipelineOptimizationModes({
         {_id: "true", test: true, redacted: []}, // Expect that documents were pruned.
         {_id: "false", test: false, redacted: [ // Expect that $redact descended instead.
             {_id: "true", test: true},
-            {_id: "false", test: false} 
+            {_id: "false", test: false}
         ]}
     ]
 });
@@ -95,4 +95,3 @@ verifyAggregationForBothPipelineOptimizationModes({
 
 // Reset optimization mode.
 setPipelineOptimizationMode(oldMode);
-}());

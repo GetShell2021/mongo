@@ -1,3 +1,8 @@
+/**
+ * @tags: [
+ *   requires_scripting
+ * ]
+ */
 // Test for SERVER-9129
 // Verify global scope data does not persist past logout or auth.
 // NOTE: Each test case covers 3 state transitions:
@@ -6,9 +11,6 @@
 //          auth user 'b' -> logout
 //
 //       These transitions are tested for $where and MapReduce.
-
-(function() {
-'use strict';
 
 const conn = MongoRunner.runMongod();
 const test = conn.getDB("test");
@@ -103,4 +105,3 @@ testMapReduce();
 testMapReduce();
 
 MongoRunner.stopMongod(conn);
-})();

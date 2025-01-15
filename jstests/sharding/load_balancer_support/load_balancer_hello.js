@@ -1,16 +1,12 @@
 /**
- * @tags: [requires_fcv_53]
- *
  * Test the extension to the mongos `hello` command by which clients
  * that have arrived through a load balancer affirm that they are
  * compatible with the way mongos handles load-balanced clients.
  * See `src/mongo/s/load_balancing_support.h`.
  */
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 (() => {
-    "use strict";
-
-    load('jstests/libs/fail_point_util.js');
-
     /**
      * The whole ShardingTest is restarted just to get a fresh connection.
      * Obviously this could be accomplished much more efficiently.
@@ -55,11 +51,6 @@
      * The ordinary baseline non-load-balanced case.
      */
     runInShardingTest((admin) => {
-        // Before getting started, confirm that the feature is enabled.
-        assert(admin.adminCommand({getParameter: 1, featureFlagLoadBalancer: 1})
-                   .featureFlagLoadBalancer.value,
-               'featureFlagLoadBalancer should be enabled for this test');
-
         jsTestLog("Initial hello command");
         assertNoServiceId(doHello(admin, {}));
         jsTestLog("Non-initial hello command");

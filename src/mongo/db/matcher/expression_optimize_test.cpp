@@ -27,29 +27,53 @@
  *    it in the license file.
  */
 
-#include "mongo/db/pipeline/expression.h"
-
+#include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
+#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/index_tag.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/query/parsed_find_command.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/query/tailable_mode_gen.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
 
-static const NamespaceString nss("testdb.testcoll");
+static const NamespaceString nss =
+    NamespaceString::createNamespaceString_forTest("testdb.testcoll");
 
-using unittest::assertGet;
 
 /**
  * Helper function to parse the given BSON object as a MatchExpression, checks the status,
- * and return the MatchExpression*.
+ * and return the MatchExpression pointer.
  */
-MatchExpression* parseMatchExpression(const BSONObj& obj) {
+std::unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     StatusWithMatchExpression status =
         MatchExpressionParser::parse(obj,
@@ -63,7 +87,7 @@ MatchExpression* parseMatchExpression(const BSONObj& obj) {
         FAIL(ss);
     }
 
-    return status.getValue().release();
+    return std::move(status.getValue());
 }
 
 /**
@@ -75,7 +99,8 @@ Status isValid(const std::string& queryStr, const FindCommandRequest& findComman
     BSONObj queryObj = fromjson(queryStr);
     std::unique_ptr<MatchExpression> me(parseMatchExpression(queryObj));
     me = MatchExpression::optimize(std::move(me));
-    if (auto status = CanonicalQuery::isValid(me.get(), findCommand).getStatus(); !status.isOK()) {
+    if (auto status = parsed_find_command::isValid(me.get(), findCommand).getStatus();
+        !status.isOK()) {
         return status;
     }
     return CanonicalQuery::isValidNormalized(me.get());
@@ -103,8 +128,8 @@ TEST(ExpressionOptimizeTest, IsValidText) {
     // Invalid: TEXT inside NOR.
     ASSERT_NOT_OK(isValid("{$nor: [{$text: {$search: 's'}}, {a: 1}]}", *findCommand));
 
-    // Invalid: TEXT inside NOR.
-    ASSERT_NOT_OK(
+    // Valid: Boolean expression simplifier opens up $nor expressions.
+    ASSERT_OK(
         isValid("{$nor: ["
                 "    {$or: ["
                 "        {$text: {$search: 's'}},"
@@ -335,7 +360,7 @@ TEST(ExpressionOptimizeTest, NormalizeWithInAndRegexPreservesTags) {
 TEST(ExpressionOptimizeTest, NormalizeWithInPreservesCollator) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     BSONObj obj = fromjson("{'': 'string'}");
-    auto inMatchExpression = std::make_unique<InMatchExpression>("");
+    auto inMatchExpression = std::make_unique<InMatchExpression>(""_sd);
     inMatchExpression->setCollator(&collator);
     std::vector<BSONElement> equalities{obj.firstElement()};
     ASSERT_OK(inMatchExpression->setEqualities(std::move(equalities)));
@@ -350,67 +375,51 @@ TEST(ExpressionOptimizeTest, AndWithAlwaysFalseChildOptimizesToAlwaysFalse) {
     BSONObj obj = fromjson("{$and: [{a: 1}, {$alwaysFalse: 1}]}");
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysFalse: 1}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{$alwaysFalse: 1}"));
 }
 
 TEST(ExpressionOptimizeTest, AndRemovesAlwaysTrueChildren) {
     BSONObj obj = fromjson("{$and: [{a: 1}, {$alwaysTrue: 1}]}");
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{a: {$eq: 1}}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{a: {$eq: 1}}"));
 }
 
 TEST(ExpressionOptimizeTest, AndWithSingleChildAlwaysTrueOptimizesToEmptyAnd) {
     BSONObj obj = fromjson("{$and: [{$alwaysTrue: 1}]}");
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
-    // TODO SERVER-34759 We want this to optimize to an AlwaysTrueMatchExpression.
     ASSERT_TRUE(dynamic_cast<AndMatchExpression*>(optimizedMatchExpression.get()));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{}"));
 }
 
 TEST(ExpressionOptimizeTest, AndWithEachChildAlwaysTrueOptimizesToEmptyAnd) {
     BSONObj obj = fromjson("{$and: [{$alwaysTrue: 1}, {$alwaysTrue: 1}]}");
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
-    // TODO SERVER-34759 We want this to optimize to an AlwaysTrueMatchExpression.
     ASSERT_TRUE(dynamic_cast<AndMatchExpression*>(optimizedMatchExpression.get()));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{}"));
 }
 
 TEST(ExpressionOptimizeTest, NestedAndWithAlwaysFalseOptimizesToAlwaysFalse) {
     BSONObj obj = fromjson("{$and: [{$and: [{$alwaysFalse: 1}, {a: 1}]}, {b: 1}]}");
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysFalse: 1}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{$alwaysFalse: 1}"));
 }
 
 TEST(ExpressionOptimizeTest, OrWithAlwaysTrueOptimizesToAlwaysTrue) {
     BSONObj obj = fromjson("{$or: [{a: 1}, {$alwaysTrue: 1}]}");
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysTrue: 1}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{}"));
 }
 
 TEST(ExpressionOptimizeTest, OrRemovesAlwaysFalseChildren) {
     BSONObj obj = fromjson("{$or: [{a: 1}, {$alwaysFalse: 1}]}");
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{a: {$eq: 1}}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{a: {$eq: 1}}"));
 }
 
 TEST(ExpressionOptimizeTest, OrPromotesSingleAlwaysFalseAfterOptimize) {
@@ -419,9 +428,7 @@ TEST(ExpressionOptimizeTest, OrPromotesSingleAlwaysFalseAfterOptimize) {
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
     ASSERT_TRUE(dynamic_cast<AlwaysFalseMatchExpression*>(optimizedMatchExpression.get()));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysFalse: 1}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{$alwaysFalse: 1}"));
 }
 
 TEST(ExpressionOptimizeTest, OrPromotesSingleAlwaysFalse) {
@@ -429,9 +436,7 @@ TEST(ExpressionOptimizeTest, OrPromotesSingleAlwaysFalse) {
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
     ASSERT_TRUE(dynamic_cast<AlwaysFalseMatchExpression*>(optimizedMatchExpression.get()));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysFalse: 1}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{$alwaysFalse: 1}"));
 }
 
 TEST(ExpressionOptimizeTest, OrPromotesMultipleAlwaysFalse) {
@@ -439,18 +444,14 @@ TEST(ExpressionOptimizeTest, OrPromotesMultipleAlwaysFalse) {
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
     ASSERT_TRUE(dynamic_cast<AlwaysFalseMatchExpression*>(optimizedMatchExpression.get()));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysFalse: 1}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{$alwaysFalse: 1}"));
 }
 
 TEST(ExpressionOptimizeTest, NestedOrWithAlwaysTrueOptimizesToAlwaysTrue) {
     BSONObj obj = fromjson("{$or: [{$or: [{$alwaysTrue: 1}, {a: 1}]}, {b: 1}]}");
     std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
     auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
-    BSONObjBuilder bob;
-    optimizedMatchExpression->serialize(&bob, true);
-    ASSERT_BSONOBJ_EQ(bob.obj(), fromjson("{$alwaysTrue: 1}"));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{}"));
 }
 
 TEST(ExpressionOptimizeTest, OrRewrittenToIn) {
@@ -477,9 +478,7 @@ TEST(ExpressionOptimizeTest, OrRewrittenToIn) {
         auto obj = fromjson(exprStr);
         std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
         auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
-        BSONObjBuilder bob;
-        optimizedMatchExpression->serialize(&bob, true);
-        return bob.obj();
+        return optimizedMatchExpression->serialize();
     };
 
     ASSERT_BSONOBJ_EQ(optimizeExpr(queries[0].first), fromjson(queries[0].second));
@@ -495,5 +494,97 @@ TEST(ExpressionOptimizeTest, OrRewrittenToIn) {
     ASSERT_BSONOBJ_EQ(optimizeExpr(queries[10].first), fromjson(queries[10].second));
 }
 
+TEST(ExpressionOptimizeTest, OrRewrittenToInWithParameters) {
+    BSONObj obj = fromjson("{$or: [{f1: {$eq: 3}}, {f1: {$eq: 4}}]}");
+    std::unique_ptr<MatchExpression> matchExpr(parseMatchExpression(obj));
+    bool parameterized;
+    MatchExpression::parameterize(
+        matchExpr.get(), boost::none /*maxParamCount=*/, 0 /*startingParamId=*/, &parameterized);
+    ASSERT_TRUE(parameterized);
+    ASSERT_BSONOBJ_EQ(matchExpr->serialize(), obj);
+}
+
+TEST(ExpressionOptimizeTest, PartialOrToInRewriteDoesNotGenerateDirectlyNestedOr) {
+    // Test with the boolean simplifier on and off. In both cases, we should get the same result
+    // expression after optimization. This makes sure to test that 'MatchExpression::optimize()'
+    // itself does not unnecessarily generate intermediate nested $or nodes as described in
+    // SERVER-83602.
+    for (auto booleanSimplificationEnabled : {false, true}) {
+        RAIIServerParameterControllerForTest simplifierParamController(
+            "internalQueryEnableBooleanExpressionsSimplifier", booleanSimplificationEnabled);
+        BSONObj obj = fromjson("{$or: [{x: {$eq: 3}}, {x: {$eq: 4}}, {y: 5}, {z: 6}]}");
+        // We call MatchExpression::normalize() here to ensure the stability of the predicate order
+        // after optimizations.
+        auto optimizedAndNormalizedMatchExpression =
+            MatchExpression::normalize(parseMatchExpression(obj));
+        ASSERT_BSONOBJ_EQ(optimizedAndNormalizedMatchExpression->serialize(),
+                          fromjson("{$or: [{y: {$eq: 5}}, {z: {$eq: 6}}, {x: {$in: [3, 4]}}]}"));
+    }
+}
+
+TEST(ExpressionOptimizeTest, NorAlwaysTrueOptimizesToAlwaysFalse) {
+    BSONObj obj = fromjson("{$nor: [{$alwaysTrue: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{$alwaysFalse: 1}"));
+}
+
+TEST(ExpressionOptimizeTest, NorAlwaysFalseOptimizesToEmptyExpression) {
+    BSONObj obj = fromjson("{$nor: [{$alwaysFalse: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{}"));
+}
+
+TEST(ExpressionOptimizeTest, NorNorAlwaysTrueOptimizesToEmptyExpression) {
+    BSONObj obj = fromjson("{$nor: [{$nor: [{$alwaysTrue: 1}]}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{}"));
+}
+
+TEST(ExpressionOptimizeTest, NorNorAlwaysFalseOptimizesToAlwaysTrue) {
+    BSONObj obj = fromjson("{$nor: [{$nor: [{$alwaysFalse: 1}]}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{$alwaysFalse: 1}"));
+}
+
+TEST(ExpressionOptimizeTest, NorRemovesAlwaysFalseChildren) {
+    BSONObj obj = fromjson("{$nor: [{a: 1}, {$alwaysFalse: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{a: {$not: {$eq: 1}}}"));
+}
+
+TEST(ExpressionOptimizeTest, NorWithoutChildrenOptimizesToEmptyAnd) {
+    BSONObj obj = fromjson("{$nor: [{$alwaysFalse: 1}, {$alwaysFalse: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_TRUE(dynamic_cast<AndMatchExpression*>(optimizedMatchExpression.get()));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{}"));
+}
+
+TEST(ExpressionOptimizeTest, NorWithAlwaysTrueChildOptimizesToAlwaysFalse) {
+    BSONObj obj = fromjson("{$nor: [{a: 1}, {$alwaysTrue: 1}]}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{$alwaysFalse: 1}"));
+}
+
+TEST(ExpressionOptimizeTest, EmptyInOptimizesToAlwaysFalse) {
+    BSONObj obj = fromjson("{x: {$in: []}}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(), fromjson("{$alwaysFalse: 1}"));
+}
+
+TEST(ExpressionOptimizeTest, InWithJustRegexesIsNotOptimizedToAlwaysFalse) {
+    BSONObj obj = fromjson("{x: {$in: [/foo/, /bar/]}}");
+    std::unique_ptr<MatchExpression> matchExpression(parseMatchExpression(obj));
+    auto optimizedMatchExpression = MatchExpression::optimize(std::move(matchExpression));
+    ASSERT_BSONOBJ_EQ(optimizedMatchExpression->serialize(),
+                      fromjson("{x: {$in: [/foo/, /bar/]}}"));
+}
 }  // namespace
 }  // namespace mongo

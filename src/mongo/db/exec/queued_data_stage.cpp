@@ -30,14 +30,11 @@
 #include "mongo/db/exec/queued_data_stage.h"
 
 #include <memory>
-
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_common.h"
+#include <vector>
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
 
 const char* QueuedDataStage::kStageType = "QUEUED_DATA";
 
@@ -54,7 +51,7 @@ PlanStage::StageState QueuedDataStage::doWork(WorkingSetID* out) {
     return PlanStage::ADVANCED;
 }
 
-bool QueuedDataStage::isEOF() {
+bool QueuedDataStage::isEOF() const {
     return _members.empty();
 }
 

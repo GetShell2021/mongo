@@ -12,6 +12,7 @@ parameter supplied. This lets ESLint search for candidate files to lint.
 
 import logging
 import os
+import platform
 import shutil
 import string
 import subprocess
@@ -19,13 +20,13 @@ import sys
 import tarfile
 import tempfile
 import threading
-from typing import Optional
 import urllib.error
 import urllib.parse
 import urllib.request
-
-from distutils import spawn  # pylint: disable=no-name-in-module
+from distutils import spawn
 from optparse import OptionParser
+from typing import Optional
+
 import structlog
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
@@ -33,8 +34,9 @@ if __name__ == "__main__" and __package__ is None:
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(os.path.realpath(__file__)))))
 
 # pylint: disable=wrong-import-position
-from buildscripts.linter.filediff import gather_changed_files_for_lint
 from buildscripts.linter import git, parallel
+from buildscripts.linter.filediff import gather_changed_files_for_lint
+
 # pylint: enable=wrong-import-position
 
 ##############################################################################
@@ -45,26 +47,35 @@ from buildscripts.linter import git, parallel
 
 # Expected version of ESLint.
 # If you want to update the version, please refer to `buildscripts/eslint/README.md`
-ESLINT_VERSION = "7.22.0"
+ESLINT_VERSION = "8.28.0"
 
 # Name of ESLint as a binary.
 ESLINT_PROGNAME = "eslint"
 
+# Arch of running system
+ARCH = platform.machine() if platform.machine() != "aarch64" else "arm64"
+
 # URL location of our provided ESLint binaries.
-ESLINT_HTTP_LINUX_CACHE = "https://s3.amazonaws.com/boxes.10gen.com/build/eslint-" + \
-                           ESLINT_VERSION + "-linux.tar.gz"
-ESLINT_HTTP_DARWIN_CACHE = "https://s3.amazonaws.com/boxes.10gen.com/build/eslint-" + \
-                            ESLINT_VERSION + "-darwin.tar.gz"
+ESLINT_HTTP_LINUX_CACHE = (
+    "https://s3.amazonaws.com/boxes.10gen.com/build/eslint-"
+    + ESLINT_VERSION
+    + "-linux-"
+    + ARCH
+    + ".tar.gz"
+)
+ESLINT_HTTP_DARWIN_CACHE = (
+    "https://s3.amazonaws.com/boxes.10gen.com/build/eslint-" + ESLINT_VERSION + "-darwin.tar.gz"
+)
 
 # Path in the tarball to the ESLint binary.
-ESLINT_SOURCE_TAR_BASE = string.Template(ESLINT_PROGNAME + "-$platform-$arch")
+ESLINT_SOURCE_TAR_BASE = string.Template(ESLINT_PROGNAME + "-$operating_system-$arch")
 
 LOGGER = structlog.get_logger(__name__)
 
 
 def callo(args):
     """Call a program, and capture its output."""
-    return subprocess.check_output(args).decode('utf-8')
+    return subprocess.check_output(args).decode("utf-8")
 
 
 def extract_eslint(tar_path, target_file):
@@ -76,15 +87,15 @@ def extract_eslint(tar_path, target_file):
     tarfp.close()
 
 
-def get_eslint_from_cache(dest_file, platform, arch):
+def get_eslint_from_cache(dest_file, operating_system, arch):
     """Get ESLint binary from mongodb's cache."""
     # Get URL
-    if platform == "Linux":
+    if operating_system == "Linux":
         url = ESLINT_HTTP_LINUX_CACHE
-    elif platform == "Darwin":
+    elif operating_system == "Darwin":
         url = ESLINT_HTTP_DARWIN_CACHE
     else:
-        raise ValueError('ESLint is not available as a binary for ' + platform)
+        raise ValueError("ESLint is not available as a binary for " + operating_system)
 
     dest_dir = tempfile.gettempdir()
     temp_tar_file = os.path.join(dest_dir, "temp.tar.gz")
@@ -93,9 +104,10 @@ def get_eslint_from_cache(dest_file, platform, arch):
     print("Downloading ESLint %s from %s, saving to %s" % (ESLINT_VERSION, url, temp_tar_file))
     urllib.request.urlretrieve(url, temp_tar_file)
 
-    # pylint: disable=too-many-function-args
     print("Extracting ESLint %s to %s" % (ESLINT_VERSION, dest_file))
-    eslint_distfile = ESLINT_SOURCE_TAR_BASE.substitute(platform=platform, arch=arch)
+    eslint_distfile = ESLINT_SOURCE_TAR_BASE.substitute(
+        operating_system=operating_system, arch=arch
+    )
     extract_eslint(temp_tar_file, eslint_distfile)
     shutil.move(eslint_distfile, dest_file)
 
@@ -103,13 +115,13 @@ def get_eslint_from_cache(dest_file, platform, arch):
 class ESLint(object):
     """Class encapsulates finding a suitable copy of ESLint, and linting an individual file."""
 
-    def __init__(self, path, cache_dir):  # pylint: disable=too-many-branches
+    def __init__(self, path, cache_dir):
         """Initialize ESLint."""
         eslint_progname = ESLINT_PROGNAME
 
         # Initialize ESLint configuration information
         if sys.platform.startswith("linux"):
-            self.arch = "x86_64"
+            self.arch = ARCH
             self.tar_path = None
         elif sys.platform == "darwin":
             self.arch = "x86_64"
@@ -147,7 +159,8 @@ class ESLint(object):
 
             if os.path.isfile(self.path) and not self._validate_version(warn=True):
                 print(
-                    "WARNING: removing ESLint from %s to download the correct version" % self.path)
+                    "WARNING: removing ESLint from %s to download the correct version" % self.path
+                )
                 os.remove(self.path)
 
             if not os.path.isfile(self.path):
@@ -156,11 +169,13 @@ class ESLint(object):
                 elif sys.platform == "darwin":
                     get_eslint_from_cache(self.path, "Darwin", self.arch)
                 else:
-                    print("ERROR: eslint.py does not support downloading ESLint "
-                          "on this platform, please install ESLint " + ESLINT_VERSION)
+                    print(
+                        "ERROR: eslint.py does not support downloading ESLint "
+                        "on this platform, please install ESLint " + ESLINT_VERSION
+                    )
         # Validate we have the correct version
         if not self._validate_version():
-            raise ValueError('correct version of ESLint was not found.')
+            raise ValueError("correct version of ESLint was not found.")
 
         self.print_lock = threading.Lock()
 
@@ -172,8 +187,10 @@ class ESLint(object):
             return True
 
         if warn:
-            print("WARNING: ESLint found in path %s, but the version is incorrect: %s" %
-                  (self.path, esl_version))
+            print(
+                "WARNING: ESLint found in path %s, but the version is incorrect: %s"
+                % (self.path, esl_version)
+            )
         return False
 
     def _lint(self, file_name, print_diff):
@@ -203,8 +220,9 @@ class ESLint(object):
 
 def is_interesting_file(file_name):
     """Return true if this file should be checked."""
-    return ((file_name.startswith("src/mongo") or file_name.startswith("jstests"))
-            and file_name.endswith(".js"))
+    return (
+        file_name.startswith("src/mongo") or file_name.startswith("jstests")
+    ) and file_name.endswith(".js")
 
 
 def _get_build_dir():
@@ -220,8 +238,10 @@ def _lint_files(eslint, files):
     lint_clean = parallel.parallel_process([os.path.abspath(f) for f in files], eslint.lint)
 
     if not lint_clean:
-        print("ERROR: ESLint found errors. Run ESLint manually to see errors in "
-              "files that were skipped")
+        print(
+            "ERROR: ESLint found errors. Run ESLint manually to see errors in "
+            "files that were skipped"
+        )
         sys.exit(1)
 
     return True
@@ -291,14 +311,16 @@ def main():
     """Execute Main entry point."""
     success = False
     usage = "%prog [-e <eslint>] [-d] lint|lint-patch|fix [glob patterns] "
-    description = ("The script will try to find ESLint version %s on your system and run it. "
-                   "If it won't find the version it will try to download it and then run it. "
-                   "Commands description: lint runs ESLint on provided patterns or all .js "
-                   "files under `jstests/` and `src/mongo`; "
-                   "lint-patch runs ESLint against .js files modified in the "
-                   "provided patch file (for upload.py); "
-                   "fix runs ESLint with --fix on provided patterns "
-                   "or files under jstests/ and src/mongo." % ESLINT_VERSION)
+    description = (
+        "The script will try to find ESLint version %s on your system and run it. "
+        "If it won't find the version it will try to download it and then run it. "
+        "Commands description: lint runs ESLint on provided patterns or all .js "
+        "files under `jstests/` and `src/mongo`; "
+        "lint-patch runs ESLint against .js files modified in the "
+        "provided patch file (for upload.py); "
+        "fix runs ESLint with --fix on provided patterns "
+        "or files under jstests/ and src/mongo." % ESLINT_VERSION
+    )
     epilog = "*Unless you specify -d a separate ESLint process will be launched for every file"
     parser = OptionParser(usage=usage, description=description, epilog=epilog)
     parser.add_option(

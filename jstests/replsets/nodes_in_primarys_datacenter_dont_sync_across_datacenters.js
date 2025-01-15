@@ -9,12 +9,14 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/libs/sync_source.js");
-load('jstests/replsets/rslib.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    DataCenter,
+    delayMessagesBetweenDataCenters,
+    forceSyncSource
+} from "jstests/replsets/libs/sync_source.js";
+import {setLogVerbosity} from "jstests/replsets/rslib.js";
 
 const name = jsTestName();
 const rst = new ReplSetTest({
@@ -25,6 +27,7 @@ const rst = new ReplSetTest({
             // Set 'maxNumSyncSourceChangesPerHour' to a high value to remove the limit on how many
             // times nodes change sync sources in an hour.
             maxNumSyncSourceChangesPerHour: 99,
+            writePeriodicNoops: true,
         }
     },
     settings: {
@@ -36,7 +39,7 @@ const rst = new ReplSetTest({
 });
 
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const primary = rst.getPrimary();
 const testNode = rst.getSecondaries()[0];
@@ -122,4 +125,3 @@ assert.eq(numSyncSourceChanges + 1,
           serverStatus.syncSource.numSyncSourceChangesDueToSignificantlyCloserNode);
 
 rst.stopSet();
-})();

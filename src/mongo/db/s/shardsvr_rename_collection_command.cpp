@@ -28,16 +28,32 @@
  */
 
 
+#include <memory>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/s/rename_collection_coordinator.h"
+#include "mongo/db/s/sharded_rename_collection_gen.h"
+#include "mongo/db/s/sharding_ddl_coordinator_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
-#include "mongo/db/s/sharding_ddl_util.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -81,26 +97,36 @@ public:
                     fromNss != toNss);
 
             auto const shardingState = ShardingState::get(opCtx);
-            uassertStatusOK(shardingState->canAcceptShardedCommands());
+            shardingState->assertCanAcceptShardedCommands();
 
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
-            if (fromNss.db() != toNss.db()) {
-                sharding_ddl_util::checkDbPrimariesOnTheSameShard(opCtx, fromNss, toNss);
-            }
+            uassert(ErrorCodes::IllegalOperation,
+                    "Can't rename a collection in the config database",
+                    !fromNss.isConfigDB());
+            uassert(ErrorCodes::IllegalOperation,
+                    "Can't rename a collection in the admin database",
+                    !fromNss.isAdminDB());
 
             validateNamespacesForRenameCollection(opCtx, fromNss, toNss);
 
-            auto coordinatorDoc = RenameCollectionCoordinatorDocument();
-            coordinatorDoc.setRenameCollectionRequest(req.getRenameCollectionRequest());
-            coordinatorDoc.setShardingDDLCoordinatorMetadata(
-                {{fromNss, DDLCoordinatorTypeEnum::kRenameCollection}});
-            auto service = ShardingDDLCoordinatorService::getService(opCtx);
-            auto renameCollectionCoordinator = checked_pointer_cast<RenameCollectionCoordinator>(
-                service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+            auto renameCollectionCoordinator = [&]() {
+                FixedFCVRegion fixedFcvRegion{opCtx};
+                auto coordinatorDoc = RenameCollectionCoordinatorDocument();
+                coordinatorDoc.setRenameCollectionRequest(req.getRenameCollectionRequest());
+                coordinatorDoc.setShardingDDLCoordinatorMetadata(
+                    {{fromNss, DDLCoordinatorTypeEnum::kRenameCollection}});
+                coordinatorDoc.setAllowEncryptedCollectionRename(
+                    req.getAllowEncryptedCollectionRename().value_or(false));
+                auto service = ShardingDDLCoordinatorService::getService(opCtx);
+                auto coordinator = checked_pointer_cast<RenameCollectionCoordinator>(
+                    service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+                return coordinator;
+            }();
+
             return renameCollectionCoordinator->getResponse(opCtx);
         }
 
@@ -117,12 +143,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-
-} shardsvrRenameCollectionCommand;
+};
+MONGO_REGISTER_COMMAND(ShardsvrRenameCollectionCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

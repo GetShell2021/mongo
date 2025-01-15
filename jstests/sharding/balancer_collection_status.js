@@ -2,8 +2,7 @@
  * Test the balancerCollectionStatus command and its possible outputs
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const chunkSizeMB = 1;
 let st = new ShardingTest({
@@ -92,12 +91,6 @@ assert.eq(result.firstComplianceViolation, 'zoneViolation');
 
 // run balancer until balanced
 runBalancer();
+assert.eq(result.chunkSize, chunkSizeMB);
 
-const configDB = st.configRS.getPrimary().getDB('config');
-const fcvDoc = configDB.adminCommand({getParameter: 1, featureCompatibilityVersion: 1});
-if (MongoRunner.compareBinVersions(fcvDoc.featureCompatibilityVersion.version, '5.3') >= 0) {
-    // Ensure that the expected chunk size is part of the response.
-    assert.eq(result.chunkSize, chunkSizeMB);
-}
 st.stop();
-})();

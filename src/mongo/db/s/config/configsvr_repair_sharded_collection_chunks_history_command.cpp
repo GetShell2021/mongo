@@ -28,17 +28,36 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/vector_clock.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/request_types/repair_sharded_collection_chunks_history_gen.h"
+#include "mongo/s/routing_information_cache.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -46,15 +65,58 @@
 namespace mongo {
 namespace {
 
-class ConfigSvrRepairShardedCollectionChunksHistoryCommand : public BasicCommand {
+class ConfigSvrRepairShardedCollectionChunksHistoryCommand
+    : public TypedCommand<ConfigSvrRepairShardedCollectionChunksHistoryCommand> {
 public:
-    ConfigSvrRepairShardedCollectionChunksHistoryCommand()
-        : BasicCommand("_configsvrRepairShardedCollectionChunksHistory") {}
+    using Request = ConfigsvrRepairShardedCollectionChunksHistory;
 
-    std::string help() const override {
-        return "Internal command, which is exported by the sharding config server. Do not call "
-               "directly.";
-    }
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        void typedRun(OperationContext* opCtx) {
+
+            uassert(
+                ErrorCodes::IllegalOperation,
+                "_configsvrRepairShardedCollectionChunksHistory can only be run on config servers",
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+
+            // Set the operation context read concern level to local for reads into the config
+            // database.
+            repl::ReadConcernArgs::get(opCtx) =
+                repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+
+            CommandHelpers::uassertCommandRunWithMajority(
+                ConfigsvrRepairShardedCollectionChunksHistory::kCommandName,
+                opCtx->getWriteConcern());
+
+            auto currentTime = VectorClock::get(opCtx)->getTime();
+            auto validAfter = currentTime.configTime().asTimestamp();
+
+            ShardingCatalogManager::get(opCtx)->upgradeChunksHistory(
+                opCtx, ns(), request().getForce(), validAfter);
+
+            RoutingInformationCache::get(opCtx)->invalidateCollectionEntry_LINEARIZABLE(ns());
+        }
+
+    private:
+        NamespaceString ns() const override {
+            return request().getCommandParameter();
+        }
+
+        bool supportsWriteConcern() const override {
+            return true;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
+        }
+    };
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -64,52 +126,12 @@ public:
         return true;
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
+    std::string help() const override {
+        return "Internal command, which is exported by the sharding config server. Do not call "
+               "directly.";
     }
-
-    std::string parseNs(const std::string& unusedDbName, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
-    }
-
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string& unusedDbName,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        uassert(ErrorCodes::IllegalOperation,
-                "_configsvrRepairShardedCollectionChunksHistory can only be run on config servers",
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
-
-        // Set the operation context read concern level to local for reads into the config database.
-        repl::ReadConcernArgs::get(opCtx) =
-            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
-
-        CommandHelpers::uassertCommandRunWithMajority(getName(), opCtx->getWriteConcern());
-
-        const NamespaceString nss{parseNs(unusedDbName, cmdObj)};
-
-        auto currentTime = VectorClock::get(opCtx)->getTime();
-        auto validAfter = currentTime.configTime().asTimestamp();
-
-        ShardingCatalogManager::get(opCtx)->upgradeChunksHistory(
-            opCtx, nss, cmdObj["force"].booleanSafe(), validAfter);
-
-        Grid::get(opCtx)->catalogCache()->invalidateCollectionEntry_LINEARIZABLE(nss);
-
-        return true;
-    }
-
-} configSvrRepairShardedCollectionChunksHistoryCommand;
+};
+MONGO_REGISTER_COMMAND(ConfigSvrRepairShardedCollectionChunksHistoryCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

@@ -8,8 +8,7 @@
  *     requires_replication,
  * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 3});
 rst.startSet();
@@ -39,4 +38,3 @@ assert.commandWorked(db.runCommand(
     {applyOps: [{op: "d", ns: nss(dbName, collName), ts: Timestamp(20, 0), o: {_id: 19}}]}));
 
 rst.stopSet();
-}());

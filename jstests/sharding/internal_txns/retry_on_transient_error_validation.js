@@ -3,16 +3,18 @@
  *
  * @tags: [requires_fcv_60, uses_transactions]
  */
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const kDbName = "testDb";
 const kCollName = "testColl";
 const kNs = kDbName + "." + kCollName;
 
 (() => {
+    if (jsTestOptions().useAutoBootstrapProcedure) {  // TODO: SERVER-80318 Delete test case
+        return;
+    }
+
     const rst = new ReplSetTest({nodes: 1});
 
     rst.startSet();
@@ -92,5 +94,4 @@ const kNs = kDbName + "." + kCollName;
     assert.commandFailedWithCode(shard0TestDB.runCommand(insertCmdObj), ErrorCodes.InvalidOptions);
 
     st.stop();
-})();
 })();

@@ -1,8 +1,7 @@
 // Verify that speculative auth works with mongos.
 // @tags: [requires_sharding]
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const CLIENT_NAME = 'CN=client,OU=KernelUser,O=MongoDB,L=New York City,ST=New York,C=US';
 const CLIENT_CERT = 'jstests/libs/client.pem';
@@ -26,7 +25,6 @@ const st = new ShardingTest({
         configOptions: options,
         mongosOptions: options,
         rsOptions: options,
-        shardOptions: options
     }
 });
 
@@ -109,4 +107,3 @@ if (st.configRS) {
 }
 
 st.stop();
-}());

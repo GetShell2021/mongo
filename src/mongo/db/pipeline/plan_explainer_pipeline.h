@@ -29,8 +29,15 @@
 
 #pragma once
 
+#include <cstddef>
+#include <string>
+#include <vector>
+
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 /**
@@ -51,8 +58,6 @@ public:
     PlanStatsDetails getWinningPlanTrialStats() const final;
     std::vector<PlanStatsDetails> getRejectedPlansStats(
         ExplainOptions::Verbosity verbosity) const final;
-    std::vector<PlanStatsDetails> getCachedPlanStats(const plan_cache_debug_info::DebugInfo&,
-                                                     ExplainOptions::Verbosity) const final;
 
     void incrementNReturned() {
         ++_nReturned;

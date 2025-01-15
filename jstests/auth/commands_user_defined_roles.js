@@ -5,9 +5,19 @@ Exhaustive test for authorization of commands with user-defined roles.
 The test logic implemented here operates on the test cases defined
 in jstests/auth/lib/commands_lib.js.
 
-@tags: [requires_sharding]
+@tags: [requires_sharding, requires_scripting]
 
 */
+
+import {
+    adminDbName,
+    authCommandsLib,
+    authErrCode,
+    commandNotSupportedCode
+} from "jstests/auth/lib/commands_lib.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {MongotMock} from "jstests/with_mongot/mongotmock/lib/mongotmock.js";
 
 // This test involves killing all sessions, which will not work as expected if the kill command is
 // sent with an implicit session.
@@ -16,9 +26,6 @@ TestData.disableImplicitSessions = true;
 // constants
 var testUser = "userDefinedRolesTestUser";
 var testRole = "userDefinedRolesTestRole";
-
-load("jstests/auth/lib/commands_lib.js");
-load("jstests/libs/fail_point_util.js");
 
 function doTestSetup(conn, t, testcase, privileges) {
     const admin = conn.getDB('admin');
@@ -41,15 +48,21 @@ function doTestTeardown(conn, t, testcase, res) {
  * Run the command specified in 't' with the privileges specified in 'privileges'.
  */
 function testProperAuthorization(conn, t, testcase, privileges) {
-    const runOnDb = conn.getDB(testcase.runOnDb);
+    const authDb = conn.getDB(testcase.runOnDb);
     const state = doTestSetup(conn.sidechannel, t, testcase, privileges);
-    authCommandsLib.authenticatedSetup(t, runOnDb);
+    authCommandsLib.authenticatedSetup(t, authDb);
 
     let command = t.command;
     if (typeof (command) === "function") {
         command = t.command(state, testcase.commandArgs);
     }
-    const res = runOnDb.runCommand(command);
+
+    let cmdDb = authDb;
+    if (t.hasOwnProperty("runOnDb")) {
+        assert.eq(typeof (t.runOnDb), "function");
+        cmdDb = authDb.getSiblingDB(t.runOnDb(state));
+    }
+    const res = cmdDb.runCommand(command);
 
     let out = "";
     if (!testcase.expectFail && (res.ok != 1) && (res.code != commandNotSupportedCode)) {
@@ -94,11 +107,15 @@ function runOneTest(conn, t) {
 
     // Some tests requires mongot, however, setting this failpoint will make search queries to
     // return EOF, that way all the hassle of setting it up can be avoided.
-    let disableSearchFailpoint;
+    let disableSearchFailpointShard, disableSearchFailpointRouter;
     if (t.disableSearch) {
-        disableSearchFailpoint = configureFailPoint(conn.rs0 ? conn.rs0.getPrimary() : conn,
-                                                    'searchReturnEofImmediately');
+        disableSearchFailpointShard = configureFailPoint(conn.rs0 ? conn.rs0.getPrimary() : conn,
+                                                         'searchReturnEofImmediately');
+        if (conn.s) {
+            disableSearchFailpointRouter = configureFailPoint(conn.s, 'searchReturnEofImmediately');
+        }
     }
+
     for (let i = 0; i < t.testcases.length; i++) {
         const testcase = t.testcases[i];
         if (!("privileges" in testcase)) {
@@ -187,8 +204,12 @@ function runOneTest(conn, t) {
         }
     }
 
-    if (disableSearchFailpoint) {
-        disableSearchFailpoint.off();
+    if (disableSearchFailpointShard) {
+        disableSearchFailpointShard.off();
+    }
+
+    if (disableSearchFailpointRouter) {
+        disableSearchFailpointRouter.off();
     }
 
     return failures;
@@ -210,13 +231,26 @@ function createUsers(conn) {
     assert(adminDb.auth(testUser, "password"));
 }
 
+let mongotmock;
+let mongotHost = "localhost:27017";
+if (!_isWindows()) {
+    mongotmock = new MongotMock();
+    mongotmock.start();
+    mongotHost = mongotmock.getConnection().host;
+}
+
 const opts = {
     auth: "",
-    enableExperimentalStorageDetailsCmd: ""
+    setParameter: {
+        mongotHost,   // We have to set the mongotHost parameter for the
+                      // $search-related tests to pass configuration checks.
+        syncdelay: 0  // Disable checkpoints as this can cause some commands to fail transiently.
+    }
 };
 const impls = {
     createUsers: createUsers,
-    runOneTest: runOneTest
+    runOneTest: runOneTest,
+    getSideChannel: conn => conn.sidechannel,
 };
 
 // run all tests standalone
@@ -237,9 +271,15 @@ const impls = {
         mongos: 1,
         config: 1,
         keyFile: "jstests/libs/key1",
-        other: {shardOptions: opts}
+        // We have to set the mongotHost parameter for the $search-related tests to pass
+        // configuration checks.
+        other: {rsOptions: opts, mongosOptions: {setParameter: {mongotHost}}}
     });
     conn.sidechannel = new Mongo(conn.s0.host);
     authCommandsLib.runTests(conn, impls);
     conn.stop();
+}
+
+if (mongotmock) {
+    mongotmock.stop();
 }

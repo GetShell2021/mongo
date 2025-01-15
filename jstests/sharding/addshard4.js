@@ -1,5 +1,6 @@
 // A replica set's passive nodes should be okay to add as part of a shard config
-(function() {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({name: "addshard4", shards: 2, mongos: 1, other: {useHostname: true}});
 
@@ -14,8 +15,6 @@ r.initiate(config);
 // Wait for replica set to be fully initialized - could take some time
 // to pre-allocate files on slow systems
 r.awaitReplication();
-
-var primary = r.getPrimary();
 
 var members = config.members.map(function(elem) {
     return elem.host;
@@ -37,19 +36,16 @@ var result = s.adminCommand({"addshard": shardName});
 printjson(result);
 assert.eq(result, true);
 
-r.stopSet();
-r = new ReplSetTest({name: "addshard42", nodes: 3, nodeOptions: {shardsvr: ""}});
-r.startSet();
+var r42 = new ReplSetTest({name: "addshard42", nodes: 3, nodeOptions: {shardsvr: ""}});
+r42.startSet();
 
-config = r.getReplSetConfig();
+config = r42.getReplSetConfig();
 config.members[2].arbiterOnly = true;
 
-r.initiate(config);
+r42.initiate(config);
 // Wait for replica set to be fully initialized - could take some time
 // to pre-allocate files on slow systems
-r.awaitReplication();
-
-primary = r.getPrimary();
+r42.awaitReplication();
 
 print("adding shard addshard42");
 
@@ -63,4 +59,4 @@ assert.eq(result, true);
 
 s.stop();
 r.stopSet();
-})();
+r42.stopSet();

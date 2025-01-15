@@ -1,7 +1,4 @@
-// Test X509 auth when --sslAllowInvalidCertificates is enabled
-
-(function() {
-'use strict';
+// Test X509 auth when --tlsAllowInvalidCertificates is enabled
 
 const CLIENT_NAME = "CN=client,OU=KernelUser,O=MongoDB,L=New York City,ST=New York,C=US";
 const CLIENT_CERT = 'jstests/libs/client.pem';
@@ -10,11 +7,12 @@ const CA_CERT = 'jstests/libs/ca.pem';
 const SELF_SIGNED_CERT = 'jstests/libs/client-self-signed.pem';
 
 function hasX509AuthSucceeded(conn) {
-    if (checkLog.checkContainsOnce(conn, 'Successfully authenticated')) {
-        return true;
-    }
     if (checkLog.checkContainsOnce(conn, 'No verified subject name available from client')) {
         return false;
+    }
+
+    if (checkLog.checkContainsOnce(conn, 'Successfully authenticated')) {
+        return true;
     }
     print("Not yet clear what was the result...");
     return null;
@@ -24,10 +22,10 @@ function testClient(cert, name, shouldSucceed) {
     print("Starting mongod...");
     const conn = MongoRunner.runMongod({
         auth: '',
-        sslMode: 'requireSSL',
-        sslPEMKeyFile: SERVER_CERT,
-        sslCAFile: CA_CERT,
-        sslAllowInvalidCertificates: '',
+        tlsMode: 'requireTLS',
+        tlsCertificateKeyFile: SERVER_CERT,
+        tlsCAFile: CA_CERT,
+        tlsAllowInvalidCertificates: '',
     });
 
     print("Creating admin user...");
@@ -51,11 +49,11 @@ function testClient(cert, name, shouldSucceed) {
 
     const script = 'assert(db.getSiblingDB(\'$external\').auth(' + tojson(auth) + '));';
     const exitCode = runMongoProgram('mongo',
-                                     '--ssl',
-                                     '--sslAllowInvalidHostnames',
-                                     '--sslPEMKeyFile',
+                                     '--tls',
+                                     '--tlsAllowInvalidHostnames',
+                                     '--tlsCertificateKeyFile',
                                      cert,
-                                     '--sslCAFile',
+                                     '--tlsCAFile',
                                      CA_CERT,
                                      '--port',
                                      conn.port,
@@ -77,4 +75,3 @@ testClient(CLIENT_CERT, CLIENT_NAME, true);
 testClient(SELF_SIGNED_CERT, CLIENT_NAME, false);
 testClient(CLIENT_CERT, null, true);
 testClient(SELF_SIGNED_CERT, null, false);
-})();

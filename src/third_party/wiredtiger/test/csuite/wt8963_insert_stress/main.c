@@ -35,12 +35,13 @@
  * suite does not allow overriding validation at the moment.
  */
 
-#define THREAD_NUM_ITERATIONS 200000
+#define THREAD_NUM_ITERATIONS (200 * WT_THOUSAND)
 #define NUM_THREADS 110
 #define KEY_MAX UINT32_MAX
 #define TABLE_CONFIG_FMT "key_format=%s,value_format=%s,memory_page_image_max=50MB"
 
-static const char *const conn_config = "create,cache_size=4G";
+static const char *const conn_config =
+  "create,cache_size=4G,statistics=(all),statistics_log=(json,on_close,wait=1)";
 
 static uint64_t ready_counter;
 
@@ -89,12 +90,12 @@ main(int argc, char *argv[])
     opts->nthreads = NUM_THREADS;
     opts->table_type = TABLE_ROW;
     testutil_check(testutil_parse_opts(argc, argv, opts));
-    testutil_make_work_dir(opts->home);
+    testutil_recreate_dir(opts->home);
 
     testutil_check(wiredtiger_open(opts->home, NULL, conn_config, &opts->conn));
     testutil_check(opts->conn->open_session(opts->conn, NULL, NULL, &session));
-    testutil_check(__wt_snprintf(tableconf, sizeof(tableconf), TABLE_CONFIG_FMT,
-      opts->table_type == TABLE_ROW ? "Q" : "r", opts->table_type == TABLE_FIX ? "8t" : "Q"));
+    testutil_snprintf(tableconf, sizeof(tableconf), TABLE_CONFIG_FMT,
+      opts->table_type == TABLE_ROW ? "Q" : "r", opts->table_type == TABLE_FIX ? "8t" : "Q");
     testutil_check(session->create(session, opts->uri, tableconf));
 
     cs = clock();
@@ -156,7 +157,7 @@ thread_insert_race(void *arg)
     /* Wait until all the threads are ready to go. */
     (void)__wt_atomic_add64(&ready_counter, 1);
     for (;; __wt_yield()) {
-        WT_ORDERED_READ(ready_counter_local, ready_counter);
+        WT_ACQUIRE_READ_WITH_BARRIER(ready_counter_local, ready_counter);
         if (ready_counter_local >= opts->nthreads)
             break;
     }

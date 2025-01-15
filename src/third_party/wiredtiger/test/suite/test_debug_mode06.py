@@ -47,7 +47,7 @@ class test_debug_mode06(wttest.WiredTigerTestCase):
         # Validate checkpoint time if asked for.
         if (assert_time > 0):
             stat_cur = self.session.open_cursor('statistics:', None, None)
-            checkpoint_time = int(stat_cur[wiredtiger.stat.conn.txn_checkpoint_time_recent][2])
+            checkpoint_time = int(stat_cur[wiredtiger.stat.conn.checkpoint_time_recent][2])
             self.assertTrue(checkpoint_time >= assert_time)
             stat_cur.close()
 
@@ -61,6 +61,3 @@ class test_debug_mode06(wttest.WiredTigerTestCase):
         conn_reconfig = 'debug_mode=(slow_checkpoint=false)'
         self.conn.reconfigure(conn_reconfig)
         self.insert_data()
-
-if __name__ == '__main__':
-    wttest.run()

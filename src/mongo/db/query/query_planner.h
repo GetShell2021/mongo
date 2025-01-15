@@ -29,10 +29,25 @@
 
 #pragma once
 
+#include "mongo/db/query/ce/sampling_estimator.h"
+#include <cstddef>
+#include <functional>
+#include <map>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/classic_plan_cache.h"
+#include "mongo/db/query/cost_based_ranker/estimates_storage.h"
+#include "mongo/db/query/index_entry.h"
 #include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
 
@@ -91,10 +106,38 @@ public:
         std::map<IndexEntry::Identifier, size_t> indexMap;
     };
 
+    /**
+     * Holds the result of plan enumeration from cost-based ranking.
+     */
+    struct CostBasedRankerResult {
+        // Query solutions resulting from plan enumeration. This set contains the best plan as
+        // determined by the cost-based ranker and plans for which we were unable to estimate a
+        // cost, likely due to the lack of cardinality estimates. These plans are intended to be
+        // passed along to the multi-planner to pick the best one using runtime planning.
+        std::vector<std::unique_ptr<QuerySolution>> solutions;
+
+        // For explain purposes.
+
+        // Query solutions which the cost-based ranker rejects from consideration because their cost
+        // estimate is higher than another plan. Useful for the implementation of explain to expose
+        // why certain plans were not chosen.
+        std::vector<std::unique_ptr<QuerySolution>> rejectedPlans;
+
+        // Estimate information for all QuerySolutionNodes in all the plans which we were able to
+        // cost. This may include some plans in 'solutions' and all of the plans in 'rejectedPlans'.
+        // If two plans contain identical QSNs, they are treated as separate entries in this map.
+        cost_based_ranker::EstimateMap estimates;
+    };
+
+    /**
+     * Given a CanonicalQuery and a QSN tree, creates QSN nodes for each pipeline stage in 'query'
+     * and grafts them on top of the existing QSN tree. If 'query' has an empty pipeline, this
+     * function is a noop.
+     */
     static std::unique_ptr<QuerySolution> extendWithAggPipeline(
-        const CanonicalQuery& query,
+        CanonicalQuery& query,
         std::unique_ptr<QuerySolution>&& solution,
-        const std::map<NamespaceString, SecondaryCollectionInfo>& secondaryCollInfos);
+        const std::map<NamespaceString, CollectionInfo>& secondaryCollInfos);
 
     /**
      * Returns the list of possible query solutions for the provided 'query' for multi-planning.
@@ -102,6 +145,17 @@ public:
      */
     static StatusWith<std::vector<std::unique_ptr<QuerySolution>>> plan(
         const CanonicalQuery& query, const QueryPlannerParams& params);
+
+    /**
+     * Invokes 'QueryPlanner::plan()' to enumerate the set of possible plans. Then estimate each
+     * plan's cost using the cardinality estimation (CE) and costing modules. The return value
+     * contains a list of plans that were rejected on the basis of cost, as well as any non-rejected
+     * plans from which the caller can select a winner.
+     */
+    static StatusWith<CostBasedRankerResult> planWithCostBasedRanking(
+        const CanonicalQuery& query,
+        const QueryPlannerParams& params,
+        const ce::SamplingEstimator* samplingEstimator);
 
     /**
      * Generates and returns a query solution, given data retrieved from the plan cache.
@@ -113,7 +167,7 @@ public:
     static StatusWith<std::unique_ptr<QuerySolution>> planFromCache(
         const CanonicalQuery& query,
         const QueryPlannerParams& params,
-        const CachedSolution& cachedSoln);
+        const SolutionCacheData& solnCacheData);
 
     /**
      * Plan each branch of the rooted $or query independently, and return the resulting
@@ -128,7 +182,8 @@ public:
             const CanonicalQuery& cq, const CollectionPtr& coll)> getSolutionCachedData,
         const CollectionPtr& collection,
         const CanonicalQuery& query,
-        const QueryPlannerParams& params);
+        const QueryPlannerParams& params,
+        const ce::SamplingEstimator* samplingEstimator);
 
     /**
      * Generates and returns the index tag tree that will be inserted into the plan cache. This data

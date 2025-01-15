@@ -1,8 +1,7 @@
 // Test for auth counters in serverStatus.
 // @tags: [requires_replication]
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const keyfile = 'jstests/libs/key1';
 const badKeyfile = 'jstests/libs/key2';
@@ -134,4 +133,3 @@ const finalStats =
 replTest.stopSet();
 
 printjson(finalStats);
-})();

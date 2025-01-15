@@ -37,15 +37,27 @@
 
 #include <algorithm>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <cstring>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#ifndef _WIN32
+#include <strings.h>
+#endif
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/platform/bits.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/ctype.h"
+#include "mongo/util/str_basic.h"  // IWYU pragma: export
 
 namespace mongo {
 namespace str {
@@ -394,10 +406,6 @@ public:
 private:
     bool _lexOnly;
 };
-
-// TODO: Sane-ify core std::string functionality
-// For now, this needs to be near the LexNumCmp or else
-int versionCmp(StringData rhs, StringData lhs);
 
 /**
  * A method to escape whitespace and control characters in strings. For example, the string "\t"

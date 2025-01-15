@@ -1,16 +1,14 @@
 // Test that manually inserted impersonation can't escalate privileges.
 // @tags: [requires_replication]
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function testMongod(mongod, systemuserpwd = undefined) {
     const admin = mongod.getDB('admin');
     admin.createUser({user: 'admin', pwd: 'admin', roles: ['root']});
 
-    function assertUnauthorized(cmd, msg) {
-        const errmsg =
-            assert.commandFailedWithCode(admin.runCommand(cmd), ErrorCodes.Unauthorized).errmsg;
+    function assertError(cmd, msg, code) {
+        const errmsg = assert.commandFailedWithCode(admin.runCommand(cmd), code).errmsg;
         assert(errmsg.includes(msg), "Error message is missing '" + msg + "': " + errmsg);
     }
 
@@ -18,7 +16,8 @@ function testMongod(mongod, systemuserpwd = undefined) {
 
     // Localhost authbypass is disabled, and we haven't logged in,
     // so normal auth-required commands should fail.
-    assertUnauthorized({usersInfo: 1}, 'command usersInfo requires authentication');
+    assertError(
+        {usersInfo: 1}, 'Command usersInfo requires authentication', ErrorCodes.Unauthorized);
 
     // Hello command requires no auth, so it works fine.
     assert.commandWorked(admin.runCommand({hello: 1}));
@@ -29,15 +28,17 @@ function testMongod(mongod, systemuserpwd = undefined) {
     const kImpersonatedHello = {
         hello: 1,
         "$audit": {
-            "$impersonatedUsers": [{user: 'admin', db: 'admin'}],
+            "$impersonatedUser": {user: 'admin', db: 'admin'},
             "$impersonatedRoles": [{role: 'root', db: 'admin'}],
         }
     };
-    assertUnauthorized(kImpersonatedHello, 'Unauthorized use of impersonation metadata');
+    assertError(
+        kImpersonatedHello, 'Unauthorized use of impersonation metadata', ErrorCodes.Unauthorized);
 
     // Try as admin (root role), should still fail.
     admin.auth('admin', 'admin');
-    assertUnauthorized(kImpersonatedHello, 'Unauthorized use of impersonation metadata');
+    assertError(
+        kImpersonatedHello, 'Unauthorized use of impersonation metadata', ErrorCodes.Unauthorized);
     admin.logout();
 
     if (systemuserpwd !== undefined) {
@@ -59,13 +60,6 @@ function testMongod(mongod, systemuserpwd = undefined) {
     MongoRunner.stopMongod(standalone);
 }
 
-if (!jsTestOptions().noJournal &&
-    (!jsTest.options().storageEngine || jsTest.options().storageEngine === "wiredTiger")) {
-    print("Skipping test because running WiredTiger without journaling isn't a valid" +
-          " replica set configuration");
-    return;
-}
-
 {
     const kKeyfile = 'jstests/libs/key1';
     const kKey = cat(kKeyfile).replace(/[\011-\015\040]/g, '');
@@ -77,4 +71,3 @@ if (!jsTestOptions().noJournal &&
     testMongod(rst.getPrimary(), kKey);
     rst.stopSet();
 }
-})();

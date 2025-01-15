@@ -27,27 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
 
-#include "mongo/db/pipeline/accumulator_for_window_functions.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_for_window_functions.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
-REGISTER_WINDOW_FUNCTION_CONDITIONALLY(
+REGISTER_WINDOW_FUNCTION(
     locf,
     mongo::window_function::ExpressionFromLeftUnboundedWindowFunction<AccumulatorLocf>::parse,
-    feature_flags::gFeatureFlagLocf.getVersion(),
-    AllowedWithApiStrict::kAlways,
-    feature_flags::gFeatureFlagLocf.isEnabledAndIgnoreFCV());
+    AllowedWithApiStrict::kAlways);
 
 AccumulatorLocf::AccumulatorLocf(ExpressionContext* const expCtx)
     : AccumulatorForWindowFunctions(expCtx) {
-    _memUsageBytes = sizeof(*this) + _lastNonNull.getApproximateSize();
+    _memUsageTracker.set(sizeof(*this) + _lastNonNull.getApproximateSize());
 }
 
 void AccumulatorLocf::processInternal(const Value& input, bool merging) {
@@ -55,7 +59,7 @@ void AccumulatorLocf::processInternal(const Value& input, bool merging) {
 
     if (!input.nullish()) {
         _lastNonNull = input;
-        _memUsageBytes = sizeof(*this) + _lastNonNull.getApproximateSize();
+        _memUsageTracker.set(sizeof(*this) + _lastNonNull.getApproximateSize());
     }
 }
 
@@ -66,10 +70,7 @@ Value AccumulatorLocf::getValue(bool toBeMerged) {
 
 void AccumulatorLocf::reset() {
     _lastNonNull = Value(BSONNULL);
-    _memUsageBytes = sizeof(*this) + _lastNonNull.getApproximateSize();
+    _memUsageTracker.set(sizeof(*this) + _lastNonNull.getApproximateSize());
 }
 
-boost::intrusive_ptr<AccumulatorState> AccumulatorLocf::create(ExpressionContext* const expCtx) {
-    return new AccumulatorLocf(expCtx);
-}
 }  // namespace mongo

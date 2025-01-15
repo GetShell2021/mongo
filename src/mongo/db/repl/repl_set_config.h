@@ -29,18 +29,36 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <compare>
+#include <cstddef>
+#include <iosfwd>
+#include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/db/repl/member_config.h"
+#include "mongo/db/repl/member_id.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_set_config_gen.h"
 #include "mongo/db/repl/repl_set_tag.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -56,7 +74,7 @@ namespace repl {
 class ConfigVersionAndTerm {
 public:
     ConfigVersionAndTerm() : _version(0), _term(OpTime::kUninitializedTerm) {}
-    ConfigVersionAndTerm(int version, long long term) : _version(version), _term(term) {}
+    ConfigVersionAndTerm(long long version, long long term) : _version(version), _term(term) {}
 
     inline bool operator==(const ConfigVersionAndTerm& rhs) const {
         // If term of either item is uninitialized (-1), then we ignore terms entirely and only
@@ -146,8 +164,6 @@ protected:
      * Returns a pointer to a mutable MemberConfig.
      */
     MemberConfig* _findMemberByID(MemberId id);
-
-    ReplSetConfigPtr _recipientConfig;
 };
 
 /**
@@ -157,7 +173,7 @@ class ReplSetConfig : private MutableReplSetConfig {
 public:
     typedef std::vector<MemberConfig>::const_iterator MemberIterator;
 
-    using ReplSetConfigBase::kConfigServerFieldName;
+    using ReplSetConfigBase::kConfigServer_deprecatedFieldName;
     using ReplSetConfigBase::kConfigTermFieldName;
     static constexpr char kMajorityWriteConcernModeName[] = "$majority";
     static constexpr char kVotingMembersWriteConcernModeName[] = "$votingMembers";
@@ -186,7 +202,7 @@ public:
     static const Milliseconds kDefaultCatchUpTakeoverDelay;
 
     // Methods inherited from the base IDL class.  Do not include any setters here.
-    using ReplSetConfigBase::getConfigServer;
+    using ReplSetConfigBase::getConfigServer_deprecated;
     using ReplSetConfigBase::getConfigTerm;
     using ReplSetConfigBase::getConfigVersion;
     using ReplSetConfigBase::getProtocolVersion;
@@ -315,6 +331,13 @@ public:
             }
         }
         return votingMembers;
+    };
+
+    /**
+     * Returns a count voting members in this ReplSetConfig.
+     */
+    size_t getCountOfVotingMembers() const {
+        return _votingMemberCount;
     };
 
     /**
@@ -544,17 +567,6 @@ public:
     Status validateWriteConcern(const WriteConcernOptions& writeConcern) const;
 
     /**
-     * Returns true if this config is a split config, which is determined by checking if it contains
-     * a recipient config for a shard split operation.
-     */
-    bool isSplitConfig() const;
-
-    /**
-     * Returns the config for the recipient during a tenant split operation, if it exists.
-     */
-    ReplSetConfigPtr getRecipientConfig() const;
-
-    /**
      * Compares the write concern modes with another config and returns 'true' if they are
      * identical.
      */
@@ -608,6 +620,7 @@ private:
     int _writableVotingMembersCount = 0;
     int _writeMajority = 0;
     int _totalVotingMembers = 0;
+    int _votingMemberCount = 0;
     ReplSetTagConfig _tagConfig;
     StringMap<ReplSetTagPattern> _customWriteConcernModes;
     ConnectionString _connectionString;

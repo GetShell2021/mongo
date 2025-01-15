@@ -1,17 +1,17 @@
 // Tests whether a split and a migrate in a sharded cluster preserve the epoch\
 
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 2, mongos: 1});
 // Balancer is by default stopped, thus it will not interfere
 
 var config = st.s.getDB("config");
 var admin = st.s.getDB("admin");
-var coll = st.s.getCollection("foo.bar");
+const kDbName = "foo";
 
 // First enable sharding
-admin.runCommand({enableSharding: coll.getDB() + ""});
-st.ensurePrimaryShard(coll.getDB().getName(), st.shard1.shardName);
+admin.runCommand({enableSharding: kDbName, primaryShard: st.shard1.shardName});
+var coll = st.s.getCollection(kDbName + ".bar");
 admin.runCommand({shardCollection: coll + "", key: {_id: 1}});
 
 var primary = config.databases.find({_id: coll.getDB() + ""}).primary;

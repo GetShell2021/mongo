@@ -11,6 +11,8 @@ import { connect } from "react-redux";
 import { getCounts } from "./redux/store";
 import { setCounts } from "./redux/counts";
 
+const {REACT_APP_API_URL} = process.env;
+
 const columns = [
   { id: "ID", field: "type", headerName: "Count Type", width: 50 },
   { field: "value", headerName: "Value", width: 50 },
@@ -25,11 +27,13 @@ const useStyles = makeStyles({
 const GraphInfo = ({ selectedGraph, counts, datawidth, setCounts }) => {
   React.useEffect(() => {
     let gitHash = selectedGraph;
-    fetch('/api/graphs/' + gitHash + '/analysis')
-      .then(response => response.json())
-      .then(data => {
-        setCounts(data.results);
-      });
+    if (gitHash) {
+      fetch(REACT_APP_API_URL + '/api/graphs/' + gitHash + '/analysis')
+        .then(response => response.json())
+        .then(data => {
+          setCounts(data.results);
+        });
+    }
   }, [selectedGraph]);
   
   const classes = useStyles();

@@ -18,7 +18,6 @@
 #include "jstypes.h"
 
 #include "util/Poison.h"
-#include "util/Windows.h"
 #include "vm/HelperThreads.h"
 
 using namespace js;
@@ -101,14 +100,20 @@ bool js::gExtraPoisoningEnabled = false;
 #  endif
 #endif
 
+// MONGODB MODIFICATION: We don't want to compile the below code when running in mongo embedding. 
+// Instead, we would like to rely on our own JS custom allocator implementation in mongo_sources.
+#ifndef JS_USE_CUSTOM_ALLOCATOR
 JS_PUBLIC_DATA arena_id_t js::MallocArena;
 JS_PUBLIC_DATA arena_id_t js::ArrayBufferContentsArena;
 JS_PUBLIC_DATA arena_id_t js::StringBufferArena;
 
 void js::InitMallocAllocator() {
-  MallocArena = moz_create_arena();
+  arena_params_t mallocArenaParams;
+  mallocArenaParams.mMaxDirtyIncreaseOverride = 5;
+  MallocArena = moz_create_arena_with_params(&mallocArenaParams);
 
   arena_params_t params;
+  params.mMaxDirtyIncreaseOverride = 5;
   params.mFlags |= ARENA_FLAG_RANDOMIZE_SMALL_ENABLED;
   ArrayBufferContentsArena = moz_create_arena_with_params(&params);
   StringBufferArena = moz_create_arena_with_params(&params);
@@ -119,6 +124,7 @@ void js::ShutDownMallocAllocator() {
   // moz_dispose_arena(MallocArena);
   // moz_dispose_arena(ArrayBufferContentsArena);
 }
+#endif
 
 extern void js::AssertJSStringBufferInCorrectArena(const void* ptr) {
 //  `jemalloc_ptr_info()` only exists if MOZ_MEMORY is defined, and it only

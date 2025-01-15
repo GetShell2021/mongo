@@ -27,28 +27,43 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/query/index_bounds_builder_test.h"
-
-#include "mongo/db/query/expression_index.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/query/expression_geo_index_mapping.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/index_bounds_builder.h"
+#include "mongo/db/query/index_bounds_builder_test_fixture.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/interval.h"
+#include "mongo/db/query/interval_evaluation_tree.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
 /**
- * Asserts that 'oil' contains exactly two bounds: [[undefined, undefined], [null, null]].
+ * Asserts that 'oil' contains exactly one bound: [null, null]].
  */
 void assertBoundsRepresentEqualsNull(const OrderedIntervalList& oil) {
-    ASSERT_EQUALS(oil.intervals.size(), 2U);
-    ASSERT_EQUALS(
-        Interval::INTERVAL_EQUALS,
-        oil.intervals[0].compare(Interval(fromjson("{'': undefined, '': undefined}"), true, true)));
+    ASSERT_EQUALS(oil.intervals.size(), 1U);
     ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
-                  oil.intervals[1].compare(Interval(fromjson("{'': null, '': null}"), true, true)));
+                  oil.intervals[0].compare(Interval(fromjson("{'': null, '': null}"), true, true)));
 }
 
-TEST_F(IndexBoundsBuilderTest, TranslateExprEqualToNullIsInexactFetch) {
+TEST_F(IndexBoundsBuilderTest, TranslateExprEqualToNullIsExactMaybeCovered) {
     BSONObj keyPattern = BSON("a" << 1);
     BSONElement elt = keyPattern.firstElement();
     auto testIndex = buildSimpleIndexEntry(keyPattern);
@@ -59,17 +74,12 @@ TEST_F(IndexBoundsBuilderTest, TranslateExprEqualToNullIsInexactFetch) {
     interval_evaluation_tree::Builder ietBuilder{};
     IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness, &ietBuilder);
     ASSERT_EQUALS(oil.name, "a");
-    ASSERT_EQUALS(oil.intervals.size(), 2U);
-    ASSERT_EQUALS(
-        Interval::INTERVAL_EQUALS,
-        oil.intervals[0].compare(Interval(fromjson("{'': undefined, '': undefined}"), true, true)));
-    ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
-                  oil.intervals[1].compare(Interval(fromjson("{'': null, '': null}"), true, true)));
-    ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_FETCH);
+    assertBoundsRepresentEqualsNull(oil);
+    ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT_MAYBE_COVERED);
     assertIET(inputParamIdMap, ietBuilder, elt, testIndex, oil);
 }
 
-TEST_F(IndexBoundsBuilderTest, TranslateEqualsToNullShouldBuildInexactBounds) {
+TEST_F(IndexBoundsBuilderTest, TranslateEqualsToNullShouldBuildExactMaybeCoveredBounds) {
     BSONObj indexPattern = BSON("a" << 1);
     auto testIndex = buildSimpleIndexEntry(indexPattern);
 
@@ -83,14 +93,56 @@ TEST_F(IndexBoundsBuilderTest, TranslateEqualsToNullShouldBuildInexactBounds) {
         expr.get(), indexPattern.firstElement(), testIndex, &oil, &tightness, &ietBuilder);
 
     ASSERT_EQUALS(oil.name, "a");
-    ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_FETCH);
+    ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT_MAYBE_COVERED);
     assertBoundsRepresentEqualsNull(oil);
     assertIET(inputParamIdMap, ietBuilder, indexPattern.firstElement(), testIndex, oil);
 }
 
-TEST_F(IndexBoundsBuilderTest, TranslateDottedEqualsToNullShouldBuildInexactBounds) {
+TEST_F(IndexBoundsBuilderTest, TranslateDottedEqualsToNullShouldBuildExactMaybeCoveredBounds) {
     BSONObj indexPattern = BSON("a.b" << 1);
     auto testIndex = buildSimpleIndexEntry(indexPattern);
+
+    BSONObj obj = BSON("a.b" << BSONNULL);
+    auto [expr, inputParamIdMap] = parseMatchExpression(obj);
+
+    OrderedIntervalList oil;
+    IndexBoundsBuilder::BoundsTightness tightness;
+    interval_evaluation_tree::Builder ietBuilder{};
+    IndexBoundsBuilder::translate(
+        expr.get(), indexPattern.firstElement(), testIndex, &oil, &tightness, &ietBuilder);
+
+    ASSERT_EQUALS(oil.name, "a.b");
+    // Depending on the query projection, this will either be converted to EXACT or to INEXACT_FETCH
+    // before we build an IXSCAN plan.
+    ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT_MAYBE_COVERED);
+    assertBoundsRepresentEqualsNull(oil);
+    assertIET(inputParamIdMap, ietBuilder, indexPattern.firstElement(), testIndex, oil);
+}
+
+TEST_F(IndexBoundsBuilderTest, TranslateEqualsToNullMultiKeyShouldBuildExactBounds) {
+    BSONObj indexPattern = BSON("a" << 1);
+    auto testIndex = buildSimpleIndexEntry(indexPattern);
+    testIndex.multikey = true;
+
+    BSONObj obj = BSON("a" << BSONNULL);
+    auto [expr, inputParamIdMap] = parseMatchExpression(obj);
+
+    OrderedIntervalList oil;
+    IndexBoundsBuilder::BoundsTightness tightness;
+    interval_evaluation_tree::Builder ietBuilder{};
+    IndexBoundsBuilder::translate(
+        expr.get(), indexPattern.firstElement(), testIndex, &oil, &tightness, &ietBuilder);
+
+    ASSERT_EQUALS(oil.name, "a");
+    ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT_MAYBE_COVERED);
+    assertBoundsRepresentEqualsNull(oil);
+    assertIET(inputParamIdMap, ietBuilder, indexPattern.firstElement(), testIndex, oil);
+}
+
+TEST_F(IndexBoundsBuilderTest, TranslateDottedEqualsToNullMultiKeyShouldBuildInexactBounds) {
+    BSONObj indexPattern = BSON("a.b" << 1);
+    auto testIndex = buildSimpleIndexEntry(indexPattern);
+    testIndex.multikey = true;
 
     BSONObj obj = BSON("a.b" << BSONNULL);
     auto [expr, inputParamIdMap] = parseMatchExpression(obj);
@@ -107,27 +159,7 @@ TEST_F(IndexBoundsBuilderTest, TranslateDottedEqualsToNullShouldBuildInexactBoun
     assertIET(inputParamIdMap, ietBuilder, indexPattern.firstElement(), testIndex, oil);
 }
 
-TEST_F(IndexBoundsBuilderTest, TranslateEqualsToNullMultiKeyShouldBuildInexactBounds) {
-    BSONObj indexPattern = BSON("a" << 1);
-    auto testIndex = buildSimpleIndexEntry(indexPattern);
-    testIndex.multikey = true;
-
-    BSONObj obj = BSON("a" << BSONNULL);
-    auto [expr, inputParamIdMap] = parseMatchExpression(obj);
-
-    OrderedIntervalList oil;
-    IndexBoundsBuilder::BoundsTightness tightness;
-    interval_evaluation_tree::Builder ietBuilder{};
-    IndexBoundsBuilder::translate(
-        expr.get(), indexPattern.firstElement(), testIndex, &oil, &tightness, &ietBuilder);
-
-    ASSERT_EQUALS(oil.name, "a");
-    ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_FETCH);
-    assertBoundsRepresentEqualsNull(oil);
-    assertIET(inputParamIdMap, ietBuilder, indexPattern.firstElement(), testIndex, oil);
-}
-
-TEST_F(IndexBoundsBuilderTest, TranslateEqualsToNullShouldBuildTwoIntervalsForHashedIndex) {
+TEST_F(IndexBoundsBuilderTest, TranslateEqualsToNullShouldBuildOneIntervalForHashedIndex) {
     BSONObj indexPattern = BSON("a"
                                 << "hashed");
     auto testIndex = buildSimpleIndexEntry(indexPattern);
@@ -144,28 +176,13 @@ TEST_F(IndexBoundsBuilderTest, TranslateEqualsToNullShouldBuildTwoIntervalsForHa
 
     ASSERT_EQUALS(oil.name, "a");
     ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_FETCH);
-    // We should have one for undefined, and one for null.
-    ASSERT_EQUALS(oil.intervals.size(), 2U);
-    {
-        const BSONObj undefinedElementObj = BSON("" << BSONUndefined);
-        const BSONObj hashedUndefinedInterval =
-            ExpressionMapping::hash(undefinedElementObj.firstElement());
-        ASSERT_EQ(hashedUndefinedInterval.firstElement().type(), BSONType::NumberLong);
-
-        const auto& firstInterval = oil.intervals[0];
-        ASSERT_TRUE(firstInterval.startInclusive);
-        ASSERT_TRUE(firstInterval.endInclusive);
-        ASSERT_EQ(firstInterval.start.type(), BSONType::NumberLong);
-        ASSERT_EQ(firstInterval.start.numberLong(),
-                  hashedUndefinedInterval.firstElement().numberLong());
-    }
-
+    ASSERT_EQUALS(oil.intervals.size(), 1U);
     {
         const BSONObj nullElementObj = BSON("" << BSONNULL);
         const BSONObj hashedNullInterval = ExpressionMapping::hash(nullElementObj.firstElement());
         ASSERT_EQ(hashedNullInterval.firstElement().type(), BSONType::NumberLong);
 
-        const auto& secondInterval = oil.intervals[1];
+        const auto& secondInterval = oil.intervals[0];
         ASSERT_TRUE(secondInterval.startInclusive);
         ASSERT_TRUE(secondInterval.endInclusive);
         ASSERT_EQ(secondInterval.start.type(), BSONType::NumberLong);
@@ -176,14 +193,14 @@ TEST_F(IndexBoundsBuilderTest, TranslateEqualsToNullShouldBuildTwoIntervalsForHa
 }
 
 /**
- * Asserts that 'oil' contains exactly two bounds: [MinKey, undefined) and (null, MaxKey].
+ * Asserts that 'oil' contains exactly two bounds: [MinKey, null) and (null, MaxKey].
  */
 void assertBoundsRepresentNotEqualsNull(const OrderedIntervalList& oil) {
     ASSERT_EQUALS(oil.intervals.size(), 2U);
     {
         BSONObjBuilder bob;
         bob.appendMinKey("");
-        bob.appendUndefined("");
+        bob.appendNull("");
         ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
                       oil.intervals[0].compare(Interval(bob.obj(), true, false)));
     }
@@ -205,7 +222,7 @@ TEST_F(IndexBoundsBuilderTest, TranslateNotEqualToNullShouldBuildExactBoundsIfIn
     BSONObj indexPattern = BSON("a" << 1);
     auto testIndex = buildSimpleIndexEntry(indexPattern);
 
-    for (BSONObj obj : kNeNullQueries) {
+    for (const BSONObj& obj : kNeNullQueries) {
         // It's necessary to call optimize since the $not will have a singleton $and child, which
         // IndexBoundsBuilder::translate cannot handle.
         auto [expr, inputParamIdMap] = parseMatchExpression(obj);
@@ -217,7 +234,7 @@ TEST_F(IndexBoundsBuilderTest, TranslateNotEqualToNullShouldBuildExactBoundsIfIn
         IndexBoundsBuilder::translate(
             expr.get(), indexPattern.firstElement(), testIndex, &oil, &tightness, &ietBuilder);
 
-        // Bounds should be [MinKey, undefined), (null, MaxKey].
+        // Bounds should be [MinKey, null), (null, MaxKey].
         ASSERT_EQUALS(oil.name, "a");
         ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
         assertBoundsRepresentNotEqualsNull(oil);
@@ -232,7 +249,7 @@ TEST_F(IndexBoundsBuilderTest,
     testIndex.multikeyPaths = {MultikeyComponents{},
                                MultikeyComponents{0}};  // "a" is not multi-key, but "b" is.
 
-    for (BSONObj obj : kNeNullQueries) {
+    for (const BSONObj& obj : kNeNullQueries) {
         // It's necessary to call optimize since the $not will have a singleton $and child, which
         // IndexBoundsBuilder::translate cannot handle.
         auto [expr, inputParamIdMap] = parseMatchExpression(obj);
@@ -244,7 +261,7 @@ TEST_F(IndexBoundsBuilderTest,
         IndexBoundsBuilder::translate(
             expr.get(), indexPattern.firstElement(), testIndex, &oil, &tightness, &ietBuilder);
 
-        // Bounds should be [MinKey, undefined), (null, MaxKey].
+        // Bounds should be [MinKey, null), (null, MaxKey].
         ASSERT_EQUALS(oil.name, "a");
         ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
         assertBoundsRepresentNotEqualsNull(oil);
@@ -256,7 +273,7 @@ TEST_F(IndexBoundsBuilderTest, TranslateNotEqualToNullShouldBuildExactBoundsOnRe
     BSONObj indexPattern = BSON("a" << -1);
     auto testIndex = buildSimpleIndexEntry(indexPattern);
 
-    for (BSONObj obj : kNeNullQueries) {
+    for (const BSONObj& obj : kNeNullQueries) {
         // It's necessary to call optimize since the $not will have a singleton $and child, which
         // IndexBoundsBuilder::translate cannot handle.
         auto [expr, inputParamIdMap] = parseMatchExpression(obj);
@@ -268,7 +285,7 @@ TEST_F(IndexBoundsBuilderTest, TranslateNotEqualToNullShouldBuildExactBoundsOnRe
         IndexBoundsBuilder::translate(
             expr.get(), indexPattern.firstElement(), testIndex, &oil, &tightness, &ietBuilder);
 
-        // Bounds should be [MinKey, undefined), (null, MaxKey].
+        // Bounds should be [MinKey, null), (null, MaxKey].
         ASSERT_EQUALS(oil.name, "a");
         ASSERT_EQUALS(tightness, IndexBoundsBuilder::EXACT);
         assertBoundsRepresentNotEqualsNull(oil);
@@ -281,7 +298,7 @@ TEST_F(IndexBoundsBuilderTest, TranslateNotEqualToNullShouldBuildInexactBoundsIf
     auto testIndex = buildSimpleIndexEntry(indexPattern);
     testIndex.multikey = true;
 
-    for (BSONObj obj : kNeNullQueries) {
+    for (const BSONObj& obj : kNeNullQueries) {
         // It's necessary to call optimize since the $not will have a singleton $and child, which
         // IndexBoundsBuilder::translate cannot handle.
         auto [expr, inputParamIdMap] = parseMatchExpression(obj);
@@ -307,7 +324,7 @@ TEST_F(IndexBoundsBuilderTest, TranslateInequalityToNullShouldProduceExactEmptyB
     const std::vector<BSONObj> inequalities = {BSON("a" << BSON("$lt" << BSONNULL)),
                                                BSON("a" << BSON("$gt" << BSONNULL))};
 
-    for (BSONObj obj : inequalities) {
+    for (const BSONObj& obj : inequalities) {
         // It's necessary to call optimize since the $not will have a singleton $and child, which
         // IndexBoundsBuilder::translate cannot handle.
         auto [expr, inputParamIdMap] = parseMatchExpression(obj);
@@ -333,7 +350,7 @@ TEST_F(IndexBoundsBuilderTest, TranslateNotInequalityToNullShouldProduceExactFul
         BSON("a" << BSON("$not" << BSON("$lt" << BSONNULL))),
         BSON("a" << BSON("$not" << BSON("$gt" << BSONNULL)))};
 
-    for (BSONObj obj : inequalities) {
+    for (const BSONObj& obj : inequalities) {
         // It's necessary to call optimize since the $not will have a singleton $and child, which
         // IndexBoundsBuilder::translate cannot handle.
         auto [expr, inputParamIdMap] = parseMatchExpression(obj);
@@ -363,7 +380,7 @@ TEST_F(IndexBoundsBuilderTest,
         BSON("a" << BSON("$not" << BSON("$lt" << BSONNULL))),
         BSON("a" << BSON("$not" << BSON("$gt" << BSONNULL)))};
 
-    for (BSONObj obj : inequalities) {
+    for (const BSONObj& obj : inequalities) {
         // It's necessary to call optimize since the $not will have a singleton $and child, which
         // IndexBoundsBuilder::translate cannot handle.
         auto [expr, inputParamIdMap] = parseMatchExpression(obj);

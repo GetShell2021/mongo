@@ -29,12 +29,21 @@
 
 #pragma once
 
+#include <cstdint>
+#include <cstring>
+#include <iosfwd>
 #include <string>
+#include <string_view>
+#include <sys/types.h>
 
 #include "mongo/base/data_range.h"
 #include "mongo/base/data_view.h"
 #include "mongo/base/static_assert.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -72,15 +81,6 @@ class SecureRandom;
  */
 class OID {
 public:
-    /**
-     * Functor compatible with std::hash for std::unordered_{map,set}
-     * Warning: The hash function is subject to change. Do not use in cases where hashes need
-     *          to be consistent across versions.
-     */
-    struct Hasher {
-        size_t operator()(const OID& oid) const;
-    };
-
     OID() : _data() {}
 
     enum { kOIDSize = 12, kTimestampSize = 4, kInstanceUniqueSize = 5, kIncrementSize = 3 };
@@ -180,10 +180,28 @@ public:
     }
 
     /**
+     * Functor compatible with std::hash for std::unordered_{map,set}
+     * Warning: The hash function is subject to change. Do not use in cases where hashes need
+     *          to be consistent across versions.
+     */
+    struct Hasher {
+        size_t operator()(const OID& oid) const;
+    };
+
+    /**
      * this is not consistent
      * do not store on disk
      */
     void hash_combine(size_t& seed) const;
+
+    /**
+     * Hash function compatible with absl::Hash for absl::unordered_{map,set}
+     */
+    template <typename H>
+    friend H AbslHashValue(H h, const OID& oid) {
+        const auto& d = oid._data;
+        return H::combine(std::move(h), std::string_view(d, sizeof(d)));
+    }
 
     /** call this after a fork to update the process id */
     static void justForked();

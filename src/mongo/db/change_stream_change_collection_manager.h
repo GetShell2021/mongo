@@ -29,18 +29,88 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_set.h>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/exec/delete_stage.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/query/record_id_bound.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
+
+/**
+ * Metadata associated with a particular change collection that is used by the purging job.
+ */
+struct ChangeCollectionPurgingJobMetadata {
+    // The wall time in milliseconds of the first document of the change collection.
+    long long firstDocWallTimeMillis;
+
+    // Current maximum record id present in the change collection.
+    RecordIdBound maxRecordIdBound;
+};
 
 /**
  * Manages the creation, deletion and insertion lifecycle of the change collection.
  */
 class ChangeStreamChangeCollectionManager {
 public:
+    /**
+     * Statistics of the change collection purging job.
+     */
+    struct PurgingJobStats {
+        /**
+         * Total number of deletion passes completed by the purging job.
+         */
+        AtomicWord<long long> totalPass;
+
+        /**
+         * Cumulative number of change collections documents deleted by the purging job.
+         */
+        AtomicWord<long long> docsDeleted;
+
+        /**
+         * Cumulative size in bytes of all deleted documents from all change collections by the
+         * purging job.
+         */
+        AtomicWord<long long> bytesDeleted;
+
+        /**
+         * Cumulative number of change collections scanned by the purging job.
+         */
+        AtomicWord<long long> scannedCollections;
+
+        /**
+         * Cumulative number of milliseconds elapsed since the first pass by the purging job.
+         */
+        AtomicWord<long long> timeElapsedMillis;
+
+        /**
+         * Maximum wall time in milliseconds from the first document of each change collection.
+         */
+        AtomicWord<long long> maxStartWallTimeMillis;
+
+        /**
+         * Serializes the purging job statistics to the BSON object.
+         */
+        BSONObj toBSON() const;
+    };
+
     explicit ChangeStreamChangeCollectionManager(ServiceContext* service) {}
 
     ~ChangeStreamChangeCollectionManager() = default;
@@ -61,61 +131,110 @@ public:
     static ChangeStreamChangeCollectionManager& get(OperationContext* opCtx);
 
     /**
-     * Returns true if change collections are enabled for recording oplog entries, false
-     * otherwise.
+     * Creates a change collection for the specified tenant, if it doesn't exist.
      */
-    static bool isChangeCollectionsModeActive();
-
-    /**
-     * Returns true if the change collection is present for the specified tenant, false otherwise.
-     */
-    bool hasChangeCollection(OperationContext* opCtx, boost::optional<TenantId> tenantId) const;
-
-    /**
-     * Creates a change collection for the specified tenant, if it doesn't exist. Returns Status::OK
-     * if the change collection already exists.
-     *
-     * TODO: SERVER-65950 make tenantId field mandatory.
-     */
-    Status createChangeCollection(OperationContext* opCtx, boost::optional<TenantId> tenantId);
+    void createChangeCollection(OperationContext* opCtx, const TenantId& tenantId);
 
     /**
      * Deletes the change collection for the specified tenant, if it already exist.
-     *
-     * TODO: SERVER-65950 make tenantId field mandatory.
      */
-    Status dropChangeCollection(OperationContext* opCtx, boost::optional<TenantId> tenantId);
+    void dropChangeCollection(OperationContext* opCtx, const TenantId& tenantId);
 
     /**
-     * Inserts documents to change collections. The parameter 'oplogRecords' is a vector of oplog
-     * records and the parameter 'oplogTimestamps' is a vector for respective timestamp for each
-     * oplog record.
+     * Inserts documents to change collections. The parameter 'oplogRecords' is a vector of
+     * oplog records and the parameter 'oplogTimestamps' is a vector for respective timestamp
+     * for each oplog record.
      *
-     * The method fetches the tenant-id from the oplog entry, performs necessary modification to the
-     * document and then write to the tenant's change collection at the specified oplog timestamp.
+     * The method fetches the tenant-id from the oplog entry, performs necessary modification to
+     * the document and then write to the tenant's change collection at the specified oplog
+     * timestamp.
      *
-     * Failure in insertion to any change collection will result in a fatal exception and will bring
-     * down the node.
-     *
-     * TODO: SERVER-65950 make tenantId field mandatory.
+     * Failure in insertion to any change collection will result in a fatal exception and will
+     * bring down the node.
      */
     void insertDocumentsToChangeCollection(OperationContext* opCtx,
                                            const std::vector<Record>& oplogRecords,
                                            const std::vector<Timestamp>& oplogTimestamps);
 
+    class ChangeCollectionsWriterInternal;
 
     /**
-     * Performs a range inserts on respective change collections using the oplog entries as
-     * specified by 'beginOplogEntries' and 'endOplogEntries'.
-     *
-     * Bails out if a failure is encountered in inserting documents to a particular change
-     * collection.
+     * Change Collection Writer. After acquiring ChangeCollectionsWriter the user should trigger
+     * acquisition of the locks by calling 'acquireLocks()' before the first write in the Write
+     * Unit of Work. Then the write of documents to change collections can be triggered by
+     * calling 'write()'.
      */
-    Status insertDocumentsToChangeCollection(
+    class ChangeCollectionsWriter {
+        friend class ChangeStreamChangeCollectionManager;
+
+        /**
+         * Constructs a writer from a range ['beginOplogEntries', 'endOplogEntries') of oplog
+         * entries.
+         */
+        ChangeCollectionsWriter(OperationContext* opCtx,
+                                std::vector<InsertStatement>::const_iterator beginOplogEntries,
+                                std::vector<InsertStatement>::const_iterator endOplogEntries,
+                                OpDebug* opDebug);
+
+    public:
+        ChangeCollectionsWriter(ChangeCollectionsWriter&&);
+        ChangeCollectionsWriter& operator=(ChangeCollectionsWriter&&);
+
+        /**
+         * Acquires locks needed to write documents to change collections.
+         */
+        void acquireLocks();
+
+        /**
+         * Writes documents to change collections.
+         */
+        Status write();
+
+        ~ChangeCollectionsWriter();
+
+    private:
+        std::unique_ptr<ChangeCollectionsWriterInternal> _writer;
+    };
+
+    /**
+     * Returns a change collection writer that can insert change collection entries into
+     * respective change collections. The entries are constructed from a range
+     * ['beginOplogEntries', 'endOplogEntries') of oplog entries.
+     */
+    ChangeCollectionsWriter createChangeCollectionsWriter(
         OperationContext* opCtx,
         std::vector<InsertStatement>::const_iterator beginOplogEntries,
         std::vector<InsertStatement>::const_iterator endOplogEntries,
         OpDebug* opDebug);
-};
 
+    PurgingJobStats& getPurgingJobStats() {
+        return _purgingJobStats;
+    }
+
+    /**
+     * Scans the provided change collection and returns its metadata that will be used by the
+     * purging job to perform deletion on it. The method returns 'boost::none' if the collection
+     * is empty.
+     */
+    static boost::optional<ChangeCollectionPurgingJobMetadata>
+    getChangeCollectionPurgingJobMetadata(OperationContext* opCtx,
+                                          const CollectionAcquisition& changeCollection);
+
+    /**
+     * Removes documents from a change collection whose wall time is less than the
+     * 'expirationTime'. Returns the number of documents deleted. The 'maxRecordIdBound' is the
+     * maximum record id bound that will not be included in the collection scan.
+     *
+     * The removal process is performed with a collection scan + batch delete.
+     */
+    static size_t removeExpiredChangeCollectionsDocumentsWithCollScan(
+        OperationContext* opCtx,
+        const CollectionAcquisition& changeCollection,
+        RecordIdBound maxRecordIdBound,
+        Date_t expirationTime);
+
+private:
+    // Change collections purging job stats.
+    PurgingJobStats _purgingJobStats;
+};
 }  // namespace mongo

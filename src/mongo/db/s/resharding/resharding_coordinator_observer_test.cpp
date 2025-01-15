@@ -28,15 +28,24 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <utility>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/s/resharding/resharding_coordinator_observer.h"
 #include "mongo/db/s/resharding/resharding_util.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/shard_id.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -252,5 +261,46 @@ TEST_F(ReshardingCoordinatorObserverTest, onDonorsReportedMinFetchTimestamp) {
 
     reshardingObserver->interrupt(Status{ErrorCodes::Interrupted, "interrupted"});
 }
+
+TEST_F(ReshardingCoordinatorObserverTest, onAllParticipantsReportingAbortReason) {
+    auto reshardingObserver = std::make_shared<ReshardingCoordinatorObserver>();
+    auto futRecipient = reshardingObserver->awaitAllRecipientsDone();
+    auto futDonor = reshardingObserver->awaitAllDonorsDone();
+    ASSERT_FALSE(futRecipient.isReady());
+    ASSERT_FALSE(futDonor.isReady());
+
+    auto abortReason = Status{ErrorCodes::InternalError, "We gotta abort"};
+    auto abortReasonFromCoordinator =
+        Status{ErrorCodes::ReshardCollectionAborted, "Recieved abort from coordinator"};
+
+    auto recipientShards0 =
+        makeMockRecipientsInState(RecipientStateEnum::kAwaitingFetchTimestamp, Timestamp(1, 1));
+    std::vector<DonorShardEntry> donorShards0{
+        {resharding::makeDonorShard(
+            ShardId{"s1"}, DonorStateEnum::kError, Timestamp(1, 1), abortReason)},
+        {resharding::makeDonorShard(
+            ShardId{"s2"}, DonorStateEnum::kPreparingToDonate, Timestamp(1, 1))}};
+
+    auto coordinatorDoc0 =
+        makeCoordinatorDocWithRecipientsAndDonors(recipientShards0, donorShards0, abortReason);
+    reshardingObserver->onReshardingParticipantTransition(coordinatorDoc0);
+    ASSERT_FALSE(futRecipient.isReady());
+    ASSERT_FALSE(futDonor.isReady());
+
+    auto recipientShards1 = makeMockRecipientsInState(
+        RecipientStateEnum::kDone, Timestamp(1, 1), abortReasonFromCoordinator);
+    std::vector<DonorShardEntry> donorShards1{
+        {resharding::makeDonorShard(
+            ShardId{"s1"}, DonorStateEnum::kDone, Timestamp(1, 1), abortReason)},
+        {resharding::makeDonorShard(
+            ShardId{"s2"}, DonorStateEnum::kDone, Timestamp(1, 1), abortReasonFromCoordinator)}};
+
+    auto coordinatorDoc1 =
+        makeCoordinatorDocWithRecipientsAndDonors(recipientShards1, donorShards1, abortReason);
+    reshardingObserver->onReshardingParticipantTransition(coordinatorDoc1);
+    ASSERT_TRUE(futRecipient.isReady());
+    ASSERT_TRUE(futDonor.isReady());
+}
+
 }  // namespace
 }  // namespace mongo

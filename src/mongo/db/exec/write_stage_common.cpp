@@ -29,17 +29,30 @@
 
 #include "mongo/db/exec/write_stage_common.h"
 
+
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/exec/shard_filterer_impl.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/logv2/redaction.h"
-#include "mongo/s/pm2423_feature_flags_gen.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
@@ -49,29 +62,19 @@ namespace mongo {
 namespace write_stage_common {
 
 PreWriteFilter::PreWriteFilter(OperationContext* opCtx, NamespaceString nss)
-    : _opCtx(opCtx),
-      _nss(std::move(nss)),
-      _isEnabled([] {
-          auto& fcv = serverGlobalParams.featureCompatibility;
-          return fcv.isVersionInitialized() &&
-              feature_flags::gFeatureFlagNoChangeStreamEventsDueToOrphans.isEnabled(fcv);
-      }()),
-      _skipFiltering([&] {
-          // Always allow writes on replica sets.
-          if (serverGlobalParams.clusterRole == ClusterRole::None) {
+    : _opCtx(opCtx), _nss(std::move(nss)), _skipFiltering([&] {
+          // Allow writes on standalone and replica set.
+          if (serverGlobalParams.clusterRole.has(ClusterRole::None)) {
               return true;
           }
 
-          // Always allow writes on standalone and secondary nodes.
-          const auto replCoord{repl::ReplicationCoordinator::get(opCtx)};
-          return !replCoord->canAcceptWritesForDatabase(opCtx, NamespaceString::kAdminDb);
+          // Only the primary node of a shard that is a replica set should run this filter.
+          const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+          return !replCoord->getSettings().isReplSet() ||
+              !replCoord->canAcceptWritesForDatabase(opCtx, DatabaseName::kAdmin);
       }()) {}
 
 PreWriteFilter::Action PreWriteFilter::computeAction(const Document& doc) {
-    // Skip the checks if the Filter is not enabled.
-    if (!_isEnabled)
-        return Action::kWrite;
-
     if (_skipFiltering) {
         // Secondaries do not apply any filtering logic as the primary already did.
         return Action::kWrite;
@@ -88,8 +91,9 @@ PreWriteFilter::Action PreWriteFilter::computeAction(const Document& doc) {
 bool PreWriteFilter::_documentBelongsToMe(const BSONObj& doc) {
     if (!_shardFilterer) {
         _shardFilterer = [&] {
-            const auto css{CollectionShardingState::get(_opCtx, _nss)};
-            return std::make_unique<ShardFiltererImpl>(css->getOwnershipFilter(
+            auto scopedCss =
+                CollectionShardingState::assertCollectionLockedAndAcquire(_opCtx, _nss);
+            return std::make_unique<ShardFiltererImpl>(scopedCss->getOwnershipFilter(
                 _opCtx,
                 CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup,
                 true /*supportNonVersionedOperations*/));
@@ -115,6 +119,30 @@ void PreWriteFilter::restoreState() {
     _shardFilterer.reset();
 }
 
+void PreWriteFilter::logSkippingDocument(const Document& doc,
+                                         StringData opKind,
+                                         const NamespaceString& collNs) {
+    LOGV2_DEBUG(5983201,
+                3,
+                "Skipping the operation to orphan document to prevent a wrong change "
+                "stream event",
+                "op"_attr = opKind,
+                logAttrs(collNs),
+                "record"_attr = doc);
+}
+
+void PreWriteFilter::logFromMigrate(const Document& doc,
+                                    StringData opKind,
+                                    const NamespaceString& collNs) {
+    LOGV2_DEBUG(6184700,
+                3,
+                "Marking the operation to orphan document with the fromMigrate flag to "
+                "prevent a wrong change stream event",
+                "op"_attr = opKind,
+                logAttrs(collNs),
+                "record"_attr = doc);
+}
+
 bool ensureStillMatches(const CollectionPtr& collection,
                         OperationContext* opCtx,
                         WorkingSet* ws,
@@ -123,7 +151,7 @@ bool ensureStillMatches(const CollectionPtr& collection,
     // If the snapshot changed, then we have to make sure we have the latest copy of the doc and
     // that it still matches.
     WorkingSetMember* member = ws->get(id);
-    if (opCtx->recoveryUnit()->getSnapshotId() != member->doc.snapshotId()) {
+    if (shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId() != member->doc.snapshotId()) {
         std::unique_ptr<SeekableRecordCursor> cursor(collection->getCursor(opCtx));
 
         if (!WorkingSetCommon::fetch(opCtx, ws, id, cursor.get(), collection, collection->ns())) {
@@ -132,7 +160,8 @@ bool ensureStillMatches(const CollectionPtr& collection,
         }
 
         // Make sure the re-fetched doc still matches the predicate.
-        if (cq && !cq->root()->matchesBSON(member->doc.value().toBson(), nullptr)) {
+        if (cq &&
+            !cq->getPrimaryMatchExpression()->matchesBSON(member->doc.value().toBson(), nullptr)) {
             // No longer matches.
             return false;
         }
@@ -142,6 +171,11 @@ bool ensureStillMatches(const CollectionPtr& collection,
         member->makeObjOwnedIfNeeded();
     }
     return true;
+}
+
+bool isRetryableWrite(OperationContext* opCtx) {
+    const auto replCoord{repl::ReplicationCoordinator::get(opCtx)};
+    return replCoord->isRetryableWrite(opCtx);
 }
 
 }  // namespace write_stage_common

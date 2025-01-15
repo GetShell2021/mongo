@@ -6,10 +6,8 @@
  *   requires_persistence,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/global_snapshot_reads_util.js");
+import {SnapshotReadsTest} from "jstests/libs/global_snapshot_reads_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const options = {
     // Set a large snapshot window of 10 minutes for the test.
@@ -17,7 +15,7 @@ const options = {
 };
 const replSet = new ReplSetTest({nodes: 3, nodeOptions: options});
 replSet.startSet();
-replSet.initiateWithHighElectionTimeout();
+replSet.initiate();
 let primaryAdmin = replSet.getPrimary().getDB("admin");
 assert.eq(assert
               .commandWorked(
@@ -49,4 +47,3 @@ const distinctResult = assert.commandWorked(primaryDB.runCommand({distinct: "tes
 assert(!distinctResult.hasOwnProperty("atClusterTime"));
 
 replSet.stopSet();
-})();

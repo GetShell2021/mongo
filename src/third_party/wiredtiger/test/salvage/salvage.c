@@ -28,8 +28,6 @@
 
 #include "test_util.h"
 
-#include <assert.h>
-
 #define HOME "WT_TEST"
 #define DUMP "WT_TEST/__slvg.dump"   /* Dump file */
 #define LOAD "WT_TEST/__slvg.load"   /* Build file */
@@ -170,11 +168,9 @@ usage(void)
 void
 run(int r)
 {
-    char buf[128];
-
     printf("\t%s: run %d\n", __wt_page_type_string(page_type), r);
 
-    testutil_make_work_dir(HOME);
+    testutil_recreate_dir(HOME);
 
     testutil_assert_errno((res_fp = fopen(RSLT, "w")) != NULL);
 
@@ -483,13 +479,9 @@ run(int r)
 
     process();
 
-    testutil_check(__wt_snprintf(buf, sizeof(buf), "cmp %s %s > /dev/null", DUMP, RSLT));
-    if (system(buf)) {
-        fprintf(stderr, "check failed, salvage results were incorrect\n");
-        exit(EXIT_FAILURE);
-    }
+    testutil_system("cmp %s %s > /dev/null", DUMP, RSLT);
 
-    testutil_clean_work_dir(HOME);
+    testutil_remove(HOME);
 }
 
 /*
@@ -521,31 +513,32 @@ build(int ikey, int ivalue, int cnt)
     /*
      * Disable logging: we're modifying files directly, we don't want to run recovery.
      */
-    testutil_check(wiredtiger_open(HOME, NULL, "create,log=(enabled=false)", &conn));
+    testutil_check(wiredtiger_open(HOME, NULL,
+      "create,log=(enabled=false),statistics=(all),statistics_log=(json,on_close,wait=1)", &conn));
     testutil_check(conn->open_session(conn, NULL, NULL, &session));
     testutil_check(session->drop(session, LOAD_URI, "force"));
 
     switch (page_type) {
     case WT_PAGE_COL_FIX:
-        testutil_check(__wt_snprintf(config, sizeof(config),
+        testutil_snprintf(config, sizeof(config),
           "key_format=r,value_format=7t,allocation_size=%d,internal_page_max=%d,leaf_page_max=%d,"
           "leaf_key_max=%d,leaf_value_max=%d",
-          PSIZE, PSIZE, PSIZE, OSIZE, OSIZE));
+          PSIZE, PSIZE, PSIZE, OSIZE, OSIZE);
         break;
     case WT_PAGE_COL_VAR:
-        testutil_check(__wt_snprintf(config, sizeof(config),
+        testutil_snprintf(config, sizeof(config),
           "key_format=r,allocation_size=%d,internal_page_max=%d,leaf_page_max=%d,leaf_key_max=%d,"
           "leaf_value_max=%d",
-          PSIZE, PSIZE, PSIZE, OSIZE, OSIZE));
+          PSIZE, PSIZE, PSIZE, OSIZE, OSIZE);
         break;
     case WT_PAGE_ROW_LEAF:
-        testutil_check(__wt_snprintf(config, sizeof(config),
+        testutil_snprintf(config, sizeof(config),
           "key_format=u,allocation_size=%d,internal_page_max=%d,leaf_page_max=%d,leaf_key_max=%d,"
           "leaf_value_max=%d",
-          PSIZE, PSIZE, PSIZE, OSIZE, OSIZE));
+          PSIZE, PSIZE, PSIZE, OSIZE, OSIZE);
         break;
     default:
-        assert(0);
+        testutil_assert(0);
     }
     testutil_check(session->create(session, LOAD_URI, config));
     testutil_check(session->open_cursor(session, LOAD_URI, NULL, "bulk,append", &cursor));
@@ -555,7 +548,7 @@ build(int ikey, int ivalue, int cnt)
         case WT_PAGE_COL_VAR:
             break;
         case WT_PAGE_ROW_LEAF:
-            testutil_check(__wt_snprintf(kbuf, sizeof(kbuf), "%010d KEY------", ikey));
+            testutil_snprintf(kbuf, sizeof(kbuf), "%010d KEY------", ikey);
             key.data = kbuf;
             key.size = 20;
             cursor->set_key(cursor, &key);
@@ -568,8 +561,7 @@ build(int ikey, int ivalue, int cnt)
             break;
         case WT_PAGE_COL_VAR:
         case WT_PAGE_ROW_LEAF:
-            testutil_check(
-              __wt_snprintf(vbuf, sizeof(vbuf), "%010d VALUE----", value_unique ? ivalue : 37));
+            testutil_snprintf(vbuf, sizeof(vbuf), "%010d VALUE----", value_unique ? ivalue : 37);
             value.data = vbuf;
             value.size = 20;
             cursor->set_value(cursor, &value);
@@ -703,8 +695,10 @@ process(void)
     /* Salvage. */
     config[0] = '\0';
     if (verbose)
-        testutil_check(__wt_snprintf(
-          config, sizeof(config), "error_prefix=\"%s\",verbose=[salvage,verify],", progname));
+        testutil_snprintf(config, sizeof(config),
+          "error_prefix=\"%s\",verbose=[salvage,verify],statistics=(all),statistics_log=(json,on_"
+          "close,wait=1),",
+          progname);
     strcat(config, "log=(enabled=false),");
 
     testutil_check(wiredtiger_open(HOME, NULL, config, &conn));

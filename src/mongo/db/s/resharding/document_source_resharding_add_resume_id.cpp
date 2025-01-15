@@ -27,11 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/s/resharding/document_source_resharding_add_resume_id.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -66,7 +75,7 @@ Document appendId(Document inputDoc) {
 }  // namespace
 
 REGISTER_INTERNAL_DOCUMENT_SOURCE(_addReshardingResumeId,
-                                  LiteParsedDocumentSourceDefault::parse,
+                                  LiteParsedDocumentSourceInternal::parse,
                                   DocumentSourceReshardingAddResumeId::createFromBson,
                                   true);
 
@@ -101,8 +110,7 @@ StageConstraints DocumentSourceReshardingAddResumeId::constraints(
                             ChangeStreamRequirement::kDenylist);
 }
 
-Value DocumentSourceReshardingAddResumeId::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceReshardingAddResumeId::serialize(const SerializationOptions& opts) const {
     return Value(Document{{kStageName, Value(Document{})}});
 }
 
@@ -121,8 +129,8 @@ DocumentSource::GetModPathsReturn DocumentSourceReshardingAddResumeId::getModifi
 
 DocumentSource::GetNextResult DocumentSourceReshardingAddResumeId::doGetNext() {
     uassert(6387804,
-            str::stream() << kStageName << " cannot be executed from mongos",
-            !pExpCtx->inMongos);
+            str::stream() << kStageName << " cannot be executed from router",
+            !pExpCtx->getInRouter());
 
     // Get the next input document.
     auto input = pSource->getNext();

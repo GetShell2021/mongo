@@ -28,7 +28,8 @@
  */
 
 #include "mongo/db/storage/execution_context.h"
-#include "mongo/db/storage/storage_parameters_gen.h"
+
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 const OperationContext::Decoration<StorageExecutionContext> StorageExecutionContext::get =

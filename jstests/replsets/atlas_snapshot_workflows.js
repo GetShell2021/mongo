@@ -7,17 +7,15 @@
 
 // Set up a standard 3-node replica set.  Note the two secondaries are priority 0; this is
 // different than the real Atlas configuration where the secondaries would be electable.
-(function() {
-"use strict";
-
 // Snapshot works only on enterprise.
 if (!buildInfo()["modules"].includes("enterprise")) {
     printjson(buildInfo()["modules"]);
     jsTestLog("Skipping snapshot tests because not running on enterprise.");
-    return 0;
+    quit();
 }
 
-load("jstests/libs/backup_utils.js");
+import {backupData} from "jstests/libs/backup_utils.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = TestData.testName;
 const rst = new ReplSetTest({
@@ -69,7 +67,7 @@ function testAddWithSnapshot(secondariesDown) {
     const useForce = secondariesDown > 1;
     if (useForce) {
         // Wait for the set to become unhealthy.
-        rst.waitForState(primary, ReplSetTest.State.SECONDARY);
+        rst.awaitSecondaryNodes(null, [primary]);
     }
     // Atlas always adds nodes with 0 votes and priority
     const newNode =
@@ -84,7 +82,7 @@ function testAddWithSnapshot(secondariesDown) {
         {replSetReconfig: config, maxTimeMS: ReplSetTest.kDefaultTimeoutMS, force: useForce}));
 
     jsTestLog("Waiting for node to sync.");
-    rst.waitForState(newNode, ReplSetTest.State.SECONDARY);
+    rst.awaitSecondaryNodes(null, [newNode]);
 
     jsTestLog("Reconfiguring added node to have votes");
     config = rst.getReplSetConfigFromNode(primary.nodeId);
@@ -128,7 +126,7 @@ function testReplaceWithSnapshot(node, secondariesDown) {
     disconnectSecondaries(secondariesDown);
     if (useForce) {
         // Wait for the set to become unhealthy.
-        rst.waitForState(primary, ReplSetTest.State.SECONDARY);
+        rst.awaitSecondaryNodes(null, [primary]);
     }
     jsTestLog("Stopping node for replacement of data");
     rst.stop(node, undefined, undefined, {forRestart: true});
@@ -175,4 +173,3 @@ jsTestLog("Test replacing a node with snapshot with two secondaries unreachable.
 testReplaceWithSnapshot(newNode, 2);
 
 rst.stopSet();
-})();

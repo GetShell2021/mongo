@@ -29,22 +29,44 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_connection.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/base_cloner.h"
+#include "mongo/db/repl/collection_bulk_loader.h"
 #include "mongo/db/repl/initial_sync_base_cloner.h"
 #include "mongo/db/repl/initial_sync_shared_data.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/task_runner.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/progress_meter.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
 
-namespace {
-const int kProgressMeterSecondsBetween = 60;
-const int kProgressMeterCheckInterval = 128;
-}  // namespace
+inline const int kProgressMeterSecondsBetween = 60;
+inline const int kProgressMeterCheckInterval = 128;
 
 class CollectionCloner final : public InitialSyncBaseCloner {
 public:
@@ -52,7 +74,7 @@ public:
         static constexpr StringData kDocumentsToCopyFieldName = "documentsToCopy"_sd;
         static constexpr StringData kDocumentsCopiedFieldName = "documentsCopied"_sd;
 
-        std::string ns;
+        NamespaceString nss;
         Date_t start;
         Date_t end;
         size_t documentToCopy{0};
@@ -85,7 +107,7 @@ public:
                      StorageInterface* storageInterface,
                      ThreadPool* dbPool);
 
-    virtual ~CollectionCloner() = default;
+    ~CollectionCloner() override = default;
 
     /**
      * Waits for any database work to finish or fail.
@@ -100,7 +122,7 @@ public:
         return _sourceNss;
     }
     UUID getSourceUuid() const {
-        return *_sourceDbAndUuid.uuid();
+        return _sourceDbAndUuid.uuid();
     }
 
     /**
@@ -162,8 +184,9 @@ private:
     };
 
     std::string describeForFuzzer(BaseClonerStage* stage) const final {
-        return _sourceNss.db() + " db: { " + stage->getName() + ": UUID(\"" +
-            _sourceDbAndUuid.uuid()->toString() + "\") coll: " + _sourceNss.coll() + " }";
+        return toStringForLogging(_sourceNss.dbName()) + " db: { " + stage->getName() +
+            ": UUID(\"" + _sourceDbAndUuid.uuid().toString() + "\") coll: " + _sourceNss.coll() +
+            " }";
     }
 
     /**
@@ -175,6 +198,11 @@ private:
      * The postStage sets the end time in _stats.
      */
     void postStage() final;
+
+    /**
+     * Stage function that runs the collStats command on the collection.
+     */
+    AfterStageBehavior collStatsStage();
 
     /**
      * Stage function that counts the number of documents in the collection on the source in order
@@ -226,6 +254,12 @@ private:
      */
     void runQuery();
 
+    /**
+     * Drops the collection if it was dropped on the sync source, if we'd created it and not
+     * finished loading it.
+     */
+    void _maybeDropCollectionOnSyncSourceDrop();
+
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
     //
@@ -240,6 +274,7 @@ private:
     // The size of the batches of documents returned in collection cloning.
     int _collectionClonerBatchSize;  // (R)
 
+    CollectionClonerStage _collStatsStage;                               // (R)
     CollectionClonerStage _countStage;                                   // (R)
     CollectionClonerStage _listIndexesStage;                             // (R)
     CollectionClonerStage _createCollectionStage;                        // (R)

@@ -29,11 +29,20 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/query/explain_options.h"
-#include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/multiple_collection_accessor.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache.h"
+#include "mongo/db/query/plan_cache/sbe_plan_cache.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_explainer.h"
-#include "mongo/db/query/sbe_plan_cache.h"
+#include "mongo/util/serialization_context.h"
 
 namespace mongo {
 
@@ -76,6 +85,15 @@ public:
                               const CollectionPtr& collection,
                               ExplainOptions::Verbosity verbosity,
                               BSONObj extraInfo,
+                              const SerializationContext& serializationContext,
+                              const BSONObj& command,
+                              BSONObjBuilder* out);
+
+    static void explainStages(PlanExecutor* exec,
+                              const CollectionAcquisition& collection,
+                              ExplainOptions::Verbosity verbosity,
+                              BSONObj extraInfo,
+                              const SerializationContext& serializationContext,
                               const BSONObj& command,
                               BSONObjBuilder* out);
 
@@ -87,6 +105,7 @@ public:
                               const MultipleCollectionAccessor& collections,
                               ExplainOptions::Verbosity verbosity,
                               BSONObj extraInfo,
+                              const SerializationContext& serializationContext,
                               const BSONObj& command,
                               BSONObjBuilder* out);
 
@@ -114,6 +133,7 @@ public:
         Status executePlanStatus,
         boost::optional<PlanExplainer::PlanStatsDetails> winningPlanTrialStats,
         BSONObj extraInfo,
+        const SerializationContext& serializationContext,
         const BSONObj& command,
         BSONObjBuilder* out);
 
@@ -140,8 +160,8 @@ public:
      * intended to be human readable, and useful for debugging query performance problems related to
      * the plan cache.
      */
-    static void planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* out);
-    static void planCacheEntryToBSON(const sbe::PlanCacheEntry& entry, BSONObjBuilder* out);
+    static void planCacheEntryToBSON(const mongo::PlanCacheEntry& entry, BSONObjBuilder* out);
+    static void planCacheEntryToBSON(const mongo::sbe::PlanCacheEntry& entry, BSONObjBuilder* out);
 };
 
 }  // namespace mongo

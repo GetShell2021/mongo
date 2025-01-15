@@ -1,9 +1,8 @@
 // Test the killCursors command.
 // @tags: [requires_sharding]
-(function() {
-'use strict';
-
 // Multiple users cannot be authenticated on one connection within a session.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 TestData.disableImplicitSessions = true;
 
 function runTest(mongod) {
@@ -131,4 +130,3 @@ const st =
     new ShardingTest({shards: 1, mongos: 1, config: 1, other: {keyFile: 'jstests/libs/key1'}});
 runTest(st.s0);
 st.stop();
-})();

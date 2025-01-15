@@ -234,6 +234,13 @@ my_cursor_remove(WT_CURSOR *wtcursor)
     return (0);
 }
 static int
+my_cursor_bound(WT_CURSOR *wtcursor, const char *config)
+{
+    (void)wtcursor;
+    (void)config;
+    return (0);
+}
+static int
 my_cursor_close(WT_CURSOR *wtcursor)
 {
     (void)wtcursor;
@@ -271,7 +278,7 @@ my_open_cursor(WT_DATA_SOURCE *dsrc, WT_SESSION *session, const char *uri, WT_CO
     cursor->wtcursor.update = my_cursor_update;
     cursor->wtcursor.remove = my_cursor_remove;
     cursor->wtcursor.close = my_cursor_close;
-
+    cursor->wtcursor.bound = my_cursor_bound;
     /*
      * Configure local cursor information.
      */
@@ -524,19 +531,6 @@ my_terminate(WT_DATA_SOURCE *dsrc, WT_SESSION *session)
     return (0);
 }
 
-/*! [WT_DATA_SOURCE lsm_pre_merge] */
-static int
-my_lsm_pre_merge(WT_DATA_SOURCE *dsrc, WT_CURSOR *source, WT_CURSOR *dest)
-/*! [WT_DATA_SOURCE lsm_pre_merge] */
-{
-    /* Unused parameters */
-    (void)dsrc;
-    (void)source;
-    (void)dest;
-
-    return (0);
-}
-
 static const char *home;
 
 int
@@ -553,7 +547,7 @@ main(int argc, char *argv[])
         /*! [WT_DATA_SOURCE register] */
         static WT_DATA_SOURCE my_dsrc = {my_alter, my_create, my_compact, my_drop, my_open_cursor,
           my_rename, my_salvage, my_size, my_truncate, my_range_truncate, my_verify, my_checkpoint,
-          my_terminate, my_lsm_pre_merge};
+          my_terminate};
         error_check(conn->add_data_source(conn, "dsrc:", &my_dsrc, NULL));
         /*! [WT_DATA_SOURCE register] */
     }

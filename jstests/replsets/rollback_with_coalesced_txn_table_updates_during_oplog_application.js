@@ -9,9 +9,8 @@
  * @tags: [requires_persistence]
  */
 
-(function() {
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const oplogApplierBatchSize = 100;
 
@@ -39,10 +38,20 @@ function runTest(crashAfterRollbackTruncation) {
     rst.startSet();
     rst.initiate();
 
+    const lsid = ({id: UUID()});
     const primary = rst.getPrimary();
     const ns = "test.retryable_write_partial_rollback";
     assert.commandWorked(
         primary.getCollection(ns).insert({_id: 0, counter: 0}, {writeConcern: {w: 5}}));
+    // SERVER-65971: Do a write with `lsid` to add an entry to config.transactions. This write will
+    // persist after rollback and be updated when the rollback code corrects for omitted writes to
+    // the document.
+    assert.commandWorked(primary.getCollection(ns).runCommand("insert", {
+        documents: [{_id: ObjectId()}],
+        lsid,
+        txnNumber: NumberLong(1),
+        writeConcern: {w: 5},
+    }));
     // The default WC is majority and this test can't satisfy majority writes.
     assert.commandWorked(primary.adminCommand(
         {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
@@ -65,12 +74,10 @@ function runTest(crashAfterRollbackTruncation) {
                                    'stopReplProducerOnDocument',
                                    {document: {"diff.u.counter": counterMajorityCommitted + 1}}));
 
-    const lsid = ({id: UUID()});
-
     assert.commandWorked(primary.getCollection(ns).runCommand("update", {
         updates: Array.from({length: counterTotal}, () => ({q: {_id: 0}, u: {$inc: {counter: 1}}})),
         lsid,
-        txnNumber: NumberLong(1),
+        txnNumber: NumberLong(2),
     }));
 
     const stmtMajorityCommitted = primary.getCollection("local.oplog.rs")
@@ -120,16 +127,16 @@ function runTest(crashAfterRollbackTruncation) {
     rst.freeze(primary);
     rst.awaitNodesAgreeOnPrimary(undefined, undefined, secondary2);
 
-    for (const fp of stopReplProducerOnDocumentFailpoints) {
-        fp.off();
-    }
-
     // Wait for secondary2 to be a writable primary.
     rst.getPrimary();
 
     // Do a write which becomes majority committed and wait for secondary1 to complete its rollback.
     assert.commandWorked(
         secondary2.getCollection("test.dummy").insert({}, {writeConcern: {w: 'majority'}}));
+
+    for (const fp of stopReplProducerOnDocumentFailpoints) {
+        fp.off();
+    }
 
     // Wait for rollback to finish truncating oplog.
     // Entering rollback will close connections so we expect some network errors while waiting.
@@ -145,7 +152,7 @@ function runTest(crashAfterRollbackTruncation) {
             "noReplSet": false,
             setParameter: 'failpoint.stopReplProducer=' + tojson({mode: 'alwaysOn'})
         });
-        rst.waitForState(secondary1, ReplSetTest.State.SECONDARY);
+        rst.awaitSecondaryNodes(null, [secondary1]);
         secondary1.setSecondaryOk();
         // On startup, we expect to see the update persisted in the 'config.transactions' table.
         let restoredDoc =
@@ -155,7 +162,7 @@ function runTest(crashAfterRollbackTruncation) {
     } else {
         // Lift the failpoint to let rollback complete and wait for state to change to SECONDARY.
         hangAfterTruncate.off();
-        rst.waitForState(secondary1, ReplSetTest.State.SECONDARY);
+        rst.awaitSecondaryNodes(null, [secondary1]);
     }
 
     // Reconnect to secondary1 after it completes its rollback and step it up to be the new primary.
@@ -169,7 +176,7 @@ function runTest(crashAfterRollbackTruncation) {
     assert.commandWorked(secondary1.getCollection(ns).runCommand("update", {
         updates: Array.from({length: counterTotal}, () => ({q: {_id: 0}, u: {$inc: {counter: 1}}})),
         lsid,
-        txnNumber: NumberLong(1),
+        txnNumber: NumberLong(2),
         writeConcern: {w: 5},
     }));
 
@@ -185,4 +192,3 @@ runTest(false);
 // Extends the test to crash the secondary in the middle of rollback right after oplog truncation.
 // We assert that the update made to the 'config.transactions' table persisted on startup.
 runTest(true);
-})();

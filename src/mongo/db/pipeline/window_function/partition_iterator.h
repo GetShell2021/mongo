@@ -29,14 +29,27 @@
 
 #pragma once
 
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/memory_usage_tracker.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/partition_key_comparator.h"
-#include "mongo/db/pipeline/window_function/spillable_cache.h"
+#include "mongo/db/pipeline/spilling/spillable_deque.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
-#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/sort_pattern.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/memory_usage_tracker.h"
 
 namespace mongo {
 
@@ -59,6 +72,8 @@ public:
                       boost::optional<boost::intrusive_ptr<Expression>> partitionExpr,
                       const boost::optional<SortPattern>& sortPattern);
 
+    ~PartitionIterator();
+
     using SlotId = unsigned int;
     SlotId newSlot() {
         tassert(5371200,
@@ -75,6 +90,13 @@ public:
      */
     boost::optional<Document> current() {
         return (*this)[0];
+    }
+
+    /**
+     * Returns true if iterator execution is paused.
+     */
+    bool isPaused() {
+        return _state == IteratorState::kPauseExecution;
     }
 
     enum class AdvanceResult {
@@ -111,7 +133,7 @@ public:
      * structures.
      */
     auto getApproximateSize() const {
-        return _cache->getApproximateSize() + getNextPartitionStateSize();
+        return _cache.getApproximateSize() + getNextPartitionStateSize();
     }
 
     /**
@@ -119,11 +141,11 @@ public:
      * allowed.
      */
     void spillToDisk() {
-        _cache->spillToDisk();
+        _cache.spillToDisk();
     }
 
     bool usedDisk() const {
-        return _cache->usedDisk();
+        return _cache.usedDisk();
     }
 
     /**
@@ -131,7 +153,17 @@ public:
      * are invalid after calling this.
      */
     void finalize() {
-        _cache->finalize();
+        _cache.finalize();
+    }
+
+    /**
+     * Optimizes the partition expression if one exists. If the partition expression references a
+     * let variable it would not have been optimized when initialized.
+     */
+    void optimizePartition() {
+        if (_partitionExpr) {
+            _partitionExpr = _partitionExpr->get()->optimize();
+        }
     }
 
 private:
@@ -173,7 +205,7 @@ private:
      * This value is negative or zero, because the current document is always in '_cache'.
      */
     auto getMinCachedOffset() const {
-        return -_indexOfCurrentInPartition + _cache->getLowestIndex();
+        return -_indexOfCurrentInPartition + _cache.getLowestIndex();
     }
 
     /**
@@ -186,7 +218,7 @@ private:
      * This value is positive or zero, because the current document is always in '_cache'.
      */
     auto getMaxCachedOffset() const {
-        return _cache->getHighestIndex() - _indexOfCurrentInPartition;
+        return _cache.getHighestIndex() - _indexOfCurrentInPartition;
     }
 
     /**
@@ -229,7 +261,7 @@ private:
     void getNextDocument();
 
     void resetCache() {
-        _cache->clear();
+        _cache.clear();
         _indexOfCurrentInPartition = 0;
         for (int slot = 0; slot < (int)_slots.size(); slot++) {
             _slots[slot] = -1;
@@ -239,20 +271,7 @@ private:
     /**
      * Resets the state of the iterator with the first document of the new partition.
      */
-    void advanceToNextPartition() {
-        tassert(5340101,
-                "Invalid call to PartitionIterator::advanceToNextPartition",
-                _nextPartitionDoc != boost::none);
-        resetCache();
-        // The memory accounted for in the _nextPartitionDoc will be moved to the spillable cache,
-        // so subtract it out here.
-        _tracker->update(-1 * getNextPartitionStateSize());
-
-        // Cache is cleared, and we are moving the _nextPartitionDoc value to different positions.
-        _cache->addDocument(std::move(*_nextPartitionDoc));
-        _nextPartitionDoc.reset();
-        _state = IteratorState::kIntraPartition;
-    }
+    void advanceToNextPartition();
 
     // Internal helpers for 'getEndpoints()'.
     boost::optional<std::pair<int, int>> getEndpointsRangeBased(
@@ -277,16 +296,23 @@ private:
     // iterator has advanced to it. This document is not accessible until then.
     boost::optional<Document> _nextPartitionDoc;
     size_t getNextPartitionStateSize() const {
+        size_t size = 0;
         if (_nextPartitionDoc) {
-            return _nextPartitionDoc->getApproximateSize() +
-                _partitionComparator->getApproximateSize();
+            size += _nextPartitionDoc->getApproximateSize();
         }
-        return 0;
+        if (_partitionComparator) {
+            size += _partitionComparator->getApproximateSize();
+        }
+        return size;
     }
+    void updateNextPartitionStateSize();
 
     enum class IteratorState {
         // Default state, no documents have been pulled into the cache.
         kNotInitialized,
+        // Input sources do not have a result to be processed yet, but there may be more results in
+        // the future.
+        kPauseExecution,
         // Iterating the current partition. We don't know where the current partition ends, or
         // whether it's the last partition.
         kIntraPartition,
@@ -304,10 +330,12 @@ private:
     int _indexOfCurrentInPartition = 0;
 
     // The actual cache of the PartitionIterator. Holds documents and spills documents that exceed
-    // the memory limit given to PartitionIterator to disk. Behaves like a deque.
-    std::unique_ptr<SpillableCache> _cache = nullptr;
+    // the memory limit given to PartitionIterator to disk.
+    SpillableDeque _cache;
 
-    MemoryUsageTracker* _tracker;
+    // Memory token, used to track memory consumption of PartitionIterator. Needed to avoid problems
+    // when getNextPartitionStateSize() changes value between invocations.
+    MemoryUsageToken _memoryToken;
 };
 
 /**

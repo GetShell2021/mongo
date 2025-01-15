@@ -7,10 +7,8 @@
  * @tags: [requires_majority_read_concern]
  */
 
-load("jstests/replsets/rslib.js");  // For reconfig.
-
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
 // Set up a set and grab things for later.
 var name = "read_committed_no_snapshots";
@@ -24,15 +22,16 @@ var replTest = new ReplSetTest({
             rsConfig: {priority: 0}
         }
     ],
-    nodeOptions: {enableMajorityReadConcern: ''},
     settings: {protocolVersion: 1}
 });
 
 replTest.startSet();
 
 // Cannot wait for a stable recovery timestamp due to the no-snapshot secondary.
-replTest.initiateWithAnyNodeAsPrimary(
-    null, "replSetInitiate", {doNotWaitForStableRecoveryTimestamp: true});
+replTest.initiate(
+    null,
+    "replSetInitiate",
+    {doNotWaitForStableRecoveryTimestamp: true, initiateWithDefaultElectionTimeout: true});
 
 // Get connections and collection.
 var primary = replTest.getPrimary();
@@ -77,4 +76,3 @@ assert.commandFailedWithCode(primary.getSiblingDB(name).foo.runCommand(
                                  'find', {"readConcern": {"level": "majority"}, "maxTimeMS": 1000}),
                              ErrorCodes.MaxTimeMSExpired);
 replTest.stopSet();
-})();

@@ -29,12 +29,36 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
 #include <queue>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/plan_explainer_pipeline.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/restore_context.h"
+#include "mongo/db/query/write_ops/update_result.h"
+#include "mongo/db/record_id.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -47,9 +71,11 @@ public:
      * Determines the type of resumable scan being run by the PlanExecutorPipeline.
      */
     enum class ResumableScanType {
-        kNone,          // No resuming. This is the default.
-        kChangeStream,  // For change stream pipelines.
-        kOplogScan      // For non-changestream resumable oplog scans.
+        kNone,              // No resuming. This is the default.
+        kChangeStream,      // For change stream pipelines.
+        kNaturalOrderScan,  // For pipelines requesting a record ID resume token from a natural
+                            // order non-oplog scan.
+        kOplogScan          // For non-changestream resumable oplog scans.
     };
 
     PlanExecutorPipeline(boost::intrusive_ptr<ExpressionContext> expCtx,
@@ -61,7 +87,7 @@ public:
     }
 
     const NamespaceString& nss() const override {
-        return _expCtx->ns;
+        return _expCtx->getNamespaceString();
     }
 
     const std::vector<NamespaceStringOrUUID>& getSecondaryNamespaces() const final {
@@ -74,7 +100,7 @@ public:
     }
 
     OperationContext* getOpCtx() const override {
-        return _expCtx->opCtx;
+        return _expCtx->getOperationContext();
     }
 
     // Pipeline execution does not support the saveState()/restoreState() interface. Instead, the
@@ -94,20 +120,17 @@ public:
     ExecState getNext(BSONObj* objOut, RecordId* recordIdOut) override;
     ExecState getNextDocument(Document* docOut, RecordId* recordIdOut) override;
 
-    bool isEOF() override;
+    bool isEOF() const override;
 
     // DocumentSource execution is only used for executing aggregation commands, so the interfaces
     // for executing other CRUD operations are not supported.
     long long executeCount() override {
         MONGO_UNREACHABLE;
     }
-    UpdateResult executeUpdate() override {
-        MONGO_UNREACHABLE;
-    }
     UpdateResult getUpdateResult() const override {
         MONGO_UNREACHABLE;
     }
-    long long executeDelete() override {
+    long long getDeleteResult() const override {
         MONGO_UNREACHABLE;
     }
     BatchedDeleteStats getBatchedDeleteStats() override {
@@ -128,7 +151,7 @@ public:
         return !_killStatus.isOK();
     }
 
-    Status getKillStatus() override {
+    Status getKillStatus() const override {
         invariant(isMarkedAsKilled());
         return _killStatus;
     }
@@ -158,7 +181,8 @@ public:
      * providing the level of detail specified by 'verbosity'.
      */
     std::vector<Value> writeExplainOps(ExplainOptions::Verbosity verbosity) const {
-        return _pipeline->writeExplainOps(verbosity);
+        auto opts = SerializationOptions{.verbosity = verbosity};
+        return _pipeline->writeExplainOps(opts);
     }
 
     void enableSaveRecoveryUnitAcrossCommandsIfSupported() override {}
@@ -169,6 +193,13 @@ public:
     boost::optional<StringData> getExecutorType() const override {
         tassert(6253504, "Can't get type string without pipeline", _pipeline);
         return _pipeline->getTypeString();
+    }
+
+    PlanExecutor::QueryFramework getQueryFramework() const final;
+
+    bool usesCollectionAcquisitions() const final {
+        // TODO SERVER-78724: Replace this whenever aggregations use shard role acquisitions.
+        return false;
     }
 
 private:
@@ -183,6 +214,11 @@ private:
      * be thrown.
      */
     boost::optional<Document> _tryGetNext();
+
+    /**
+     * Serialize the given document to BSON while updating stats for BSONObjectTooLarge exception.
+     */
+    BSONObj _trySerializeToBson(const Document& doc);
 
     /**
      * For a change stream or resumable oplog scan, updates the scan state based on the latest
@@ -206,6 +242,12 @@ private:
      * postBatchResumeToken value from the underlying pipeline.
      */
     void _performResumableOplogScanAccounting();
+
+    /**
+     * For a resumable natural order non-oplog scan, updates the postBatchResumeToken value from the
+     * underlying pipeline.
+     */
+    void _performResumableNaturalOrderScanAccounting();
 
     /**
      * Set the speculative majority read timestamp if we have scanned up to a certain oplog

@@ -27,16 +27,51 @@
  *    it in the license file.
  */
 
-
 #include "mongo/db/s/sessions_collection_config_server.h"
 
-#include "mongo/logv2/log.h"
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/session/sessions_collection.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_collection_gen.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_constraints.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_ddl.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 #include "mongo/s/stale_shard_version_helpers.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
@@ -48,23 +83,52 @@ void SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext* 
     try {
         checkSessionsCollectionExists(opCtx);
         return;
-    } catch (const DBException&) {
-        // If the sessions collection doesn't exist, create it
+    } catch (const ExceptionFor<ErrorCodes::NamespaceNotSharded>&) {
+        // If the sessions collection isn't sharded, shard it.
     }
 
     // If we don't have any shards, we can't set up this collection yet.
     uassert(ErrorCodes::ShardNotFound,
-            str::stream() << "Failed to create " << NamespaceString::kLogicalSessionsNamespace
+            str::stream() << "Failed to create "
+                          << NamespaceString::kLogicalSessionsNamespace.toStringForErrorMsg()
                           << ": cannot create the collection until there are shards",
-            Grid::get(opCtx)->shardRegistry()->getNumShardsNoReload() != 0);
+            Grid::get(opCtx)->shardRegistry()->getNumShards(opCtx) != 0);
 
-    ShardsvrCreateCollection shardsvrCollRequest(NamespaceString::kLogicalSessionsNamespace);
-    CreateCollectionRequest requestParamsObj;
-    requestParamsObj.setShardKey(BSON("_id" << 1));
-    shardsvrCollRequest.setCreateCollectionRequest(std::move(requestParamsObj));
-    shardsvrCollRequest.setDbName(NamespaceString::kLogicalSessionsNamespace.db());
+    cluster::createCollection(opCtx, cluster::shardLogicalSessionsCollectionRequest());
 
-    cluster::createCollection(opCtx, shardsvrCollRequest);
+    Lock::GlobalLock lock(opCtx, MODE_IX);
+    if (const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        replCoord->canAcceptWritesFor(opCtx, CollectionType::ConfigNS)) {
+        auto filterQuery =
+            BSON("_id" << NamespaceStringUtil::serialize(NamespaceString::kLogicalSessionsNamespace,
+                                                         SerializationContext::stateDefault())
+                       << CollectionType::kMaxChunkSizeBytesFieldName << BSON("$exists" << false));
+        auto updateQuery = BSON("$set" << BSON(CollectionType::kMaxChunkSizeBytesFieldName
+                                               << logical_sessions::kMaxChunkSizeBytes));
+
+        const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+
+        // TODO SERVER-83917: Make a more general API to switch the service used by the client.
+        auto originalService = opCtx->getService();
+        auto shardService = opCtx->getServiceContext()->getService(ClusterRole::ShardServer);
+        {
+            ClientLock lk(opCtx->getClient());
+            opCtx->getClient()->setService(shardService);
+        }
+
+        ScopeGuard onScopeExitGuard([&] {
+            ClientLock lk(opCtx->getClient());
+            opCtx->getClient()->setService(originalService);
+        });
+
+        uassertStatusOK(
+            catalogClient->updateConfigDocument(opCtx,
+                                                CollectionType::ConfigNS,
+                                                filterQuery,
+                                                updateQuery,
+                                                false,
+                                                ShardingCatalogClient::kLocalWriteConcern));
+    }
 }
 
 void SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* opCtx) {
@@ -75,30 +139,36 @@ void SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* 
         nss,
         "SessionsCollectionConfigServer::_generateIndexesIfNeeded",
         [&] {
-            const ChunkManager cm = [&]() {
+            const auto cri = [&]() {
                 // (SERVER-61214) wait for the catalog cache to acknowledge that the sessions
                 // collection is sharded in order to be sure to get a valid routing table
                 while (true) {
-                    auto cm = uassertStatusOK(
-                        Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx,
-                                                                                              nss));
 
-                    if (cm.isSharded()) {
-                        return cm;
+                    const auto& cri = uassertStatusOK(
+                        Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+
+                    if (cri.cm.isSharded()) {
+                        return cri;
                     }
+
+                    // Force a refresh of the catalog cache on next lookup
+                    Grid::get(opCtx)->catalogCache()->onStaleCollectionVersion(
+                        nss, boost::none /* wantedVersion */);
                 }
             }();
 
             return scatterGatherVersionedTargetByRoutingTable(
                 opCtx,
-                nss.db(),
+                nss.dbName(),
                 nss,
-                cm,
+                cri,
                 SessionsCollection::generateCreateIndexesCmd(),
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                 Shard::RetryPolicy::kNoRetry,
-                BSONObj() /* query */,
-                BSONObj() /* collation */);
+                BSONObj() /*query*/,
+                BSONObj() /*collation*/,
+                boost::none /*letParameters*/,
+                boost::none /*runtimeConstants*/);
         });
 
     for (auto& shardResult : shardResults) {
@@ -114,28 +184,10 @@ void SessionsCollectionConfigServer::setupSessionsCollection(OperationContext* o
             "sharding state is not yet initialized",
             Grid::get(opCtx)->isShardingInitialized());
 
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     _shardCollectionIfNeeded(opCtx);
     _generateIndexesIfNeeded(opCtx);
-    static constexpr int64_t kAverageSessionDocSizeBytes = 200;
-    static constexpr int64_t kDesiredDocsInChunks = 1000;
-    static constexpr int64_t kMaxChunkSizeBytes =
-        kAverageSessionDocSizeBytes * kDesiredDocsInChunks;
-    auto filterQuery =
-        BSON("_id" << NamespaceString::kLogicalSessionsNamespace.ns()
-                   << CollectionType::kMaxChunkSizeBytesFieldName << BSON("$exists" << false));
-    auto updateQuery = BSON("$set" << BSON(CollectionType::kMaxChunkSizeBytesFieldName
-                                           << kMaxChunkSizeBytes
-                                           << CollectionType::kNoAutoSplitFieldName << true));
-
-    uassertStatusOK(Grid::get(opCtx)->catalogClient()->updateConfigDocument(
-        opCtx,
-        CollectionType::ConfigNS,
-        filterQuery,
-        updateQuery,
-        false,
-        ShardingCatalogClient::kMajorityWriteConcern));
 }
 
 }  // namespace mongo

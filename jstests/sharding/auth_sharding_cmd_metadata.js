@@ -2,13 +2,11 @@
  * Tests that only the internal user will be able to advance the config server opTime.
  */
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 // The index consistency checker doesn't take into account that
 // authentication is needed for contacting shard0 of this cluster
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
-
-(function() {
-
-"use strict";
 
 function getConfigOpTime() {
     var srvStatus = assert.commandWorked(shardTestDB.serverStatus());
@@ -29,7 +27,15 @@ const shardAdminDB = st.rs0.getPrimary().getDB('admin');
 const shardTestDB = st.rs0.getPrimary().getDB('test');
 
 // ConfigOpTime can't be advanced from external clients
+if (TestData.configShard) {
+    // We've already used up the localhost bypass in config shard mode, so we have to log in to
+    // create the user below.
+    shardAdminDB.auth('foo', 'bar');
+}
 shardAdminDB.createUser({user: 'user', pwd: 'pwd', roles: jsTest.adminUserRoles});
+if (TestData.configShard) {
+    shardAdminDB.logout();
+}
 shardAdminDB.auth('user', 'pwd');
 const newTimestamp = Timestamp(getConfigOpTime().getTime() + 1000, 0);
 assert.commandWorked(shardTestDB.runCommand({ping: 1, $configTime: newTimestamp}));
@@ -43,4 +49,3 @@ assert(timestampCmp(getConfigOpTime(), newTimestamp) < 0, "Unexpected ConfigOpTi
 mongosAdminDB.logout();
 shardAdminDB.logout();
 st.stop();
-})();

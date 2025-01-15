@@ -28,13 +28,21 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <memory>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
-
+#include "mongo/db/index/index_constants.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/logv2/log.h"
-#include "mongo/util/represent_as.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -42,28 +50,26 @@
 namespace mongo {
 namespace clustered_util {
 
-static constexpr StringData kDefaultClusteredIndexName = "_id_"_sd;
-
 void ensureClusteredIndexName(ClusteredIndexSpec& indexSpec) {
     if (!indexSpec.getName()) {
         auto clusterKey = indexSpec.getKey().firstElement().fieldNameStringData();
         if (clusterKey == "_id") {
-            indexSpec.setName(kDefaultClusteredIndexName);
+            indexSpec.setName(IndexConstants::kIdIndexName);
         } else {
-            indexSpec.setName(StringData(clusterKey + "_1"));
+            indexSpec.setName(clusterKey + "_1");
         }
     }
 }
 
 ClusteredCollectionInfo makeCanonicalClusteredInfoForLegacyFormat() {
     auto indexSpec = ClusteredIndexSpec{BSON("_id" << 1), true /* unique */};
-    indexSpec.setName(kDefaultClusteredIndexName);
+    indexSpec.setName(IndexConstants::kIdIndexName);
     return ClusteredCollectionInfo(std::move(indexSpec), true /* legacy */);
 }
 
 ClusteredCollectionInfo makeDefaultClusteredIdIndex() {
     auto indexSpec = ClusteredIndexSpec{BSON("_id" << 1), true /* unique */};
-    indexSpec.setName(kDefaultClusteredIndexName);
+    indexSpec.setName(IndexConstants::kIdIndexName);
     return makeCanonicalClusteredInfo(indexSpec);
 }
 
@@ -89,41 +95,33 @@ boost::optional<ClusteredCollectionInfo> parseClusteredInfo(const BSONElement& e
         return makeCanonicalClusteredInfoForLegacyFormat();
     }
 
-    auto indexSpec = ClusteredIndexSpec::parse({"ClusteredUtil::parseClusteredInfo"}, elem.Obj());
+    auto indexSpec = ClusteredIndexSpec::parse(
+        IDLParserContext{"ClusteredUtil::parseClusteredInfo"}, elem.Obj());
     ensureClusteredIndexName(indexSpec);
     return makeCanonicalClusteredInfo(std::move(indexSpec));
 }
-
-boost::optional<ClusteredCollectionInfo> createClusteredInfoForNewCollection(
-    const BSONObj& indexSpec) {
-    if (!indexSpec["clustered"]) {
-        return boost::none;
-    }
-
-    auto filteredIndexSpec = indexSpec.removeField("clustered"_sd);
-    auto clusteredIndexSpec = ClusteredIndexSpec::parse(
-        {"ClusteredUtil::createClusteredInfoForNewCollection"}, filteredIndexSpec);
-    ensureClusteredIndexName(clusteredIndexSpec);
-    return makeCanonicalClusteredInfo(std::move(clusteredIndexSpec));
-};
 
 bool requiresLegacyFormat(const NamespaceString& nss) {
     return nss.isTimeseriesBucketsCollection() || nss.isChangeStreamPreImagesCollection();
 }
 
 BSONObj formatClusterKeyForListIndexes(const ClusteredCollectionInfo& collInfo,
-                                       const BSONObj& collation) {
+                                       const BSONObj& collation,
+                                       const boost::optional<int64_t>& expireAfterSeconds) {
     BSONObjBuilder bob;
     collInfo.getIndexSpec().serialize(&bob);
     if (!collation.isEmpty()) {
         bob.append("collation", collation);
+    }
+    if (expireAfterSeconds) {
+        bob.append("expireAfterSeconds", expireAfterSeconds.value());
     }
     bob.append("clustered", true);
     return bob.obj();
 }
 
 bool isClusteredOnId(const boost::optional<ClusteredCollectionInfo>& collInfo) {
-    return clustered_util::matchesClusterKey(BSON("_id" << 1), collInfo);
+    return collInfo && "_id"_sd == getClusterKeyFieldName(collInfo->getIndexSpec());
 }
 
 bool matchesClusterKey(const BSONObj& keyPatternObj,
@@ -154,6 +152,37 @@ StringData getClusterKeyFieldName(const ClusteredIndexSpec& indexSpec) {
 
 BSONObj getSortPattern(const ClusteredIndexSpec& indexSpec) {
     return indexSpec.getKey();
+}
+
+void checkCreationOptions(const CreateCommand& cmd) {
+    uassert(ErrorCodes::Error(6049200),
+            str::stream() << "'size' field for capped collections is not allowed on clustered "
+                             "collections. Did you mean 'capped: true' with 'expireAfterSeconds'?",
+            !cmd.getSize());
+
+    uassert(ErrorCodes::Error(6049204),
+            str::stream() << "'max' field for capped collections is not allowed on clustered "
+                             "collections. Did you mean 'capped: true' with 'expireAfterSeconds'?",
+            !cmd.getMax());
+
+    if (cmd.getCapped()) {
+        uassert(
+            ErrorCodes::Error(6127800),
+            "Clustered capped collection only available with 'enableTestCommands' server parameter",
+            getTestCommandsEnabled());
+
+        uassert(ErrorCodes::Error(6049201),
+                "A capped clustered collection requires the 'expireAfterSeconds' field",
+                cmd.getExpireAfterSeconds());
+    }
+
+    if (cmd.getTimeseries()) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Invalid option 'clusteredIndex: false': clustered index can't be disabled for "
+                "timeseries collection",
+                !cmd.getClusteredIndex() || !holds_alternative<bool>(*cmd.getClusteredIndex()) ||
+                    get<bool>(*cmd.getClusteredIndex()));
+    }
 }
 
 }  // namespace clustered_util

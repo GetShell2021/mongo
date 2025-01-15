@@ -27,29 +27,77 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <fmt/format.h>
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/dbdirectclient.h"
-#include "mongo/db/ops/write_ops.h"
-#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/query/client_cursor/cursor_response.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/s/shard_local.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/snapshot_manager.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
 class ShardLocalTest : public ServiceContextMongoDTest {
 protected:
-    ServiceContext::UniqueOperationContext _opCtx;
-    std::unique_ptr<ShardLocal> _shardLocal;
+    ShardLocalTest() {
+        serverGlobalParams.clusterRole = {
+            ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
+    }
+
+    ~ShardLocalTest() override {
+        serverGlobalParams.clusterRole = ClusterRole::None;
+    }
+
+    void setUp() override {
+        ServiceContextMongoDTest::setUp();
+        _opCtx = getGlobalServiceContext()->makeOperationContext(&cc());
+        _shardLocal = std::make_unique<ShardLocal>(ShardId::kConfigServerId);
+        const repl::ReplSettings replSettings = {};
+        repl::ReplicationCoordinator::set(
+            getGlobalServiceContext(),
+            std::unique_ptr<repl::ReplicationCoordinator>(
+                new repl::ReplicationCoordinatorMock(_opCtx->getServiceContext(), replSettings)));
+        ASSERT_OK(repl::ReplicationCoordinator::get(getGlobalServiceContext())
+                      ->setFollowerMode(repl::MemberState::RS_PRIMARY));
+
+        repl::createOplog(_opCtx.get());
+
+        // Set a committed snapshot so that we can perform majority reads.
+        WriteUnitOfWork wuow{_opCtx.get()};
+        _opCtx->getServiceContext()->getStorageEngine()->getSnapshotManager()->setCommittedSnapshot(
+            repl::getNextOpTime(_opCtx.get()).getTimestamp());
+        wuow.commit();
+    }
+
+    void tearDown() override {
+        _opCtx.reset();
+        ServiceContextMongoDTest::tearDown();
+        repl::ReplicationCoordinator::set(getGlobalServiceContext(), nullptr);
+    }
 
     /**
      * Sets up and runs a FindAndModify command with ShardLocal's runCommand. Finds a document in
@@ -58,7 +106,22 @@ protected:
      */
     StatusWith<Shard::CommandResponse> runFindAndModifyRunCommand(NamespaceString nss,
                                                                   BSONObj find,
-                                                                  BSONObj set);
+                                                                  BSONObj set) {
+        auto findAndModifyRequest = write_ops::FindAndModifyCommandRequest(nss);
+        findAndModifyRequest.setQuery(find);
+        findAndModifyRequest.setUpdate(write_ops::UpdateModification::parseFromClassicUpdate(set));
+        findAndModifyRequest.setUpsert(true);
+        findAndModifyRequest.setNew(true);
+        findAndModifyRequest.setWriteConcern(WriteConcernOptions(
+            WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, Seconds(15)));
+
+        return _shardLocal->runCommandWithFixedRetryAttempts(
+            _opCtx.get(),
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            nss.dbName(),
+            findAndModifyRequest.toBSON(),
+            Shard::RetryPolicy::kNoRetry);
+    }
     /**
      * Facilitates running a find query by supplying the redundant parameters. Finds documents in
      * namespace "nss" that match "query" and returns "limit" (if there are that many) number of
@@ -72,82 +135,33 @@ protected:
     /**
      * Returns the index definitions that exist for the given collection.
      */
-    StatusWith<std::vector<BSONObj>> getIndexes(NamespaceString nss);
+    StatusWith<std::vector<BSONObj>> getIndexes(NamespaceString nss) {
+        auto response = _shardLocal->runCommandWithFixedRetryAttempts(
+            _opCtx.get(),
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            nss.dbName(),
+            BSON("listIndexes" << nss.coll().toString()),
+            Shard::RetryPolicy::kIdempotent);
+        if (!response.isOK()) {
+            return response.getStatus();
+        }
+        if (!response.getValue().commandStatus.isOK()) {
+            return response.getValue().commandStatus;
+        }
 
-private:
-    void setUp() override;
-    void tearDown() override;
+        auto cursorResponse = CursorResponse::parseFromBSON(response.getValue().response);
+        if (!cursorResponse.isOK()) {
+            return cursorResponse.getStatus();
+        }
+
+        return cursorResponse.getValue().getBatch();
+    }
+
+    service_context_test::ShardRoleOverride _shardRole;
+
+    ServiceContext::UniqueOperationContext _opCtx;
+    std::unique_ptr<ShardLocal> _shardLocal;
 };
-
-void ShardLocalTest::setUp() {
-    ServiceContextMongoDTest::setUp();
-    _opCtx = getGlobalServiceContext()->makeOperationContext(&cc());
-    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
-    _shardLocal = std::make_unique<ShardLocal>(ShardId::kConfigServerId);
-    const repl::ReplSettings replSettings = {};
-    repl::ReplicationCoordinator::set(
-        getGlobalServiceContext(),
-        std::unique_ptr<repl::ReplicationCoordinator>(
-            new repl::ReplicationCoordinatorMock(_opCtx->getServiceContext(), replSettings)));
-    ASSERT_OK(repl::ReplicationCoordinator::get(getGlobalServiceContext())
-                  ->setFollowerMode(repl::MemberState::RS_PRIMARY));
-
-    repl::createOplog(_opCtx.get());
-
-    // Set a committed snapshot so that we can perform majority reads.
-    WriteUnitOfWork wuow{_opCtx.get()};
-    _opCtx->getServiceContext()->getStorageEngine()->getSnapshotManager()->setCommittedSnapshot(
-        repl::getNextOpTime(_opCtx.get()).getTimestamp());
-    wuow.commit();
-}
-
-void ShardLocalTest::tearDown() {
-    _opCtx.reset();
-    ServiceContextMongoDTest::tearDown();
-    repl::ReplicationCoordinator::set(getGlobalServiceContext(), nullptr);
-}
-
-StatusWith<Shard::CommandResponse> ShardLocalTest::runFindAndModifyRunCommand(NamespaceString nss,
-                                                                              BSONObj find,
-                                                                              BSONObj set) {
-    auto findAndModifyRequest = write_ops::FindAndModifyCommandRequest(nss);
-    findAndModifyRequest.setQuery(find);
-    findAndModifyRequest.setUpdate(write_ops::UpdateModification::parseFromClassicUpdate(set));
-    findAndModifyRequest.setUpsert(true);
-    findAndModifyRequest.setNew(true);
-    findAndModifyRequest.setWriteConcern(WriteConcernOptions(WriteConcernOptions::kMajority,
-                                                             WriteConcernOptions::SyncMode::UNSET,
-                                                             Seconds(15))
-                                             .toBSON());
-
-    return _shardLocal->runCommandWithFixedRetryAttempts(
-        _opCtx.get(),
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        nss.db().toString(),
-        findAndModifyRequest.toBSON({}),
-        Shard::RetryPolicy::kNoRetry);
-}
-
-StatusWith<std::vector<BSONObj>> ShardLocalTest::getIndexes(NamespaceString nss) {
-    auto response = _shardLocal->runCommandWithFixedRetryAttempts(
-        _opCtx.get(),
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        nss.db().toString(),
-        BSON("listIndexes" << nss.coll().toString()),
-        Shard::RetryPolicy::kIdempotent);
-    if (!response.isOK()) {
-        return response.getStatus();
-    }
-    if (!response.getValue().commandStatus.isOK()) {
-        return response.getValue().commandStatus;
-    }
-
-    auto cursorResponse = CursorResponse::parseFromBSON(response.getValue().response);
-    if (!cursorResponse.isOK()) {
-        return cursorResponse.getStatus();
-    }
-    return cursorResponse.getValue().getBatch();
-}
 
 /**
  * Takes a FindAndModify command's BSON response and parses it for the returned "value" field.
@@ -173,7 +187,7 @@ StatusWith<Shard::QueryResponse> ShardLocalTest::runFindQuery(NamespaceString ns
 }
 
 TEST_F(ShardLocalTest, RunCommand) {
-    NamespaceString nss("admin.bar");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("admin.bar");
     StatusWith<Shard::CommandResponse> findAndModifyResponse = runFindAndModifyRunCommand(
         nss, BSON("fooItem" << 1), BSON("$set" << BSON("fooRandom" << 254)));
 
@@ -185,7 +199,7 @@ TEST_F(ShardLocalTest, RunCommand) {
 }
 
 TEST_F(ShardLocalTest, FindOneWithoutLimit) {
-    NamespaceString nss("admin.bar");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("admin.bar");
 
     // Set up documents to be queried.
     StatusWith<Shard::CommandResponse> findAndModifyResponse = runFindAndModifyRunCommand(
@@ -209,7 +223,7 @@ TEST_F(ShardLocalTest, FindOneWithoutLimit) {
 }
 
 TEST_F(ShardLocalTest, FindManyWithLimit) {
-    NamespaceString nss("admin.bar");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("admin.bar");
 
     // Set up documents to be queried.
     StatusWith<Shard::CommandResponse> findAndModifyResponse = runFindAndModifyRunCommand(
@@ -239,7 +253,7 @@ TEST_F(ShardLocalTest, FindManyWithLimit) {
 }
 
 TEST_F(ShardLocalTest, FindNoMatchingDocumentsEmpty) {
-    NamespaceString nss("admin.bar");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("admin.bar");
 
     // Set up a document.
     StatusWith<Shard::CommandResponse> findAndModifyResponse = runFindAndModifyRunCommand(

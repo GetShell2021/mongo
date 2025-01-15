@@ -28,14 +28,25 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <absl/meta/type_traits.h>
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <set>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/client/connection_string.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/is_mongos.h"
 #include "mongo/s/sharding_task_executor_pool_controller.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kConnectionPool
 
@@ -59,17 +70,13 @@ void emplaceOrInvariant(Map&& map, Args&&... args) noexcept {
 }
 
 bool isConfigServer(const ShardRegistry* sr, const HostAndPort& peer) {
-    if (!sr)
-        return false;
-    auto shard = sr->getShardForHostNoReload(peer);
-    if (!shard)
-        return false;
-    return shard->isConfig();
+    return sr && sr->isConfigServer(peer);
 }
 
 }  // namespace
 
-Status ShardingTaskExecutorPoolController::validateHostTimeout(const int& hostTimeoutMS) {
+Status ShardingTaskExecutorPoolController::validateHostTimeout(const int& hostTimeoutMS,
+                                                               const boost::optional<TenantId>&) {
     auto toRefreshTimeoutMS = gParameters.toRefreshTimeoutMS.load();
     auto pendingTimeoutMS = gParameters.pendingTimeoutMS.load();
     if (hostTimeoutMS >= (toRefreshTimeoutMS + pendingTimeoutMS)) {
@@ -83,7 +90,8 @@ Status ShardingTaskExecutorPoolController::validateHostTimeout(const int& hostTi
     return Status(ErrorCodes::BadValue, msg);
 }
 
-Status ShardingTaskExecutorPoolController::validatePendingTimeout(const int& pendingTimeoutMS) {
+Status ShardingTaskExecutorPoolController::validatePendingTimeout(
+    const int& pendingTimeoutMS, const boost::optional<TenantId>&) {
     auto toRefreshTimeoutMS = gParameters.toRefreshTimeoutMS.load();
     if (pendingTimeoutMS < toRefreshTimeoutMS) {
         return Status::OK();
@@ -97,7 +105,7 @@ Status ShardingTaskExecutorPoolController::validatePendingTimeout(const int& pen
 
 Status ShardingTaskExecutorPoolController::onUpdateMatchingStrategy(const std::string& str) {
     if (str == "automatic") {
-        if (isMongos()) {
+        if (serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer)) {
             gParameters.matchingStrategy.store(MatchingStrategy::kMatchPrimaryNode);
         } else {
             gParameters.matchingStrategy.store(MatchingStrategy::kDisabled);
@@ -255,7 +263,7 @@ auto ShardingTaskExecutorPoolController::updateHost(PoolId id, const HostState& 
                 "maxConns"_attr = maxConns);
 
     // Update the target for just the pool first
-    poolData.target = stats.requests + stats.active;
+    poolData.target = stats.requests + stats.active + stats.leased;
 
     if (poolData.target < minConns) {
         poolData.target = minConns;

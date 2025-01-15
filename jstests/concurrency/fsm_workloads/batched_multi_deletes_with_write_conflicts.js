@@ -1,6 +1,3 @@
-'use strict';
-load("jstests/libs/analyze_plan.js");
-
 /**
  * batched_multi_deletes_with_write_conflicts.js
  *
@@ -13,8 +10,9 @@ load("jstests/libs/analyze_plan.js");
  *  requires_fcv_61,
  * ]
  */
+import {checkNWouldDelete, getPlanStage, getPlanStages} from "jstests/libs/query/analyze_plan.js";
 
-var $config = (function() {
+export const $config = (function() {
     // 'data' is passed (copied) to each of the worker threads.
     var data = {
         // Defines the number of subsets of data, which are randomly picked to create conflicts.
@@ -45,10 +43,21 @@ var $config = (function() {
             if (clusterTopology === '') {
                 assert(getPlanStage(expl, "BATCHED_DELETE"), tojson(expl));
             } else {
+                // Normally, we target both shards; however, in rare cases when the balancer is
+                // running, we may only target a single shard if during the last refresh, a shard no
+                // longer owns a chunk it used to, which makes targeting more specific.
                 const shardNames = Object.keys(clusterTopology.shards);
                 const stages = getPlanStages(expl, "BATCHED_DELETE");
-                assert.eq(stages.length, shardNames.length, tojson(expl));
+                assert.gte(stages.length, 1, tojson(expl));
+                // Only expect a specific number of shards when shard membership is stable.
+                if (!TestData.shardsAddedRemoved) {
+                    assert.lte(stages.length, shardNames.length, tojson(expl));
+                }
             }
+
+            // Verify we wouldn't delete anything, since no ObjectId() would match the
+            // predicate {$gte: 0}.
+            checkNWouldDelete(expl, 0);
             assert.commandWorked(db[collName].remove({}));
         }
 
@@ -100,7 +109,7 @@ var $config = (function() {
             // Create array of (subsetSize * numInsertSubsets) docs, by repeating the
             // subsetTemplates baseInsertSize times.
             const docs = Array(this.subsetSize).fill(subsetTemplates).flat();
-            assert.commandWorked(coll.insertMany(docs));
+            assert.commandWorked(coll.insertMany(docs, {ordered: false}));
 
             // Do batched delete.
             const deleteResult = coll.deleteMany({deleter_tid: this.tid, delete_query_match: true});
@@ -109,13 +118,14 @@ var $config = (function() {
 
         // Takes a random subset of documents potentially being batch deleted and updates them.
         function updateConflict(db, collName) {
-            const updateRes = db[collName].updateMany({
-                deleter_tid: {$ne: this.tid},  // Exclude self.
-                delete_query_match: true,      // Select documents that might be being deleted.
-                subset_id: getRandomUpTo(this.numInsertSubsets)  // Select subset.
-            },
-                                                      {$set: {delete_query_match: false}});
-            assert.commandWorked(updateRes);
+            retryOnRetryableError(() => {
+                assert.commandWorked(db[collName].updateMany({
+                    deleter_tid: {$ne: this.tid},  // Exclude self.
+                    delete_query_match: true,      // Select documents that might be being deleted.
+                    subset_id: getRandomUpTo(this.numInsertSubsets)  // Select subset.
+                },
+                                                             {$set: {delete_query_match: false}}));
+            }, 100, undefined, TestData.runningWithBalancer ? [ErrorCodes.QueryPlanKilled] : []);
         }
 
         // Takes a random subset of documents potentially being batch deleted and re-delete them.

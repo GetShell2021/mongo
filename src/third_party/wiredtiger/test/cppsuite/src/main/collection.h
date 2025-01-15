@@ -26,8 +26,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef COLLECTION_H
-#define COLLECTION_H
+#pragma once
 
 #include <atomic>
 #include <string>
@@ -36,7 +35,7 @@ namespace test_harness {
 
 /* A collection is made of mapped key value objects. */
 class collection {
-    public:
+public:
     collection(const uint64_t id, const uint64_t key_count, const std::string &name);
 
     /* Copies aren't allowed. */
@@ -60,13 +59,11 @@ class collection {
      */
     void increase_key_count(uint64_t increment);
 
-    public:
+public:
     const std::string name;
     const uint64_t id;
 
-    private:
+private:
     std::atomic<uint64_t> _key_count{0};
 };
 } // namespace test_harness
-
-#endif

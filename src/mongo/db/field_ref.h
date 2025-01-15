@@ -31,6 +31,11 @@
 
 #include <boost/container/small_vector.hpp>
 #include <boost/optional.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <iosfwd>
 #include <set>
 #include <string>
@@ -80,6 +85,23 @@ public:
     static bool isNumericPathComponentStrict(StringData component);
 
     /**
+     * Checks whether document path 'path' overlaps with a path of an indexed field 'indexedPath'.
+     */
+    static bool pathOverlaps(const FieldRef& path, const FieldRef& indexedPath);
+
+    /**
+     * Returns the canonicalized index form for 'path', removing numerical path components as well
+     * as '$' path components.
+     */
+    static FieldRef getCanonicalIndexField(const FieldRef& path);
+
+    /**
+     * Returns whether the provided path component can be included in the canonicalized index form
+     * of a path.
+     */
+    static bool isComponentPartOfCanonicalizedIndexPath(StringData pathComponent);
+
+    /**
      * Similar to the function above except strings that contain leading zero's are considered
      * numeric. For instance, the above function would return false for an input "01" however this
      * function will return true.
@@ -89,12 +111,6 @@ public:
     FieldRef() = default;
 
     explicit FieldRef(StringData path);
-
-    /**
-     * Field parts accessed through getPart() calls no longer would be valid, after the destructor
-     * ran.
-     */
-    ~FieldRef() {}
 
     /**
      * Builds a field path out of each field part in 'dottedField'.
@@ -156,6 +172,12 @@ public:
      * ^(0|[1-9]+[0-9]*)$.
      */
     bool isNumericPathComponentStrict(FieldIndex i) const;
+
+    /**
+     * Similar to isNumericPathComponentStrict, but returns true for 0-prefixed indices, such as
+     * "00" and "01".
+     */
+    bool isNumericPathComponentLenient(FieldIndex i) const;
 
     /**
      * Returns true if this FieldRef has any numeric path components.

@@ -1,8 +1,7 @@
 /**
  * Basic tests for the $minN/$maxN accumulators.
  */
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
 const coll = db[jsTestName()];
 coll.drop();
@@ -230,4 +229,3 @@ assert.commandFailedWithCode(coll.runCommand("aggregate", {
     cursor: {}
 }),
                              5787901);
-})();

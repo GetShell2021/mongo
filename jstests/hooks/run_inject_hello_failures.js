@@ -1,5 +1,3 @@
-'use strict';
-
 // Interval between test loops.
 const kTestLoopPeriodMs = 20 * 1000;
 
@@ -77,13 +75,13 @@ function injectHelloFail(connection) {
     jsTestLog(`Inject Hello fail to connection ${connection}`);
     const adminDB = getAdminDB(connection);
     assert.commandWorked(adminDB.runCommand({
-        configureFailPoint: 'waitInHello',
+        configureFailPoint: "shardWaitInHello",
         mode: "alwaysOn",
         data: {internalClient: 1}  // No effect if client is mongo shell.
     }));
-    const res = adminDB.runCommand({getParameter: 1, "failpoint.waitInHello": 1});
+    const res = adminDB.runCommand({getParameter: 1, "failpoint.shardWaitInHello": 1});
     assert.commandWorked(res);
-    assert.eq(res["failpoint.waitInHello"].mode, 1);
+    assert.eq(res["failpoint.shardWaitInHello"].mode, 1);
 }
 
 function freeze(connection) {
@@ -147,9 +145,8 @@ function doFailInjectionLoop(db) {
     }
 }
 
-(function() {
-load('jstests/libs/discover_topology.js');  // For Topology and DiscoverTopology.
-load('jstests/libs/fixture_helpers.js');
+import {Topology, DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 assert.eq(typeof db, 'object', 'Invalid `db` object, is the shell connected to a mongod?');
 var cmdLineOpts = db.adminCommand('getCmdLineOpts');
@@ -162,4 +159,3 @@ if (topology.type === Topology.kShardedCluster) {
     doFailInjectionLoop(db);
 }
 jsTestLog(`Hello fail hook completed`);
-})();

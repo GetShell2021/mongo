@@ -29,13 +29,28 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <set>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/change_stream_constants.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_change_stream_gen.h"
 #include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 /**
@@ -59,7 +74,7 @@ namespace mongo {
  * - Otherwise we cannot resume, as we do not know if there were any events between the resume token
  *   and the first matching document in the oplog.
  */
-class DocumentSourceChangeStreamCheckResumability : public DocumentSource {
+class DocumentSourceChangeStreamCheckResumability : public DocumentSourceInternalChangeStreamStage {
 public:
     static constexpr StringData kStageName = "$_internalChangeStreamCheckResumability"_sd;
 
@@ -68,7 +83,8 @@ public:
     enum class ResumeStatus {
         kFoundToken,      // The stream produced a document satisfying the client resume token.
         kSurpassedToken,  // The stream's latest document is more recent than the resume token.
-        kCheckNextDoc     // The next document produced by the stream may contain the resume token.
+        kCheckNextDoc,    // The next document produced by the stream may contain the resume token.
+        kNeedsSplit       // We found a candidate resume token but the event must be split.
     };
 
     const char* getSourceName() const override;
@@ -89,7 +105,9 @@ public:
         return boost::none;
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const override;
+    Value doSerialize(const SerializationOptions& opts = SerializationOptions{}) const override;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
     static boost::intrusive_ptr<DocumentSourceChangeStreamCheckResumability> createFromBson(
         BSONElement spec, const boost::intrusive_ptr<ExpressionContext>& expCtx);
@@ -98,10 +116,8 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const DocumentSourceChangeStreamSpec& spec);
 
-    static ResumeStatus compareAgainstClientResumeToken(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const Document& documentFromResumedStream,
-        const ResumeTokenData& tokenDataFromClient);
+    static ResumeStatus compareAgainstClientResumeToken(const Document& eventFromResumedStream,
+                                                        const ResumeTokenData& tokenDataFromClient);
 
 protected:
     /**

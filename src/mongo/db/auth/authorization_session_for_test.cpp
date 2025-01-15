@@ -27,40 +27,43 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <set>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authorization_session_for_test.h"
-
-#include <algorithm>
-#include <memory>
-
 #include "mongo/db/auth/builtin_roles.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/util/read_through_cache.h"
 
 namespace mongo {
-constexpr StringData AuthorizationSessionForTest::kTestDBName;
-
-void AuthorizationSessionForTest::assumePrivilegesForDB(Privilege privilege, StringData dbName) {
+void AuthorizationSessionForTest::assumePrivilegesForDB(Privilege privilege,
+                                                        const DatabaseName& dbName) {
     assumePrivilegesForDB(std::vector<Privilege>{privilege}, dbName);
 }
 
 void AuthorizationSessionForTest::assumePrivilegesForDB(PrivilegeVector privileges,
-                                                        StringData dbName) {
-    _authenticatedUser = UserHandle(User(UserName("authorizationSessionForTestUser", dbName)));
-    _authenticatedUser.get()->addPrivileges(privileges);
+                                                        const DatabaseName& dbName) {
+    std::unique_ptr<UserRequest> request = std::make_unique<UserRequestGeneral>(
+        UserName("authorizationSessionForTestUser"_sd, dbName), boost::none);
+    _authenticatedUser = UserHandle(User(std::move(request)));
+    _authenticatedUser.value()->addPrivileges(privileges);
     _authenticationMode = AuthorizationSession::AuthenticationMode::kConnection;
     _updateInternalAuthorizationState();
 }
 
-
 void AuthorizationSessionForTest::assumePrivilegesForBuiltinRole(const RoleName& roleName) {
     PrivilegeVector privileges;
     auth::addPrivilegesForBuiltinRole(roleName, &privileges);
-    StringData db = roleName.getDB();
-    if (db.empty()) {
-        db = "admin"_sd;
+    auto db = roleName.getDatabaseName();
+    if (db.isEmpty()) {
+        db = DatabaseName::kAdmin;
     }
 
     assumePrivilegesForDB(privileges, db);

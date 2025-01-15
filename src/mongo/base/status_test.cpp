@@ -27,19 +27,23 @@
  *    it in the license file.
  */
 
-#include <exception>
-#include <stdexcept>
-#include <string>
-
 #include <boost/exception/exception.hpp>
 #include <fmt/format.h>
+#include <functional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/base/status.h"
-#include "mongo/config.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/json.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -123,9 +127,9 @@ TEST(Status, Accessors) {
 }
 
 TEST(Status, IsA) {
-    ASSERT(!Status(ErrorCodes::BadValue, "").isA<ErrorCategory::Interruption>());
-    ASSERT(Status(ErrorCodes::Interrupted, "").isA<ErrorCategory::Interruption>());
-    ASSERT(!Status(ErrorCodes::Interrupted, "").isA<ErrorCategory::ShutdownError>());
+    ASSERT(!Status(ErrorCodes::BadValue, "").isA<ErrorCategory::NetworkError>());
+    ASSERT(Status(ErrorCodes::HostUnreachable, "").isA<ErrorCategory::NetworkError>());
+    ASSERT(!Status(ErrorCodes::HostUnreachable, "").isA<ErrorCategory::ShutdownError>());
 }
 
 TEST(Status, OKIsAValidStatus) {
@@ -297,7 +301,7 @@ DEATH_TEST_REGEX(ErrorExtraInfo, InvariantAllRegistered, "Invariant failure.*par
 
 #ifdef MONGO_CONFIG_DEBUG_BUILD
 DEATH_TEST_REGEX(ErrorExtraInfo, DassertShouldHaveExtraInfo, "Fatal assertion.*40680") {
-    Status(ErrorCodes::ForTestingErrorExtraInfo, "");
+    (void)Status(ErrorCodes::ForTestingErrorExtraInfo, "");
 }
 #else
 TEST(ErrorExtraInfo, ConvertCodeOnMissingExtraInfo) {

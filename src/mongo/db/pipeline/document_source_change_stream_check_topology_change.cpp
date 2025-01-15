@@ -27,12 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/document_source_change_stream_check_topology_change.h"
 
-#include "mongo/db/pipeline/change_stream_helpers_legacy.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/change_stream_topology_change_info.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -79,7 +85,7 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamCheckTopologyChange::doG
     // Throw the 'ChangeStreamTopologyChangeInfo' exception, wrapping the topology change event
     // along with its metadata. This will bypass the remainder of the pipeline and will be passed
     // directly up to mongoS.
-    if (eventOpType == change_stream_legacy::getNewShardDetectedOpName(pExpCtx)) {
+    if (eventOpType == DocumentSourceChangeStream::kNewShardDetectedOpType) {
         uasserted(ChangeStreamTopologyChangeInfo(eventDoc.toBsonWithMetaData()),
                   "Collection migrated to new shard");
     }
@@ -87,9 +93,9 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamCheckTopologyChange::doG
     return nextInput;
 }
 
-Value DocumentSourceChangeStreamCheckTopologyChange::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {
+Value DocumentSourceChangeStreamCheckTopologyChange::doSerialize(
+    const SerializationOptions& opts) const {
+    if (opts.verbosity) {
         return Value(DOC(DocumentSourceChangeStream::kStageName
                          << DOC("stage"
                                 << "internalCheckTopologyChange"_sd)));

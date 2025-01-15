@@ -32,11 +32,9 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/transaction_router.h"
 
 namespace mongo {
-namespace {
 
 /**
  * Implements the commitTransaction command for a router.
@@ -55,14 +53,14 @@ public:
         ClusterCommitTransactionCmdBase<Impl>>::RequestParser;
 
     void validateResult(const BSONObj& resultObj) final {
-        auto ctx = IDLParserErrorContext("CommitReply");
+        auto ctx = IDLParserContext("CommitReply");
         if (!BaseType::checkIsErrorStatus(resultObj, ctx)) {
             // Will throw if the result doesn't match the commitReply.
             Reply::parse(ctx, resultObj);
         }
     }
 
-    const std::set<std::string>& apiVersions() const {
+    const std::set<std::string>& apiVersions() const override {
         return Impl::getApiVersions();
     }
 
@@ -83,9 +81,9 @@ public:
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
+                                 const DatabaseName& dbName,
                                  const BSONObj& cmdObj) const override {
-        return Impl::checkAuthForOperation(opCtx);
+        return Impl::checkAuthForOperation(opCtx, dbName, cmdObj);
     }
 
     bool isTransactionCommand() const final {
@@ -97,7 +95,7 @@ public:
     }
 
     bool runWithRequestParser(OperationContext* opCtx,
-                              const std::string& dbName,
+                              const DatabaseName& dbName,
                               const BSONObj& cmdObj,
                               const RequestParser& requestParser,
                               BSONObjBuilder& result) final {
@@ -119,5 +117,4 @@ public:
     }
 };
 
-}  // namespace
 }  // namespace mongo

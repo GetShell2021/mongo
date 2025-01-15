@@ -1,24 +1,11 @@
 // Tests that text search requires a text index.
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");  // For "assertErrorCode".
-load("jstests/libs/fixture_helpers.js");      // For isSharded.
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 const coll = db.coll;
 const from = db.from;
 
 coll.drop();
 from.drop();
-
-// Do not run the rest of the tests if the foreign collection is implicitly sharded but the flag to
-// allow $lookup/$graphLookup into a sharded collection is disabled.
-const getShardedLookupParam = db.adminCommand({getParameter: 1, featureFlagShardedLookup: 1});
-const isShardedLookupEnabled = getShardedLookupParam.hasOwnProperty("featureFlagShardedLookup") &&
-    getShardedLookupParam.featureFlagShardedLookup.value;
-if (FixtureHelpers.isSharded(from) && !isShardedLookupEnabled) {
-    return;
-}
 
 const textPipeline = [{$match: {$text: {$search: "foo"}}}];
 
@@ -44,4 +31,3 @@ assert.commandWorked(from.createIndex({a: "text"}));
 // Should run when you have the text index.
 assert.eq(from.aggregate(textPipeline).itcount(), 1);
 assert.eq(coll.aggregate(pipeline).itcount(), 1);
-}());

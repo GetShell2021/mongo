@@ -1,15 +1,14 @@
 // Cannot implicitly shard accessed collections because of extra shard key index in sharded
 // collection.
+//
 // @tags: [
 //   assumes_no_implicit_index_creation,
 //   uses_multiple_connections,
-//   # This test uses benchRun which does not use runCommand (required by the
-//   # inject_tenant_prefix.js override).
-//   tenant_migration_incompatible,
+//   # benchRun does not use runCommand which is required by the `simulate_atlas_proxy` override.
+//   simulate_atlas_proxy_incompatible,
+//   # TODO SERVER-84638: remove this incompatibility once benchrun passes on shell options.
+//   grpc_incompatible,
 // ]
-(function() {
-"use strict";
-
 const t = db.bench_test1;
 t.drop();
 
@@ -49,4 +48,3 @@ benchRun(benchArgs);
 assert.soon(function() {
     return t.getIndexes().length == 1;
 });
-}());

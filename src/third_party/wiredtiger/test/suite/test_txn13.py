@@ -31,7 +31,6 @@
 # able to write them.  Expect an error over 4Gb.
 #
 
-#import fnmatch, os, shutil, run, time
 from suite_subprocess import suite_subprocess
 from wtscenario import make_scenarios
 import wiredtiger, wttest
@@ -91,7 +90,5 @@ class test_txn13(wttest.WiredTigerTestCase, suite_subprocess):
         else:
             self.session.commit_transaction()
 
+        self.ignoreStdoutPatternIfExists('Eviction took more than 1 minute')
         self.assertTrue(gotException == self.expect_err)
-
-if __name__ == '__main__':
-    wttest.run()

@@ -1,9 +1,8 @@
 // Auth tests for the $listSessions {allUsers:true} aggregation stage.
-// @tags: [requires_sharding]
+// @tags: [requires_sharding, requires_auth]
 
-(function() {
-'use strict';
-load('jstests/aggregation/extras/utils.js');
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test makes assertions about the number of sessions, which are not compatible with
 // implicit sessions.
@@ -40,15 +39,13 @@ function runListAllSessionsTest(mongod) {
     // Ensure that the cache now contains the session and is visible by admin
     admin.logout();
     assert(admin.auth('admin', 'pass'));
-    const resultArray =
-        config.system.sessions
-            .aggregate(
-                [{'$listSessions': {allUsers: true}}, {'$sort': {lastUse: -1}}, {'$limit': 1}])
-            .toArray();
+    const resultArray = config.system.sessions.aggregate([{'$listSessions': {allUsers: true}}])
+                            .toArray()
+                            .filter((session) => {
+                                assert(session._id.id !== undefined);
+                                return 0 == bsonWoCompare({y: myid}, {y: session._id.id});
+                            });
     assert.eq(resultArray.length, 1);
-    const cacheid = resultArray[0]._id.id;
-    assert(cacheid !== undefined);
-    assert.eq(0, bsonWoCompare({x: cacheid}, {x: myid}));
 
     // Make sure pipelining other collections fail.
     assertErrorCode(admin.system.collections, pipeline, ErrorCodes.InvalidNamespace);
@@ -67,4 +64,3 @@ st.rs0.getPrimary().getDB("admin").runCommand({refreshLogicalSessionCacheNow: 1}
 
 runListAllSessionsTest(st.s0);
 st.stop();
-})();

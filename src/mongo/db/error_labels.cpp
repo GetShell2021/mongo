@@ -28,11 +28,29 @@
  */
 
 #include "mongo/db/error_labels.h"
+
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -55,7 +73,8 @@ bool ErrorLabelBuilder::isTransientTransactionError() const {
     // we have already tried to abort it. An error code for which isTransientTransactionError()
     // is true indicates a transaction failure with no persistent side effects.
     return _code && _sessionOptions.getTxnNumber() && _sessionOptions.getAutocommit() &&
-        mongo::isTransientTransactionError(_code.get(), _wcCode != boost::none, _isCommitOrAbort());
+        mongo::isTransientTransactionError(
+               _code.value(), _wcCode != boost::none, _isCommitOrAbort());
 }
 
 bool ErrorLabelBuilder::isRetryableWriteError() const {
@@ -77,25 +96,43 @@ bool ErrorLabelBuilder::isRetryableWriteError() const {
     // transactions commit/abort.
     if (isRetryableWrite() || isTransactionCommitOrAbort()) {
         bool isShutDownCode = _code &&
-            (ErrorCodes::isShutdownError(_code.get()) ||
-             _code.get() == ErrorCodes::CallbackCanceled);
+            (ErrorCodes::isShutdownError(_code.value()) ||
+             _code.value() == ErrorCodes::CallbackCanceled);
         if (isShutDownCode &&
             (globalInShutdownDeprecated() ||
              MONGO_unlikely(errorLabelBuilderMockShutdown.shouldFail()))) {
             return true;
         }
 
+        // StaleConfig error for a direct shard operation is retryable because StaleConfig triggers
+        // a sharding metadata refresh. As a result, a subsequent retry will probably succeed.
+        if (!_isComingFromRouter && _code && _code.value() == ErrorCodes::StaleConfig) {
+            return true;
+        }
+
         // mongos should not attach RetryableWriteError label to retryable errors thrown by the
         // config server or targeted shards.
         return !_isMongos &&
-            ((_code && ErrorCodes::isRetriableError(_code.get())) ||
-             (_wcCode && ErrorCodes::isRetriableError(_wcCode.get())));
+            ((_code && ErrorCodes::isRetriableError(_code.value())) ||
+             (_wcCode && ErrorCodes::isRetriableError(_wcCode.value())));
     }
     return false;
 }
 
 bool ErrorLabelBuilder::isNonResumableChangeStreamError() const {
-    return _code && ErrorCodes::isNonResumableChangeStreamError(_code.get());
+    return _code && ErrorCodes::isNonResumableChangeStreamError(_code.value());
+}
+
+bool ErrorLabelBuilder::isStreamProcessorUserError() const {
+    return _code && mongo::isStreamProcessorUserError(_code.value());
+}
+
+bool ErrorLabelBuilder::isStreamProcessorRetryableError() const {
+    return _code && mongo::isStreamProcessorRetryableError(_code.value());
+}
+
+bool ErrorLabelBuilder::isSystemOverloadedError() const {
+    return _code && mongo::isSystemOverloadedError(_code.value());
 }
 
 bool ErrorLabelBuilder::isResumableChangeStreamError() const {
@@ -104,7 +141,10 @@ bool ErrorLabelBuilder::isResumableChangeStreamError() const {
         (_commandName == "aggregate" || _commandName == "getMore") && _code && !_wcCode &&
         (ErrorCodes::isRetriableError(*_code) || ErrorCodes::isNetworkError(*_code) ||
          ErrorCodes::isNeedRetargettingError(*_code) || _code == ErrorCodes::RetryChangeStream ||
-         _code == ErrorCodes::FailedToSatisfyReadPreference);
+         _code == ErrorCodes::FailedToSatisfyReadPreference ||
+         _code == ErrorCodes::QueryPlanKilled /* the change stream cursor gets killed upon node
+                                                 rollback */
+         || _code == ErrorCodes::ResumeTenantChangeStream);
 
     // If the command or exception is not relevant, bail out early.
     if (!mayNeedResumableChangeStreamErrorLabel) {
@@ -118,15 +158,16 @@ bool ErrorLabelBuilder::isResumableChangeStreamError() const {
     const auto cmdObj = (_commandName == "aggregate" ? CurOp::get(_opCtx)->opDescription()
                                                      : CurOp::get(_opCtx)->originatingCommand());
 
-    // Get the namespace string from CurOp. We will need it to build the LiteParsedPipeline.
-    const auto nss = NamespaceString{CurOp::get(_opCtx)->getNS()};
+    const auto vts = auth::ValidatedTenancyScope::get(_opCtx);
+    auto sc = vts != boost::none
+        ? SerializationContext::stateCommandRequest(vts->hasTenantId(), vts->isFromAtlasProxy())
+        : SerializationContext::stateCommandRequest();
 
-    bool apiStrict = APIParameters::get(_opCtx).getAPIStrict().value_or(false);
     // Do enough parsing to confirm that this is a well-formed pipeline with a $changeStream.
-    const auto swLitePipe = [this, &nss, &cmdObj, apiStrict]() -> StatusWith<LiteParsedPipeline> {
+    const auto swLitePipe = [this, &vts, &cmdObj, &sc]() -> StatusWith<LiteParsedPipeline> {
         try {
-            auto aggRequest = aggregation_request_helper::parseFromBSON(
-                _opCtx, nss, cmdObj, boost::none, apiStrict);
+            auto aggRequest =
+                aggregation_request_helper::parseFromBSON(cmdObj, vts, boost::none, sc);
             return LiteParsedPipeline(aggRequest);
         } catch (const DBException& ex) {
             return ex.toStatus();
@@ -179,6 +220,20 @@ void ErrorLabelBuilder::build(BSONArrayBuilder& labels) const {
     } else if (isNonResumableChangeStreamError()) {
         labels << ErrorLabel::kNonResumableChangeStream;
     }
+
+#ifdef MONGO_CONFIG_STREAMS
+    if (_commandName == "streams_startStreamProcessor" ||
+        _commandName == "streams_listStreamProcessors") {
+        // This config is only set in special stream processing enabled builds for Atlas Stream
+        // Processing. If the config is set, add labels for the stream processing error categories.
+        if (isStreamProcessorUserError()) {
+            labels << ErrorLabel::kStreamProcessorUserError;
+        }
+        if (isStreamProcessorRetryableError()) {
+            labels << ErrorLabel::kStreamProcessorRetryableError;
+        }
+    }
+#endif
 }
 
 bool ErrorLabelBuilder::_isCommitOrAbort() const {
@@ -192,16 +247,17 @@ BSONObj getErrorLabels(OperationContext* opCtx,
                        boost::optional<ErrorCodes::Error> wcCode,
                        bool isInternalClient,
                        bool isMongos,
+                       bool isComingFromRouter,
                        const repl::OpTime& lastOpBeforeRun,
                        const repl::OpTime& lastOpAfterRun) {
     if (MONGO_unlikely(errorLabelsOverride(opCtx))) {
         // This command was failed by a failCommand failpoint. Thus, we return the errorLabels
-        // specified in the failpoint to supress any other error labels that would otherwise be
+        // specified in the failpoint to suppress any other error labels that would otherwise be
         // returned by the ErrorLabelBuilder.
-        if (errorLabelsOverride(opCtx).get().isEmpty()) {
+        if (errorLabelsOverride(opCtx).value().isEmpty()) {
             return BSONObj();
         } else {
-            return BSON(kErrorLabelsFieldName << errorLabelsOverride(opCtx).get());
+            return BSON(kErrorLabelsFieldName << errorLabelsOverride(opCtx).value());
         }
     }
 
@@ -213,6 +269,7 @@ BSONObj getErrorLabels(OperationContext* opCtx,
                                    wcCode,
                                    isInternalClient,
                                    isMongos,
+                                   isComingFromRouter,
                                    lastOpBeforeRun,
                                    lastOpAfterRun);
     labelBuilder.build(labelArray);
@@ -241,11 +298,7 @@ bool isTransientTransactionError(ErrorCodes::Error code,
         case ErrorCodes::LockTimeout:
         case ErrorCodes::PreparedTransactionInProgress:
         case ErrorCodes::ShardCannotRefreshDueToLocksHeld:
-        case ErrorCodes::ShardInvalidatedForTargeting:
         case ErrorCodes::StaleDbVersion:
-        case ErrorCodes::TenantMigrationAborted:
-        case ErrorCodes::TenantMigrationCommitted:
-        case ErrorCodes::TxnRetryCounterNotSupported:
             return true;
         default:
             isTransient = false;
@@ -263,6 +316,21 @@ bool isTransientTransactionError(ErrorCodes::Error code,
     }
 
     return isTransient;
+}
+
+bool isStreamProcessorUserError(ErrorCodes::Error code) {
+    return ErrorCodes::isStreamProcessorUserError(code);
+}
+
+bool isStreamProcessorRetryableError(ErrorCodes::Error code) {
+    // All non-user errors are unexpected internal errors. The internal errors alert the
+    // on-call and we work on a mitigation. We keep these errors as retryable to make
+    // the mitigation easier.
+    return !isStreamProcessorUserError(code) || ErrorCodes::isStreamProcessorRetryableError(code);
+}
+
+bool isSystemOverloadedError(ErrorCodes::Error code) {
+    return ErrorCodes::isSystemOverloadedError(code);
 }
 
 }  // namespace mongo

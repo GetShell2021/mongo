@@ -2,6 +2,11 @@
 // MultiVersion utility functions for clusters
 //
 
+import "jstests/multiVersion/libs/multi_rs.js";
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
+
 /**
  * Restarts the specified binaries in options with the specified binVersion.
  * Note: this does not perform any upgrade operations.
@@ -11,6 +16,7 @@
  *
  * {
  *     upgradeShards: <bool>, // defaults to true
+ *     upgradeOneShard: <rs> // defaults to false,
  *     upgradeConfigs: <bool>, // defaults to true
  *     upgradeMongos: <bool>, // defaults to true
  *     waitUntilStable: <bool>, // defaults to false since it provides a more realistic
@@ -18,13 +24,12 @@
  *                                 certain tests will likely want a stable cluster after upgrading.
  * }
  */
-load("jstests/multiVersion/libs/multi_rs.js");  // Used by upgradeSet.
-load("jstests/replsets/rslib.js");              // For awaitRSClientHosts.
-
 ShardingTest.prototype.upgradeCluster = function(binVersion, options) {
     options = options || {};
     if (options.upgradeShards == undefined)
         options.upgradeShards = true;
+    if (options.upgradeOneShard == undefined)
+        options.upgradeOneShard = false;
     if (options.upgradeConfigs == undefined)
         options.upgradeConfigs = true;
     if (options.upgradeMongos == undefined)
@@ -52,6 +57,12 @@ ShardingTest.prototype.upgradeCluster = function(binVersion, options) {
         this._rs.forEach((rs) => {
             rs.test.upgradeSet({binVersion: binVersion});
         });
+    }
+
+    if (options.upgradeOneShard) {
+        // Upgrade one shard.
+        let rs = options.upgradeOneShard;
+        rs.upgradeSet({binVersion: binVersion});
     }
 
     if (options.upgradeMongos) {
@@ -83,6 +94,8 @@ ShardingTest.prototype.downgradeCluster = function(binVersion, options) {
     options = options || {};
     if (options.downgradeShards == undefined)
         options.downgradeShards = true;
+    if (options.downgradeOneShard == undefined)
+        options.downgradeOneShard = false;
     if (options.downgradeConfigs == undefined)
         options.downgradeConfigs = true;
     if (options.downgradeMongos == undefined)
@@ -115,6 +128,12 @@ ShardingTest.prototype.downgradeCluster = function(binVersion, options) {
         this._rs.forEach((rs) => {
             rs.test.upgradeSet({binVersion: binVersion});
         });
+    }
+
+    if (options.downgradeOneShard) {
+        // Downgrade one shard.
+        let rs = options.downgradeOneShard;
+        rs.upgradeSet({binVersion: binVersion});
     }
 
     if (options.downgradeConfigs) {

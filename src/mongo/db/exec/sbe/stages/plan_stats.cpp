@@ -27,11 +27,7 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/exec/sbe/stages/plan_stats.h"
-
-#include <queue>
+#include <vector>
 
 #include "mongo/db/exec/plan_stats_walker.h"
 #include "mongo/db/exec/sbe/stages/plan_stats.h"
@@ -50,9 +46,7 @@ PlanSummaryStats collectExecutionStatsSummary(const PlanStageStats& root) {
     PlanSummaryStats summary;
     summary.nReturned = root.common.advances;
 
-    if (root.common.executionTimeMillis) {
-        summary.executionTimeMillisEstimate = *root.common.executionTimeMillis;
-    }
+    summary.executionTime = root.common.executionTime;
 
     auto visitor = PlanSummaryStatsVisitor(summary);
     auto walker = PlanStageStatsWalker<true, CommonStats>(nullptr, nullptr, &visitor);

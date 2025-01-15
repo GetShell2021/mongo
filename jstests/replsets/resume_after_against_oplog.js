@@ -6,8 +6,7 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({
     nodes: 1,
@@ -22,9 +21,11 @@ const dbName = "test";
 const collName = jsTestName();
 
 jsTestLog("Inserting some data");
-// We will query the oplog for the entries corresponding to those inserts.
+// We will query the oplog for the entries corresponding to those inserts.  We insert one at time
+// to avoid batching of vectored inserts.
 const testData = [{_id: 0, ans: 42}, {_id: 1, ans: 42}, {_id: 2, ans: 42}];
-assert.commandWorked(node.getDB(dbName).getCollection(collName).insert(testData));
+testData.forEach(
+    doc => assert.commandWorked(node.getDB(dbName).getCollection(collName).insert([doc])));
 
 const localDb = node.getDB("local");
 const kNullTS = new Timestamp(0, 0);
@@ -301,4 +302,3 @@ jsTestLog("Running query on the oplog with an empty batch");
 }
 
 rst.stopSet();
-})();

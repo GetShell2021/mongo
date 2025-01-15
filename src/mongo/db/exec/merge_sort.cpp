@@ -29,21 +29,21 @@
 
 #include "mongo/db/exec/merge_sort.h"
 
+#include <cstddef>
 #include <memory>
+#include <string>
+#include <utility>
 
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set.h"
-#include "mongo/db/exec/working_set_common.h"
+#include <absl/container/node_hash_map.h>
+
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/query/collation/collation_index_key.h"
-#include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/util/str.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-using std::list;
 using std::string;
 using std::unique_ptr;
-using std::vector;
 
 // static
 const char* MergeSortStage::kStageType = "SORT_MERGE";
@@ -65,7 +65,7 @@ void MergeSortStage::addChild(std::unique_ptr<PlanStage> child) {
     _noResultToMerge.push(_children.back().get());
 }
 
-bool MergeSortStage::isEOF() {
+bool MergeSortStage::isEOF() const {
     // If we have no more results to return, and we have no more children that we can call
     // work(...) on to get results, we're done.
     return _merging.empty() && _noResultToMerge.empty();
@@ -95,16 +95,14 @@ PlanStage::StageState MergeSortStage::doWork(WorkingSetID* out) {
                 } else {
                     ++_specificStats.dupsTested;
                     // ...and there's a RecordId and and we've seen the RecordId before
-                    if (_seen.end() != _seen.find(member->recordId)) {
+                    if (!_recordIdDeduplicator.insert(member->recordId)) {
                         // ...drop it.
                         _ws->free(id);
                         ++_specificStats.dupsDropped;
                         return PlanStage::NEED_TIME;
                     } else {
-                        // Otherwise, note that we've seen it.
-                        _seen.insert(member->recordId);
-                        // We're going to use the result from the child, so we remove it from
-                        // the queue of children without a result.
+                        // Otherwise, we're going to use the result from the child, so we remove it
+                        // from the queue of children without a result.
                         _noResultToMerge.pop();
                     }
                 }
@@ -140,7 +138,7 @@ PlanStage::StageState MergeSortStage::doWork(WorkingSetID* out) {
     }
 
     // If we're here, for each non-EOF child, we have a valid WSID.
-    verify(!_merging.empty());
+    MONGO_verify(!_merging.empty());
 
     // Get the 'min' WSID.  _merging is a priority queue so its top is the smallest.
     MergingRef top = _merging.top();
@@ -173,13 +171,13 @@ bool MergeSortStage::StageWithValueComparison::operator()(const MergingRef& lhs,
         string fn = patternElt.fieldName();
 
         BSONElement lhsElt;
-        verify(lhsMember->getFieldDotted(fn, &lhsElt));
+        MONGO_verify(lhsMember->getFieldDotted(fn, &lhsElt));
 
         // Determine if the left-hand side sort key part comes from an index key.
         auto lhsIsFromIndexKey = !lhsMember->hasObj();
 
         BSONElement rhsElt;
-        verify(rhsMember->getFieldDotted(fn, &rhsElt));
+        MONGO_verify(rhsMember->getFieldDotted(fn, &rhsElt));
 
         // Determine if the right-hand side sort key part comes from an index key.
         auto rhsIsFromIndexKey = !rhsMember->hasObj();

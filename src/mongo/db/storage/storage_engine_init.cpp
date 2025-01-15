@@ -27,38 +27,47 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/storage/storage_engine_init.h"
 
+#include <exception>
 #include <map>
-#include <memory>
+#include <string>
+#include <utility>
 
-#include "mongo/base/init.h"
+#include <boost/filesystem/path.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/concurrency/lock_state.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
 #include "mongo/db/storage/storage_engine_change_context.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
-#include "mongo/db/storage/storage_engine_parameters.h"
-#include "mongo/db/storage/storage_engine_parameters_gen.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-
 namespace mongo {
-
 namespace {
 /**
  * Creates the lock file used to prevent concurrent processes from accessing the data files,
@@ -67,21 +76,21 @@ namespace {
 void createLockFile(ServiceContext* service);
 }  // namespace
 
-StorageEngine::LastShutdownState initializeStorageEngine(OperationContext* opCtx,
-                                                         const StorageEngineInitFlags initFlags) {
+StorageEngine::LastShutdownState initializeStorageEngine(
+    OperationContext* opCtx,
+    const StorageEngineInitFlags initFlags,
+    BSONObjBuilder* startupTimeElapsedBuilder) {
     ServiceContext* service = opCtx->getServiceContext();
-
-    if (storageGlobalParams.restore) {
-        uassert(6260400,
-                "Cannot use --restore when the 'featureFlagSelectiveBackup' is disabled",
-                feature_flags::gSelectiveBackup.isEnabledAndIgnoreFCV());
-    }
 
     // This should be set once.
     if ((initFlags & StorageEngineInitFlags::kForRestart) == StorageEngineInitFlags{})
         invariant(!service->getStorageEngine());
 
     if ((initFlags & StorageEngineInitFlags::kAllowNoLockFile) == StorageEngineInitFlags{}) {
+        auto scopedTimer = createTimeElapsedBuilderScopedTimer(
+            service->getFastClockSource(),
+            "Create storage engine lock file in the data directory",
+            startupTimeElapsedBuilder);
         createLockFile(service);
     }
 
@@ -143,45 +152,24 @@ StorageEngine::LastShutdownState initializeStorageEngine(OperationContext* opCtx
 
     std::unique_ptr<StorageEngineMetadata> metadata;
     if ((initFlags & StorageEngineInitFlags::kSkipMetadataFile) == StorageEngineInitFlags{}) {
+        auto scopedTimer =
+            createTimeElapsedBuilderScopedTimer(service->getFastClockSource(),
+                                                "Get metadata describing storage engine",
+                                                startupTimeElapsedBuilder);
         metadata = StorageEngineMetadata::forPath(dbpath);
     }
 
     // Validate options in metadata against current startup options.
     if (metadata.get()) {
+        auto scopedTimer = createTimeElapsedBuilderScopedTimer(
+            service->getFastClockSource(),
+            "Validate options in metadata against current startup options",
+            startupTimeElapsedBuilder);
         uassertStatusOK(factory->validateMetadata(*metadata, storageGlobalParams));
     }
 
     // This should be set once during startup.
     if ((initFlags & StorageEngineInitFlags::kForRestart) == StorageEngineInitFlags{}) {
-        auto readTransactions = gConcurrentReadTransactions.load();
-        static constexpr auto DEFAULT_TICKETS_VALUE = 128;
-        readTransactions = readTransactions == 0 ? DEFAULT_TICKETS_VALUE : readTransactions;
-        auto writeTransactions = gConcurrentWriteTransactions.load();
-        writeTransactions = writeTransactions == 0 ? DEFAULT_TICKETS_VALUE : writeTransactions;
-
-        auto svcCtx = opCtx->getServiceContext();
-        auto& ticketHolders = TicketHolders::get(svcCtx);
-        if (feature_flags::gFeatureFlagExecutionControl.isEnabledAndIgnoreFCV()) {
-            LOGV2_DEBUG(5190400, 1, "Enabling new ticketing policies");
-            switch (gTicketQueueingPolicy) {
-                case QueueingPolicyEnum::Semaphore:
-                    LOGV2_DEBUG(6382201, 1, "Using Semaphore-based ticketing scheduler");
-                    ticketHolders.setGlobalThrottling(
-                        std::make_unique<SemaphoreTicketHolder>(readTransactions, svcCtx),
-                        std::make_unique<SemaphoreTicketHolder>(writeTransactions, svcCtx));
-                    break;
-                case QueueingPolicyEnum::FifoQueue:
-                    LOGV2_DEBUG(6382200, 1, "Using FIFO queue-based ticketing scheduler");
-                    ticketHolders.setGlobalThrottling(
-                        std::make_unique<FifoTicketHolder>(readTransactions, svcCtx),
-                        std::make_unique<FifoTicketHolder>(writeTransactions, svcCtx));
-                    break;
-            }
-        } else {
-            ticketHolders.setGlobalThrottling(
-                std::make_unique<SemaphoreTicketHolder>(readTransactions, svcCtx),
-                std::make_unique<SemaphoreTicketHolder>(writeTransactions, svcCtx));
-        }
     }
 
     ScopeGuard guard([&] {
@@ -192,26 +180,36 @@ StorageEngine::LastShutdownState initializeStorageEngine(OperationContext* opCtx
     });
 
     auto& lockFile = StorageEngineLockFile::get(service);
-    if ((initFlags & StorageEngineInitFlags::kForRestart) == StorageEngineInitFlags{}) {
-        auto storageEngine = std::unique_ptr<StorageEngine>(
-            factory->create(opCtx, storageGlobalParams, lockFile ? &*lockFile : nullptr));
-        service->setStorageEngine(std::move(storageEngine));
-    } else {
-        auto storageEngineChangeContext = StorageEngineChangeContext::get(service);
-        auto token = storageEngineChangeContext->killOpsForStorageEngineChange(service);
-        auto storageEngine = std::unique_ptr<StorageEngine>(
-            factory->create(opCtx, storageGlobalParams, lockFile ? &*lockFile : nullptr));
-        storageEngineChangeContext->changeStorageEngine(
-            service, std::move(token), std::move(storageEngine));
+    {
+        auto scopedTimer = createTimeElapsedBuilderScopedTimer(
+            service->getFastClockSource(), "Create storage engine", startupTimeElapsedBuilder);
+        if ((initFlags & StorageEngineInitFlags::kForRestart) == StorageEngineInitFlags{}) {
+            auto storageEngine = std::unique_ptr<StorageEngine>(
+                factory->create(opCtx, storageGlobalParams, lockFile ? &*lockFile : nullptr));
+            service->setStorageEngine(std::move(storageEngine));
+        } else {
+            auto storageEngineChangeContext = StorageEngineChangeContext::get(service);
+            auto lk = storageEngineChangeContext->killOpsForStorageEngineChange(service);
+            auto storageEngine = std::unique_ptr<StorageEngine>(
+                factory->create(opCtx, storageGlobalParams, lockFile ? &*lockFile : nullptr));
+            storageEngineChangeContext->changeStorageEngine(
+                service, std::move(lk), std::move(storageEngine));
+        }
     }
 
     if (lockFile) {
+        auto scopedTimer = createTimeElapsedBuilderScopedTimer(
+            service->getFastClockSource(), "Write current PID to file", startupTimeElapsedBuilder);
         uassertStatusOK(lockFile->writePid());
     }
 
     // Write a new metadata file if it is not present.
     if (!metadata.get() &&
         (initFlags & StorageEngineInitFlags::kSkipMetadataFile) == StorageEngineInitFlags{}) {
+        auto scopedTimer =
+            createTimeElapsedBuilderScopedTimer(service->getFastClockSource(),
+                                                "Write a new metadata for storage engine",
+                                                startupTimeElapsedBuilder);
         metadata.reset(new StorageEngineMetadata(storageGlobalParams.dbpath));
         metadata->setStorageEngine(factory->getCanonicalName().toString());
         metadata->setStorageEngineOptions(factory->createMetadataOptions(storageGlobalParams));
@@ -234,11 +232,11 @@ void shutdownGlobalStorageEngineCleanly(ServiceContext* service,
     auto storageEngine = service->getStorageEngine();
     invariant(storageEngine);
     // We always use 'forRestart' = false here because 'forRestart' = true is only appropriate if
-    // we're going to restart controls on the same storage engine, which we are not here because
-    // we are shutting the storage engine down. Additionally, we need to terminate any background
+    // we're going to restart controls on the same storage engine, which we are not here because we
+    // are shutting the storage engine down. Additionally, we need to terminate any background
     // threads as they may be holding onto an OperationContext, as opposed to pausing them.
     StorageControl::stopStorageControls(service, errorToReport, /*forRestart=*/false);
-    storageEngine->cleanShutdown();
+    storageEngine->cleanShutdown(service);
     auto& lockFile = StorageEngineLockFile::get(service);
     if (lockFile) {
         lockFile->clearPidAndUnlock();
@@ -259,13 +257,14 @@ StorageEngine::LastShutdownState reinitializeStorageEngine(
     StorageEngineInitFlags initFlags,
     std::function<void()> changeConfigurationCallback) {
     auto service = opCtx->getServiceContext();
-    opCtx->recoveryUnit()->abandonSnapshot();
+    shard_role_details::getRecoveryUnit(opCtx)->abandonSnapshot();
     shutdownGlobalStorageEngineCleanly(
         service,
         {ErrorCodes::InterruptedDueToStorageChange, "The storage engine is being reinitialized."},
         /*forRestart=*/true);
-    opCtx->setRecoveryUnit(std::make_unique<RecoveryUnitNoop>(),
-                           WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+    shard_role_details::setRecoveryUnit(opCtx,
+                                        std::make_unique<RecoveryUnitNoop>(),
+                                        WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
     changeConfigurationCallback();
     auto lastShutdownState =
         initializeStorageEngine(opCtx, initFlags | StorageEngineInitFlags::kForRestart);
@@ -362,59 +361,13 @@ Status validateStorageOptions(
     return Status::OK();
 }
 
-namespace {
-BSONArray storageEngineList(ServiceContext* service) {
-    if (!service)
-        return BSONArray();
-
-    BSONArrayBuilder engineArrayBuilder;
-
-    for (const auto& nameAndFactory : storageFactories(service)) {
-        engineArrayBuilder.append(nameAndFactory.first);
-    }
-
-    return engineArrayBuilder.arr();
-}
-}  // namespace
-
-void appendStorageEngineList(ServiceContext* service, BSONObjBuilder* result) {
-    result->append("storageEngines", storageEngineList(service));
+std::vector<StringData> getStorageEngineNames(ServiceContext* svcCtx) {
+    const auto& factories = storageFactories(svcCtx);
+    std::vector<StringData> ret;
+    std::transform(factories.begin(), factories.end(), std::back_inserter(ret), [](auto& it) {
+        return StringData(it.first);
+    });
+    return ret;
 }
 
-namespace {
-
-class StorageClientObserver final : public ServiceContext::ClientObserver {
-public:
-    void onCreateClient(Client* client) override{};
-    void onDestroyClient(Client* client) override{};
-    void onCreateOperationContext(OperationContext* opCtx) {
-        // Use a fully fledged lock manager even when the storage engine is not set.
-        opCtx->setLockState(std::make_unique<LockerImpl>(opCtx->getServiceContext()));
-
-        auto service = opCtx->getServiceContext();
-
-        // There are a few cases where we don't have a storage engine available yet when creating an
-        // operation context.
-        // 1. During startup, we create an operation context to allow the storage engine
-        //    initialization code to make use of the lock manager.
-        // 2. There are unit tests that create an operation context before initializing the storage
-        //    engine.
-        // 3. Unit tests that use an operation context but don't require a storage engine for their
-        //    testing purpose.
-        auto storageEngine = service->getStorageEngine();
-        if (!storageEngine) {
-            return;
-        }
-        opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(storageEngine->newRecoveryUnit()),
-                               WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
-    }
-    void onDestroyOperationContext(OperationContext* opCtx) {}
-};
-
-ServiceContext::ConstructorActionRegisterer registerStorageClientObserverConstructor{
-    "RegisterStorageClientObserverConstructor", [](ServiceContext* service) {
-        service->registerClientObserver(std::make_unique<StorageClientObserver>());
-    }};
-
-}  // namespace
 }  // namespace mongo

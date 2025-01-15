@@ -1,9 +1,10 @@
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/parallel_shell_helpers.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-const UserWriteBlockHelpers = (function() {
-    'use strict';
-
+export const UserWriteBlockHelpers = (function() {
     const WriteBlockState = {UNKNOWN: 0, DISABLED: 1, ENABLED: 2};
 
     const bypassUser = "adminUser";
@@ -101,10 +102,8 @@ const UserWriteBlockHelpers = (function() {
             assert.eq(expectedUserWriteBlockMode, status.repl.userWriteBlockMode);
         }
 
-        _hangTransition(targetConn, failpoint, awaitShell) {
-            let hangFailPoint = configureFailPoint(targetConn, failpoint);
-            hangFailPoint.wait();
-            return {waiter: awaitShell, failpoint: hangFailPoint};
+        _hangTransition(targetConn, failpoint) {
+            return configureFailPoint(targetConn, failpoint);
         }
 
         setFailPoint(failpointName) {
@@ -119,7 +118,19 @@ const UserWriteBlockHelpers = (function() {
             throw "UNIMPLEMENTED";
         }
 
+        stepDown() {
+            throw "UNIMPLEMENTED";
+        }
+
         setProfilingLevel(level) {
+            throw "UNIMPLEMENTED";
+        }
+
+        assertFCV(expectedFCV) {
+            throw "UNIMPLEMENTED";
+        }
+
+        applyOps(params) {
             throw "UNIMPLEMENTED";
         }
     }
@@ -199,6 +210,8 @@ const UserWriteBlockHelpers = (function() {
 
         restart() {
             this.rst.stopSet(undefined, /* restart */ true);
+            // Setting the restart option to true when starting the set will proactively attempt to
+            // find a node to step up, rather than waiting for the election timeout.
             this.rst.startSet({}, /* restart */ true);
             this.rst.waitForPrimary();
 
@@ -209,16 +222,43 @@ const UserWriteBlockHelpers = (function() {
             this.rst.stopSet();
         }
 
+        stepDown() {
+            const primary = this.rst.getPrimary();
+
+            this.rst.asCluster(this.rst.nodes, () => {
+                this.rst.awaitReplication();
+                assert.commandWorked(primary.adminCommand({replSetStepDown: 20}));
+                this.rst.stepUp(primary);
+            });
+        }
+
         setProfilingLevel(level) {
             return assert.commandWorked(
                 this.adminConn.getDB(jsTestName()).setProfilingLevel(level));
         }
+
+        assertFCV(expectedFCV) {
+            const actualFCV = assert
+                                  .commandWorked(this.adminConn.getDB('admin').runCommand(
+                                      {getParameter: 1, featureCompatibilityVersion: 1}))
+                                  .featureCompatibilityVersion.version;
+            assert.eq(expectedFCV, actualFCV);
+        }
+
+        applyOps(params) {
+            assert.commandWorked(this.adminConn.getDB('admin').runCommand({applyOps: params}));
+        }
     }
 
     class ShardingFixture extends Fixture {
-        constructor() {
-            const st =
-                new ShardingTest({shards: 1, rs: {nodes: 3}, auth: "", other: {keyFile: keyfile}});
+        constructor(initiateWithDefaultElectionTimeout = false) {
+            const st = new ShardingTest({
+                shards: 1,
+                rs: {nodes: 3},
+                auth: "",
+                other: {keyFile: keyfile},
+                initiateWithDefaultElectionTimeout: initiateWithDefaultElectionTimeout
+            });
 
             super(st.s.port);
             this.st = st;
@@ -231,13 +271,16 @@ const UserWriteBlockHelpers = (function() {
         }
 
         hangTransition(command, failpoint) {
+            const configuredFp = this._hangTransition(this.st.shard0, failpoint);
             const awaitShell =
                 startParallelShell(funWithArgs((username, password, command) => {
                                        let admin = db.getSiblingDB("admin");
                                        admin.auth(username, password);
                                        assert.commandWorked(admin.runCommand(command));
                                    }, bypassUser, password, command), this.conn.port);
-            return this._hangTransition(this.st.shard0, failpoint, awaitShell);
+            configuredFp.wait();
+
+            return {waiter: awaitShell, failpoint: configuredFp};
         }
 
         restartConfigPrimary() {
@@ -260,10 +303,46 @@ const UserWriteBlockHelpers = (function() {
             this.st.stop();
         }
 
+        stepDown() {
+            const forceStepDown = function(rst) {
+                const primary = rst.getPrimary();
+
+                rst.asCluster(rst.nodes, () => {
+                    rst.awaitReplication();
+                    assert.commandWorked(primary.adminCommand({replSetStepDown: 20}));
+                    rst.stepUp(primary);
+                });
+            };
+
+            this.st._rs.forEach((rst) => {
+                forceStepDown(rst.test);
+            });
+
+            forceStepDown(this.st.configRS);
+        }
+
         setProfilingLevel(level) {
             const backend = this.st.rs0.getPrimary();
             return authutil.asCluster(
                 backend, keyfile, () => backend.getDB(jsTestName()).setProfilingLevel(level));
+        }
+
+        assertFCV(expectedFCV) {
+            const configAdminDB = this.st.c0.getDB('admin');
+            assert(configAdminDB.auth(bypassUser, password));
+            const actualFCV = assert
+                                  .commandWorked(configAdminDB.runCommand(
+                                      {getParameter: 1, featureCompatibilityVersion: 1}))
+                                  .featureCompatibilityVersion.version;
+            assert.eq(actualFCV, expectedFCV);
+        }
+
+        applyOps(params) {
+            const backend = this.st.rs0.getPrimary();
+            return authutil.asCluster(
+                backend,
+                keyfile,
+                () => assert.commandWorked(backend.getDB('admin').runCommand({applyOps: params})));
         }
     }
 

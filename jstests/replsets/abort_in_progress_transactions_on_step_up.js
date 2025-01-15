@@ -6,10 +6,9 @@
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-load("jstests/replsets/rslib.js");  // For reconnect()
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {getLastOpTime, reconnect, setLogVerbosity} from "jstests/replsets/rslib.js";
 
 function getTxnTableEntry(db) {
     let txnTableEntries = db.getSiblingDB("config")["transactions"].find().toArray();
@@ -71,7 +70,7 @@ assert.commandWorked(sessionDB.getCollection(collName).insert({_id: "last in txn
 
 jsTestLog("Committing transaction but fail on replication");
 let res = session.commitTransaction_forTesting();
-assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
+assert.commandFailedWithCode(res, ErrorCodes.WriteConcernTimeout);
 
 // Remember the start and commit OpTimes on primary.
 let txnTableEntry = getTxnTableEntry(testDB);
@@ -144,8 +143,7 @@ const secondDoc = {
 };
 assert.commandWorked(newSession.getDatabase(dbName).getCollection(collName).insert(secondDoc));
 assert.commandWorked(newSession.commitTransaction_forTesting());
-assert.docEq(testDB.getCollection(collName).find().toArray(), [secondDoc]);
-assert.docEq(newTestDB.getCollection(collName).find().toArray(), [secondDoc]);
+assert.docEq([secondDoc], testDB.getCollection(collName).find().toArray());
+assert.docEq([secondDoc], newTestDB.getCollection(collName).find().toArray());
 
 replTest.stopSet();
-})();

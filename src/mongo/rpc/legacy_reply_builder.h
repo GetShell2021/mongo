@@ -29,9 +29,12 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 
 #include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/rpc/message.h"
 #include "mongo/rpc/protocol.h"
@@ -49,7 +52,7 @@ public:
     LegacyReplyBuilder(Message&&);
     ~LegacyReplyBuilder() final;
 
-    // Override of setCommandReply specifically used to handle StaleConfigException.
+    // Override of setCommandReply specifically used to handle StaleConfig errors
     LegacyReplyBuilder& setCommandReply(Status nonOKStatus, BSONObj extraErrorInfo) final;
     LegacyReplyBuilder& setRawCommandReply(const BSONObj& commandReply) final;
 

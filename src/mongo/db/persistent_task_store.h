@@ -29,19 +29,36 @@
 
 #pragma once
 
+#include <cstddef>
 #include <fmt/format.h>
+#include <functional>
+#include <memory>
+#include <string>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/ops/write_ops_gen.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
-
-using namespace fmt::literals;
 
 namespace WriteConcerns {
 
@@ -75,7 +92,7 @@ public:
         const auto commandResponse = dbClient.runCommand([&] {
             write_ops::InsertCommandRequest insertOp(_storageNss);
             insertOp.setDocuments({task.toBSON()});
-            return insertOp.serialize({});
+            return insertOp.serialize();
         }());
 
         const auto commandReply = commandResponse->getCommandReply();
@@ -131,7 +148,7 @@ public:
                 return entry;
             }()});
 
-            return deleteOp.serialize({});
+            return deleteOp.serialize();
         }());
 
         const auto commandReply = commandResponse->getCommandReply();
@@ -159,7 +176,7 @@ public:
         while (cursor->more()) {
             auto bson = cursor->next();
             auto t = T::parse(
-                IDLParserErrorContext("PersistentTaskStore:" + _storageNss.toString()), bson);
+                IDLParserContext("PersistentTaskStore:" + _storageNss.toStringForErrorMsg()), bson);
 
             if (bool shouldContinue = handler(t); !shouldContinue)
                 return;
@@ -187,6 +204,7 @@ private:
                  bool upsert,
                  const WriteConcernOptions& writeConcern =
                      WriteConcerns::kMajorityWriteConcernShardingTimeout) {
+        using namespace fmt::literals;
         DBDirectClient dbClient(opCtx);
 
         auto commandResponse = write_ops::checkWriteErrors(dbClient.update([&] {
@@ -201,7 +219,7 @@ private:
 
         uassert(ErrorCodes::NoMatchingDocument,
                 "No matching document found for query {} on namespace {}"_format(
-                    filter.toString(), _storageNss.toString()),
+                    filter.toString(), _storageNss.toStringForErrorMsg()),
                 upsert || commandResponse.getN() > 0);
 
         WriteConcernResult ignoreResult;

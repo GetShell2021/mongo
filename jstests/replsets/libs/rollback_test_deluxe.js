@@ -35,11 +35,9 @@
  * of restarts.
  */
 
-"use strict";
-
-load("jstests/hooks/validate_collections.js");
-load("jstests/replsets/libs/two_phase_drops.js");
-load("jstests/replsets/rslib.js");
+import {CollectionValidator} from "jstests/hooks/validate_collections.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 Random.setRandomSeed();
 
@@ -55,8 +53,10 @@ Random.setRandomSeed();
  *
  * @param {string} [optional] name the name of the test being run
  * @param {Object} [optional] replSet the ReplSetTest instance to adopt
+ * @param {Object} [optional] nodeOptions command-line options to apply to all nodes in the replica
+ *     set. Ignored if 'replSet' is provided.
  */
-function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
+export function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet, nodeOptions) {
     const State = {
         kStopped: "kStopped",
         kRollbackOps: "kRollbackOps",
@@ -96,7 +96,7 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
     let lastStandbySecondaryRBID;
 
     // Make sure we have a replica set up and running.
-    replSet = (replSet === undefined) ? performStandardSetup() : replSet;
+    replSet = (replSet === undefined) ? performStandardSetup(nodeOptions) : replSet;
     validateAndUseSetup(replSet);
 
     /**
@@ -143,9 +143,9 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
     function performStandardSetup() {
         let nodeOptions = {};
         if (TestData.logComponentVerbosity) {
-            nodeOptions["setParameter"] = {
-                "logComponentVerbosity": tojsononeline(TestData.logComponentVerbosity)
-            };
+            nodeOptions["setParameter"] = nodeOptions["setParameter"] || {};
+            nodeOptions["setParameter"]["logComponentVerbosity"] =
+                tojsononeline(TestData.logComponentVerbosity);
         }
         if (TestData.syncdelay) {
             nodeOptions["syncdelay"] = TestData.syncdelay;
@@ -213,16 +213,6 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
         assert.eq(curState,
                   State.kSteadyStateOps,
                   "Not in kSteadyStateOps state; cannot check data consistency");
-
-        // Wait for collection drops to complete so that we don't get spurious failures during
-        // consistency checks.
-        rst.nodes.forEach(node => {
-            if (node.getDB('admin').isMaster('admin').arbiterOnly === true) {
-                log(`Skipping waiting for collection drops on arbiter ${node.host}`);
-                return;
-            }
-            TwoPhaseDropCollectionTest.waitForAllCollectionDropsToComplete(node);
-        });
 
         const name = rst.name;
         rst.checkOplogs(name);
@@ -295,12 +285,13 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
             case RollbackTestDeluxe.RoleCycleMode.kFixedRollbackSecondary:
                 [standbySecondary, curPrimary] = [curPrimary, standbySecondary];
                 break;
-            case RollbackTestDeluxe.RoleCycleMode.kRandom:
+            case RollbackTestDeluxe.RoleCycleMode.kRandom: {
                 let oldStandbySecondary = standbySecondary;
                 [standbySecondary, rollbackSecondary] =
                     Array.shuffle([curPrimary, rollbackSecondary]);
                 curPrimary = oldStandbySecondary;
                 break;
+            }
             default:
                 throw new Error(`Unknown role cycle mode ${curRoleCycleMode}`);
         }

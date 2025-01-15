@@ -28,13 +28,28 @@
  */
 
 #include "mongo/db/pipeline/window_function/window_function_exec.h"
+
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <variant>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/db/pipeline/document_source_set_window_fields.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/window_function/window_bounds.h"
 #include "mongo/db/pipeline/window_function/window_function_exec_derivative.h"
 #include "mongo/db/pipeline/window_function/window_function_exec_first_last.h"
 #include "mongo/db/pipeline/window_function/window_function_exec_linear_fill.h"
+#include "mongo/db/pipeline/window_function/window_function_exec_min_max_scalar.h"
 #include "mongo/db/pipeline/window_function/window_function_exec_non_removable.h"
 #include "mongo/db/pipeline/window_function/window_function_exec_non_removable_range.h"
 #include "mongo/db/pipeline/window_function/window_function_exec_removable_document.h"
 #include "mongo/db/pipeline/window_function/window_function_exec_removable_range.h"
+#include "mongo/db/pipeline/window_function/window_function_expression.h"
 #include "mongo/db/pipeline/window_function/window_function_shift.h"
 
 namespace mongo {
@@ -68,16 +83,27 @@ boost::intrusive_ptr<Expression> translateInputExpression(
     return expr->input();
 }
 
+// Assertions for when 'WindowBounds' are 'RangeBased'.
+void assertRangeBasedBoundsChecks(const boost::optional<SortPattern>& sortBy) {
+    tassert(5429401,
+            "Range-based window needs a non-compound sortBy",
+            sortBy != boost::none && sortBy->size() == 1);
+    SortPattern::SortPatternPart part = *sortBy->begin();
+    tassert(5429410,
+            "Range-based window doesn't work on expression-sortBy",
+            part.fieldPath != boost::none && !part.expression);
+}
+
 std::unique_ptr<WindowFunctionExec> translateDocumentWindow(
     PartitionIterator* iter,
     boost::intrusive_ptr<window_function::Expression> expr,
     const boost::optional<SortPattern>& sortBy,
     const WindowBounds::DocumentBased& bounds,
-    MemoryUsageTracker::PerFunctionMemoryTracker* memTracker) {
+    MemoryUsageTracker::Impl* memTracker) {
     auto inputExpr = translateInputExpression(expr, sortBy);
 
-    return stdx::visit(
-        visit_helper::Overloaded{
+    return visit(
+        OverloadedVisitor{
             [&](const WindowBounds::Unbounded&) -> std::unique_ptr<WindowFunctionExec> {
                 // A left unbounded window will always be non-removable regardless of the upper
                 // bound.
@@ -95,7 +121,7 @@ std::unique_ptr<mongo::WindowFunctionExec> translateDerivative(
     window_function::ExpressionDerivative* expr,
     PartitionIterator* iter,
     const boost::optional<SortPattern>& sortBy,
-    MemoryUsageTracker::PerFunctionMemoryTracker* memTracker) {
+    MemoryUsageTracker::Impl* memTracker) {
     tassert(5490703,
             "$derivative requires a 1-field sortBy",
             sortBy && sortBy->size() == 1 && !sortBy->begin()->expression);
@@ -108,6 +134,80 @@ std::unique_ptr<mongo::WindowFunctionExec> translateDerivative(
         iter, expr->input(), sortExpr, expr->bounds(), expr->unit(), memTracker);
 }
 
+// $minMaxScalar uses a custom translation from a ExpressionMinMaxScalar to WindowFunctionExec
+// because, like other window functions, it differentiates its execution implementation between
+// removable and non-removable windows for execution efficiency; however, unlike other window
+// functions, it does not use the generic implementation of non-removable WindowFunctionExecs
+// becuase it is unable to implement a generic accumulator, due to needing the value of
+// the "current" document being processed.
+std::unique_ptr<mongo::WindowFunctionExec> translateMinMaxScalar(
+    ExpressionContext* expCtx,
+    window_function::ExpressionMinMaxScalar* minMaxScalarExpr,
+    PartitionIterator* iter,
+    const boost::optional<SortPattern>& sortBy,
+    MemoryUsageTracker::Impl* memTracker) {
+    WindowBounds bounds = minMaxScalarExpr->bounds();
+    return visit(
+        OverloadedVisitor{
+            [&](const WindowBounds::DocumentBased& docBounds) {
+                return visit(
+                    OverloadedVisitor{
+                        [&](const WindowBounds::Unbounded&) -> std::unique_ptr<WindowFunctionExec> {
+                            // TODO: SERVER-95229 remove assertion when non-removable
+                            // implementations are supported.
+                            uasserted(ErrorCodes::NotImplemented,
+                                      str::stream() << "left unbounded windows for "
+                                                       "$minMaxScalar are not yet supported");
+                            // A left unbounded window will always be non-removable regardless of
+                            // the upper bound.
+                            return std::make_unique<WindowFunctionExecMinMaxScalarNonRemovable>(
+                                iter,
+                                minMaxScalarExpr->input(),
+                                minMaxScalarExpr->getDomainMinAndMax(),
+                                memTracker);
+                        },
+                        [&](const auto&) -> std::unique_ptr<WindowFunctionExec> {
+                            return std::make_unique<WindowFunctionExecRemovableDocument>(
+                                iter,
+                                minMaxScalarExpr->input(),
+                                minMaxScalarExpr->buildRemovable(),
+                                docBounds,
+                                memTracker);
+                        }},
+                    docBounds.lower);
+            },
+            [&](const WindowBounds::RangeBased& rangeBounds)
+                -> std::unique_ptr<WindowFunctionExec> {
+                // These checks should be enforced already during parsing.
+                assertRangeBasedBoundsChecks(sortBy);
+                auto sortByExpr = ExpressionFieldPath::createPathFromString(
+                    expCtx, sortBy->begin()->fieldPath->fullPath(), expCtx->variablesParseState);
+                if (holds_alternative<WindowBounds::Unbounded>(rangeBounds.lower)) {
+                    // TODO: SERVER-95229 remove assertion when non-removable implementations are
+                    // supported.
+                    uasserted(ErrorCodes::NotImplemented,
+                              str::stream() << "left unbounded windows for "
+                                               "$minMaxScalar are not yet supported");
+                    // A left unbounded window will always be non-removable regardless of
+                    // the upper bound.
+                    return std::make_unique<WindowFunctionExecMinMaxScalarNonRemovable>(
+                        iter,
+                        minMaxScalarExpr->input(),
+                        minMaxScalarExpr->getDomainMinAndMax(),
+                        memTracker);
+                } else {
+                    return std::make_unique<WindowFunctionExecRemovableRange>(
+                        iter,
+                        minMaxScalarExpr->input(),
+                        std::move(sortByExpr),
+                        minMaxScalarExpr->buildRemovable(),
+                        bounds,
+                        memTracker);
+                }
+            },
+        },
+        bounds.bounds);
+}
 
 }  // namespace
 
@@ -118,10 +218,12 @@ std::unique_ptr<WindowFunctionExec> WindowFunctionExec::create(
     const boost::optional<SortPattern>& sortBy,
     MemoryUsageTracker* memTracker) {
 
-    MemoryUsageTracker::PerFunctionMemoryTracker& functionMemTracker =
-        (*memTracker)[functionStmt.fieldName];
+    MemoryUsageTracker::Impl& functionMemTracker = (*memTracker)[functionStmt.fieldName];
     if (auto expr = dynamic_cast<window_function::ExpressionDerivative*>(functionStmt.expr.get())) {
         return translateDerivative(expr, iter, sortBy, &functionMemTracker);
+    } else if (auto expr = dynamic_cast<window_function::ExpressionMinMaxScalar*>(
+                   functionStmt.expr.get())) {
+        return translateMinMaxScalar(expCtx, expr, iter, sortBy, &functionMemTracker);
     } else if (auto expr =
                    dynamic_cast<window_function::ExpressionFirst*>(functionStmt.expr.get())) {
         return std::make_unique<WindowFunctionExecFirst>(
@@ -144,8 +246,8 @@ std::unique_ptr<WindowFunctionExec> WindowFunctionExec::create(
 
     WindowBounds bounds = functionStmt.expr->bounds();
 
-    return stdx::visit(
-        visit_helper::Overloaded{
+    return visit(
+        OverloadedVisitor{
             [&](const WindowBounds::DocumentBased& docBounds) {
                 return translateDocumentWindow(
                     iter, functionStmt.expr, sortBy, docBounds, &functionMemTracker);
@@ -153,18 +255,11 @@ std::unique_ptr<WindowFunctionExec> WindowFunctionExec::create(
             [&](const WindowBounds::RangeBased& rangeBounds)
                 -> std::unique_ptr<WindowFunctionExec> {
                 // These checks should be enforced already during parsing.
-                tassert(5429401,
-                        "Range-based window needs a non-compound sortBy",
-                        sortBy != boost::none && sortBy->size() == 1);
-                SortPattern::SortPatternPart part = *sortBy->begin();
-                tassert(5429410,
-                        "Range-based window doesn't work on expression-sortBy",
-                        part.fieldPath != boost::none && !part.expression);
+                assertRangeBasedBoundsChecks(sortBy);
                 auto sortByExpr = ExpressionFieldPath::createPathFromString(
-                    expCtx, part.fieldPath->fullPath(), expCtx->variablesParseState);
-
+                    expCtx, sortBy->begin()->fieldPath->fullPath(), expCtx->variablesParseState);
                 auto inputExpr = translateInputExpression(functionStmt.expr, sortBy);
-                if (stdx::holds_alternative<WindowBounds::Unbounded>(rangeBounds.lower)) {
+                if (holds_alternative<WindowBounds::Unbounded>(rangeBounds.lower)) {
                     return std::make_unique<WindowFunctionExecNonRemovableRange>(
                         iter,
                         inputExpr,

@@ -29,15 +29,30 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <boost/shared_array.hpp>
+#include <boost/smart_ptr/shared_array.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <map>
+#include <memory>
+#include <set>
+#include <vector>
 
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/storage/capped_callback.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/damage_vector.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/record_data.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/concurrency/with_lock.h"
-
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -48,72 +63,120 @@ namespace mongo {
  */
 class EphemeralForTestRecordStore : public RecordStore {
 public:
-    explicit EphemeralForTestRecordStore(StringData ns,
+    explicit EphemeralForTestRecordStore(boost::optional<UUID> uuid,
                                          StringData identName,
                                          std::shared_ptr<void>* dataInOut,
                                          bool isCapped = false,
-                                         CappedCallback* cappedCallback = nullptr);
+                                         bool isOplog = false);
 
-    virtual const char* name() const;
+    const char* name() const override;
 
-    virtual KeyFormat keyFormat() const {
+    boost::optional<UUID> uuid() const override;
+
+    bool isTemp() const override;
+
+    std::shared_ptr<Ident> getSharedIdent() const override;
+
+    const std::string& getIdent() const override;
+
+    void setIdent(std::shared_ptr<Ident>) override;
+
+    KeyFormat keyFormat() const override {
         return KeyFormat::Long;
     }
 
-    virtual RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const;
+    RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const override;
 
-    virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const;
+    bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const override;
 
-    void doDeleteRecord(OperationContext* opCtx, const RecordId& dl) override;
+    void deleteRecord(OperationContext*, const RecordId&) override;
 
-    Status doInsertRecords(OperationContext* opCtx,
-                           std::vector<Record>* inOutRecords,
-                           const std::vector<Timestamp>& timestamps) override;
+    Status insertRecords(OperationContext*,
+                         std::vector<Record>*,
+                         const std::vector<Timestamp>&) override;
 
-    Status doUpdateRecord(OperationContext* opCtx,
-                          const RecordId& oldLocation,
-                          const char* data,
-                          int len) override;
+    StatusWith<RecordId> insertRecord(OperationContext*,
+                                      const char* data,
+                                      int len,
+                                      Timestamp) override;
 
-    virtual bool updateWithDamagesSupported() const;
+    StatusWith<RecordId> insertRecord(
+        OperationContext*, const RecordId&, const char* data, int len, Timestamp) override;
 
-    StatusWith<RecordData> doUpdateWithDamages(OperationContext* opCtx,
-                                               const RecordId& loc,
-                                               const RecordData& oldRec,
-                                               const char* damageSource,
-                                               const mutablebson::DamageVector& damages) override;
+    Status updateRecord(OperationContext*, const RecordId&, const char* data, int len) override;
 
-    virtual void printRecordMetadata(OperationContext* opCtx, const RecordId& recordId) const {}
+    bool updateWithDamagesSupported() const override;
+
+    StatusWith<RecordData> updateWithDamages(OperationContext*,
+                                             const RecordId& loc,
+                                             const RecordData& oldRec,
+                                             const char* damageSource,
+                                             const DamageVector& damages) override;
+
+    void printRecordMetadata(const RecordId& recordId,
+                             std::set<Timestamp>* recordTimestamps) const override {}
 
     std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                     bool forward) const final;
 
-    Status doTruncate(OperationContext* opCtx) override;
+    std::unique_ptr<RecordCursor> getRandomCursor(OperationContext*) const override;
 
-    void doCappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) override;
+    Status truncate(OperationContext*) override;
+    Status rangeTruncate(OperationContext*,
+                         const RecordId& minRecordId,
+                         const RecordId& maxRecordId,
+                         int64_t hintDataSizeDiff,
+                         int64_t hintNumRecordsDiff) override;
 
-    virtual void appendNumericCustomStats(OperationContext* opCtx,
-                                          BSONObjBuilder* result,
-                                          double scale) const {}
+    bool compactSupported() const override;
 
-    virtual int64_t storageSize(OperationContext* opCtx,
-                                BSONObjBuilder* extraInfo = nullptr,
-                                int infoLevel = 0) const;
+    StatusWith<int64_t> compact(OperationContext*, const CompactOptions&) override;
 
-    virtual long long dataSize(OperationContext* opCtx) const {
+    void validate(RecoveryUnit&,
+                  const CollectionValidation::ValidationOptions&,
+                  ValidateResults*) override;
+
+    void appendNumericCustomStats(RecoveryUnit& ru,
+                                  BSONObjBuilder* result,
+                                  double scale) const override {}
+
+    void appendAllCustomStats(RecoveryUnit&, BSONObjBuilder*, double scale) const override {}
+
+    int64_t storageSize(RecoveryUnit&,
+                        BSONObjBuilder* extraInfo = nullptr,
+                        int infoLevel = 0) const override;
+
+    int64_t freeStorageSize(RecoveryUnit&) const override;
+
+    long long dataSize() const override {
         return _data->dataSize;
     }
 
-    virtual long long numRecords(OperationContext* opCtx) const {
+    long long numRecords() const override {
         return _data->records.size();
     }
 
-    virtual void updateStatsAfterRepair(OperationContext* opCtx,
-                                        long long numRecords,
-                                        long long dataSize) {
+    void updateStatsAfterRepair(long long numRecords, long long dataSize) override {
         stdx::lock_guard<stdx::recursive_mutex> lock(_data->recordsMutex);
         invariant(_data->records.size() == size_t(numRecords));
         _data->dataSize = dataSize;
+    }
+
+    RecordId getLargestKey(OperationContext* opCtx) const final {
+        stdx::lock_guard<stdx::recursive_mutex> lock(_data->recordsMutex);
+        return RecordId(_data->nextId - 1);
+    }
+
+    void reserveRecordIds(OperationContext* opCtx,
+                          std::vector<RecordId>* out,
+                          size_t nRecords) final{};
+
+    RecordStore::Capped* capped() override {
+        return nullptr;
+    }
+
+    RecordStore::Oplog* oplog() override {
+        return nullptr;
     }
 
 protected:
@@ -131,8 +194,6 @@ protected:
 
     virtual const EphemeralForTestRecord* recordFor(WithLock, const RecordId& loc) const;
     virtual EphemeralForTestRecord* recordFor(WithLock, const RecordId& loc);
-    void waitForAllEarlierOplogWritesToBeVisibleImpl(OperationContext* opCtx) const override {}
-
 
 public:
     //
@@ -143,9 +204,6 @@ public:
 
     bool isCapped() const {
         return _isCapped;
-    }
-    void setCappedCallback(CappedCallback* cb) {
-        _cappedCallback = cb;
     }
 
 private:
@@ -158,15 +216,14 @@ private:
     StatusWith<RecordId> extractAndCheckLocForOplog(WithLock, const char* data, int len) const;
 
     RecordId allocateLoc(WithLock);
-    void deleteRecord(WithLock lk, OperationContext* opCtx, const RecordId& dl);
 
+    boost::optional<UUID> _uuid;
+    std::shared_ptr<Ident> _ident;
     const bool _isCapped;
-    CappedCallback* _cappedCallback;
 
     // This is the "persistent" data.
     struct Data {
-        Data(StringData ns, bool isOplog)
-            : dataSize(0), recordsMutex(), nextId(1), isOplog(isOplog) {}
+        explicit Data(bool isOplog) : dataSize(0), recordsMutex(), nextId(1), isOplog(isOplog) {}
 
         int64_t dataSize;
         stdx::recursive_mutex recordsMutex;

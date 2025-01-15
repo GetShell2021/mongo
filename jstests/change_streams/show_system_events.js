@@ -9,24 +9,10 @@
  *  assumes_no_implicit_index_creation
  * ]
  */
-(function() {
-"use strict";
-
-load('jstests/libs/change_stream_util.js');        // For 'ChangeStreamTest' and
-                                                   // 'assertChangeStreamEventEq'.
-load('jstests/libs/collection_drop_recreate.js');  // For 'assertDropCollection'.
+import {assertDropCollection} from "jstests/libs/collection_drop_recreate.js";
+import {ChangeStreamTest} from "jstests/libs/query/change_stream_util.js";
 
 const testDB = db.getSiblingDB(jsTestName());
-
-if (!isChangeStreamsVisibilityEnabled(testDB)) {
-    assert.commandFailedWithCode(testDB.runCommand({
-        aggregate: 1,
-        pipeline: [{$changeStream: {showSystemEvents: true}}],
-        cursor: {},
-    }),
-                                 6189301);
-    return;
-}
 
 // Assert that the flag is not allowed with 'apiStrict'.
 assert.commandFailedWithCode(testDB.runCommand({
@@ -44,7 +30,6 @@ const systemNS = {
     db: testDB.getName(),
     coll: 'system.js'
 };
-const collRenamed = 'collRenamed';
 
 function runWholeDbChangeStreamTestWithoutSystemEvents(test, cursor, nonSystemColl) {
     assertDropCollection(testDB, nonSystemColl.getName());
@@ -212,4 +197,3 @@ runWholeDbChangeStreamTestWithSystemEvents(test, cursor, regularColl);
 pipeline = [{$changeStream: {showExpandedEvents: true, showSystemEvents: false}}];
 cursor = test.startWatchingChanges({pipeline: pipeline, collection: 1});
 runWholeDbChangeStreamTestWithoutSystemEvents(test, cursor, regularColl);
-}());

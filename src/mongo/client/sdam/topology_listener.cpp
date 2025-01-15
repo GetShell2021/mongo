@@ -28,7 +28,15 @@
  */
 
 #include "mongo/client/sdam/topology_listener.h"
+
+#include <algorithm>
+#include <iterator>
+#include <mutex>
+#include <utility>
+
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -92,7 +100,7 @@ void TopologyEventsPublisher::onServerHandshakeCompleteEvent(HelloRTT duration,
                                                              const HostAndPort& address,
                                                              const BSONObj reply) {
     {
-        stdx::lock_guard<Mutex> lock(_eventQueueMutex);
+        stdx::lock_guard<stdx::mutex> lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
         event->type = EventType::HANDSHAKE_COMPLETE;
         event->duration = duration;
@@ -107,7 +115,7 @@ void TopologyEventsPublisher::onServerHandshakeFailedEvent(const HostAndPort& ad
                                                            const Status& status,
                                                            const BSONObj reply) {
     {
-        stdx::lock_guard<Mutex> lock(_eventQueueMutex);
+        stdx::lock_guard<stdx::mutex> lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
         event->type = EventType::HANDSHAKE_FAILURE;
         event->hostAndPort = address;
@@ -218,7 +226,7 @@ void TopologyEventsPublisher::_nextDelivery() {
     }
 
     // send to the listeners outside of the lock.
-    for (auto listener : listeners) {
+    for (const auto& listener : listeners) {
         // The copy logic above guaranteed that only non-empty elements are in the vector.
         _sendEvent(listener.get(), *nextEvent);
     }

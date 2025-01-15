@@ -28,31 +28,53 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/client.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/namespace_string.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/server_parameter_with_storage.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/catalog/type_shard.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/request_types/add_shard_request_type.h"
-#include "mongo/util/str.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 
 namespace mongo {
-namespace {
-
-const long long kMaxSizeMBDefault = 0;
 
 /**
  * Internal sharding command run on config servers to add a shard to the cluster.
@@ -83,23 +105,25 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forClusterResource(dbName.tenantId()),
+                     ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& unusedDbName,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrAddShard can only be run on config servers",
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
         CommandHelpers::uassertCommandRunWithMajority(getName(), opCtx->getWriteConcern());
 
         // Set the operation context read concern level to local for reads into the config database.
@@ -112,35 +136,34 @@ public:
 
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
 
-        auto validationStatus = parsedRequest.validate(replCoord->isConfigLocalHostAllowed());
+        auto validationStatus = parsedRequest.validate(replCoord->getConfig().isLocalHostAllowed());
         uassertStatusOK(validationStatus);
 
         audit::logAddShard(Client::getCurrent(),
                            parsedRequest.hasName() ? parsedRequest.getName() : "",
-                           parsedRequest.getConnString().toString(),
-                           parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize()
-                                                      : kMaxSizeMBDefault);
+                           parsedRequest.getConnString().toString());
 
         StatusWith<std::string> addShardResult = ShardingCatalogManager::get(opCtx)->addShard(
             opCtx,
             parsedRequest.hasName() ? &parsedRequest.getName() : nullptr,
             parsedRequest.getConnString(),
-            parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize() : kMaxSizeMBDefault);
+            false);
 
-        if (!addShardResult.isOK()) {
+        Status status = addShardResult.getStatus();
+
+        if (!status.isOK()) {
             LOGV2(21920,
-                  "addShard request '{request}' failed: {error}",
                   "addShard request failed",
                   "request"_attr = parsedRequest,
-                  "error"_attr = addShardResult.getStatus());
-            uassertStatusOK(addShardResult.getStatus());
+                  "error"_attr = status);
+            uassertStatusOK(status);
         }
 
         result << "shardAdded" << addShardResult.getValue();
 
         return true;
     }
-} configsvrAddShardCmd;
+};
+MONGO_REGISTER_COMMAND(ConfigSvrAddShardCommand).forShard();
 
-}  // namespace
 }  // namespace mongo

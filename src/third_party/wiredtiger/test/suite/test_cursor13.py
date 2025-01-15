@@ -123,34 +123,42 @@ class test_cursor13_02(test_cursor02.test_cursor02, test_cursor13_base):
 class test_cursor13_03(test_cursor03.test_cursor03, test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt01(test_checkpoint01.test_checkpoint,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt02(test_checkpoint01.test_checkpoint_cursor,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt03(test_checkpoint01.test_checkpoint_target,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt04(test_checkpoint01.test_checkpoint_cursor_update,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt05(test_checkpoint01.test_checkpoint_last,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt06(test_checkpoint01.test_checkpoint_empty,
                            test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_ckpt2(test_checkpoint02.test_checkpoint02,
                           test_cursor13_base):
     pass
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_reopens(test_cursor13_base):
     # The SimpleDataSet uses simple tables, that have no column groups or
     # indices. Thus, these tables will be cached. The more complex data sets
@@ -469,7 +477,7 @@ class test_cursor13_big(test_cursor13_big_base):
 
         # At this point, we'll randomly open/close lots of cursors, keeping
         # track of how many of each. As long as we don't have more than [deep]
-        # cursors open for each uri, we should always be taking then from
+        # cursors open for each uri, we should always be taking them from
         # the set of cached cursors.
         while self.opencount < self.nopens:
             self.open_or_close(uri_map, rand, 0, self.nuris)
@@ -480,8 +488,8 @@ class test_cursor13_big(test_cursor13_big_base):
         #         ', closes = ' + str(self.closecount))
         #self.tty('stats after = ' + str(end_stats))
 
-        self.assertEquals(end_stats[0] - begin_stats[0], self.closecount)
-        self.assertEquals(end_stats[1] - begin_stats[1], self.opencount)
+        self.assertEqual(end_stats[0] - begin_stats[0], self.closecount)
+        self.assertEqual(end_stats[1] - begin_stats[1], self.opencount)
 
 class test_cursor13_sweep(test_cursor13_big_base):
     # Set dhandle sweep configuration so that dhandles should be closed within
@@ -540,7 +548,7 @@ class test_cursor13_sweep(test_cursor13_big_base):
         #         ', closes = ' + str(self.closecount))
         #self.tty('stats after = ' + str(end_stats))
         #self.tty('sweep stats after = ' + str(end_sweep_stats))
-        self.assertEquals(end_stats[0] - begin_stats[0], self.closecount)
+        self.assertEqual(end_stats[0] - begin_stats[0], self.closecount)
         swept = end_sweep_stats[3] - begin_sweep_stats[3]
 
         # Although this is subject to tuning parameters, we know that
@@ -563,6 +571,7 @@ class test_cursor13_sweep(test_cursor13_big_base):
         # predictable.
         self.assertGreater(end_stats[1] - begin_stats[1], 0)
 
+@wttest.skip_for_hook("tiered", "uses cached cursors")
 class test_cursor13_dup(test_cursor13_base):
     def test_dup(self):
         self.cursor_stats_init()

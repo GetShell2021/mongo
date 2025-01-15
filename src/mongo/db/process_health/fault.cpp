@@ -29,6 +29,15 @@
 
 #include "mongo/db/process_health/fault.h"
 
+#include <algorithm>
+#include <mutex>
+#include <utility>
+
+
+#include "mongo/db/process_health/health_check_status.h"
+#include "mongo/db/process_health/health_monitoring_server_parameters_gen.h"
+#include "mongo/util/assert_util_core.h"
+
 namespace mongo {
 namespace process_health {
 
@@ -102,6 +111,7 @@ void Fault::appendDescription(BSONObjBuilder* builder) const {
     builder->append("id", getId().toBSON());
     builder->append("duration", getDuration().toBSON());
     BSONObjBuilder facetsBuilder;
+    auto lk = stdx::lock_guard(_mutex);
     for (auto& facet : _facets) {
         facetsBuilder.append(FaultFacetType_serializer(facet->getType()), facet->toBSON());
     }

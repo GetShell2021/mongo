@@ -28,11 +28,13 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <utility>
 
-#include "mongo/db/repl/repl_settings.h"
 
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/util/assert_util_core.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
@@ -49,8 +51,8 @@ std::string ReplSettings::ourSetName() const {
     return _replSetString.substr(0, sl);
 }
 
-bool ReplSettings::usingReplSets() const {
-    return _isServerless || !_replSetString.empty();
+bool ReplSettings::isReplSet() const {
+    return _isServerless || !_replSetString.empty() || _shouldAutoInitiate;
 }
 
 /**
@@ -74,6 +76,14 @@ bool ReplSettings::shouldRecoverFromOplogAsStandalone() {
     return recoverFromOplogAsStandalone;
 }
 
+bool ReplSettings::shouldSkipOplogSampling() {
+    return skipOplogSampling;
+}
+
+bool ReplSettings::shouldAutoInitiate() const {
+    return _shouldAutoInitiate;
+}
+
 /**
  * Setters
  */
@@ -90,6 +100,11 @@ void ReplSettings::setReplSetString(std::string replSetString) {
 void ReplSettings::setServerlessMode() {
     invariant(_replSetString.empty());
     _isServerless = true;
+}
+
+void ReplSettings::setShouldAutoInitiate() {
+    invariant(!_isServerless);
+    _shouldAutoInitiate = true;
 }
 
 }  // namespace repl

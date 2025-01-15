@@ -30,7 +30,8 @@ global:
 
 imports:
     - "mongo/db/auth/auth_types.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/auth/parsed_privilege.idl"
+    - "mongo/db/basic_types.idl"
 
 structs:
     ConnectionStatusReplyAuthInfo:
@@ -44,15 +45,19 @@ structs:
                 type: array<RoleName>
             authenticatedUserPrivileges:
                 description: 'Currently authorized privileges across granted roles'
-                type: array<Privilege>
+                type: array<ParsedPrivilege>
                 optional: true
 
     ConnectionStatusReply:
         description: 'Reply to connectionStatus command'
+        is_command_reply: true
         fields:
             authInfo:
                 description: 'Authenticated users and roles'
                 type: ConnectionStatusReplyAuthInfo
+            uuid:
+                description: 'UUID of the current client'
+                type: uuid
 
 commands:
     connectionStatus:

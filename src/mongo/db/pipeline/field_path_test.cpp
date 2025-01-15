@@ -27,18 +27,17 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/bson/bson_depth.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
 
 using std::string;
-using std::vector;
 
 /** FieldPath constructed from empty string. */
 TEST(FieldPathTest, Empty) {

@@ -40,19 +40,20 @@ from typing import Dict, List, Set
 from pymongo import MongoClient
 
 # Permit imports from "buildscripts".
-sys.path.append(os.path.normpath(os.path.join(os.path.abspath(__file__), '../../..')))
+sys.path.append(os.path.normpath(os.path.join(os.path.abspath(__file__), "../../..")))
 
-# pylint: disable=wrong-import-position,wrong-import-order
+# pylint: disable=wrong-import-position
+from idl import syntax
+
 from buildscripts.idl.lib import list_idls, parse_idl
 from buildscripts.resmokelib import configure_resmoke
 from buildscripts.resmokelib.logging import loggers
 from buildscripts.resmokelib.testing.fixtures import interface
 from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
-from buildscripts.resmokelib.testing.fixtures.shardedcluster import ShardedClusterFixture
-from buildscripts.resmokelib.testing.fixtures.standalone import MongoDFixture
-from idl import syntax
 
-LOGGER_NAME = 'check-idl-definitions'
+# pylint: enable=wrong-import-position
+
+LOGGER_NAME = "check-idl-definitions"
 LOGGER = logging.getLogger(LOGGER_NAME)
 
 
@@ -67,8 +68,9 @@ def is_test_or_third_party_idl(idl_path: str) -> bool:
     return False
 
 
-def get_command_definitions(api_version: str, directory: str,
-                            import_directories: List[str]) -> Dict[str, syntax.Command]:
+def get_command_definitions(
+    api_version: str, directory: str, import_directories: List[str]
+) -> Dict[str, syntax.Command]:
     """Get parsed IDL definitions of commands in a given API version."""
 
     LOGGER.info("Searching for command definitions in %s", directory)
@@ -97,28 +99,41 @@ def list_commands_for_api(api_version: str, mongod_or_mongos: str, install_dir: 
         logger = loggers.new_fixture_logger("MongoDFixture", 0)
         logger.parent = LOGGER
         fixture: interface.Fixture = fixturelib.make_fixture(
-            "MongoDFixture", logger, 0, dbpath_prefix=dbpath.name,
-            mongod_executable=mongod_executable, mongod_options={"set_parameters": {}})
+            "MongoDFixture",
+            logger,
+            0,
+            dbpath_prefix=dbpath.name,
+            mongod_executable=mongod_executable,
+            mongod_options={"set_parameters": {}},
+        )
     else:
         logger = loggers.new_fixture_logger("ShardedClusterFixture", 0)
         logger.parent = LOGGER
         fixture = fixturelib.make_fixture(
-            "ShardedClusterFixture", logger, 0, dbpath_prefix=dbpath.name,
-            mongos_executable=mongos_executable, mongod_executable=mongod_executable,
-            mongod_options={"set_parameters": {}})
+            "ShardedClusterFixture",
+            logger,
+            0,
+            dbpath_prefix=dbpath.name,
+            mongos_executable=mongos_executable,
+            mongod_executable=mongod_executable,
+            mongod_options={"set_parameters": {}},
+        )
 
     fixture.setup()
     fixture.await_ready()
 
     try:
-        client = MongoClient(fixture.get_driver_connection_url())
-        reply = client.admin.command('listCommands')
+        client = MongoClient(fixture.get_driver_connection_url())  # type: MongoClient
+        reply = client.admin.command("listCommands")  # type: Mapping[str, Any]
         commands = {
-            name
-            for name, info in reply['commands'].items() if api_version in info['apiVersions']
+            name for name, info in reply["commands"].items() if api_version in info["apiVersions"]
         }
-        logging.info("Found %s commands in API Version %s on %s", len(commands), api_version,
-                     mongod_or_mongos)
+        logging.info(
+            "Found %s commands in API Version %s on %s",
+            len(commands),
+            api_version,
+            mongod_or_mongos,
+        )
         return commands
     finally:
         fixture.teardown()
@@ -138,13 +153,16 @@ def assert_command_sets_equal(api_version: str, command_sets: Dict[str, Set[str]
     for other_name, other_commands in it:
         if commands != other_commands:
             if commands - other_commands:
-                LOGGER.error("%s has commands not in %s: %s", name, other_name,
-                             commands - other_commands)
+                LOGGER.error(
+                    "%s has commands not in %s: %s", name, other_name, commands - other_commands
+                )
             if other_commands - commands:
-                LOGGER.error("%s has commands not in %s: %s", other_name, name,
-                             other_commands - commands)
+                LOGGER.error(
+                    "%s has commands not in %s: %s", other_name, name, other_commands - commands
+                )
             raise AssertionError(
-                f"{name} and {other_name} have different commands in API Version {api_version}")
+                f"{name} and {other_name} have different commands in API Version {api_version}"
+            )
 
 
 def remove_skipped_commands(command_sets: Dict[str, Set[str]]):
@@ -156,6 +174,8 @@ def remove_skipped_commands(command_sets: Dict[str, Set[str]]):
         "testDeprecationInVersion2",
         # Idl specifies the command_name as hello.
         "isMaster",
+        "_clusterQueryWithoutShardKey",  # Is internal only command.
+        "_clusterWriteWithoutShardKey",  # Is internal only command.
     }
 
     for key in command_sets.keys():
@@ -165,10 +185,15 @@ def remove_skipped_commands(command_sets: Dict[str, Set[str]]):
 def main():
     """Run the script."""
     arg_parser = argparse.ArgumentParser(description=__doc__)
-    arg_parser.add_argument("--include", type=str, action="append",
-                            help="Directory to search for IDL import files")
-    arg_parser.add_argument("--install-dir", dest="install_dir", required=True,
-                            help="Directory to search for MongoDB binaries")
+    arg_parser.add_argument(
+        "--include", type=str, action="append", help="Directory to search for IDL import files"
+    )
+    arg_parser.add_argument(
+        "--install-dir",
+        dest="install_dir",
+        required=True,
+        help="Directory to search for MongoDB binaries",
+    )
     arg_parser.add_argument("-v", "--verbose", action="count", help="Enable verbose logging")
     arg_parser.add_argument("api_version", metavar="API_VERSION", help="API Version to check")
     args = arg_parser.parse_args()
@@ -181,7 +206,7 @@ def main():
             self.command = ""
 
     # pylint: disable=protected-access
-    configure_resmoke._update_config_vars(FakeArgs())
+    configure_resmoke._update_config_vars(arg_parser, FakeArgs())
     configure_resmoke._set_logging_config()
 
     # Configure Fixture logging.

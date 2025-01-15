@@ -30,7 +30,12 @@
 #pragma once
 
 #include <memory>
+#include <utility>
 
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 
 namespace mongo {
@@ -40,6 +45,7 @@ class TaskExecutor;
 }
 
 class OperationContext;
+
 class OpObserverRegistry;
 class ServiceContext;
 
@@ -48,13 +54,17 @@ namespace repl {
 class PrimaryOnlyService;
 class PrimaryOnlyServiceRegistry;
 
-class PrimaryOnlyServiceMongoDTest : public ServiceContextMongoDTest {
+extern FailPoint primaryOnlyServiceTestStepUpWaitForRebuildComplete;
+
+class PrimaryOnlyServiceMongoDTest : service_context_test::WithSetupTransportLayer,
+                                     public ServiceContextMongoDTest {
 public:
     void setUp() override;
     void tearDown() override;
 
 protected:
-    explicit PrimaryOnlyServiceMongoDTest(Options options = {})
+    PrimaryOnlyServiceMongoDTest() : ServiceContextMongoDTest(Options{}) {}
+    explicit PrimaryOnlyServiceMongoDTest(Options options)
         : ServiceContextMongoDTest(std::move(options)) {}
 
     void startup(OperationContext* opCtx);
@@ -65,6 +75,8 @@ protected:
 
     virtual std::unique_ptr<repl::PrimaryOnlyService> makeService(
         ServiceContext* serviceContext) = 0;
+
+    virtual std::unique_ptr<repl::ReplicationCoordinator> makeReplicationCoordinator();
 
     /**
      * Used to add your own op observer to the op observer registry during setUp prior to running
@@ -78,11 +90,20 @@ protected:
      */
     virtual void setUpPersistence(OperationContext* opCtx){};
 
+    virtual void shutdownHook();
+
     OpObserverRegistry* _opObserverRegistry = nullptr;
     repl::PrimaryOnlyServiceRegistry* _registry = nullptr;
     repl::PrimaryOnlyService* _service = nullptr;
     long long _term = 0;
 };
+
+void stepUp(OperationContext* opCtx,
+            ServiceContext* serviceCtx,
+            repl::PrimaryOnlyServiceRegistry* registry,
+            long long& term);
+
+void stepDown(ServiceContext* serviceCtx, repl::PrimaryOnlyServiceRegistry* registry);
 
 }  // namespace repl
 }  // namespace mongo

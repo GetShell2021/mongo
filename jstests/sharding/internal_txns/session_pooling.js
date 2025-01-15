@@ -3,8 +3,7 @@
  *
  * @tags: [requires_fcv_60, uses_transactions]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 1, config: 1});
 const shard0Primary = st.rs0.getPrimary();
@@ -17,14 +16,22 @@ assert.commandWorked(mongosTestColl.insert({x: 1}));  // Set up the collection.
 const sessionsColl = st.s.getCollection("config.system.sessions");
 const transactionsCollOnShard = shard0Primary.getCollection("config.transactions");
 
-function assertNumEntries({sessionUUID, numSessionsCollEntries, numTransactionsCollEntries}) {
+function assertNumEntries(
+    {sessionUUID, numSessionsCollEntries, numTransactionsCollEntries, allowedDelta}) {
     const filter = {"_id.id": sessionUUID};
-    assert.eq(numSessionsCollEntries,
-              sessionsColl.find(filter).itcount(),
-              tojson(sessionsColl.find().toArray()));
-    assert.eq(numTransactionsCollEntries,
-              transactionsCollOnShard.find(filter).itcount(),
-              tojson(transactionsCollOnShard.find().toArray()));
+
+    // Assert the number of entries is within a range because sometimes the session created by an
+    // internal transaction is returned after the next internal transaction is created resulting in
+    // more sessions than expected.
+    const actualNumSessionsCollEntries = sessionsColl.find(filter).itcount();
+    assert(actualNumSessionsCollEntries <= (numSessionsCollEntries + allowedDelta) &&
+               actualNumSessionsCollEntries >= numSessionsCollEntries,
+           tojson(sessionsColl.find().toArray()));
+
+    const actualNumTransactionsCollEntries = transactionsCollOnShard.find(filter).itcount();
+    assert(actualNumTransactionsCollEntries <= (numTransactionsCollEntries + allowedDelta) &&
+               actualNumTransactionsCollEntries >= numTransactionsCollEntries,
+           tojson(transactionsCollOnShard.find().toArray()));
 }
 
 function runInternalTxn(conn, lsid) {
@@ -44,8 +51,12 @@ function runTest(conn) {
 
     assert.commandWorked(conn.adminCommand({refreshLogicalSessionCacheNow: 1}));
     assert.commandWorked(shard0Primary.adminCommand({refreshLogicalSessionCacheNow: 1}));
-    assertNumEntries(
-        {sessionUUID: parentLsid.id, numSessionsCollEntries: 1, numTransactionsCollEntries: 1});
+    assertNumEntries({
+        sessionUUID: parentLsid.id,
+        numSessionsCollEntries: 1,
+        numTransactionsCollEntries: 1,
+        allowedDelta: 0,
+    });
 
     // Run more transactions and verify the number of sessions used doesn't change.
 
@@ -55,8 +66,12 @@ function runTest(conn) {
 
     assert.commandWorked(conn.adminCommand({refreshLogicalSessionCacheNow: 1}));
     assert.commandWorked(shard0Primary.adminCommand({refreshLogicalSessionCacheNow: 1}));
-    assertNumEntries(
-        {sessionUUID: parentLsid.id, numSessionsCollEntries: 1, numTransactionsCollEntries: 1});
+    assertNumEntries({
+        sessionUUID: parentLsid.id,
+        numSessionsCollEntries: 1,
+        numTransactionsCollEntries: 1,
+        allowedDelta: 1
+    });
 
     // Verify other sessions can be pooled concurrently.
 
@@ -75,21 +90,26 @@ function runTest(conn) {
 
     assert.commandWorked(conn.adminCommand({refreshLogicalSessionCacheNow: 1}));
     assert.commandWorked(shard0Primary.adminCommand({refreshLogicalSessionCacheNow: 1}));
-    assertNumEntries(
-        {sessionUUID: parentLsid.id, numSessionsCollEntries: 1, numTransactionsCollEntries: 1});
+    assertNumEntries({
+        sessionUUID: parentLsid.id,
+        numSessionsCollEntries: 1,
+        numTransactionsCollEntries: 1,
+        allowedDelta: 1
+    });
     assertNumEntries({
         sessionUUID: otherParentLsid1.id,
         numSessionsCollEntries: 1,
-        numTransactionsCollEntries: 1
+        numTransactionsCollEntries: 1,
+        allowedDelta: 1,
     });
     assertNumEntries({
         sessionUUID: otherParentLsid2.id,
         numSessionsCollEntries: 1,
-        numTransactionsCollEntries: 1
+        numTransactionsCollEntries: 1,
+        allowedDelta: 1,
     });
 }
 
 runTest(st.s);
 
 st.stop();
-})();

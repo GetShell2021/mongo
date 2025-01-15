@@ -46,8 +46,8 @@ static void create_perf_json(bool, int, int);
 
 #define BLOOM false
 #define GAP_WARNINGS 3 /* Threshold for seconds of gap to be displayed */
-#define N_RECORDS 10000
-#define N_INSERT 1000000
+#define N_RECORDS (10 * WT_THOUSAND)
+#define N_INSERT WT_MILLION
 #define N_INSERT_THREAD 1
 #define N_GET_THREAD 1
 #define S64 "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789::"
@@ -104,10 +104,11 @@ main(int argc, char *argv[])
         testutil_die(ENOTSUP, "Fixed-length column store not supported");
     sharedopts->usecolumns = (opts->table_type == TABLE_COL);
 
-    testutil_make_work_dir(opts->home);
+    testutil_recreate_dir(opts->home);
     testutil_progress(opts, "start");
 
-    testutil_check(wiredtiger_open(opts->home, NULL, "create,cache_size=1G", &opts->conn));
+    testutil_check(wiredtiger_open(opts->home, NULL,
+      "create,cache_size=1G,statistics=(all),statistics_log=(json,on_close,wait=5)", &opts->conn));
     testutil_progress(opts, "wiredtiger_open");
 
     testutil_check(opts->conn->open_session(opts->conn, NULL, NULL, &session));
@@ -117,20 +118,17 @@ main(int argc, char *argv[])
      * Note: id is repeated as id2. This makes it easier to identify the primary key in dumps of the
      * index files.
      */
-    testutil_check(__wt_snprintf(tableconf, sizeof(tableconf),
+    testutil_snprintf(tableconf, sizeof(tableconf),
       "key_format=%s,value_format=iiSii,columns=(id,post,bal,extra,flag,id2)",
-      sharedopts->usecolumns ? "r" : "i"));
+      sharedopts->usecolumns ? "r" : "i");
     testutil_check(session->create(session, opts->uri, tableconf));
 
     tablename = strchr(opts->uri, ':');
     testutil_assert(tablename != NULL);
     tablename++;
-    testutil_check(
-      __wt_snprintf(sharedopts->posturi, sizeof(sharedopts->posturi), "index:%s:post", tablename));
-    testutil_check(
-      __wt_snprintf(sharedopts->baluri, sizeof(sharedopts->baluri), "index:%s:bal", tablename));
-    testutil_check(
-      __wt_snprintf(sharedopts->flaguri, sizeof(sharedopts->flaguri), "index:%s:flag", tablename));
+    testutil_snprintf(sharedopts->posturi, sizeof(sharedopts->posturi), "index:%s:post", tablename);
+    testutil_snprintf(sharedopts->baluri, sizeof(sharedopts->baluri), "index:%s:bal", tablename);
+    testutil_snprintf(sharedopts->flaguri, sizeof(sharedopts->flaguri), "index:%s:flag", tablename);
 
     testutil_check(session->create(session, sharedopts->posturi, "columns=(post)"));
     testutil_check(session->create(session, sharedopts->baluri, "columns=(bal)"));
@@ -253,7 +251,7 @@ thread_insert(void *arg)
         if (__wt_random(&rnd) % 2 == 0)
             post = 54321;
         else
-            post = i % 100000;
+            post = i % (100 * WT_THOUSAND);
         if (__wt_random(&rnd) % 2 == 0) {
             bal = -100;
             flag = 1;
@@ -270,8 +268,8 @@ thread_insert(void *arg)
         testutil_assert(ret == 0);
         testutil_check(maincur->reset(maincur));
         testutil_check(session->commit_transaction(session, NULL));
-        if (i % 1000 == 0 && i != 0) {
-            if (i % 10000 == 0)
+        if (i % WT_THOUSAND == 0 && i != 0) {
+            if (i % (10 * WT_THOUSAND) == 0)
                 fprintf(stderr, "*");
             else
                 fprintf(stderr, ".");
@@ -381,8 +379,7 @@ create_perf_json(bool usecolumns, int njoins, int nwarnings)
 
     fp = NULL;
 
-    testutil_check(
-      __wt_snprintf(testname, sizeof(testname), "wt2853_perf_%s", usecolumns ? "col" : "row"));
+    testutil_snprintf(testname, sizeof(testname), "wt2853_perf_%s", usecolumns ? "col" : "row");
     testutil_assert_errno((fp = fopen("wt2853_perf.json", "w")) != NULL);
     testutil_assert(fprintf(fp,
                       "[{\"info\":{\"test_name\": \"%s\"},"

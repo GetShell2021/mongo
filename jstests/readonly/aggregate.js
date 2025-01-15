@@ -1,7 +1,6 @@
-load('jstests/readonly/lib/read_only_test.js');
+import {runReadOnlyTest} from "jstests/readonly/lib/read_only_test.js";
 
 runReadOnlyTest(function() {
-    'use strict';
     return {
         name: 'aggregate_readonly',
 
@@ -73,8 +72,8 @@ runReadOnlyTest(function() {
                 {$limit: 2},
             ];
 
-            assert.docEq(readableCollection.aggregate(mostAwardsPipeline).toArray(),
-                         [{_id: "Spotlight", count: 3}, {_id: "The Revenant", count: 3}]);
+            assert.docEq([{_id: "Spotlight", count: 3}, {_id: "The Revenant", count: 3}],
+                         readableCollection.aggregate(mostAwardsPipeline).toArray());
         }
     };
 }());

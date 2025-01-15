@@ -11,11 +11,8 @@
  *   multiversion_incompatible
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = TestData.testName;
 const dbName = testName;
@@ -74,4 +71,3 @@ jsTestLog("Joining failed write");
 joinHungWrite({checkExitStatus: false});
 
 replTest.stopSet();
-})();

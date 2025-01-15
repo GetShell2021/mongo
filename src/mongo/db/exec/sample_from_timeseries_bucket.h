@@ -29,9 +29,24 @@
 
 #pragma once
 
-#include "mongo/db/exec/bucket_unpacker.h"
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+#include <absl/hash/hash.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/data_view.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/shard_filterer.h"
+#include "mongo/db/exec/timeseries/bucket_unpacker.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 /**
@@ -59,7 +74,7 @@ public:
     SampleFromTimeseriesBucket(ExpressionContext* expCtx,
                                WorkingSet* ws,
                                std::unique_ptr<PlanStage> child,
-                               BucketUnpacker bucketUnpacker,
+                               timeseries::BucketUnpacker bucketUnpacker,
                                boost::optional<std::unique_ptr<ShardFilterer>> shardFilterer,
                                int maxConsecutiveAttempts,
                                long long sampleSize,
@@ -69,7 +84,7 @@ public:
         return STAGE_SAMPLE_FROM_TIMESERIES_BUCKET;
     }
 
-    bool isEOF() final {
+    bool isEOF() const final {
         return _nSampledSoFar >= _sampleSize;
     }
 
@@ -79,7 +94,7 @@ public:
         return &_specificStats;
     }
 
-    PlanStage::StageState doWork(WorkingSetID* id);
+    PlanStage::StageState doWork(WorkingSetID* id) override;
 
 private:
     /**
@@ -115,7 +130,7 @@ private:
     void materializeMeasurement(int64_t measurementIdx, WorkingSetMember* out);
 
     WorkingSet& _ws;
-    BucketUnpacker _bucketUnpacker;
+    timeseries::BucketUnpacker _bucketUnpacker;
     boost::optional<std::unique_ptr<ShardFilterer>> _shardFilterer;
     SampleFromTimeseriesBucketStats _specificStats;
 

@@ -8,15 +8,14 @@
  * - Insert a document into the new collection.
  * - Create an index on the new collection.
  *
- * @tags: [disabled_for_fcv_6_1_upgrade, requires_v4_0]
+ * @tags: [requires_v4_0]
  */
 
-(function() {
-'use strict';
+import "jstests/multiVersion/libs/multi_rs.js";
+import "jstests/multiVersion/libs/verify_versions.js";
 
-load('jstests/libs/index_catalog_helpers.js');
-load('jstests/multiVersion/libs/multi_rs.js');
-load('jstests/multiVersion/libs/verify_versions.js');
+import {IndexCatalogHelpers} from "jstests/libs/index_catalog_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Setup the dbpath for this test.
 const dbpath = MongoRunner.dataPath + 'major_version_upgrade';
@@ -30,13 +29,18 @@ const defaultOptions = {
 
 // This lists all supported releases and needs to be kept up to date as versions are added and
 // dropped.
+// TODO SERVER-76166: Programmatically generate list of LTS versions.
 const versions = [
-    {binVersion: '4.0', featureCompatibilityVersion: '4.0', testCollection: 'four_zero'},
-    {binVersion: '4.2', featureCompatibilityVersion: '4.2', testCollection: 'four_two'},
     {binVersion: '4.4', featureCompatibilityVersion: '4.4', testCollection: 'four_four'},
     {binVersion: '5.0', featureCompatibilityVersion: '5.0', testCollection: 'five_zero'},
-    {binVersion: 'last-lts', testCollection: 'last_lts'},
-    {binVersion: 'last-continuous', testCollection: 'last_continuous'},
+    {binVersion: '6.0', featureCompatibilityVersion: '6.0', testCollection: 'six_zero'},
+    {binVersion: '7.0', featureCompatibilityVersion: '7.0', testCollection: 'seven_zero'},
+    {binVersion: 'last-lts', featureCompatibilityVersion: lastLTSFCV, testCollection: 'last_lts'},
+    {
+        binVersion: 'last-continuous',
+        featureCompatibilityVersion: lastContinuousFCV,
+        testCollection: 'last_continuous'
+    },
     {binVersion: 'latest', featureCompatibilityVersion: latestFCV, testCollection: 'latest'},
 ];
 
@@ -91,8 +95,19 @@ for (let i = 0; i < versions.length; i++) {
     // Set the appropriate featureCompatibilityVersion upon upgrade, if applicable.
     if (version.hasOwnProperty('featureCompatibilityVersion')) {
         let adminDB = conn.getDB("admin");
-        assert.commandWorked(adminDB.runCommand(
-            {"setFeatureCompatibilityVersion": version.featureCompatibilityVersion}));
+        const res = adminDB.runCommand(
+            {"setFeatureCompatibilityVersion": version.featureCompatibilityVersion});
+        if (!res.ok && res.code === 7369100) {
+            // We failed due to requiring 'confirm: true' on the command. This will only
+            // occur on 7.0+ nodes that have 'enableTestCommands' set to false. Retry the
+            // setFCV command with 'confirm: true'.
+            assert.commandWorked(adminDB.runCommand({
+                "setFeatureCompatibilityVersion": version.featureCompatibilityVersion,
+                confirm: true,
+            }));
+        } else {
+            assert.commandWorked(res);
+        }
     }
 
     // Shutdown the current mongod.
@@ -177,20 +192,28 @@ for (let i = 0; i < versions.length; i++) {
     // Set the appropriate featureCompatibilityVersion upon upgrade, if applicable.
     if (version.hasOwnProperty('featureCompatibilityVersion')) {
         let primaryAdminDB = primary.getDB("admin");
-        assert.commandWorked(primaryAdminDB.runCommand(
-            {setFeatureCompatibilityVersion: version.featureCompatibilityVersion}));
+        const res = primaryAdminDB.runCommand(
+            {"setFeatureCompatibilityVersion": version.featureCompatibilityVersion});
+        if (!res.ok && res.code === 7369100) {
+            // We failed due to requiring 'confirm: true' on the command. This will only
+            // occur on 7.0+ nodes that have 'enableTestCommands' set to false. Retry the
+            // setFCV command with 'confirm: true'.
+            assert.commandWorked(primaryAdminDB.runCommand({
+                "setFeatureCompatibilityVersion": version.featureCompatibilityVersion,
+                confirm: true,
+            }));
+        } else {
+            assert.commandWorked(res);
+        }
         rst.awaitReplication();
+
         // Make sure we reach the new featureCompatibilityVersion in the committed snapshot on
         // on all nodes before continuing to upgrade.
-        // checkFCV does not work for version 3.4 (and below)
-        if (version.featureCompatibilityVersion != '3.4') {
-            for (let n of rst.nodes) {
-                checkFCV(n.getDB("admin"), version.featureCompatibilityVersion);
-            }
+        for (let n of rst.nodes) {
+            checkFCV(n.getDB("admin"), version.featureCompatibilityVersion);
         }
     }
 }
 
 // Stop the replica set.
 rst.stopSet();
-})();

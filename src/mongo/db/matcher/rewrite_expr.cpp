@@ -28,14 +28,22 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/matcher/rewrite_expr.h"
-
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/matcher/expression_internal_expr_comparison.h"
-#include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/matcher/rewrite_expr.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -47,7 +55,7 @@ using CmpOp = ExpressionCompare::CmpOp;
 RewriteExpr::RewriteResult RewriteExpr::rewrite(const boost::intrusive_ptr<Expression>& expression,
                                                 const CollatorInterface* collator) {
     LOGV2_DEBUG(
-        20725, 5, "Expression prior to rewrite", "expression"_attr = expression->serialize(false));
+        20725, 5, "Expression prior to rewrite", "expression"_attr = expression->serialize());
 
     RewriteExpr rewriteExpr(collator);
     std::unique_ptr<MatchExpression> matchExpression;
@@ -58,14 +66,19 @@ RewriteExpr::RewriteResult RewriteExpr::rewrite(const boost::intrusive_ptr<Expre
                     5,
                     "Post-rewrite MatchExpression",
                     "expression"_attr = matchExpression->debugString());
-        matchExpression = MatchExpression::optimize(std::move(matchExpression));
+        // The Boolean simplifier is disabled since we don't want to simplify sub-expressions, but
+        // simplify the whole expression instead.
+        matchExpression =
+            MatchExpression::optimize(std::move(matchExpression), /* enableSimplification */ false);
         LOGV2_DEBUG(20727,
                     5,
                     "Post-rewrite/post-optimized MatchExpression",
                     "expression"_attr = matchExpression->debugString());
     }
 
-    return {std::move(matchExpression), std::move(rewriteExpr._matchExprElemStorage)};
+    return {std::move(matchExpression),
+            std::move(rewriteExpr._matchExprElemStorage),
+            rewriteExpr._allSubExpressionsRewritten};
 }
 
 std::unique_ptr<MatchExpression> RewriteExpr::_rewriteExpression(
@@ -88,8 +101,11 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteAndExpression(
     auto andMatch = std::make_unique<AndMatchExpression>();
 
     for (auto&& child : currExprNode->getOperandList())
-        if (auto childMatch = _rewriteExpression(child))
+        if (auto childMatch = _rewriteExpression(child)) {
             andMatch->add(std::move(childMatch));
+        } else {
+            _allSubExpressionsRewritten = false;
+        }
 
     if (andMatch->numChildren() > 0)
         return andMatch;
@@ -104,10 +120,12 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteOrExpression(
     for (auto&& child : currExprNode->getOperandList())
         if (auto childExpr = _rewriteExpression(child))
             orMatch->add(std::move(childExpr));
-        else
+        else {
             // If any child cannot be rewritten to a MatchExpression then we must abandon adding
             // this $or clause.
+            _allSubExpressionsRewritten = false;
             return nullptr;
+        }
 
     if (orMatch->numChildren() > 0)
         return orMatch;
@@ -187,28 +205,28 @@ std::unique_ptr<MatchExpression> RewriteExpr::_buildComparisonMatchExpression(
 
     switch (comparisonOp) {
         case ExpressionCompare::EQ: {
-            matchExpr = std::make_unique<InternalExprEqMatchExpression>(fieldAndValue.fieldName(),
-                                                                        fieldAndValue);
+            matchExpr = std::make_unique<InternalExprEqMatchExpression>(
+                fieldAndValue.fieldNameStringData(), fieldAndValue);
             break;
         }
         case ExpressionCompare::GT: {
-            matchExpr = std::make_unique<InternalExprGTMatchExpression>(fieldAndValue.fieldName(),
-                                                                        fieldAndValue);
+            matchExpr = std::make_unique<InternalExprGTMatchExpression>(
+                fieldAndValue.fieldNameStringData(), fieldAndValue);
             break;
         }
         case ExpressionCompare::GTE: {
-            matchExpr = std::make_unique<InternalExprGTEMatchExpression>(fieldAndValue.fieldName(),
-                                                                         fieldAndValue);
+            matchExpr = std::make_unique<InternalExprGTEMatchExpression>(
+                fieldAndValue.fieldNameStringData(), fieldAndValue);
             break;
         }
         case ExpressionCompare::LT: {
-            matchExpr = std::make_unique<InternalExprLTMatchExpression>(fieldAndValue.fieldName(),
-                                                                        fieldAndValue);
+            matchExpr = std::make_unique<InternalExprLTMatchExpression>(
+                fieldAndValue.fieldNameStringData(), fieldAndValue);
             break;
         }
         case ExpressionCompare::LTE: {
-            matchExpr = std::make_unique<InternalExprLTEMatchExpression>(fieldAndValue.fieldName(),
-                                                                         fieldAndValue);
+            matchExpr = std::make_unique<InternalExprLTEMatchExpression>(
+                fieldAndValue.fieldNameStringData(), fieldAndValue);
             break;
         }
         default:
@@ -233,7 +251,7 @@ bool RewriteExpr::_canRewriteComparison(
     const auto& operandList = expression->getOperandList();
     bool hasFieldPath = false;
 
-    for (auto operand : operandList) {
+    for (const auto& operand : operandList) {
         if (auto exprFieldPath = dynamic_cast<ExpressionFieldPath*>(operand.get())) {
             if (exprFieldPath->isVariableReference() || exprFieldPath->isROOT()) {
                 // Rather than a local document field path, this field path refers to either a

@@ -27,11 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/db/update/unset_node.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/db/update/unset_node.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -64,7 +67,7 @@ void UnsetNode::validateUpdate(mutablebson::ConstElement updatedElement,
                                ModifyResult modifyResult,
                                bool validateForStorage,
                                bool* containsDotsAndDollarsField) const {
-    invariant(modifyResult == ModifyResult::kNormalUpdate);
+    invariant(modifyResult.type == ModifyResult::kNormalUpdate);
 
     // We only need to check the left and right sibling to see if the removed element was part of a
     // now invalid DBRef.
@@ -77,6 +80,7 @@ void UnsetNode::validateUpdate(mutablebson::ConstElement updatedElement,
                                          recursionLevelForCheck,
                                          false, /* allowTopLevelDollarPrefixedFields */
                                          validateForStorage,
+                                         false, /* isEmbeddedInIdField */
                                          containsDotsAndDollarsField);
     }
 
@@ -86,6 +90,7 @@ void UnsetNode::validateUpdate(mutablebson::ConstElement updatedElement,
                                          recursionLevelForCheck,
                                          false, /* allowTopLevelDollarPrefixedFields */
                                          validateForStorage,
+                                         false, /* isEmbeddedInIdField */
                                          containsDotsAndDollarsField);
     }
 }
@@ -96,7 +101,7 @@ void UnsetNode::logUpdate(LogBuilderInterface* logBuilder,
                           ModifyResult modifyResult,
                           boost::optional<int> createdFieldIdx) const {
     invariant(logBuilder);
-    invariant(modifyResult == ModifyResult::kNormalUpdate);
+    invariant(modifyResult.type == ModifyResult::kNormalUpdate);
     invariant(!createdFieldIdx);
 
     if (pathTaken.types().back() == RuntimeUpdatePath::ComponentType::kArrayIndex) {

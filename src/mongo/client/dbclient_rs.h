@@ -33,18 +33,41 @@
  * Connect to a Replica Set, from C++.
  */
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <map>
+#include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/authenticate.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/client/dbclient_connection.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/config.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/rpc/message.h"
+#include "mongo/rpc/metadata.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/unique_message.h"
 #include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_types.h"
 
 namespace mongo {
 
 class ReplicaSetMonitor;
 class TagSet;
 struct ReadPreferenceSetting;
+
 typedef std::shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorPtr;
 
 /** Use this class to connect to a replica set of servers.  The class will manage
@@ -75,7 +98,7 @@ public:
      */
     Status connect();
 
-    Status authenticateInternalUser(auth::StepDownBehavior stepDownBehavior) override;
+    void authenticateInternalUser(auth::StepDownBehavior stepDownBehavior) override;
 
     /**
      * Logs out the connection for the given database.
@@ -84,7 +107,7 @@ public:
      * @param info the result object for the logout command (provided for backwards
      *     compatibility with mongo shell)
      */
-    void logout(const std::string& dbname, BSONObj& info) override;
+    void logout(const DatabaseName& dbname, BSONObj& info) override;
 
     // ----------- simple functions --------------
 
@@ -92,19 +115,19 @@ public:
                                          const ReadPreferenceSetting& readPref,
                                          ExhaustMode exhaustMode) override;
 
-    void insert(const std::string& ns,
+    void insert(const NamespaceString& nss,
                 BSONObj obj,
                 bool ordered = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
     /** insert multiple objects.  Note that single object insert is asynchronous, so this version
         is only nominally faster and not worth a special effort to try to use.  */
-    void insert(const std::string& ns,
+    void insert(const NamespaceString& nss,
                 const std::vector<BSONObj>& v,
                 bool ordered = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    void remove(const std::string& ns,
+    void remove(const NamespaceString& nss,
                 const BSONObj& filter,
                 bool removeMany = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
@@ -133,7 +156,7 @@ public:
     // ---- callback pieces -------
 
     void say(Message& toSend, bool isRetry = false, std::string* actualServer = nullptr) override;
-    Status recv(Message& toRecv, int lastRequestId) override;
+    Message recv(int lastRequestId) override;
 
     /* this is the callback from our underlying connections to notify us that we got a "not primary"
      * error.
@@ -194,11 +217,6 @@ public:
     int getMaxWireVersion() final;
     // ---- low level ------
 
-    bool call(Message& toSend,
-              Message& response,
-              bool assertOk,
-              std::string* actualServer) override;
-
     /**
      * Performs a "soft reset" by clearing all states relating to secondary nodes and
      * returning secondary connections to the pool.
@@ -243,8 +261,10 @@ private:
 
     DBClientConnection* checkPrimary();
 
+    Message _call(Message& toSend, std::string* actualServer) override;
+
     template <typename Authenticate>
-    Status _runAuthLoop(Authenticate authCb);
+    void _runAuthLoop(Authenticate authCb);
 
     /**
      * Helper method for selecting a node based on the read preference. Will advance
@@ -319,7 +339,7 @@ private:
     // this could be a security issue, as the password is stored in memory
     // not sure if/how we should handle
     bool _internalAuthRequested = false;
-    std::map<std::string, BSONObj> _auths;  // dbName -> auth parameters
+    absl::flat_hash_map<DatabaseName, BSONObj> _auths;  // dbName -> auth parameters
 
     MongoURI _uri;
 

@@ -27,29 +27,56 @@
  *    it in the license file.
  */
 
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/audit.h"
-#include "mongo/db/auth/action_set.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/basic_types.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/write_concern_options.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/balancer_configuration.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_options.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_commands_gen.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/shard_key_pattern_query_util.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 #include "mongo/util/timer.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
 
 namespace mongo {
 namespace {
@@ -100,12 +127,16 @@ public:
             return request().getCommandParameter();
         }
 
-        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) {
+        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
 
             Timer t;
-            const auto chunkManager = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
-                                                                                             ns()));
+
+            const auto chunkManager =
+                getRefreshedCollectionRoutingInfoAssertSharded_DEPRECATED(opCtx, ns()).cm;
+            uassert(ErrorCodes::NamespaceNotSharded,
+                    str::stream() << "Can't execute " << Request::kCommandName
+                                  << " on unsharded collection " << ns().toStringForErrorMsg(),
+                    chunkManager.isSharded());
 
             uassert(ErrorCodes::InvalidOptions,
                     "bounds can only have exactly 2 elements",
@@ -124,14 +155,11 @@ public:
             const auto toStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, destination);
 
             if (!toStatus.isOK()) {
-                LOGV2_OPTIONS(
-                    22755,
-                    {logv2::UserAssertAfterLog(ErrorCodes::ShardNotFound)},
-                    "Could not move chunk in {namespace} to {toShardId} because that shard"
-                    " does not exist",
-                    "moveChunk destination shard does not exist",
-                    "toShardId"_attr = destination,
-                    "namespace"_attr = ns());
+                LOGV2_OPTIONS(22755,
+                              {logv2::UserAssertAfterLog(ErrorCodes::ShardNotFound)},
+                              "moveChunk destination shard does not exist",
+                              "toShardId"_attr = destination,
+                              logAttrs(ns()));
             }
 
 
@@ -145,12 +173,17 @@ public:
 
             if (find) {
                 // find
-                BSONObj shardKey = uassertStatusOK(
-                    chunkManager.getShardKeyPattern().extractShardKeyFromQuery(opCtx, ns(), *find));
+                BSONObj shardKey = uassertStatusOK(extractShardKeyFromBasicQuery(
+                    opCtx, ns(), chunkManager.getShardKeyPattern(), *find));
 
                 uassert(656450,
                         str::stream() << "no shard key found in chunk query " << *find,
                         !shardKey.isEmpty());
+
+                if (find && chunkManager.getShardKeyPattern().isHashedPattern()) {
+                    LOGV2_WARNING(7065400,
+                                  "bounds should be used instead of query for hashed shard keys");
+                }
 
                 chunk.emplace(chunkManager.findIntersectingChunkWithSimpleCollation(shardKey));
             } else {
@@ -186,43 +219,36 @@ public:
 
 
             ConfigsvrMoveRange configsvrRequest(ns());
-            configsvrRequest.setDbName(NamespaceString::kAdminDb);
+            configsvrRequest.setDbName(DatabaseName::kAdmin);
             configsvrRequest.setMoveRangeRequestBase(moveRangeReq);
 
             const auto secondaryThrottle = uassertStatusOK(
-                MigrationSecondaryThrottleOptions::createFromCommand(request().toBSON({})));
+                MigrationSecondaryThrottleOptions::createFromCommand(request().toBSON()));
 
             configsvrRequest.setSecondaryThrottle(secondaryThrottle);
 
             configsvrRequest.setForceJumbo(request().getForceJumbo() ? ForceJumbo::kForceManual
                                                                      : ForceJumbo::kDoNotForce);
+            generic_argument_util::setMajorityWriteConcern(configsvrRequest);
 
             auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-            auto commandResponse = configShard->runCommand(
-                opCtx,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                NamespaceString::kAdminDb.toString(),
-                CommandHelpers::appendMajorityWriteConcern(configsvrRequest.toBSON({})),
-                Shard::RetryPolicy::kIdempotent);
+            auto commandResponse =
+                configShard->runCommand(opCtx,
+                                        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                        DatabaseName::kAdmin,
+                                        configsvrRequest.toBSON(),
+                                        Shard::RetryPolicy::kIdempotent);
             uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(std::move(commandResponse)));
 
-            Grid::get(opCtx)
-                ->catalogCache()
-                ->invalidateShardOrEntireCollectionEntryForShardedCollection(
-                    ns(), boost::none, chunk->getShardId());
-            Grid::get(opCtx)
-                ->catalogCache()
-                ->invalidateShardOrEntireCollectionEntryForShardedCollection(
-                    ns(), boost::none, to->getId());
+            Grid::get(opCtx)->catalogCache()->onStaleCollectionVersion(ns(), boost::none);
 
             BSONObjBuilder resultbson;
             resultbson.append("millis", t.millis());
             result->getBodyBuilder().appendElements(resultbson.obj());
         }
     };
-
-
-} clusterMoveChunk;
+};
+MONGO_REGISTER_COMMAND(MoveChunkCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

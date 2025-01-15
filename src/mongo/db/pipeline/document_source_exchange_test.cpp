@@ -28,22 +28,38 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <cstdint>
+#include <mutex>
+#include <utility>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/hasher.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_exchange.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/service_context.h"
 #include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/random.h"
-#include "mongo/unittest/temp_dir.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/clock_source_mock.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/concurrency/thread_pool.h"
-#include "mongo/util/system_clock_source.h"
 #include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -58,7 +74,7 @@ namespace {
  */
 class MutexYielder : public ResourceYielder {
 public:
-    MutexYielder(Mutex* mutex) : _lock(*mutex, stdx::defer_lock) {}
+    MutexYielder(stdx::mutex* mutex) : _lock(*mutex, stdx::defer_lock) {}
 
     void yield(OperationContext* opCtx) override {
         _lock.unlock();
@@ -68,12 +84,12 @@ public:
         _lock.lock();
     }
 
-    stdx::unique_lock<Latch>& getLock() {
+    stdx::unique_lock<stdx::mutex>& getLock() {
         return _lock;
     }
 
 private:
-    stdx::unique_lock<Latch> _lock;
+    stdx::unique_lock<stdx::mutex> _lock;
 };
 
 /**
@@ -87,25 +103,23 @@ struct ThreadInfo {
 };
 }  // namespace
 
-const NamespaceString kTestNss = NamespaceString("test.docSourceExchange"_sd);
+const NamespaceString kTestNss =
+    NamespaceString::createNamespaceString_forTest("test.docSourceExchange"_sd);
 
-class DocumentSourceExchangeTest : public AggregationContextFixture {
+class DocumentSourceExchangeTest : service_context_test::WithSetupTransportLayer,
+                                   public AggregationContextFixture {
 protected:
-    std::unique_ptr<executor::TaskExecutor> _executor;
-    virtual void setUp() override {
-        getExpCtx()->mongoProcessInterface = std::make_shared<StubMongoProcessInterface>();
-
+    void setUp() override {
         auto net = executor::makeNetworkInterface("ExchangeTest");
 
         ThreadPool::Options options;
         auto pool = std::make_unique<ThreadPool>(options);
 
-        _executor =
-            std::make_unique<executor::ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
+        _executor = executor::ThreadPoolTaskExecutor::create(std::move(pool), std::move(net));
         _executor->startup();
     }
 
-    virtual void tearDown() override {
+    void tearDown() override {
         _executor->shutdown();
         _executor.reset();
     }
@@ -139,7 +153,7 @@ protected:
     }
 
     auto parseSpec(const BSONObj& spec) {
-        IDLParserErrorContext ctx("internalExchange");
+        IDLParserContext ctx("internalExchange");
         return ExchangeSpec::parse(ctx, spec);
     }
 
@@ -147,7 +161,7 @@ protected:
         std::vector<ThreadInfo> threads;
         for (size_t idx = 0; idx < nConsumers; ++idx) {
             ServiceContext::UniqueClient client =
-                getServiceContext()->makeClient("exchange client");
+                getServiceContext()->getService()->makeClient("exchange client");
             ServiceContext::UniqueOperationContext opCtxOwned =
                 getServiceContext()->makeOperationContext(client.get());
             OperationContext* opCtx = opCtxOwned.get();
@@ -155,12 +169,14 @@ protected:
                 std::move(client),
                 std::move(opCtxOwned),
                 new DocumentSourceExchange(
-                    new ExpressionContext(opCtx, nullptr, kTestNss), ex, idx, nullptr),
+                    ExpressionContextBuilder{}.opCtx(opCtx).ns(kTestNss).build(), ex, idx, nullptr),
             });
         }
         return threads;
     }
-};
+
+    std::shared_ptr<executor::TaskExecutor> _executor;
+};  // namespace mongo
 
 TEST_F(DocumentSourceExchangeTest, SimpleExchange1Consumer) {
     const size_t nDocs = 500;
@@ -519,25 +535,27 @@ TEST_F(DocumentSourceExchangeTest, RandomExchangeNConsumerResourceYielding) {
     // thread holds this while it calls getNext(). This is to simulate the case where a thread may
     // hold some "real" resources which need to be yielded while waiting, such as the Session, or
     // the locks held in a transaction.
-    auto artificalGlobalMutex = MONGO_MAKE_LATCH();
+    stdx::mutex artificalGlobalMutex;
 
     boost::intrusive_ptr<Exchange> ex =
         new Exchange(std::move(spec), Pipeline::create({source}, getExpCtx()));
     std::vector<ThreadInfo> threads;
 
     for (size_t idx = 0; idx < nConsumers; ++idx) {
-        ServiceContext::UniqueClient client = getServiceContext()->makeClient("exchange client");
+        ServiceContext::UniqueClient client =
+            getServiceContext()->getService()->makeClient("exchange client");
         ServiceContext::UniqueOperationContext opCtxOwned =
             getServiceContext()->makeOperationContext(client.get());
         OperationContext* opCtx = opCtxOwned.get();
         auto yielder = std::make_unique<MutexYielder>(&artificalGlobalMutex);
         auto yielderRaw = yielder.get();
-
         threads.push_back(ThreadInfo{
             std::move(client),
             std::move(opCtxOwned),
-            new DocumentSourceExchange(
-                new ExpressionContext(opCtx, nullptr, kTestNss), ex, idx, std::move(yielder)),
+            new DocumentSourceExchange(ExpressionContextBuilder{}.opCtx(opCtx).ns(kTestNss).build(),
+                                       ex,
+                                       idx,
+                                       std::move(yielder)),
             yielderRaw});
     }
 
@@ -746,6 +764,32 @@ TEST_F(DocumentSourceExchangeTest, RejectInvalidMissingKeys) {
                         << BSON_ARRAY(0));
     ASSERT_THROWS_CODE(
         Exchange(parseSpec(spec), Pipeline::create({}, getExpCtx())), AssertionException, 50967);
+}
+
+TEST_F(DocumentSourceExchangeTest, QueryShape) {
+    const size_t nDocs = 500;
+
+    auto source = getMockSource(nDocs);
+
+    ExchangeSpec spec;
+    spec.setPolicy(ExchangePolicyEnum::kRoundRobin);
+    spec.setConsumers(1);
+    spec.setBufferSize(1024);
+    boost::intrusive_ptr<Exchange> ex = new Exchange(spec, Pipeline::create({source}, getExpCtx()));
+    boost::intrusive_ptr<DocumentSourceExchange> stage =
+        new DocumentSourceExchange(getExpCtx(), ex, 0, nullptr);
+
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({
+            "$_internalExchange": {
+                "policy": "roundrobin",
+                "consumers": "?number",
+                "orderPreserving": false,
+                "bufferSize": "?number",
+                "key": "?object"
+            }
+        })",
+        redact(*stage));
 }
 
 }  // namespace mongo

@@ -30,14 +30,18 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -92,7 +96,7 @@ private:
 
     const Milliseconds _granularity;
 
-    stdx::mutex _mutex;  // NOLINT
+    stdx::mutex _mutex;
     stdx::condition_variable _condition;
     bool _inShutdown = false;
     bool _started = false;

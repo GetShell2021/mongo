@@ -27,22 +27,29 @@
  *    it in the license file.
  */
 
+#include "mongo/db/s/shard_key_index_util.h"
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <memory>
+
+#include <boost/optional/optional.hpp>
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/s/shard_key_index_util.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 
 namespace mongo {
-
 namespace {
-boost::optional<ShardKeyIndex> _findShardKeyPrefixedIndex(
+
+boost::optional<ShardKeyIndex> findShardKeyPrefixedIndex(
     OperationContext* opCtx,
     const CollectionPtr& collection,
     const IndexCatalog* indexCatalog,
@@ -65,6 +72,10 @@ boost::optional<ShardKeyIndex> _findShardKeyPrefixedIndex(
         auto indexDescriptor = indexEntry->descriptor();
 
         if (excludeName && indexDescriptor->indexName() == *excludeName) {
+            continue;
+        }
+
+        if (indexDescriptor->hidden()) {
             continue;
         }
 
@@ -179,24 +190,43 @@ bool isCompatibleWithShardKey(OperationContext* opCtx,
     return false;
 }
 
-bool isLastShardKeyIndex(OperationContext* opCtx,
-                         const CollectionPtr& collection,
-                         const IndexCatalog* indexCatalog,
-                         const std::string& indexName,
-                         const BSONObj& shardKey) {
-    return !_findShardKeyPrefixedIndex(
-                opCtx, collection, indexCatalog, indexName, shardKey, false /* requireSingleKey */)
-                .is_initialized();
+bool isLastNonHiddenRangedShardKeyIndex(OperationContext* opCtx,
+                                        const CollectionPtr& collection,
+                                        const std::string& indexName,
+                                        const BSONObj& shardKey) {
+    const auto index = collection->getIndexCatalog()->findIndexByName(opCtx, indexName);
+    if (!index ||
+        !isCompatibleWithShardKey(
+            opCtx, collection, index->getEntry(), shardKey, false /* requireSingleKey */)) {
+        return false;
+    }
+
+    // Users are allowed to drop hashed shard key indexes.
+    if (ShardKeyPattern(shardKey).isHashedPattern()) {
+        return false;
+    }
+
+    return !findShardKeyPrefixedIndex(opCtx,
+                                      collection,
+                                      collection->getIndexCatalog(),
+                                      indexName,
+                                      shardKey,
+                                      true /* requireSingleKey */)
+                .has_value();
 }
 
 boost::optional<ShardKeyIndex> findShardKeyPrefixedIndex(OperationContext* opCtx,
                                                          const CollectionPtr& collection,
-                                                         const IndexCatalog* indexCatalog,
                                                          const BSONObj& shardKey,
                                                          bool requireSingleKey,
                                                          std::string* errMsg) {
-    return _findShardKeyPrefixedIndex(
-        opCtx, collection, indexCatalog, boost::none, shardKey, requireSingleKey, errMsg);
+    return findShardKeyPrefixedIndex(opCtx,
+                                     collection,
+                                     collection->getIndexCatalog(),
+                                     boost::none,
+                                     shardKey,
+                                     requireSingleKey,
+                                     errMsg);
 }
 
 }  // namespace mongo

@@ -1,7 +1,9 @@
 /*
  * Utilities for shard versioning testing.
  */
-var ShardVersioningUtil = (function() {
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+
+export var ShardVersioningUtil = (function() {
     /*
      * Shard version indicating that shard version checking must be skipped.
      */
@@ -48,26 +50,23 @@ var ShardVersioningUtil = (function() {
     };
 
     /*
-     * Moves the chunk that matches the given query to toShard. Forces fromShard to skip the
-     * recipient metadata refresh post-migration commit.
+     * Moves the chunk that matches the given query to toShard. Forces the recipient to skip the
+     * metadata refresh post-migration commit.
      */
     let moveChunkNotRefreshRecipient = function(mongos, ns, fromShard, toShard, findQuery) {
-        let failPoint = configureFailPoint(fromShard, "doNotRefreshRecipientAfterCommit");
-
-        // TODO SERVER-60415: After 6.0 is released, no longer accept FailPointSetFailed errors
-        assert.commandWorkedOrFailedWithCode(
-            toShard.adminCommand(
-                {configureFailPoint: "migrationRecipientFailPostCommitRefresh", mode: "alwaysOn"}),
-            ErrorCodes.FailPointSetFailed);
+        let failPoint = configureFailPoint(toShard, "migrationRecipientFailPostCommitRefresh");
 
         assert.commandWorked(mongos.adminCommand(
             {moveChunk: ns, find: findQuery, to: toShard.shardName, _waitForDelete: true}));
 
         failPoint.off();
-        assert.commandWorkedOrFailedWithCode(
-            toShard.adminCommand(
-                {configureFailPoint: "migrationRecipientFailPostCommitRefresh", mode: "off"}),
-            ErrorCodes.FailPointSetFailed);
+    };
+
+    const getDbVersion = function(mongos, dbName) {
+        const version = mongos.getDB('config')['databases'].findOne({_id: dbName}).version;
+        // Explicitly make lastMod an int so that the server doesn't complain
+        // it's a double if you pass a dbVersion to a parallel shell.
+        return {...version, lastMod: NumberInt(version.lastMod)};
     };
 
     return {
@@ -76,6 +75,7 @@ var ShardVersioningUtil = (function() {
         assertCollectionVersionEquals,
         assertCollectionVersionOlderThan,
         assertShardVersionEquals,
-        moveChunkNotRefreshRecipient
+        moveChunkNotRefreshRecipient,
+        getDbVersion
     };
 })();

@@ -36,10 +36,11 @@ static bool use_columns = false;
 
 #define RECORDS_FILE "records"
 
-#define ENV_CONFIG                                     \
-    "create,log=(enabled,file_max=100K,remove=false)," \
-    "transaction_sync=(enabled,method=none)"
-#define ENV_CONFIG_REC "log=(recover=on)"
+#define ENV_CONFIG                                                                                \
+    "create,log=(enabled,file_max=100K,remove=false),"                                            \
+    "transaction_sync=(enabled,method=none),statistics=(all),statistics_log=(json,on_close,wait=" \
+    "1)"
+#define ENV_CONFIG_ADD_REC "log=(recover=on),statistics=(all),statistics_log=(json,on_close,wait=1)"
 
 #define LOG_FILE_1 "WiredTigerLog.0000000001"
 
@@ -176,18 +177,18 @@ fill_db(void)
      * and file creation records. Then subtract out a few more records to be conservative.
      */
     units = (K_SIZE + V_SIZE) / 128 + 1;
-    min_key = 90000 / (units * 128) - 15;
+    min_key = (90 * WT_THOUSAND) / (units * 128) - 15;
     max_key = min_key * 2;
     first = true;
     for (i = 0; i < max_key; ++i) {
         if (use_columns)
             cursor->set_key(cursor, i + 1);
         else {
-            testutil_check(__wt_snprintf(k, sizeof(k), "key%03" PRIu32, i));
+            testutil_snprintf(k, sizeof(k), "key%03" PRIu32, i);
             cursor->set_key(cursor, k);
         }
-        testutil_check(
-          __wt_snprintf(v, sizeof(v), "value%0*" PRIu32, (int)(V_SIZE - (strlen("value") + 1)), i));
+        testutil_snprintf(
+          v, sizeof(v), "value%0*" PRIu32, (int)(V_SIZE - (strlen("value") + 1)), i);
         cursor->set_value(cursor, v);
         testutil_check(cursor->insert(cursor));
 
@@ -275,7 +276,7 @@ main(int argc, char *argv[])
         usage();
 
     testutil_work_dir_from_path(home, sizeof(home), working_dir);
-    testutil_make_work_dir(home);
+    testutil_recreate_dir(home);
 
     /*
      * Fork a child to do its work. Wait for it to exit.
@@ -318,7 +319,7 @@ main(int argc, char *argv[])
     if (truncate(LOG_FILE_1, (wt_off_t)new_offset) != 0)
         testutil_die(errno, "truncate");
 
-    testutil_check(wiredtiger_open(NULL, NULL, ENV_CONFIG_REC, &conn));
+    testutil_check(wiredtiger_open(NULL, NULL, ENV_CONFIG_ADD_REC, &conn));
     testutil_check(conn->open_session(conn, NULL, NULL, &session));
     testutil_check(session->open_cursor(session, uri, NULL, NULL, &cursor));
 
@@ -350,7 +351,7 @@ main(int argc, char *argv[])
         /* At this point $PATH is inside `home`, which we intend to delete. cd to the parent dir. */
         if (chdir("../") != 0)
             testutil_die(errno, "root chdir: %s", home);
-        testutil_clean_work_dir(home);
+        testutil_remove(home);
     }
 
     return (EXIT_SUCCESS);

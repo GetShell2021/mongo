@@ -27,9 +27,24 @@
  *    it in the license file.
  */
 
+#include <fmt/format.h>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/s/split_chunk_request_type.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -42,14 +57,13 @@ TEST(SplitChunkRequest, BasicValidConfigCommand) {
              << "TestDB.TestColl"
              << "collEpoch" << OID("7fffffff0000000000000001") << "min" << BSON("a" << 1) << "max"
              << BSON("a" << 10) << "splitPoints" << BSON_ARRAY(BSON("a" << 5)) << "shard"
-             << "shard0000"
-             << "fromChunkSplitter" << true)));
-    ASSERT_EQ(NamespaceString("TestDB", "TestColl"), request.getNamespace());
+             << "shard0000")));
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl"),
+              request.getNamespace());
     ASSERT_EQ(OID("7fffffff0000000000000001"), request.getEpoch());
     ASSERT(ChunkRange(BSON("a" << 1), BSON("a" << 10)) == request.getChunkRange());
     ASSERT_BSONOBJ_EQ(BSON("a" << 5), request.getSplitPoints().at(0));
     ASSERT_EQ("shard0000", request.getShardName());
-    ASSERT_EQ(true, request.isFromChunkSplitter());
 }
 
 TEST(SplitChunkRequest, ValidWithMultipleSplits) {
@@ -60,13 +74,13 @@ TEST(SplitChunkRequest, ValidWithMultipleSplits) {
              << BSON("a" << 10) << "splitPoints" << BSON_ARRAY(BSON("a" << 5) << BSON("a" << 7))
              << "shard"
              << "shard0000")));
-    ASSERT_EQ(NamespaceString("TestDB", "TestColl"), request.getNamespace());
+    ASSERT_EQ(NamespaceString::createNamespaceString_forTest("TestDB", "TestColl"),
+              request.getNamespace());
     ASSERT_EQ(OID("7fffffff0000000000000001"), request.getEpoch());
     ASSERT(ChunkRange(BSON("a" << 1), BSON("a" << 10)) == request.getChunkRange());
     ASSERT_BSONOBJ_EQ(BSON("a" << 5), request.getSplitPoints().at(0));
     ASSERT_BSONOBJ_EQ(BSON("a" << 7), request.getSplitPoints().at(1));
     ASSERT_EQ("shard0000", request.getShardName());
-    ASSERT(!request.isFromChunkSplitter());  // fromChunkSplitter must be false if unset
 }
 
 TEST(SplitChunkRequest, ConfigCommandtoBSON) {
@@ -89,7 +103,6 @@ TEST(SplitChunkRequest, ConfigCommandtoBSON) {
     auto requestToBSON = request.toConfigCommandBSON(writeConcernObj);
 
     ASSERT_BSONOBJ_EQ(cmdBuilder.obj(), requestToBSON);
-    ASSERT(!request.isFromChunkSplitter());
 }
 
 TEST(SplitChunkRequest, MissingNamespaceErrors) {
@@ -117,7 +130,7 @@ TEST(SplitChunkRequest, MissingChunkToSplitErrors) {
              << "collEpoch" << OID("7fffffff0000000000000001") << "max" << BSON("a" << 10)
              << "splitPoints" << BSON_ARRAY(BSON("a" << 5)) << "shard"
              << "shard0000"));
-    ASSERT_EQ(ErrorCodes::NoSuchKey, request.getStatus());
+    ASSERT_EQ(ErrorCodes::IDLFailedToParse, request.getStatus());
 }
 
 TEST(SplitChunkRequest, MissingSplitPointErrors) {

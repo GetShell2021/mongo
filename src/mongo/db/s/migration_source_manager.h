@@ -29,14 +29,31 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <utility>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_coordinator.h"
 #include "mongo/db/s/move_timing_helper.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/timer.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -49,9 +66,8 @@ struct ShardingStatistics;
  * are held.
  *
  * The intended workflow is as follows:
- *  - Acquire a distributed lock on the collection whose chunk is about to be moved.
- *  - Instantiate a MigrationSourceManager on the stack. This will snapshot the latest collection
- *      metadata, which should stay stable because of the distributed collection lock.
+ *  - Instantiate a MigrationSourceManager on the stack.
+ *      This will perform preliminary checks and snapshot the latest collection
  *  - Call startClone to initiate background cloning of the chunk contents. This will perform the
  *      necessary registration of the cloner with the replication subsystem and will start listening
  *      for document changes, while at the same time responding to data fetch requests from the
@@ -76,29 +92,23 @@ public:
      * Retrieves the MigrationSourceManager pointer that corresponds to the given collection under
      * a CollectionShardingRuntime that has its ResourceMutex locked.
      */
-    static MigrationSourceManager* get(CollectionShardingRuntime* csr,
-                                       CollectionShardingRuntime::CSRLock& csrLock);
+    static MigrationSourceManager* get(const CollectionShardingRuntime& csr);
 
     /**
      * If the currently installed migration has reached the cloning stage (i.e., after startClone),
      * returns the cloner currently in use.
-     *
-     * Must be called with a both a collection lock and the CSRLock.
      */
     static std::shared_ptr<MigrationChunkClonerSource> getCurrentCloner(
-        CollectionShardingRuntime* csr, CollectionShardingRuntime::CSRLock& csrLock);
+        const CollectionShardingRuntime& csr);
 
     /**
-     * Instantiates a new migration source manager with the specified migration parameters. Must be
-     * called with the distributed lock acquired in advance (not asserted).
+     * Instantiates a new migration source manager with the specified migration parameters.
      *
-     * Loads the most up-to-date collection metadata and uses it as a starting point. It is assumed
-     * that because of the distributed lock, the collection's metadata will not change further.
+     * Loads the most up-to-date collection metadata and uses it as a starting point.
      *
      * May throw any exception. Known exceptions are:
      *  - InvalidOptions if the operation context is missing shard version
-     *  - StaleConfigException if the expected collection version does not match what we find it
-     *      to be after acquiring the distributed lock.
+     *  - StaleConfig if the expected placement version does not match the one known by this shard.
      */
     MigrationSourceManager(OperationContext* opCtx,
                            ShardsvrMoveRange&& request,
@@ -170,10 +180,23 @@ public:
      *
      * Must be called with some form of lock on the collection namespace.
      */
-    BSONObj getMigrationStatusReport() const;
+    BSONObj getMigrationStatusReport(
+        const CollectionShardingRuntime::ScopedSharedCollectionShardingRuntime& scopedCsrLock)
+        const;
 
     const NamespaceString& nss() {
         return _args.getCommandParameter();
+    }
+
+    boost::optional<UUID> getMigrationId() {
+        if (_coordinator) {
+            return _coordinator->getMigrationId();
+        }
+        return boost::none;
+    }
+
+    long long getOpTimeMillis() {
+        return _entireOpTimer.millis();
     }
 
 private:
@@ -189,7 +212,7 @@ private:
         kDone
     };
 
-    CollectionMetadata _getCurrentMetadataAndCheckEpoch();
+    CollectionMetadata _getCurrentMetadataAndCheckForConflictingErrors();
 
     /**
      * Called when any of the states fails. May only be called once and will put the migration
@@ -206,6 +229,9 @@ private:
      * Resulting state: kDone
      */
     void _cleanupOnError() noexcept;
+
+    // Mutex to protect concurrent reads and writes to internal attributes
+    mutable stdx::mutex _mutex;
 
     // This is the opCtx of the moveChunk request that constructed the MigrationSourceManager.
     // The caller must guarantee it outlives the MigrationSourceManager.
@@ -229,9 +255,6 @@ private:
     // Information about the moveChunk to be used in the critical section.
     const BSONObj _critSecReason;
 
-    // It states whether the critical section has to be acquired on the recipient.
-    const bool _acquireCSOnRecipient;
-
     // Times the entire moveChunk operation
     const Timer _entireOpTimer;
 
@@ -253,9 +276,7 @@ private:
     // sharding runtime for the collection
     class ScopedRegisterer {
     public:
-        ScopedRegisterer(MigrationSourceManager* msm,
-                         CollectionShardingRuntime* csr,
-                         const CollectionShardingRuntime::CSRLock& csrLock);
+        ScopedRegisterer(MigrationSourceManager* msm, CollectionShardingRuntime& csr);
         ~ScopedRegisterer();
 
     private:
@@ -266,8 +287,10 @@ private:
     // The epoch of the collection being migrated and its UUID, as of the time the migration
     // started. Values are boost::optional only up until the constructor runs, because UUID doesn't
     // have a default constructor.
+    // TODO SERVER-80188: remove _collectionEpoch once 8.0 becomes last-lts.
     boost::optional<OID> _collectionEpoch;
     boost::optional<UUID> _collectionUUID;
+    boost::optional<Timestamp> _collectionTimestamp;
 
     // The version of the chunk at the time the migration started.
     boost::optional<ChunkVersion> _chunkVersion;
@@ -292,7 +315,7 @@ private:
     // Optional future that is populated if the migration succeeds and range deletion is scheduled
     // on this node. The future is set when the range deletion completes. Used if the moveChunk was
     // sent with waitForDelete.
-    boost::optional<SemiFuture<void>> _cleanupCompleteFuture;
+    boost::optional<SharedSemiFuture<void>> _cleanupCompleteFuture;
 };
 
 }  // namespace mongo

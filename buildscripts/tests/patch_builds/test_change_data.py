@@ -1,14 +1,13 @@
 """Unit tests for buildscripts.patch_builds.change_data.py."""
+
 from __future__ import absolute_import
 
 import os
 import unittest
 
-from mock import patch, MagicMock
+from mock import MagicMock, patch
 
 import buildscripts.patch_builds.change_data as under_test
-
-# pylint: disable=missing-docstring
 
 NS = "buildscripts.patch_builds.change_data"
 

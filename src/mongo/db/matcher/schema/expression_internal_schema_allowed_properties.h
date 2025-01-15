@@ -30,13 +30,27 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <cstddef>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_visitor.h"
 #include "mongo/db/matcher/expression_with_placeholder.h"
+#include "mongo/db/matcher/match_details.h"
+#include "mongo/db/matcher/matchable.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/pcre.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -136,9 +150,11 @@ public:
     bool matches(const MatchableDocument* doc, MatchDetails* details) const final;
     bool matchesSingleElement(const BSONElement& element, MatchDetails* details) const final;
 
-    void serialize(BSONObjBuilder* builder, bool includePath) const final;
+    void serialize(BSONObjBuilder* builder,
+                   const SerializationOptions& opts = {},
+                   bool includePath = true) const final;
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
     std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
@@ -149,7 +165,7 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
-        invariant(i < numChildren());
+        tassert(6400212, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
 
         if (i == 0) {
             return _otherwise->getFilter();
@@ -158,7 +174,7 @@ public:
         return _patternProperties[i - 1].second->getFilter();
     }
 
-    virtual void resetChild(size_t i, MatchExpression* other) {
+    void resetChild(size_t i, MatchExpression* other) override {
         tassert(6329408, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
 
         if (i == 0) {
@@ -184,6 +200,14 @@ public:
         return _patternProperties;
     }
 
+    StringData getNamePlaceholder() const {
+        return _namePlaceholder;
+    }
+
+    const ExpressionWithPlaceholder* getOtherwise() const {
+        return _otherwise.get();
+    }
+
 private:
     ExpressionOptimizerFunc getOptimizer() const final;
 
@@ -191,10 +215,6 @@ private:
      * Helper function for matches() and matchesSingleElement().
      */
     bool _matchesBSONObj(const BSONObj& obj) const;
-
-    void _doAddDependencies(DepsTracker* deps) const final {
-        deps->needWholeDocument = true;
-    }
 
     // The names of the properties are owned by the BSONObj used to create this match expression.
     // Since that BSONObj must outlive this object, we can safely store StringData.

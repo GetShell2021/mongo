@@ -8,10 +8,8 @@
  * @tags: [requires_majority_read_concern]
  */
 
-load("jstests/libs/write_concern_util.js");
-
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const majorityWriteConcern = {
     writeConcern: {w: "majority", wtimeout: 60 * 1000}
@@ -55,8 +53,7 @@ const testCases = {
 
 // Set up a set and grab things for later.
 var name = "read_committed";
-var replTest =
-    new ReplSetTest({name: name, nodes: 3, nodeOptions: {enableMajorityReadConcern: ''}});
+var replTest = new ReplSetTest({name: name, nodes: 3});
 
 replTest.startSet();
 var nodes = replTest.nodeList();
@@ -176,4 +173,3 @@ for (var testName in testCases) {
     }
 }
 replTest.stopSet();
-}());

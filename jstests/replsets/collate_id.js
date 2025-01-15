@@ -1,7 +1,6 @@
 // Test that oplog application on the secondary happens correctly when the collection has a default
 // collation and operations by _id which must respect the collation are issued.
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 Random.setRandomSeed();
 
@@ -40,6 +39,8 @@ assert.commandWorked(primary.adminCommand(
 // on the secondary in a large batch.
 assert.commandWorked(
     secondaryDB.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "alwaysOn"}));
+checkLog.contains(secondaryDB,
+                  "rsSyncApplyStop fail point enabled. Blocking until fail point is disabled");
 
 assert.commandWorked(primaryDB.createCollection(primaryColl.getName(), caseInsensitive));
 
@@ -69,4 +70,3 @@ assert.commandWorked(
 replTest.awaitReplication();
 assert.eq(0, secondaryColl.find().itcount());
 replTest.stopSet();
-})();

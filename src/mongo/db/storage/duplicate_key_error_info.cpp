@@ -27,16 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
+#include <vector>
 
-#include "mongo/db/storage/duplicate_key_error_info.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/text.h"
-#include "mongo/util/visit_helper.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
+#include "mongo/util/text.h"                // IWYU pragma: keep
 
 namespace mongo {
 namespace {
@@ -48,13 +53,17 @@ MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(DuplicateKeyErrorInfo);
 DuplicateKeyErrorInfo::DuplicateKeyErrorInfo(const BSONObj& keyPattern,
                                              const BSONObj& keyValue,
                                              const BSONObj& collation,
-                                             FoundValue&& foundValue)
+                                             FoundValue&& foundValue,
+                                             boost::optional<RecordId> duplicateRid)
     : _keyPattern(keyPattern.getOwned()),
       _keyValue(keyValue.getOwned()),
       _collation(collation.getOwned()),
       _foundValue(std::move(foundValue)) {
-    if (auto foundValueObj = stdx::get_if<BSONObj>(&_foundValue)) {
+    if (auto foundValueObj = get_if<BSONObj>(&_foundValue)) {
         _foundValue = foundValueObj->getOwned();
+    }
+    if (duplicateRid) {
+        _duplicateRid = *duplicateRid;
     }
 }
 
@@ -94,17 +103,20 @@ void DuplicateKeyErrorInfo::serialize(BSONObjBuilder* bob) const {
         bob->append("collation", _collation);
     }
 
-    stdx::visit(
-        visit_helper::Overloaded{
-            [](stdx::monostate) {},
-            [bob](const RecordId& rid) { rid.serializeToken("foundValue", bob); },
-            [bob](const BSONObj& obj) {
-                if (obj.objsize() < BSONObjMaxUserSize / 2) {
-                    bob->append("foundValue", obj);
-                }
-            },
-        },
-        _foundValue);
+    visit(OverloadedVisitor{
+              [](std::monostate) {},
+              [bob](const RecordId& rid) { rid.serializeToken("foundValue", bob); },
+              [bob](const BSONObj& obj) {
+                  if (obj.objsize() < BSONObjMaxUserSize / 2) {
+                      bob->append("foundValue", obj);
+                  }
+              },
+          },
+          _foundValue);
+
+    if (_duplicateRid) {
+        _duplicateRid->serializeToken("duplicateRid", bob);
+    }
 }
 
 std::shared_ptr<const ErrorExtraInfo> DuplicateKeyErrorInfo::parse(const BSONObj& obj) {
@@ -146,8 +158,13 @@ std::shared_ptr<const ErrorExtraInfo> DuplicateKeyErrorInfo::parse(const BSONObj
         }
     }
 
+    boost::optional<RecordId> duplicateRid;
+    if (auto duplicateRidElt = obj["duplicateRid"]) {
+        duplicateRid = RecordId::deserializeToken(duplicateRidElt);
+    }
+
     return std::make_shared<DuplicateKeyErrorInfo>(
-        keyPattern, keyValue, collation, std::move(foundValue));
+        keyPattern, keyValue, collation, std::move(foundValue), duplicateRid);
 }
 
 }  // namespace mongo

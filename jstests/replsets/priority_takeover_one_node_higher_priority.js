@@ -3,10 +3,10 @@
 // Wait for replica set to stabilize with higher priority node as primary.
 // Step down high priority node. Wait for the lower priority electable node to become primary.
 // Eventually high priority node will run a priority takeover election to become primary.
-(function() {
-'use strict';
-load('jstests/replsets/rslib.js');
-load('jstests/replsets/libs/election_metrics.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    verifyServerStatusElectionReasonCounterChange
+} from "jstests/replsets/libs/election_metrics.js";
 
 var name = 'priority_takeover_one_node_higher_priority';
 var replSet = new ReplSetTest({
@@ -18,7 +18,7 @@ var replSet = new ReplSetTest({
     ]
 });
 replSet.startSet();
-replSet.initiate();
+replSet.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 replSet.waitForState(replSet.nodes[0], ReplSetTest.State.PRIMARY);
 var primary = replSet.getPrimary();
@@ -30,7 +30,7 @@ replSet.awaitReplication();
 
 // Primary should step down long enough for election to occur on secondary.
 var config = assert.commandWorked(primary.adminCommand({replSetGetConfig: 1})).config;
-assert.commandWorked(primary.adminCommand({replSetStepDown: replSet.kDefaultTimeoutMS / 1000}));
+assert.commandWorked(primary.adminCommand({replSetStepDown: replSet.timeoutMS / 1000}));
 
 // Step down primary and wait for node 1 to be promoted to primary.
 replSet.waitForState(replSet.nodes[1], ReplSetTest.State.PRIMARY);
@@ -53,4 +53,3 @@ verifyServerStatusElectionReasonCounterChange(initialPrimaryStatus.electionMetri
                                               true /* allowGreater */);
 
 replSet.stopSet();
-})();

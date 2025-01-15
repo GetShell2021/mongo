@@ -5,11 +5,9 @@
  * @tags: [uses_transactions]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const rst = new ReplSetTest({
     name: jsTestName(),
@@ -19,7 +17,7 @@ const rst = new ReplSetTest({
 });
 
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 const node0 = rst.getPrimary();
 const node1 = rst.getSecondaries()[0];
 const node2 = rst.getSecondaries()[1];
@@ -49,7 +47,7 @@ rollbackFp.off();
 
 // Wait for node0 to step-up to avoid InterrupetedDueToReplStateChange errors in the inserts below.
 restartServerReplication([node1, node2]);
-rst.awaitNodesAgreeOnPrimary(rst.kDefaultTimeoutMS, rst.nodes, node0);
+rst.awaitNodesAgreeOnPrimary(rst.timeoutMS, rst.nodes, node0);
 rst.awaitReplication();
 
 // Advance the lastApplied on node0.
@@ -60,7 +58,7 @@ rst.awaitReplication();
 // When node0 stepped down it will start syncing again from node2, and it shouldn't crash trying to
 // apply entries older than the lastApplied.
 rst.stepUp(node2);
-rst.awaitNodesAgreeOnPrimary(rst.kDefaultTimeoutMS, rst.nodes, node2);
+rst.awaitNodesAgreeOnPrimary(rst.timeoutMS, rst.nodes, node2);
 rst.awaitReplication();
 
 // Verify node0 can replicate new writes.
@@ -68,4 +66,3 @@ assert.commandWorked(node2.getDB('test')[collName].insert({_id: "write 4"}));
 rst.awaitReplication();
 
 rst.stopSet();
-})();

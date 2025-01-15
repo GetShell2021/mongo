@@ -6,19 +6,15 @@
  *
  * @tags: [assumes_against_mongod_not_mongos]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/analyze_plan.js");  // For getAggPlanStages().
+import {getAggPlanStages} from "jstests/libs/query/analyze_plan.js";
 
 const coll = db[jsTestName()];
 coll.drop();
 const bigStr = Array(1025).toString();  // 1KB of ','
 const nDocs = 1000;
 const nPartitions = 50;
-// Initial docSize is 1292, after fields are loaded into Document's cache they are 2332.
-// Not const because post-cache doc size changes based on the number of fields accessed.
-let docSize = 2332;
+// Size was found through logging in 'SpillableDeque' class.
+const docSize = 1292;
 
 let bulk = coll.initializeUnorderedBulkOp();
 for (let i = 1; i <= nDocs; i++) {
@@ -94,7 +90,7 @@ function checkExplainResult(pipeline, expectedFunctionMemUsages, expectedTotalMe
     // each function. For the default [unbounded, unbounded] window type, each function uses memory
     // usage comparable to it's $group counterpart.
     let expectedFunctionMemUsages = {
-        count: 60,
+        count: 72,
         push: nDocs * 1024,
         set: 1024,
     };
@@ -137,9 +133,6 @@ function checkExplainResult(pipeline, expectedFunctionMemUsages, expectedTotalMe
     const windowSize = 10;
     // The partition iterator will only hold five documents at once. After they are added to the
     // removable document executor they will be released.
-    const numDocsHeld = 5;
-    // This test accesses fewer fields, reduce docSize accordingly.
-    docSize = 1292;
     let pipeline = [
         {
             $setWindowFields: {
@@ -217,4 +210,3 @@ function checkExplainResult(pipeline, expectedFunctionMemUsages, expectedTotalMe
     checkExplainResult(pipeline, expectedFunctionMemUsages, expectedTotal, "executionStats");
     checkExplainResult(pipeline, expectedFunctionMemUsages, expectedTotal, "allPlansExecution");
 })();
-}());

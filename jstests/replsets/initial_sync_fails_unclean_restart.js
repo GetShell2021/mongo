@@ -6,18 +6,15 @@
  * shutdown. See SERVER-50140 for more details.
  * @tags: [requires_persistence]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint, kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const dbName = "test";
 const collName = "coll";
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
-rst.initiate();
+rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 let syncSourceNode = rst.getPrimary();
 const syncSourceColl = syncSourceNode.getDB(dbName)[collName];
@@ -103,4 +100,3 @@ assert.eq(MongoRunner.EXIT_ABRUPT, waitMongoProgram(initialSyncNode.port));
 rst.remove(initialSyncNode);
 
 rst.stopSet();
-})();

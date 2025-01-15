@@ -4,13 +4,15 @@
  * @tags: [
  *   does_not_support_stepdowns,
  *   requires_replication,
- *   multiversion_incompatible
  *  ]
  */
-(function() {
-'use strict';
-
-load('jstests/libs/cluster_server_parameter_utils.js');
+import {
+    setupReplicaSet,
+    testGetClusterParameterStar,
+    testInvalidClusterParameterCommands,
+    testValidClusterParameterCommands,
+} from "jstests/libs/cluster_server_parameter_utils.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Tests that set/getClusterParameter works on a non-sharded replica set.
 const rst = new ReplSetTest({
@@ -29,5 +31,7 @@ testInvalidClusterParameterCommands(rst);
 // majority of the nodes in the replica set.
 testValidClusterParameterCommands(rst);
 
+// Ensure that getClusterParameter: "*" works as expected.
+testGetClusterParameterStar(rst);
+
 rst.stopSet();
-})();

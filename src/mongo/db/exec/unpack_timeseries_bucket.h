@@ -29,8 +29,14 @@
 
 #pragma once
 
-#include "mongo/db/exec/bucket_unpacker.h"
+#include <memory>
+
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/timeseries/bucket_unpacker.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo {
 /**
@@ -45,13 +51,13 @@ public:
     UnpackTimeseriesBucket(ExpressionContext* expCtx,
                            WorkingSet* ws,
                            std::unique_ptr<PlanStage> child,
-                           BucketUnpacker bucketUnpacker);
+                           timeseries::BucketUnpacker bucketUnpacker);
 
     StageType stageType() const final {
-        return STAGE_UNPACK_TIMESERIES_BUCKET;
+        return STAGE_UNPACK_SAMPLED_TS_BUCKET;
     }
 
-    bool isEOF() final {
+    bool isEOF() const final {
         return !_bucketUnpacker.hasNext() && child()->isEOF();
     }
 
@@ -61,11 +67,11 @@ public:
         return &_specificStats;
     }
 
-    PlanStage::StageState doWork(WorkingSetID* id);
+    PlanStage::StageState doWork(WorkingSetID* id) override;
 
 private:
     WorkingSet& _ws;
-    BucketUnpacker _bucketUnpacker;
+    timeseries::BucketUnpacker _bucketUnpacker;
     UnpackTimeseriesBucketStats _specificStats;
 };
 }  //  namespace mongo

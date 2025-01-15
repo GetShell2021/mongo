@@ -1,11 +1,13 @@
 /**
  * Runs dbCheck in background.
  */
-'use strict';
-
-(function() {
-load('jstests/libs/discover_topology.js');  // For Topology and DiscoverTopology.
-load('jstests/libs/parallelTester.js');     // For Thread.
+import {DiscoverTopology, Topology} from "jstests/libs/discover_topology.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    assertForDbCheckErrorsForAllNodes,
+    runDbCheckForDatabase
+} from "jstests/replsets/libs/dbcheck_utils.js";
 
 if (typeof db === 'undefined') {
     throw new Error(
@@ -22,6 +24,18 @@ const conn = db.getMongo();
 const topology = DiscoverTopology.findConnectedNodes(conn);
 
 const exceptionFilteredBackgroundDbCheck = function(hosts) {
+    // Set a higher rate to let 'maxDocsPerBatch' be the only limiting factor.
+    assert.commandWorkedOrFailedWithCode(
+        db.adminCommand({setParameter: 1, maxDbCheckMBperSec: 1024}), ErrorCodes.InvalidOptions);
+
+    hosts.forEach((host) => {
+        const hostConn = new Mongo(host);
+        assert.commandWorkedOrFailedWithCode(
+            hostConn.getDB("admin").adminCommand(
+                {setParameter: 1, dbCheckSecondaryBatchMaxTimeMs: 30000}),
+            ErrorCodes.InvalidOptions);
+        hostConn.close();
+    });
     const runBackgroundDbCheck = function(hosts) {
         const quietly = (func) => {
             const printOriginal = print;
@@ -42,7 +56,7 @@ const exceptionFilteredBackgroundDbCheck = function(hosts) {
             rst = new ReplSetTest(hosts[0]);
         });
 
-        const dbNames = new Set();
+        const dbs = new Map();
         const primary = rst.getPrimary();
 
         const version = assert
@@ -57,58 +71,48 @@ const exceptionFilteredBackgroundDbCheck = function(hosts) {
         print("Running dbCheck for: " + rst.getURL());
 
         const adminDb = primary.getDB('admin');
-        let res = assert.commandWorked(adminDb.runCommand({listDatabases: 1, nameOnly: true}));
+
+        const multitenancyRes = adminDb.adminCommand({getParameter: 1, multitenancySupport: 1});
+        const multitenancy = multitenancyRes.ok && multitenancyRes["multitenancySupport"];
+
+        const cmdObj = multitenancy ? {listDatabasesForAllTenants: 1} : {listDatabases: 1};
+
+        let res = assert.commandWorked(adminDb.runCommand(cmdObj));
         for (let dbInfo of res.databases) {
-            dbNames.add(dbInfo.name);
+            const key = `${dbInfo.tenantId}_${dbInfo.name}`;
+            const obj = {name: dbInfo.name, tenant: dbInfo.tenantId};
+            dbs.set(key, obj);
         }
 
         // Transactions cannot be run on the following databases so we don't attempt to read at a
         // clusterTime on them either. (The "local" database is also not replicated.)
         // The config.transactions collection is different between primaries and secondaries.
-        dbNames.delete('config');
-        dbNames.delete('local');
-
-        dbNames.forEach((dbName) => {
-            assert.commandWorked(primary.getDB(dbName).runCommand({dbCheck: 1}));
-            jsTestLog("dbCheck done on database " + dbName);
-
-            const dbCheckCompleted = (db) => {
-                return db.currentOp({$all: true}).inprog.filter(x => x["desc"] === "dbCheck")[0] ===
-                    undefined;
-            };
-
-            assert.soon(() => dbCheckCompleted(adminDb),
-                        "timed out waiting for dbCheck to finish on database: " + dbName);
-        });
-
-        // Wait for all secondaries to finish applying all dbcheck batches.
-        rst.awaitReplication();
-
-        const nodes = [
-            rst.getPrimary(),
-            ...rst.getSecondaries().filter(conn => {
-                return !conn.adminCommand({isMaster: 1}).arbiterOnly;
-            })
-        ];
-        nodes.forEach((node) => {
-            // Assert no errors (i.e., found inconsistencies). Allow warnings. Tolerate
-            // SnapshotTooOld errors, as they can occur if the primary is slow enough processing a
-            // batch that the secondary is unable to obtain the timestamp the primary used.
-            const healthlog = node.getDB('local').system.healthlog;
-            // Regex matching strings that start without "SnapshotTooOld"
-            const regexStringWithoutSnapTooOld = /^((?!^SnapshotTooOld).)*$/;
-            let errs =
-                healthlog.find({"severity": "error", "data.error": regexStringWithoutSnapTooOld});
-            if (errs.hasNext()) {
-                const err = "dbCheck found inconsistency on " + node.host;
-                jsTestLog(err + ". Errors: ");
-                for (let count = 0; errs.hasNext() && count < 20; count++) {
-                    jsTestLog(tojson(errs.next()));
-                }
-                assert(false, err);
+        dbs.forEach((db, key) => {
+            if (["config", "local"].includes(db.name)) {
+                dbs.delete(key);
             }
-            jsTestLog("Checked health log on " + node.host);
         });
+
+        dbs.forEach((db, key) => {
+            jsTestLog("dbCheck is starting on database " + (db.tenant ? db.tenant + "_" : "") +
+                      db.name + " for RS: " + rst.getURL());
+            try {
+                const token = db.tenant ? _createTenantToken({tenant: db.tenant}) : undefined;
+                rst.nodes.forEach(node => node._setSecurityToken(token));
+
+                runDbCheckForDatabase(rst,
+                                      primary.getDB(db.name),
+                                      true /*awaitCompletion*/,
+                                      20 * 60 * 1000 /*awaitCompletionTimeoutMs*/,
+                                      {maxBatchTimeMillis: 1000} /*dbCheckParameters*/);
+            } finally {
+                rst.nodes.forEach(node => node._setSecurityToken(undefined));
+            }
+            jsTestLog("dbCheck is done on database " + db.name + " for RS: " + rst.getURL());
+        });
+
+        assertForDbCheckErrorsForAllNodes(
+            rst, true /*assertForErrors*/, false /*assertForWarnings*/);
 
         return {ok: 1};
     };
@@ -159,6 +163,7 @@ if (topology.type === Topology.kReplicaSet) {
             }
         });
         if (exception) {
+            // eslint-disable-next-line
             throw exception;
         }
 
@@ -170,4 +175,3 @@ if (topology.type === Topology.kReplicaSet) {
 } else {
     throw new Error('Unsupported topology configuration: ' + tojson(topology));
 }
-})();

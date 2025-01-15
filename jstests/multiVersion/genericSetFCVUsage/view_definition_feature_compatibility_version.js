@@ -6,9 +6,6 @@
  * @tags: [requires_persistence]
  */
 
-(function() {
-"use strict";
-
 const testName = "view_definition_feature_compatibility_version_multiversion";
 const dbpath = MongoRunner.dataPath + testName;
 
@@ -54,7 +51,8 @@ function testViewDefinitionFCVBehavior(lastVersion, testCases, featureFlags = []
     }
 
     // Explicitly set feature compatibility version to the latest version.
-    assert.commandWorked(testDB.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+    assert.commandWorked(
+        testDB.adminCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
 
     // Test that we are able to create a new view with any of the new features.
     testCases.forEach(
@@ -78,13 +76,14 @@ function testViewDefinitionFCVBehavior(lastVersion, testCases, featureFlags = []
     assert.commandWorked(testDB.createView("emptyView", "coll", []));
 
     // Set the feature compatibility version to the last version.
-    assert.commandWorked(
-        testDB.adminCommand({setFeatureCompatibilityVersion: binVersionToFCV(lastVersion)}));
+    assert.commandWorked(testDB.adminCommand(
+        {setFeatureCompatibilityVersion: binVersionToFCV(lastVersion), confirm: true}));
 
     // Read against an existing view using new query features should not fail.
-    testCases.forEach(
-        (pipe, i) => assert.commandWorked(testDB.runCommand({find: "firstView" + i}),
-                                          `Failed to query view with pipeline ${tojson(pipe)}`));
+    testCases.forEach((pipe, i) => {
+        assert.commandWorked(testDB.runCommand({find: "firstView" + i}),
+                             `Failed to query view with pipeline ${tojson(pipe)}`);
+    });
 
     // Trying to create a new view in the same database as existing invalid view should fail,
     // even if the new view doesn't use any new query features.
@@ -148,12 +147,14 @@ function testViewDefinitionFCVBehavior(lastVersion, testCases, featureFlags = []
     testDB = conn.getDB(testName);
 
     // Read against an existing view using new query features should not fail.
-    testCases.forEach(
-        (pipe, i) => assert.commandWorked(testDB.runCommand({find: "firstView" + i}),
-                                          `Failed to query view with pipeline ${tojson(pipe)}`));
+    testCases.forEach((pipe, i) => {
+        assert.commandWorked(testDB.runCommand({find: "firstView" + i}),
+                             `Failed to query view with pipeline ${tojson(pipe)}`);
+    });
 
     // Set the feature compatibility version back to the latest version.
-    assert.commandWorked(testDB.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+    assert.commandWorked(
+        testDB.adminCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
 
     testCases.forEach(function(pipe, i) {
         assert.commandWorked(testDB.runCommand({find: "firstView" + i}),
@@ -176,8 +177,8 @@ function testViewDefinitionFCVBehavior(lastVersion, testCases, featureFlags = []
 
     // Set the feature compatibility version to the last version and then restart with
     // internalValidateFeaturesAsPrimary=false.
-    assert.commandWorked(
-        testDB.adminCommand({setFeatureCompatibilityVersion: binVersionToFCV(lastVersion)}));
+    assert.commandWorked(testDB.adminCommand(
+        {setFeatureCompatibilityVersion: binVersionToFCV(lastVersion), confirm: true}));
     MongoRunner.stopMongod(conn);
     conn = MongoRunner.runMongod({
         dbpath: dbpath,
@@ -190,8 +191,8 @@ function testViewDefinitionFCVBehavior(lastVersion, testCases, featureFlags = []
 
     testCases.forEach(function(pipe, i) {
         // Even though the feature compatibility version is the last version, we should still be
-        // able to create a view using new query features, because internalValidateFeaturesAsPrimary
-        // is false.
+        // able to create a view using new query features, because
+        // internalValidateFeaturesAsPrimary is false.
         assert.commandWorked(
             testDB.createView("thirdView" + i, "coll", pipe),
             `Expected to be able to create view with pipeline ${tojson(pipe)} while in FCV` +
@@ -230,4 +231,3 @@ testViewDefinitionFCVBehavior(
 testViewDefinitionFCVBehavior("last-continuous", testCasesLastContinuous);
 testViewDefinitionFCVBehavior(
     "last-continuous", testCasesLastContinuousWithFeatureFlags, featureFlagsToEnable);
-}());

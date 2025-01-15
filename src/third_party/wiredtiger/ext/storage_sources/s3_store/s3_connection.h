@@ -1,4 +1,3 @@
-
 /*-
  * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
@@ -26,8 +25,8 @@
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
  */
-#ifndef S3CONNECTION
-#define S3CONNECTION
+#ifndef S3CONNECTION_H
+#define S3CONNECTION_H
 
 #include <aws/auth/credentials.h>
 #include <aws/core/Aws.h>
@@ -45,18 +44,21 @@ static const std::map<Aws::Http::HttpResponseCode, int32_t> toErrno = {
   {Aws::Http::HttpResponseCode::BAD_REQUEST, EINVAL},
   {Aws::Http::HttpResponseCode::INTERNAL_SERVER_ERROR, EAGAIN}};
 
-// This class represents an active connection to the AWS S3 endpoint and allows for interaction with
-// S3-Crt client. The S3Connection exposes an API to list the bucket contents filtered by a
-// directory and a prefix, check for an object's existence in the bucket, put an object to the
-// cloud, and get the object from the cloud. Though not required for the file system's
-// implementation, the class also provides the means to delete the objects to clean up artifacts
-// from the internal unit testing. Note we are using S3-Crt client in this class, which differs to
-// the S3 client.
+/*
+ * This class represents an active connection to the AWS S3 endpoint and allows for interaction with
+ * S3-Crt client. The S3Connection exposes an API to list the bucket contents filtered by a
+ * directory and a prefix, check for an object's existence in the bucket, put an object to the
+ * cloud, and get the object from the cloud. Though not required for the file system's
+ * implementation, the class also provides the means to delete the objects to clean up artifacts
+ * from the internal unit testing. Note we are using S3-Crt client in this class, which differs to
+ * the S3 client.
+ */
 class S3Connection {
-    public:
-    // We have two constructors for the two different ways to start a S3 connection.
-    // First constructor uses provided credentials, the following uses credentials stored in a local
-    // file.
+public:
+    /*
+     * We have two constructors for the two different ways to start a S3 connection. First
+     * constructor uses provided credentials, the following uses credentials stored in a local file.
+     */
     S3Connection(const Aws::Auth::AWSCredentials &credentials,
       const Aws::S3Crt::ClientConfiguration &config, const std::string &bucketName,
       const std::string &objPrefix = "");
@@ -67,11 +69,12 @@ class S3Connection {
     int PutObject(const std::string &objectKey, const std::string &fileName) const;
     int DeleteObject(const std::string &objectKey) const;
     int ObjectExists(const std::string &objectKey, bool &exists, size_t &objectSize) const;
-    int GetObject(const std::string &objectKey, const std::string &path) const;
+    int ReadObjectWithRange(
+      const std::string &objectKey, size_t offset, size_t len, void *buf) const;
 
     ~S3Connection() = default;
 
-    private:
+private:
     const Aws::S3Crt::S3CrtClient _s3CrtClient;
     const std::string _bucketName;
     const std::string _objectPrefix;

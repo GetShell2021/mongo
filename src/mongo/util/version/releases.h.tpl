@@ -77,9 +77,8 @@
 ## Format a Version as `{major}_{minor}`.
 #def underscores(v): ${'{}_{}'.format(v.major, v.minor)}
 #def dotted(v): ${'{}.{}'.format(v.major, v.minor)}
-## TODO (SERVER-65400): Avoid generating the LTS FCV with 'kFullyDowngradedTo...'
-#def fcv_prefix(v): ${'kFullyDowngradedTo_' if v == $lower_bound_override else 'kVersion_'}
-#def fcv_cpp_name(v): ${'{}{}'.format($fcv_prefix(v), $underscores(v))}
+
+#def fcv_cpp_name(v): ${'kVersion_{}'.format($underscores(v))}
 ##
 #def transition_enum_name(transition, first, second):
 k$(transition)_$(underscores(first))_To_$(underscores(second))#slurp
@@ -112,12 +111,19 @@ fcv_list = []
 # A list of (FCV enum name, FCV string) tuples for all the transitioning FCV values.
 transition_fcvs = []
 
+# A list of (transition-fcv-enum, from-fcv-enum, to-fcv-enum) tuples for all the transitioning FCV values.
+transition_lookup_fcvs = []
+
 for fcv_x in fcvs[bisect_left(fcvs, lts_cutoff):bisect_right(fcvs, latest)]:
     fcv_list.append((self.fcv_cpp_name(fcv_x), self.dotted(fcv_x)))
     if fcv_x in generic_fcvs.values():
         up_transitions = []
         down_transitions = []
         for fcv_y in filter(lambda y : y > fcv_x, generic_fcvs.values()):
+            transition_lookup_fcvs.append((self.transition_enum_name(up, fcv_x, fcv_y),
+                            self.fcv_cpp_name(fcv_x), self.fcv_cpp_name(fcv_y)))
+            transition_lookup_fcvs.append((self.transition_enum_name(down, fcv_y, fcv_x),
+                            self.fcv_cpp_name(fcv_y), self.fcv_cpp_name(fcv_x)))
             up_transitions.append((self.transition_enum_name(up, fcv_x, fcv_y),
                             f'upgrading from {self.dotted(fcv_x)} to {self.dotted(fcv_y)}')) 
             down_transitions.append((self.transition_enum_name(down, fcv_y, fcv_x),
@@ -140,10 +146,6 @@ for fcv_x in fcvs[bisect_left(fcvs, lts_cutoff):bisect_right(fcvs, latest)]:
  * features of the older of the two versions.
  *
  * For versions X and Y, the legal enums and featureCompatibilityVersion documents are:
- *
- * kFullyDowngradedTo_X
- * (X, Unset, Unset): Only version X features are available, and new and existing storage
- *                    engine entries use the X format
  *
  * kUpgradingFrom_X_To_Y
  * (X, Y, Unset): Only version X features are available, but new storage engine entries
@@ -174,12 +176,12 @@ enum class FeatureCompatibilityVersion {
 };
 
 ## Calculate number of versions since v4.0.
-constexpr size_t kSince_$underscores(Version('4.0')) = ${bisect_left(fcvs, latest)};
+inline constexpr size_t kSince_$underscores(Version('4.0')) = ${bisect_left(fcvs, latest)};
 
 // Last LTS was "$last_lts".
-constexpr size_t kSinceLastLTS = ${bisect_left(fcvs, latest) - bisect_left(fcvs, last_lts)};
+inline constexpr size_t kSinceLastLTS = ${bisect_left(fcvs, latest) - bisect_left(fcvs, last_lts)};
 
-constexpr inline StringData kParameterName = "featureCompatibilityVersion"_sd;
+inline constexpr StringData kParameterName = "featureCompatibilityVersion"_sd;
 
 class GenericFCV {
 #def define_fcv_alias(id, v):
@@ -243,6 +245,24 @@ constexpr StringData toString(FeatureCompatibilityVersion v) {
     return findExtended(v).second;
 }
 
+inline int majorVersion(FeatureCompatibilityVersion v) {
+    auto str = toString(v);
+    auto pos = str.rfind('.');
+    if (pos == std::string::npos) {
+        return -1;
+    }
+    return stoi(str.substr(pos-1, 1).toString());
+}
+
+inline int minorVersion(FeatureCompatibilityVersion v) {
+    auto str = toString(v);
+    auto pos = str.rfind('.');
+    if (pos == std::string::npos) {
+        return -1;
+    }
+    return stoi(str.substr(pos+1, 1).toString());
+}
+
 /**
  * Pointers to nodes of the extended table that represent numbered software versions.
  * Other FCV enum members, such as those representing transitions, are excluded.
@@ -252,6 +272,29 @@ inline constexpr std::array standardFCVTable {
     &findExtended(FeatureCompatibilityVersion::$fcv),
 #end for
 };
+
+/**
+ * Maps transitional versions to their corresponding from and to versions.
+ */
+struct TransitionFCVInfo {
+    FeatureCompatibilityVersion transitional, from, to;
+};
+inline constexpr std::array transitionFCVInfoTable {
+#for tup in transition_lookup_fcvs:
+    TransitionFCVInfo{FeatureCompatibilityVersion::$tup[0],
+                      FeatureCompatibilityVersion::$tup[1],
+                      FeatureCompatibilityVersion::$tup[2]},
+#end for
+};
+
+constexpr TransitionFCVInfo getTransitionFCVInfo(FeatureCompatibilityVersion v) {
+    auto iter = std::find_if(transitionFCVInfoTable.begin(), transitionFCVInfoTable.end(), [&](auto&& e) {
+        return e.transitional == v;
+    });
+    if (iter == transitionFCVInfoTable.end())
+        throw std::out_of_range("Not found in transitionFCVInfoTable");
+    return *iter;
+}
 
 /**
  * Parses 'versionString', of the form "X.Y", to its corresponding FCV enum. For example, "5.1"

@@ -4,15 +4,14 @@
  * @tags: [uses_transactions, uses_multi_shard_transaction]
  */
 
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-var staticMongod = MongoRunner.runMongod({});  // For startParallelOps.
+var staticMongod = MongoRunner.runMongod({});
 
-let st = new ShardingTest({shards: 2, other: {shardOptions: {verbose: 1}}});
+let st = new ShardingTest({shards: 2, other: {rsOptions: {verbose: 1}}});
 
-assert.commandWorked(st.s.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'test', primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: 'test.user', key: {x: 1}}));
 assert.commandWorked(st.s.adminCommand({split: 'test.user', middle: {x: 42}}));
 assert.commandWorked(
@@ -74,4 +73,3 @@ commitTxn();
 
 st.stop();
 MongoRunner.stopMongod(staticMongod);
-})();

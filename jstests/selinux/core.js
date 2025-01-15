@@ -1,33 +1,19 @@
 
-'use strict';
+import {getPython3Binary} from "jstests/libs/python.js";
+import {SelinuxBaseTest} from "jstests/selinux/lib/selinux_base_test.js";
 
-load('jstests/selinux/lib/selinux_base_test.js');
-
-class TestDefinition extends SelinuxBaseTest {
-    get config() {
-        return {
-            "systemLog":
-                {"destination": "file", "logAppend": true, "path": "/var/log/mongodb/mongod.log"},
-            "storage": {"dbPath": "/var/lib/mongo", "journal": {"enabled": true}},
-            "processManagement": {
-                "fork": true,
-                "pidFilePath": "/var/run/mongodb/mongod.pid",
-                "timeZoneInfo": "/usr/share/zoneinfo"
-            },
-            "net": {"port": 27017, "bindIp": "127.0.0.1"}
-        };
-    }
-
-    run() {
-        // On RHEL7 there is no python3, but check_has_tag.py will also work with python2
-        const python = (0 == runNonMongoProgram("which", "python3")) ? "python3" : "python2";
+export class TestDefinition extends SelinuxBaseTest {
+    async run() {
+        const python = getPython3Binary();
 
         const dirs = ["jstests/core", "jstests/core_standalone"];
+
+        const TestData = {isHintsToQuerySettingsSuite: false};
 
         for (let dir of dirs) {
             jsTest.log("Running tests in " + dir);
 
-            const all_tests = ls(dir).filter(d => !d.endsWith("/")).sort();
+            const all_tests = ls(dir).filter(d => d.endsWith(".js")).sort();
             assert(all_tests);
             assert(all_tests.length);
 
@@ -36,19 +22,41 @@ class TestDefinition extends SelinuxBaseTest {
                 // we will not be fixing what is not working, and instead exclude them from running
                 // as "known" to not work. This is done by the means of "no_selinux" tag
                 const HAS_TAG = 0;
-                if (HAS_TAG ==
-                    runNonMongoProgram(python,
-                                       "buildscripts/resmokelib/utils/check_has_tag.py",
-                                       t,
-                                       "no_selinux")) {
+                const NO_TAG = 1;
+                let checkTagRc = runNonMongoProgram(
+                    python, "buildscripts/resmokelib/utils/check_has_tag.py", t, "^no_selinux$");
+                if (HAS_TAG == checkTagRc) {
                     jsTest.log("Skipping test due to no_selinux tag: " + t);
                     continue;
                 }
+                if (NO_TAG != checkTagRc) {
+                    throw ("Failure occurred while checking tags of test: " + t);
+                }
+
+                // Tests relying on featureFlagXXX will not work
+                checkTagRc = runNonMongoProgram(
+                    python, "buildscripts/resmokelib/utils/check_has_tag.py", t, "^featureFlag.+$");
+                if (HAS_TAG == checkTagRc) {
+                    jsTest.log("Skipping test due to feature flag tag: " + t);
+                    continue;
+                }
+                if (NO_TAG != checkTagRc) {
+                    throw ("Failure occurred while checking tags of test: " + t);
+                }
+
+                TestData.testName = t.substring(t.lastIndexOf('/') + 1, t.length - ".js".length);
 
                 jsTest.log("Running test: " + t);
-                if (!load(t)) {
+                try {
+                    let evalString = `TestData = ${tojson(TestData)}; load(${tojson(t)});`;
+                    let handle = startParallelShell(evalString, db.getMongo().port);
+                    let rc = handle();
+                    assert.eq(rc, 0);
+                } catch (e) {
+                    print(tojson(e));
                     throw ("failed to load test " + t);
                 }
+
                 jsTest.log("Successful test: " + t);
             }
         }

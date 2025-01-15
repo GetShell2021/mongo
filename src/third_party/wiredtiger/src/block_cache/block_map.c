@@ -9,19 +9,19 @@
 #include "wt_internal.h"
 
 /*
- * __wt_blkcache_map --
+ * __wti_blkcache_map --
  *     Map a segment of the file in, if possible.
  */
 int
-__wt_blkcache_map(WT_SESSION_IMPL *session, WT_BLOCK *block, void *mapped_regionp, size_t *lengthp,
-  void *mapped_cookiep)
+__wti_blkcache_map(WT_SESSION_IMPL *session, WT_BLOCK *block, void **mapped_regionp,
+  size_t *lengthp, void **mapped_cookiep)
 {
     WT_DECL_RET;
     WT_FILE_HANDLE *handle;
 
-    *(void **)mapped_regionp = NULL;
+    *mapped_regionp = NULL;
     *lengthp = 0;
-    *(void **)mapped_cookiep = NULL;
+    *mapped_cookiep = NULL;
 
     /* Map support is configurable. */
     if (!S2C(session)->mmap)
@@ -54,7 +54,7 @@ __wt_blkcache_map(WT_SESSION_IMPL *session, WT_BLOCK *block, void *mapped_region
      */
     ret = handle->fh_map(handle, (WT_SESSION *)session, mapped_regionp, lengthp, mapped_cookiep);
     if (ret == EBUSY || ret == ENOTSUP) {
-        *(void **)mapped_regionp = NULL;
+        *mapped_regionp = NULL;
         ret = 0;
     }
 
@@ -62,11 +62,11 @@ __wt_blkcache_map(WT_SESSION_IMPL *session, WT_BLOCK *block, void *mapped_region
 }
 
 /*
- * __wt_blkcache_unmap --
+ * __wti_blkcache_unmap --
  *     Unmap any mapped-in segment of the file.
  */
 int
-__wt_blkcache_unmap(WT_SESSION_IMPL *session, WT_BLOCK *block, void *mapped_region, size_t length,
+__wti_blkcache_unmap(WT_SESSION_IMPL *session, WT_BLOCK *block, void *mapped_region, size_t length,
   void *mapped_cookie)
 {
     WT_FILE_HANDLE *handle;
@@ -77,11 +77,11 @@ __wt_blkcache_unmap(WT_SESSION_IMPL *session, WT_BLOCK *block, void *mapped_regi
 }
 
 /*
- * __wt_blkcache_map_read --
+ * __wti_blkcache_map_read --
  *     Map address cookie referenced block into a buffer.
  */
 int
-__wt_blkcache_map_read(
+__wti_blkcache_map_read(
   WT_SESSION_IMPL *session, WT_ITEM *buf, const uint8_t *addr, size_t addr_size, bool *foundp)
 {
     WT_BLOCK *block;
@@ -94,8 +94,10 @@ __wt_blkcache_map_read(
 
     bm = S2BT(session)->bm;
 
-    if (!bm->map) /* FIXME WT-8728. */
+    if (!bm->map)
         return (0);
+
+    WT_ASSERT(session, !bm->is_multi_handle);
 
     block = bm->block;
 
@@ -103,9 +105,8 @@ __wt_blkcache_map_read(
     WT_RET(__wt_block_addr_unpack(
       session, block, addr, addr_size, &objectid, &offset, &size, &checksum));
 
-    /* Swap file handles if reading from a different object. */
-    if (block->objectid != objectid)
-        WT_RET(__wt_blkcache_get_handle(session, block, objectid, &block));
+    /* Not supported on multi-handle trees */
+    WT_ASSERT(session, block->objectid == objectid);
 
     /* Map the block if it's possible. */
     handle = block->fh->handle;

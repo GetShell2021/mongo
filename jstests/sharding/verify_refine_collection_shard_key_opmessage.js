@@ -1,10 +1,13 @@
 /**
  * Test that a special {op: 'n'} oplog event is created during refineCollectionShardKey command.
  *
- * @tags: [requires_fcv_60]
+ * @tags: [requires_fcv_61]
  */
-(function() {
-"use strict";
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
 
 const st = new ShardingTest({mongos: 1, shards: 2, rs: {nodes: 2}});
 
@@ -14,8 +17,7 @@ const kDbName = 'refineShardKey';
 const kCollName = 'coll';
 const kNsName = kDbName + '.' + kCollName;
 
-assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, primaryShard);
+assert.commandWorked(mongos.adminCommand({enableSharding: kDbName, primaryShard: primaryShard}));
 assert.commandWorked(mongos.adminCommand({shardCollection: kNsName, key: {_id: 1}}));
 assert.commandWorked(mongos.getCollection(kNsName).createIndex({_id: 1, akey: 1}));
 assert.commandWorked(
@@ -33,4 +35,3 @@ assert(logEntry != null);
 assert.eq(bsonWoCompare(logEntry.o2, o2expected), 0, logEntry);
 
 st.stop();
-})();

@@ -2,9 +2,6 @@
  * Validate that exceptions are reported correctly
  *
  */
-(function() {
-'use strict';
-
 let tests = [
     {
         callback: function() {
@@ -36,6 +33,7 @@ let tests = [
     },
     {
         callback: function() {
+            // eslint-disable-next-line
             foo.bar();
         },
         match: "uncaught exception: ReferenceError: foo is not defined :",
@@ -87,7 +85,7 @@ tests.forEach(function(t) {
         clearRawMongoProgramOutput();
         assert.throws(startParallelShell(
             code + ";\nrecurser(0," + depth + "," + tojson(t.callback) + ");", false, true));
-        let output = rawMongoProgramOutput();
+        let output = rawMongoProgramOutput(".*");
         let lines = output.split(/\s*\n|\\n/);
         let matchShellExp = false;
         while (lines.length > 0 & matchShellExp !== true) {
@@ -120,4 +118,3 @@ tests.forEach(function(t) {
         }
     });
 });
-})();

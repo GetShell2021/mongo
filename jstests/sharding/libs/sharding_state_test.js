@@ -1,12 +1,10 @@
-"use strict";
-
 /**
  * This file contains helpers for testing sharding state with various operations in the system.
  */
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-var ShardingStateTest = (function() {
-    load("jstests/replsets/rslib.js");
-
+export var ShardingStateTest = (function() {
     /**
      * Adds a node to the given shard or config server replica set. Also waits for the node
      * to become a steady-state secondary.
@@ -30,7 +28,7 @@ var ShardingStateTest = (function() {
         const newNode = replSet.add(addParams);
 
         replSet.reInitiate();
-        replSet.waitForState(newNode, ReplSetTest.State.SECONDARY);
+        replSet.awaitSecondaryNodes(null, [newNode]);
         replSet.waitForAllNewlyAddedRemovals();
 
         return newNode;
@@ -100,7 +98,24 @@ var ShardingStateTest = (function() {
     function checkShardingState(st) {
         jsTestLog("[ShardingStateTest] Performing sharding state checks.");
 
-        assert.commandWorked(st.s.getDB("sstDB").getCollection('sstColl').insert({"sstDoc": 1}));
+        const mongos = st.s;
+        const dbConn = mongos.getDB("sstDB");
+
+        jsTestLog("[ShardingStateTest] Check 1: Write to unsharded collection.");
+        assert.commandWorked(dbConn.getCollection("sstColl").insert({"sstDoc": 1}));
+
+        jsTestLog("[ShardingStateTest] Check 2: Query hashed collection.");
+
+        const shards = assert.commandWorked(mongos.adminCommand("listShards")).shards;
+
+        assert.commandWorked(dbConn.getCollection("sstHashedColl").createIndex({sstKey: "hashed"}));
+        assert.commandWorked(mongos.adminCommand({
+            shardCollection: "sstDB.sstHashedColl",
+            key: {sstKey: "hashed"},
+            numInitialChunks: shards.length,
+        }));
+
+        assert.eq(0, dbConn.getCollection("sstHashedColl").find().itcount());
 
         jsTestLog("[ShardingStateTest] Sharding state checks succeeded.");
     }

@@ -1,16 +1,11 @@
-// Validates the correctness of the '$tsSecond' and the '$tsIncrement' expression in the aggregation
-// pipeline.
-
-load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
-
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
 var testDB = db.getSiblingDB("expression_ts_second_increment");
 
 assert.commandWorked(testDB.dropDatabase());
 
-var coll = testDB.getCollection("test");
+const collName = jsTestName();
+var coll = testDB.getCollection(collName);
 
 assert.commandWorked(
     coll.insert({_id: 0, bsonTime: Timestamp(1622731060, 10), invalidBsonTime: 1622731060}));
@@ -68,5 +63,4 @@ assert.commandWorked(
                 }])
                 .toArray());
     assert.commandFailedWithCode(nonTimestampError, 5687302);
-})();
 })();

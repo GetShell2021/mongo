@@ -2,11 +2,13 @@
  * Set up a mocked Rd which supports to add and remove entries from config.shards.
  */
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 class Rd {
     constructor() {
         jsTest.log("Going to create and start Rd.");
         this.rs = new ReplSetTest({name: "Rd", nodes: 3, useHostName: true});
-        this.rs.startSet({journal: "", storageEngine: 'wiredTiger'});
+        this.rs.startSet({storageEngine: 'wiredTiger'});
         this.rs.initiate();
 
         jsTest.log("Going to create connection with Rd.");

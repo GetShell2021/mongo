@@ -29,13 +29,20 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/db/shard_id.h"
 
 namespace mongo {
 
@@ -61,10 +68,11 @@ public:
     static const BSONField<std::string> name;
     static const BSONField<std::string> host;
     static const BSONField<bool> draining;
-    static const BSONField<long long> maxSizeMB;
     static const BSONField<BSONArray> tags;
     static const BSONField<ShardState> state;
     static const BSONField<Timestamp> topologyTime;
+    static const BSONField<long long> replSetConfigVersion;
+    static const long long kUninitializedReplSetConfigVersion = -1;
 
     ShardType() = default;
     ShardType(std::string name, std::string host, std::vector<std::string> tags = {});
@@ -106,11 +114,6 @@ public:
     }
     void setDraining(bool draining);
 
-    long long getMaxSizeMB() const {
-        return _maxSizeMB.value_or(0);
-    }
-    void setMaxSizeMB(long long maxSizeMB);
-
     std::vector<std::string> getTags() const {
         return _tags.value_or(std::vector<std::string>());
     }
@@ -126,6 +129,11 @@ public:
     }
     void setTopologyTime(const Timestamp& topologyTime);
 
+    long long getReplSetConfigVersion() const {
+        return _replSetConfigVersion;
+    }
+    void setReplSetConfigVersion(long long replSetConfigVersion);
+
 private:
     // Convention: (M)andatory, (O)ptional, (S)pecial rule.
 
@@ -135,14 +143,14 @@ private:
     boost::optional<std::string> _host;
     // (O) is it draining chunks?
     boost::optional<bool> _draining;
-    // (O) maximum allowed disk space in MB
-    boost::optional<long long> _maxSizeMB;
     // (O) shard tags
     boost::optional<std::vector<std::string>> _tags;
     // (O) shard state
     boost::optional<ShardState> _state;
     // (O) topologyTime
     boost::optional<Timestamp> _topologyTime;
+    // (O) repl set config version.
+    long long _replSetConfigVersion = kUninitializedReplSetConfigVersion;
 };
 
 }  // namespace mongo

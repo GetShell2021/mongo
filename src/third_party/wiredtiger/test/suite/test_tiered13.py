@@ -33,7 +33,7 @@ import os, shutil, wiredtiger
 from helper_tiered import get_conn_config, gen_tiered_storage_sources, TieredConfigMixin
 from test_import01 import test_import_base
 from wtscenario import make_scenarios
-import wttest 
+import wttest
 
 class test_tiered13(test_import_base, TieredConfigMixin):
     storage_sources = gen_tiered_storage_sources(wttest.getss_random_prefix(), 'test_tiered13', tiered_only=True)
@@ -65,8 +65,9 @@ class test_tiered13(test_import_base, TieredConfigMixin):
         c = self.session.open_cursor(self.uri)
         c["0"] = "0"
         c.close()
-        self.session.checkpoint()
-        self.session.flush_tier(None)
+        # Use force to make sure the new object is created. Otherwise there is no
+        # existing checkpoint yet and the flush will think there is no work to do.
+        self.session.checkpoint('flush_tier=(enabled,force=true)')
         c = self.session.open_cursor(self.uri)
         c["1"] = "1"
         c.close()
@@ -95,7 +96,7 @@ class test_tiered13(test_import_base, TieredConfigMixin):
                 table_config = cursor[k]
         cursor.close()
         self.close_conn()
-        # Contruct the config strings.
+        # Construct the config strings.
         import_enabled = 'import=(enabled,repair=true)'
         import_meta = 'import=(enabled,repair=false,file_metadata=(' + \
             fileobj_config + '))'
@@ -144,7 +145,7 @@ class test_tiered13(test_import_base, TieredConfigMixin):
         # we cannot tell it was a tiered table until we read in the root page.
         # Only test this in diagnostic mode which has an assertion.
         #
-        # FIXME-8644 There is an error path bug in wt_bm_read preventing this from
+        # FIXME-WT-8644 There is an error path bug in wt_bm_read preventing this from
         # working correctly although the code to return an error is in the code.
         # Uncomment these lines when that bug is fixed.
 

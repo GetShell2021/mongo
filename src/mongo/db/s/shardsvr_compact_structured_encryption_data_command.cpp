@@ -28,17 +28,40 @@
  */
 
 
+#include <memory>
+#include <set>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/fle2_compact.h"
 #include "mongo/db/commands/fle2_compact_gen.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/s/compact_structured_encryption_data_coordinator.h"
 #include "mongo/db/s/compact_structured_encryption_data_coordinator_gen.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/db/s/sharding_ddl_coordinator_gen.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -72,38 +95,42 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
+    std::set<StringData> sensitiveFieldNames() const final {
+        return {CompactStructuredEncryptionData::kCompactionTokensFieldName};
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
 
         Reply typedRun(OperationContext* opCtx) {
-            // TODO (SERVER-65077): Remove FCV check once 6.0 is released
-            uassert(6350499,
-                    "Queryable Encryption is only supported when FCV supports 6.0",
-                    gFeatureFlagFLE2.isEnabled(serverGlobalParams.featureCompatibility));
-            FixedFCVRegion fixedFcvRegion(opCtx);
-
-            auto compact = makeRequest(opCtx);
-            if (!compact) {
-                // Nothing to do.
-                LOGV2(6548305, "Skipping compaction as there is no ECOC collection to compact");
-                return CompactStats({}, {}, {});
+            {
+                stdx::lock_guard<Client> lk(*opCtx->getClient());
+                CurOp::get(opCtx)->setShouldOmitDiagnosticInformation(lk, true);
             }
 
+            auto compactCoordinator =
+                [&]() -> std::shared_ptr<ShardingDDLCoordinatorService::Instance> {
+                FixedFCVRegion fixedFcvRegion(opCtx);
+
+                auto compact = makeRequest(opCtx);
+                return ShardingDDLCoordinatorService::getService(opCtx)->getOrCreateInstance(
+                    opCtx, compact.toBSON());
+            }();
+
             return checked_pointer_cast<CompactStructuredEncryptionDataCoordinator>(
-                       ShardingDDLCoordinatorService::getService(opCtx)->getOrCreateInstance(
-                           opCtx, compact->toBSON()))
+                       compactCoordinator)
                 ->getResponse(opCtx);
         }
 
     private:
-        boost::optional<CompactStructuredEncryptionDataState> makeRequest(OperationContext* opCtx) {
+        CompactStructuredEncryptionDataState makeRequest(OperationContext* opCtx) {
             const auto& req = request();
             const auto& nss = req.getNamespace();
 
             AutoGetCollection baseColl(opCtx, nss, MODE_IX);
             uassert(ErrorCodes::NamespaceNotFound,
-                    str::stream() << "Unknown collection: " << nss,
+                    str::stream() << "Unknown collection: " << nss.toStringForErrorMsg(),
                     baseColl.getCollection());
 
             validateCompactRequest(req, *(baseColl.getCollection().get()));
@@ -112,29 +139,39 @@ public:
                 uassertStatusOK(EncryptedStateCollectionsNamespaces::createFromDataCollection(
                     *(baseColl.getCollection().get())));
 
-            AutoGetCollection ecocColl(opCtx, namespaces.ecocNss, MODE_IX);
-            AutoGetCollection ecocTempColl(opCtx, namespaces.ecocRenameNss, MODE_IX);
-
-            if (!ecocColl.getCollection() && !ecocTempColl.getCollection()) {
-                return boost::none;
-            }
-
             CompactStructuredEncryptionDataState compact;
 
-            if (ecocColl.getCollection()) {
-                compact.setEcocUuid(ecocColl->uuid());
-            }
-            if (ecocTempColl.getCollection()) {
-                compact.setEcocRenameUuid(ecocTempColl->uuid());
+            // To avoid deadlock, IX locks for ecocRenameNss and ecocNss must be acquired in the
+            // same order they'd be acquired during renameCollection (ascending ResourceId order).
+            // Providing ecocRenameNss as a secondary to ecocNss in AutoGetCollection ensures the
+            // locks for both namespaces are acquired in correct order.
+            {
+                std::vector<NamespaceStringOrUUID> secondaryNss = {namespaces.ecocRenameNss};
+                AutoGetCollection ecocColl(opCtx,
+                                           namespaces.ecocNss,
+                                           MODE_IX,
+                                           AutoGetCollection::Options{}.secondaryNssOrUUIDs(
+                                               secondaryNss.cbegin(), secondaryNss.cend()));
+                if (ecocColl.getCollection()) {
+                    compact.setEcocUuid(ecocColl->uuid());
+                }
+                auto catalog = CollectionCatalog::get(opCtx);
+                auto ecocTempColl = CollectionPtr(
+                    catalog->lookupCollectionByNamespace(opCtx, namespaces.ecocRenameNss));
+                if (ecocTempColl) {
+                    compact.setEcocRenameUuid(ecocTempColl->uuid());
+                }
             }
 
             compact.setShardingDDLCoordinatorMetadata(
                 {{nss, DDLCoordinatorTypeEnum::kCompactStructuredEncryptionData}});
             compact.setEscNss(namespaces.escNss);
-            compact.setEccNss(namespaces.eccNss);
             compact.setEcocNss(namespaces.ecocNss);
             compact.setEcocRenameNss(namespaces.ecocRenameNss);
             compact.setCompactionTokens(req.getCompactionTokens().getOwned());
+            compact.setEncryptionInformation(req.getEncryptionInformation());
+            compact.setAnchorPaddingFactor(req.getAnchorPaddingFactor());
+
 
             return compact;
         }
@@ -151,12 +188,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-
-} shardsvrCompactStructuredEncryptionDataCommand;
+};
+MONGO_REGISTER_COMMAND(_shardsvrCompactStructuredEncryptionDataCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

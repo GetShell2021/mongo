@@ -27,12 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <list>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
-#include "mongo/db/query/util/make_data_structure.h"
-#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -44,7 +57,7 @@ void assertExpectedLastpointOpt(const boost::intrusive_ptr<ExpressionContext> ex
                                 const std::vector<std::string>& expectedPipelineStrs,
                                 const bool expectedSuccess = true) {
     std::vector<BSONObj> inputPipelineBson;
-    for (auto stageStr : inputPipelineStrs) {
+    for (const auto& stageStr : inputPipelineStrs) {
         inputPipelineBson.emplace_back(fromjson(stageStr));
     }
 
@@ -62,7 +75,7 @@ void assertExpectedLastpointOpt(const boost::intrusive_ptr<ExpressionContext> ex
 
     // Assert the pipeline is unchanged.
     auto serializedItr = serialized.begin();
-    for (auto stageStr : expectedPipelineStrs) {
+    for (const auto& stageStr : expectedPipelineStrs) {
         auto expectedStageBson = fromjson(stageStr);
         ASSERT_BSONOBJ_EQ(*serializedItr, expectedStageBson);
         ++serializedItr;
@@ -70,7 +83,6 @@ void assertExpectedLastpointOpt(const boost::intrusive_ptr<ExpressionContext> ex
 }
 
 TEST_F(InternalUnpackBucketOptimizeLastpointTest, NonLastpointDoesNotParticipateInOptimization) {
-    RAIIServerParameterControllerForTest controller("featureFlagLastPointQuery", true);
     auto assertPipelineUnoptimized = [&](const std::vector<std::string>& stageStrs) {
         assertExpectedLastpointOpt(getExpCtx(), stageStrs, stageStrs, /* expectedSuccess */ false);
     };
@@ -184,7 +196,6 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest, NonLastpointDoesNotParticipate
 
 TEST_F(InternalUnpackBucketOptimizeLastpointTest,
        LastpointWithMetaSubfieldAscendingTimeDescending) {
-    RAIIServerParameterControllerForTest controller("featureFlagLastPointQuery", true);
     assertExpectedLastpointOpt(getExpCtx(),
                                /* inputPipelineStrs */
                                {"{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
@@ -196,7 +207,7 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest,
                                 "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
                                 "{$first: '$control'}, data: {$first: '$data'}}}",
                                 "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-                                "'m', bucketMaxSpanSeconds: 60}}",
+                                "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
                                 "{$sort: {'m.a': 1, t: -1}}",
                                 "{$group: {_id: '$m.a', b: {$first: '$b'}, c: {$first: '$c'}}}"});
     assertExpectedLastpointOpt(getExpCtx(),
@@ -210,7 +221,7 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest,
                                 "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
                                 "{$first: '$control'}, data: {$first: '$data'}}}",
                                 "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-                                "'m', bucketMaxSpanSeconds: 60}}",
+                                "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
                                 "{$group: {_id: '$m.a', lastpoint: {$top: {output: {b: '$b', c: "
                                 "'$c'}, sortBy: {'m.a': 1, t: -1}}}}}"});
     assertExpectedLastpointOpt(
@@ -225,14 +236,13 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest,
          "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
          "{$first: '$control'}, data: {$first: '$data'}}}",
          "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-         "'m', bucketMaxSpanSeconds: 60}}",
+         "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
          "{$group: {_id: '$m.a', lastpoint: {$topN: {n: {$const: 1}, output: {b: '$b', c: '$c'}, "
          "sortBy: {'m.a': 1, t: -1}}}}}"});
 }
 
 TEST_F(InternalUnpackBucketOptimizeLastpointTest,
        LastpointWithMetaSubfieldDescendingTimeDescending) {
-    RAIIServerParameterControllerForTest controller("featureFlagLastPointQuery", true);
     assertExpectedLastpointOpt(getExpCtx(),
                                /* inputPipelineStrs */
                                {"{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
@@ -244,7 +254,7 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest,
                                 "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
                                 "{$first: '$control'}, data: {$first: '$data'}}}",
                                 "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-                                "'m', bucketMaxSpanSeconds: 60}}",
+                                "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
                                 "{$sort: {'m.a': -1, t: -1}}",
                                 "{$group: {_id: '$m.a', b: {$first: '$b'}, c: {$first: '$c'}}}"});
     assertExpectedLastpointOpt(getExpCtx(),
@@ -258,7 +268,7 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest,
                                 "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
                                 "{$first: '$control'}, data: {$first: '$data'}}}",
                                 "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-                                "'m', bucketMaxSpanSeconds: 60}}",
+                                "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
                                 "{$group: {_id: '$m.a', lastpoint: {$top: {output: {b: '$b', c: "
                                 "'$c'}, sortBy: {'m.a': -1, t: -1}}}}}"});
     assertExpectedLastpointOpt(
@@ -273,13 +283,12 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest,
          "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
          "{$first: '$control'}, data: {$first: '$data'}}}",
          "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-         "'m', bucketMaxSpanSeconds: 60}}",
+         "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
          "{$group: {_id: '$m.a', lastpoint: {$topN: {n: {$const: 1}, output: {b: '$b', c: "
          "'$c'}, sortBy: {'m.a': -1, t: -1}}}}}"});
 }
 
 TEST_F(InternalUnpackBucketOptimizeLastpointTest, LastpointWithMetaSubfieldAscendingTimeAscending) {
-    RAIIServerParameterControllerForTest controller("featureFlagLastPointQuery", true);
     assertExpectedLastpointOpt(getExpCtx(),
                                /* inputPipelineStrs */
                                {"{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
@@ -291,7 +300,7 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest, LastpointWithMetaSubfieldAscen
                                 "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
                                 "{$first: '$control'}, data: {$first: '$data'}}}",
                                 "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-                                "'m', bucketMaxSpanSeconds: 60}}",
+                                "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
                                 "{$sort: {'m.a': 1, t: 1}}",
                                 "{$group: {_id: '$m.a', b: {$last: '$b'}, c: {$last: '$c'}}}"});
     assertExpectedLastpointOpt(getExpCtx(),
@@ -305,7 +314,7 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest, LastpointWithMetaSubfieldAscen
                                 "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
                                 "{$first: '$control'}, data: {$first: '$data'}}}",
                                 "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-                                "'m', bucketMaxSpanSeconds: 60}}",
+                                "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
                                 "{$group: {_id: '$m.a', lastpoint: {$bottom: {output: {b: '$b', c: "
                                 "'$c'}, sortBy: {'m.a': 1, t: 1}}}}}"});
     assertExpectedLastpointOpt(
@@ -320,14 +329,13 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest, LastpointWithMetaSubfieldAscen
          "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
          "{$first: '$control'}, data: {$first: '$data'}}}",
          "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-         "'m', bucketMaxSpanSeconds: 60}}",
+         "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
          "{$group: {_id: '$m.a', lastpoint: {$bottomN: {n: {$const: 1}, output: {b: '$b', c: "
          "'$c'}, sortBy: {'m.a': 1, t: 1}}}}}"});
 }
 
 TEST_F(InternalUnpackBucketOptimizeLastpointTest,
        LastpointWithMetaSubfieldDescendingTimeAscending) {
-    RAIIServerParameterControllerForTest controller("featureFlagLastPointQuery", true);
     assertExpectedLastpointOpt(getExpCtx(),
                                /* inputPipelineStrs */
                                {"{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
@@ -339,7 +347,7 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest,
                                 "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
                                 "{$first: '$control'}, data: {$first: '$data'}}}",
                                 "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-                                "'m', bucketMaxSpanSeconds: 60}}",
+                                "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
                                 "{$sort: {'m.a': -1, t: 1}}",
                                 "{$group: {_id: '$m.a', b: {$last: '$b'}, c: {$last: '$c'}}}"});
     assertExpectedLastpointOpt(getExpCtx(),
@@ -353,7 +361,7 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest,
                                 "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
                                 "{$first: '$control'}, data: {$first: '$data'}}}",
                                 "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-                                "'m', bucketMaxSpanSeconds: 60}}",
+                                "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
                                 "{$group: {_id: '$m.a', lastpoint: {$bottom: {output: {b: '$b', c: "
                                 "'$c'}, sortBy: {'m.a': -1, t: 1}}}}}"});
     assertExpectedLastpointOpt(getExpCtx(),
@@ -367,13 +375,12 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest,
                                 "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: "
                                 "{$first: '$control'}, data: {$first: '$data'}}}",
                                 "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: "
-                                "'m', bucketMaxSpanSeconds: 60}}",
+                                "'m', bucketMaxSpanSeconds: 60, sbeCompatible: false}}",
                                 "{$group: {_id: '$m.a', lastpoint: {$bottomN: {n: {$const: 1}, "
                                 "output: {b: '$b', c: '$c'}, sortBy: {'m.a': -1, t: 1}}}}}"});
 }
 
 TEST_F(InternalUnpackBucketOptimizeLastpointTest, LastpointWithComputedMetaProjectionFields) {
-    RAIIServerParameterControllerForTest controller("featureFlagLastPointQuery", true);
     // We might get such a case if $_internalUnpackBucket swaps with a $project. Verify that the
     // lastpoint optimization does not break in this scenario. Note that in the full pipeline we
     // would expect $_internalUnpackBucket to be preceded by a stage like $addFields. However,
@@ -390,7 +397,7 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest, LastpointWithComputedMetaProje
          "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: {$first: '$control'}, data: "
          "{$first: '$data'}, abc: {$first: '$abc'}, def: {$first: '$def'}}}",
          "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: 'm', "
-         "bucketMaxSpanSeconds: 60, computedMetaProjFields: ['abc', 'def']}}",
+         "bucketMaxSpanSeconds: 60, computedMetaProjFields: ['abc', 'def'], sbeCompatible: false}}",
          "{$sort: {'m.a': -1, t: 1}}",
          "{$group: {_id: '$m.a', b: {$last: '$b'}, c: {$last: '$c'}}}"});
 
@@ -408,7 +415,7 @@ TEST_F(InternalUnpackBucketOptimizeLastpointTest, LastpointWithComputedMetaProje
          "{$group: {_id: '$meta.a', meta: {$first: '$meta'}, control: {$first: '$control'}, data: "
          "{$first: '$data'}, abc: {$first: '$abc'}, def: {$first: '$def'}}}",
          "{$_internalUnpackBucket: {exclude: [], timeField: 't', metaField: 'm', "
-         "bucketMaxSpanSeconds: 60, computedMetaProjFields: ['abc', 'def']}}",
+         "bucketMaxSpanSeconds: 60, computedMetaProjFields: ['abc', 'def'], sbeCompatible: false}}",
          "{$sort: {'m.a': -1, t: 1}}",
          "{$group: {_id: '$m.a', b: {$last: '$b'}, c: {$last: '$c'}, def: {$last: '$def'}}}"});
 }

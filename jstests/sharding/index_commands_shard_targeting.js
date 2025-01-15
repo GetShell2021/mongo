@@ -3,17 +3,26 @@
  * that have chunks for the collection. Also test that the commands fail if they are run
  * when the critical section is in progress, and block until the critical section is over.
  */
-(function() {
-"use strict";
-
-load('jstests/libs/chunk_manipulation_util.js');
-load("jstests/libs/fail_point_util.js");
-load("jstests/sharding/libs/sharded_index_util.js");
-load("jstests/sharding/libs/shard_versioning_util.js");
-load("jstests/libs/parallelTester.js");  // For Thread.
+import {
+    moveChunkParallel,
+    moveChunkStepNames,
+    pauseMoveChunkAtStep,
+    unpauseMoveChunkAtStep,
+    waitForMoveChunkStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {ShardVersioningUtil} from "jstests/sharding/libs/shard_versioning_util.js";
+import {ShardedIndexUtil} from "jstests/sharding/libs/sharded_index_util.js";
 
 // Test deliberately inserts orphans outside of migration.
 TestData.skipCheckOrphans = true;
+
+// This test connects directly to shards and creates collections.
+TestData.skipCheckShardFilteringMetadata = true;
+
+// Do not check metadata consistency as collections on non-primary shards are created for testing
+// purposes.
+TestData.skipCheckMetadataConsistency = true;
 
 /*
  * Runs the command after performing chunk operations to make the primary shard (shard0) not own
@@ -49,11 +58,6 @@ function assertCommandChecksShardVersions(st, dbName, collName, testCase) {
         testCase.setUpFuncForCheckShardVersionTest();
     }
     assert.commandWorked(st.s.getDB(dbName).runCommand(testCase.command));
-
-    // Assert that primary shard still has stale collection version after the command is run
-    // because both the shard version in the command and in the shard's cache are UNSHARDED
-    // (no chunks).
-    ShardVersioningUtil.assertCollectionVersionOlderThan(st.shard0, ns, latestCollectionVersion);
 
     // Assert that the targeted shards have the latest collection version after the command is
     // run.
@@ -187,8 +191,8 @@ const testCases = {
     },
 };
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 // Test that the index commands send and check shard vesions, and only target the shards
 // that own chunks for the collection.
@@ -229,4 +233,3 @@ for (const command of Object.keys(testCases)) {
 
 st.stop();
 MongoRunner.stopMongod(staticMongod);
-})();

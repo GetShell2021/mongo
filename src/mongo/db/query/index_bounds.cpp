@@ -29,12 +29,18 @@
 
 #include "mongo/db/query/index_bounds.h"
 
+// IWYU pragma: no_include "ext/alloc_traits.h"
 #include <algorithm>
-#include <tuple>
+#include <iterator>
+#include <memory>
 #include <utility>
 
-#include "mongo/base/simple_string_data_comparator.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -244,8 +250,64 @@ bool OrderedIntervalList::isMinToMax() const {
     return intervals.size() == 1 && intervals[0].isMinToMax();
 }
 
+bool OrderedIntervalList::isMaxToMin() const {
+    return intervals.size() == 1 && intervals[0].isMaxToMin();
+}
+
 bool OrderedIntervalList::isPoint() const {
     return intervals.size() == 1 && intervals[0].isPoint();
+}
+
+bool OrderedIntervalList::containsOnlyPointIntervals() const {
+    for (const auto& interval : intervals) {
+        if (!interval.isPoint()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * Queries whose bounds overlap the Object type bracket may require special handling, since the $**
+ * index does not index complete objects but instead only contains the leaves along each of its
+ * subpaths. Since we ban all object-value queries except those on the empty object {}, this will
+ * typically only be relevant for bounds involving MinKey and MaxKey, such as {$exists: true}.
+ */
+bool OrderedIntervalList::boundsOverlapObjectTypeBracket() const {
+    // Create an Interval representing the subrange ({}, []) of the object type bracket. We exclude
+    // both ends of the bracket because $** indexes support queries on empty objects and arrays.
+    static const Interval objectTypeBracketBounds = []() {
+        BSONObjBuilder objBracketBounds;
+        objBracketBounds.appendMinForType("", BSONType::Object);
+        objBracketBounds.appendMaxForType("", BSONType::Object);
+        return Interval(objBracketBounds.obj(), false /*startIncluded*/, false /*endIncluded*/);
+    }();
+
+    // Determine whether any of the ordered intervals overlap with the object type bracket. Because
+    // Interval's various bounds-comparison methods all depend upon the bounds being in ascending
+    // order, we reverse the direction of the input OIL if necessary here.
+    const bool isDescending = (computeDirection() == Interval::Direction::kDirectionDescending);
+    const auto& oilAscending = (isDescending ? reverseClone() : *this);
+    // Iterate through each of the OIL's intervals. If the current interval precedes the bracket, we
+    // must check the next interval in sequence. If the interval succeeds the bracket then we can
+    // stop checking. If we neither precede nor succeed the object type bracket, then they overlap.
+    for (const auto& interval : oilAscending.intervals) {
+        switch (interval.compare(objectTypeBracketBounds)) {
+            case Interval::IntervalComparison::INTERVAL_PRECEDES_COULD_UNION:
+            case Interval::IntervalComparison::INTERVAL_PRECEDES:
+                // Break out of the switch and proceed to check the next interval.
+                break;
+
+            case Interval::IntervalComparison::INTERVAL_SUCCEEDS:
+                return false;
+
+            default:
+                return true;
+        }
+    }
+    // If we're here, then all the OIL's bounds precede the object type bracket.
+    return false;
 }
 
 // static
@@ -266,18 +328,8 @@ void OrderedIntervalList::complement() {
     // We will build up a list of intervals that represents the inversion of those in the OIL.
     vector<Interval> newIntervals;
     for (const auto& curInt : intervals) {
-
-        // There is one special case worth optimizing for: we will generate two point queries for an
-        // equality-to-null predicate like {a: {$eq: null}}. The points are undefined and null, so
-        // when complementing (for {a: {$ne: null}} or similar), we know that there is nothing in
-        // between these two points, and can avoid adding that range.
-        const bool isProvablyEmptyRange =
-            (curBoundary.type() == BSONType::Undefined && curInclusive &&
-             curInt.start.type() == BSONType::jstNULL && curInt.startInclusive);
-
-        if ((0 != curInt.start.woCompare(curBoundary) ||
-             (!curInclusive && !curInt.startInclusive)) &&
-            !isProvablyEmptyRange) {
+        if ((0 != curInt.start.woCompare(curBoundary, /*compareFieldNames*/ false) ||
+             (!curInclusive && !curInt.startInclusive))) {
             // Make a new interval from 'curBoundary' to the start of 'curInterval'.
             BSONObjBuilder intBob;
             intBob.append(curBoundary);
@@ -296,7 +348,7 @@ void OrderedIntervalList::complement() {
     maxBob.appendMaxKey("");
     BSONObj maxObj = maxBob.obj();
     BSONElement maxKey = maxObj.firstElement();
-    if (0 != maxKey.woCompare(curBoundary) || !curInclusive) {
+    if (0 != maxKey.woCompare(curBoundary, /*compareFieldNames*/ false) || !curInclusive) {
         BSONObjBuilder intBob;
         intBob.append(curBoundary);
         intBob.append(maxKey);
@@ -416,6 +468,12 @@ IndexBounds IndexBounds::reverse() const {
     return reversed;
 }
 
+bool IndexBounds::isUnbounded() const {
+    return std::all_of(fields.begin(), fields.end(), [](const auto& field) {
+        return field.isMinToMax() || field.isMaxToMin();
+    });
+}
+
 //
 // Validity checking for bounds
 //
@@ -512,7 +570,7 @@ bool IndexBoundsChecker::getStartSeekPoint(IndexSeekPoint* out) {
         if (0 == _bounds->fields[i].intervals.size()) {
             return false;
         }
-        out->keySuffix[i] = &_bounds->fields[i].intervals[0].start;
+        out->keySuffix[i] = _bounds->fields[i].intervals[0].start;
         if (!_bounds->fields[i].intervals[0].startInclusive) {
             out->firstExclusive = i;
         }
@@ -588,20 +646,50 @@ bool IndexBoundsChecker::isValidKey(const BSONObj& key) {
     return true;
 }
 
+IndexBoundsChecker::KeyState IndexBoundsChecker::checkKeyWithEndPosition(
+    const BSONObj& currentKey,
+    IndexSeekPoint* query,
+    key_string::Builder& endKey,
+    Ordering ord,
+    bool forward) {
+    auto state = checkKey(currentKey, query);
+    endKey.resetToEmpty(ord);
+    if (state == VALID && !_bounds->fields.back().isPoint()) {
+        auto size = _keyValues.size();
+        std::vector<const BSONElement*> out(size);
+        key_string::Discriminator discriminator;
+        for (size_t i = 0; i < size - 1; ++i) {
+            if (_keyValues[i]) {
+                endKey.appendBSONElement(_keyValues[i]);
+            }
+        }
+        const OrderedIntervalList& oil = _bounds->fields.back();
+        endKey.appendBSONElement(oil.intervals[_curInterval.back()].end);
+        if (oil.intervals[_curInterval.back()].endInclusive) {
+            discriminator = key_string::Discriminator::kInclusive;
+        } else {
+            discriminator = forward ? key_string::Discriminator::kExclusiveBefore
+                                    : key_string::Discriminator::kExclusiveAfter;
+        }
+        endKey.appendDiscriminator(discriminator);
+    }
+    return state;
+}
+
 IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, IndexSeekPoint* out) {
-    verify(_curInterval.size() > 0);
+    MONGO_verify(_curInterval.size() > 0);
     out->keySuffix.resize(_curInterval.size());
 
     // It's useful later to go from a field number to the value for that field.  Store these.
     size_t i = 0;
     BSONObjIterator keyIt(key);
     while (keyIt.more()) {
-        verify(i < _curInterval.size());
+        MONGO_verify(i < _curInterval.size());
 
         _keyValues[i] = keyIt.next();
         i++;
     }
-    verify(i == _curInterval.size());
+    MONGO_verify(i == _curInterval.size());
 
     size_t firstNonContainedField;
     Location orientation;
@@ -636,7 +724,7 @@ IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, In
 
         for (int j = _curInterval.size() - 1; j >= out->prefixLen; --j) {
             const OrderedIntervalList& oil = _bounds->fields[j];
-            out->keySuffix[j] = &oil.intervals[_curInterval[j]].start;
+            out->keySuffix[j] = oil.intervals[_curInterval[j]].start;
             if (!oil.intervals[_curInterval[j]].startInclusive) {
                 out->firstExclusive = j;
             }
@@ -645,7 +733,7 @@ IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, In
         return MUST_ADVANCE;
     }
 
-    verify(AHEAD == orientation);
+    MONGO_verify(AHEAD == orientation);
 
     // Field number 'firstNonContainedField' of the index key is after interval we think it's
     // in.  Fields 0 through 'firstNonContained-1' are within their current intervals and we can
@@ -681,7 +769,7 @@ IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, In
             out->firstExclusive = -1;
             for (int i = _curInterval.size() - 1; i >= out->prefixLen; --i) {
                 const OrderedIntervalList& oil = _bounds->fields[i];
-                out->keySuffix[i] = &oil.intervals[_curInterval[i]].start;
+                out->keySuffix[i] = oil.intervals[_curInterval[i]].start;
                 if (!oil.intervals[_curInterval[i]].startInclusive) {
                     out->firstExclusive = i;
                 }
@@ -689,7 +777,7 @@ IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, In
 
             return MUST_ADVANCE;
         } else {
-            verify(AHEAD == where);
+            MONGO_verify(AHEAD == where);
             // Field number 'firstNonContainedField' cannot possibly be placed into an interval,
             // as it is already past its last possible interval.  The caller must move forward
             // to a key with a greater value for the previous field.
@@ -714,7 +802,7 @@ IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key, In
         }
     }
 
-    verify(firstNonContainedField == _curInterval.size());
+    MONGO_verify(firstNonContainedField == _curInterval.size());
     return VALID;
 }
 

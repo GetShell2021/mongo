@@ -11,8 +11,7 @@
  * @tags: [requires_fcv_53]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = "arbiters_not_included_in_w2_wc";
 const rst = new ReplSetTest({name: name, nodes: 5});
@@ -48,7 +47,6 @@ rst.stop(2);
 jsTestLog("Issuing a w:2 write and confirming that it times out");
 
 assert.commandFailedWithCode(testColl.insert({"b": 2}, {writeConcern: {w: 2, wtimeout: 5 * 1000}}),
-                             ErrorCodes.WriteConcernFailed);
+                             ErrorCodes.WriteConcernTimeout);
 
 rst.stopSet();
-})();

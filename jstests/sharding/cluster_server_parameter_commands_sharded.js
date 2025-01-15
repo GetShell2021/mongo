@@ -5,13 +5,15 @@
  *   does_not_support_stepdowns,
  *   requires_replication,
  *   requires_sharding,
- *   multiversion_incompatible
  *  ]
  */
-(function() {
-'use strict';
-
-load('jstests/libs/cluster_server_parameter_utils.js');
+import {
+    setupSharded,
+    testGetClusterParameterStar,
+    testInvalidClusterParameterCommands,
+    testValidClusterParameterCommands,
+} from "jstests/libs/cluster_server_parameter_utils.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Tests that set/getClusterParameter works on all nodes of a sharded cluster.
 const options = {
@@ -35,5 +37,7 @@ testInvalidClusterParameterCommands(st);
 // and the majority of nodes on all replica sets in the cluster.
 testValidClusterParameterCommands(st);
 
+// Ensure that getClusterParameter: "*" works as expected.
+testGetClusterParameterStar(st);
+
 st.stop();
-})();

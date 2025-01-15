@@ -27,41 +27,33 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/meta/type_traits.h>
 
-#include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include <absl/container/node_hash_set.h>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
 ReadConcernSupportResult LiteParsedPipeline::supportsReadConcern(
     repl::ReadConcernLevel level,
     bool isImplicitDefault,
-    boost::optional<ExplainOptions::Verbosity> explain,
-    bool enableMajorityReadConcern) const {
+    boost::optional<ExplainOptions::Verbosity> explain) const {
     // Start by assuming that we will support both readConcern and cluster-wide default.
     ReadConcernSupportResult result = ReadConcernSupportResult::allSupportedAndDefaultPermitted();
-
-    // 1. Determine whether the given read concern must be rejected for any pipeline-global reasons.
-    if (!hasChangeStream() && !enableMajorityReadConcern &&
-        (level == repl::ReadConcernLevel::kMajorityReadConcern)) {
-        // Reject non change stream aggregation queries that try to use "majority" read concern when
-        // enableMajorityReadConcern=false.
-        result.readConcernSupport = {
-            ErrorCodes::ReadConcernMajorityNotEnabled,
-            "Only change stream aggregation queries support 'majority' read concern when "
-            "enableMajorityReadConcern=false"};
-    } else if (explain && level != repl::ReadConcernLevel::kLocalReadConcern) {
-        // Reject non-local read concern when the pipeline is being explained.
-        result.readConcernSupport = {
-            ErrorCodes::InvalidOptions,
-            str::stream() << "Explain for the aggregate command cannot run with a readConcern "
-                          << "other than 'local'. Current readConcern level: "
-                          << repl::readConcernLevels::toString(level)};
-    }
 
     // 2. Determine whether the default read concern must be denied for any pipeline-global reasons.
     if (explain) {
@@ -109,10 +101,8 @@ void LiteParsedPipeline::assertSupportsMultiDocumentTransaction(
 void LiteParsedPipeline::assertSupportsReadConcern(
     OperationContext* opCtx, boost::optional<ExplainOptions::Verbosity> explain) const {
     const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    auto readConcernSupport = supportsReadConcern(readConcernArgs.getLevel(),
-                                                  readConcernArgs.isImplicitDefault(),
-                                                  explain,
-                                                  serverGlobalParams.enableMajorityReadConcern);
+    auto readConcernSupport = supportsReadConcern(
+        readConcernArgs.getLevel(), readConcernArgs.isImplicitDefault(), explain);
     if (readConcernArgs.hasLevel()) {
         if (!readConcernSupport.readConcernSupport.isOK()) {
             uassertStatusOK(readConcernSupport.readConcernSupport.withContext(
@@ -124,8 +114,7 @@ void LiteParsedPipeline::assertSupportsReadConcern(
 void LiteParsedPipeline::verifyIsSupported(
     OperationContext* opCtx,
     const std::function<bool(OperationContext*, const NamespaceString&)> isSharded,
-    const boost::optional<ExplainOptions::Verbosity> explain,
-    bool enableMajorityReadConcern) const {
+    const boost::optional<ExplainOptions::Verbosity> explain) const {
     // Verify litePipe can be run in a transaction.
     const bool inMultiDocumentTransaction = opCtx->inMultiDocumentTransaction();
     if (inMultiDocumentTransaction) {
@@ -134,19 +123,18 @@ void LiteParsedPipeline::verifyIsSupported(
     }
     // Verify that no involved namespace is sharded unless allowed by the pipeline.
     for (const auto& nss : getInvolvedNamespaces()) {
-        uassert(28769,
-                str::stream() << nss.ns() << " cannot be sharded",
-                allowShardedForeignCollection(nss, inMultiDocumentTransaction) ||
-                    !isSharded(opCtx, nss));
+        const auto status = checkShardedForeignCollAllowed(nss, inMultiDocumentTransaction);
+        uassert(status.code(),
+                str::stream() << nss.toStringForErrorMsg()
+                              << " cannot be sharded: " << status.reason(),
+                status.isOK() || !isSharded(opCtx, nss));
     }
 }
 
 void LiteParsedPipeline::tickGlobalStageCounters() const {
     for (auto&& stage : _stageSpecs) {
         // Tick counter corresponding to current stage.
-        aggStageCounters.stageCounterMap.find(stage->getParseTimeName())
-            ->second->counter.increment(1);
-
+        aggStageCounters.increment(stage->getParseTimeName(), 1);
         // Recursively step through any sub-pipelines.
         for (auto&& subPipeline : stage->getSubPipelines()) {
             subPipeline.tickGlobalStageCounters();
@@ -157,7 +145,6 @@ void LiteParsedPipeline::tickGlobalStageCounters() const {
 void LiteParsedPipeline::validate(const OperationContext* opCtx,
                                   bool performApiVersionChecks) const {
 
-    int internalUnpackBucketCount = 0;
     for (auto&& stage : _stageSpecs) {
         const auto& stageName = stage->getParseTimeName();
         const auto& stageInfo = LiteParsedDocumentSource::getInfo(stageName);
@@ -179,25 +166,10 @@ void LiteParsedPipeline::validate(const OperationContext* opCtx,
                                            sometimesCallback);
         }
 
-        internalUnpackBucketCount +=
-            (DocumentSourceInternalUnpackBucket::kStageNameInternal == stageName ||
-             DocumentSourceInternalUnpackBucket::kStageNameExternal == stageName)
-            ? 1
-            : 0;
-
         for (auto&& subPipeline : stage->getSubPipelines()) {
             subPipeline.validate(opCtx, performApiVersionChecks);
         }
     }
-
-
-    // Validates that the pipeline contains at most one $_internalUnpackBucket or $_unpackBucket
-    // stage.
-    uassert(5348302,
-            str::stream() << "Encountered pipeline with more than one "
-                          << DocumentSourceInternalUnpackBucket::kStageNameInternal << " or "
-                          << DocumentSourceInternalUnpackBucket::kStageNameExternal << " stage",
-            internalUnpackBucketCount <= 1);
 }
 
 }  // namespace mongo

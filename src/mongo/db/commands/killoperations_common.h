@@ -61,7 +61,8 @@ public:
             auto opKeys = Base::request().getOperationKeys();
 
             for (auto& opKey : opKeys) {
-                LOGV2(4615602, "Attempting to kill operation", "operationKey"_attr = opKey);
+                LOGV2_DEBUG(
+                    4615602, 2, "Attempting to kill operation", "operationKey"_attr = opKey);
                 opKiller.killOperation(OperationKey(opKey));
             }
             Derived::killCursors(opCtx, opKeys);
@@ -69,7 +70,7 @@ public:
 
     private:
         NamespaceString ns() const override {
-            return NamespaceString(Base::request().getDbName(), "");
+            return NamespaceString(Base::request().getDbName());
         }
 
         bool supportsWriteConcern() const override {
@@ -79,7 +80,8 @@ public:
         void doCheckAuthorization(OperationContext* opCtx) const override {
             auto client = opCtx->getClient();
             auto isInternal = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal);
+                ResourcePattern::forClusterResource(Base::request().getDbName().tenantId()),
+                ActionType::internal);
             if (!getTestCommandsEnabled() && !isInternal) {
                 // Either the mongod/mongos must be in testing mode or this command must come from
                 // an internal user

@@ -7,12 +7,11 @@
  * node2. Eventually after catchUpTakeoverDelayMillis has passed, node1 should be able
  * get the vote from node2 which has a lower config, and finish the catchup takeover.
  */
-
-(function() {
-'use strict';
-
-load("jstests/libs/write_concern_util.js");
-load('jstests/replsets/libs/election_metrics.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    verifyServerStatusElectionReasonCounterChange
+} from "jstests/replsets/libs/election_metrics.js";
 
 // Get the current config from the node and compare it with the provided config.
 const getNodeConfigAndCompare = function(node, config, cmp) {
@@ -50,7 +49,7 @@ let config = replSet.getReplSetConfig();
 config.settings = {
     chainingAllowed: false,
 };
-replSet.initiateWithHighElectionTimeout(config);
+replSet.initiate(config);
 replSet.awaitReplication();
 assert.eq(replSet.getPrimary(), nodes[0]);
 
@@ -72,7 +71,7 @@ hangBeforeTermBumpFpNode1.wait();
 
 // Wait for all nodes to acknowledge that node1 has become primary.
 jsTestLog(`Waiting for all nodes to agree on ${nodes[1].host} being primary`);
-replSet.awaitNodesAgreeOnPrimary(replSet.kDefaultTimeoutMS, nodes, nodes[1]);
+replSet.awaitNodesAgreeOnPrimary(replSet.timeoutMS, nodes, nodes[1]);
 
 // Check that the failpoint worked and the config has not changed.
 assert(getNodeConfigAndCompare(nodes[1], initialConfig, '='));
@@ -120,7 +119,7 @@ assert(getNodeConfigAndCompare(nodes[2], initialConfig, '='));
 
 // Lift the failpoint on node2 and wait for all nodes to see node1 as the only primary.
 hangBeforeTermBumpFpNode2.off();
-replSet.awaitNodesAgreeOnPrimary(replSet.kDefaultTimeoutMS, nodes, nodes[1]);
+replSet.awaitNodesAgreeOnPrimary(replSet.timeoutMS, nodes, nodes[1]);
 
 // Check that election metrics has been updated with the new reason counter.
 const statusAfterTakeover =
@@ -130,5 +129,8 @@ verifyServerStatusElectionReasonCounterChange(statusBeforeTakeover.electionMetri
                                               "catchUpTakeover",
                                               1);
 
+// This test produces a rollback and the above is expected to be robust to the network error
+// it causes, but stopSet below is not so we await before it is called.
+replSet.awaitSecondaryNodes();
+replSet.awaitReplication();
 replSet.stopSet();
-})();

@@ -29,8 +29,16 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/error_extra_info.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -44,7 +52,7 @@ public:
         return _nss;
     }
 
-    void serialize(BSONObjBuilder* bob) const;
+    void serialize(BSONObjBuilder* bob) const override;
 
     static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj);
 

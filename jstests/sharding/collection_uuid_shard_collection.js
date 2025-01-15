@@ -5,8 +5,7 @@
  *   requires_fcv_60,
  * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 2});
 const mongos = st.s0;
@@ -98,4 +97,3 @@ assert.eq(res.expectedCollection, coll2.getName());
 assert.eq(res.actualCollection, coll.getName());
 
 st.stop();
-})();

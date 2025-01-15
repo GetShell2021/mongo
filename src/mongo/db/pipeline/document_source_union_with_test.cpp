@@ -27,18 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
+#include <absl/container/node_hash_set.h>
 #include <array>
 #include <deque>
 #include <list>
-#include <set>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_comparator.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
-#include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_add_fields.h"
 #include "mongo/db/pipeline/document_source_facet.h"
@@ -46,11 +54,18 @@
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_replace_root.h"
 #include "mongo/db/pipeline/document_source_union_with.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/process_interface/stub_lookup_single_document_process_interface.h"
+#include "mongo/db/pipeline/serverless_aggregation_context_fixture.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/intrusive_counter.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace {
@@ -74,33 +89,26 @@ auto makeUnionFromBson(BSONElement elem, const boost::intrusive_ptr<ExpressionCo
 }
 
 TEST_F(DocumentSourceUnionWithTest, BasicSerialUnions) {
-    const auto docs = std::array{Document{{"a", 1}}, Document{{"b", 1}}, Document{{"c", 1}}};
-    const auto mock = DocumentSourceMock::createForTest(docs[0], getExpCtx());
-    const auto mockDequeOne = std::deque<DocumentSource::GetNextResult>{Document{docs[1]}};
-    const auto mockDequeTwo = std::deque<DocumentSource::GetNextResult>{Document{docs[2]}};
-    const auto mockCtxOne = getExpCtx()->copyWith({});
-    mockCtxOne->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockDequeOne);
-    const auto mockCtxTwo = getExpCtx()->copyWith({});
-    mockCtxTwo->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockDequeTwo);
+    const auto doc = Document{{"a", 1}};
+    const auto mock = DocumentSourceMock::createForTest(doc, getExpCtx());
+    const auto mockDeque = std::deque<DocumentSource::GetNextResult>{Document{doc}};
+    getExpCtx()->setMongoProcessInterface(std::make_unique<MockMongoInterface>(mockDeque));
     auto unionWithOne =
-        makeUnion(mockCtxOne,
+        makeUnion(getExpCtx(),
                   Pipeline::create(std::list<boost::intrusive_ptr<DocumentSource>>{}, getExpCtx()));
     auto unionWithTwo =
-        makeUnion(mockCtxTwo,
+        makeUnion(getExpCtx(),
                   Pipeline::create(std::list<boost::intrusive_ptr<DocumentSource>>{}, getExpCtx()));
     unionWithOne->setSource(mock.get());
     unionWithTwo->setSource(unionWithOne.get());
 
     auto comparator = DocumentComparator();
-    auto results = comparator.makeUnorderedDocumentSet();
-    for (auto& doc [[maybe_unused]] : docs) {
+    const auto expectedResults = 3;
+    for (auto i = 0; i < expectedResults; ++i) {
         auto next = unionWithTwo->getNext();
         ASSERT_TRUE(next.isAdvanced());
-        const auto [ignored, inserted] = results.insert(next.releaseDocument());
-        ASSERT_TRUE(inserted);
+        ASSERT_EQ(comparator.compare(next.releaseDocument(), doc), 0);
     }
-    for (const auto& doc : docs)
-        ASSERT_TRUE(results.find(doc) != results.end());
 
     ASSERT_TRUE(unionWithTwo->getNext().isEOF());
     ASSERT_TRUE(unionWithTwo->getNext().isEOF());
@@ -108,33 +116,26 @@ TEST_F(DocumentSourceUnionWithTest, BasicSerialUnions) {
 }
 
 TEST_F(DocumentSourceUnionWithTest, BasicNestedUnions) {
-    const auto docs = std::array{Document{{"a", 1}}, Document{{"b", 1}}, Document{{"c", 1}}};
-    const auto mock = DocumentSourceMock::createForTest(docs[0], getExpCtx());
-    const auto mockDequeOne = std::deque<DocumentSource::GetNextResult>{Document{docs[1]}};
-    const auto mockDequeTwo = std::deque<DocumentSource::GetNextResult>{Document{docs[2]}};
-    const auto mockCtxOne = getExpCtx()->copyWith({});
-    mockCtxOne->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockDequeOne);
-    const auto mockCtxTwo = getExpCtx()->copyWith({});
-    mockCtxTwo->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockDequeTwo);
+    const auto doc = Document{{"a", 1}};
+    const auto mock = DocumentSourceMock::createForTest(doc, getExpCtx());
+    const auto mockDeque = std::deque<DocumentSource::GetNextResult>{Document{doc}};
+    getExpCtx()->setMongoProcessInterface(std::make_unique<MockMongoInterface>(mockDeque));
     auto unionWithOne = make_intrusive<DocumentSourceUnionWith>(
-        mockCtxOne,
+        getExpCtx(),
         Pipeline::create(std::list<boost::intrusive_ptr<DocumentSource>>{}, getExpCtx()));
     auto unionWithTwo =
-        makeUnion(mockCtxTwo,
+        makeUnion(getExpCtx(),
                   Pipeline::create(std::list<boost::intrusive_ptr<DocumentSource>>{unionWithOne},
                                    getExpCtx()));
     unionWithTwo->setSource(mock.get());
 
     auto comparator = DocumentComparator();
-    auto results = comparator.makeUnorderedDocumentSet();
-    for (auto& doc [[maybe_unused]] : docs) {
+    const auto expectedResults = 3;
+    for (auto i = 0; i < expectedResults; ++i) {
         auto next = unionWithTwo->getNext();
         ASSERT_TRUE(next.isAdvanced());
-        const auto [ignored, inserted] = results.insert(next.releaseDocument());
-        ASSERT_TRUE(inserted);
+        ASSERT_EQ(comparator.compare(next.releaseDocument(), doc), 0);
     }
-    for (const auto& doc : docs)
-        ASSERT_TRUE(results.find(doc) != results.end());
 
     ASSERT_TRUE(unionWithTwo->getNext().isEOF());
     ASSERT_TRUE(unionWithTwo->getNext().isEOF());
@@ -142,22 +143,18 @@ TEST_F(DocumentSourceUnionWithTest, BasicNestedUnions) {
 }
 
 TEST_F(DocumentSourceUnionWithTest, UnionsWithNonEmptySubPipelines) {
-    const auto inputDocs = std::array{Document{{"a", 1}}, Document{{"b", 1}}, Document{{"c", 1}}};
-    const auto outputDocs = std::array{Document{{"a", 1}}, Document{{"c", 1}, {"d", 1}}};
-    const auto mock = DocumentSourceMock::createForTest(inputDocs[0], getExpCtx());
-    const auto mockDequeOne = std::deque<DocumentSource::GetNextResult>{Document{inputDocs[1]}};
-    const auto mockDequeTwo = std::deque<DocumentSource::GetNextResult>{Document{inputDocs[2]}};
-    const auto mockCtxOne = getExpCtx()->copyWith({});
-    mockCtxOne->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockDequeOne);
-    const auto mockCtxTwo = getExpCtx()->copyWith({});
-    mockCtxTwo->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockDequeTwo);
-    const auto filter = DocumentSourceMatch::create(BSON("d" << 1), mockCtxOne);
-    const auto proj = DocumentSourceAddFields::create(BSON("d" << 1), mockCtxTwo);
+    const auto inputDoc = Document{{"a", 1}};
+    const auto outputDocs = std::array{Document{{"a", 1}}, Document{{"a", 1}, {"d", 1}}};
+    const auto mock = DocumentSourceMock::createForTest(inputDoc, getExpCtx());
+    const auto mockDeque = std::deque<DocumentSource::GetNextResult>{Document{inputDoc}};
+    getExpCtx()->setMongoProcessInterface(std::make_unique<MockMongoInterface>(mockDeque));
+    const auto filter = DocumentSourceMatch::create(BSON("d" << 1), getExpCtx());
+    const auto proj = DocumentSourceAddFields::create(BSON("d" << 1), getExpCtx());
     auto unionWithOne = makeUnion(
-        mockCtxOne,
+        getExpCtx(),
         Pipeline::create(std::list<boost::intrusive_ptr<DocumentSource>>{filter}, getExpCtx()));
     auto unionWithTwo = makeUnion(
-        mockCtxTwo,
+        getExpCtx(),
         Pipeline::create(std::list<boost::intrusive_ptr<DocumentSource>>{proj}, getExpCtx()));
     unionWithOne->setSource(mock.get());
     unionWithTwo->setSource(unionWithOne.get());
@@ -180,8 +177,9 @@ TEST_F(DocumentSourceUnionWithTest, UnionsWithNonEmptySubPipelines) {
 
 TEST_F(DocumentSourceUnionWithTest, SerializeAndParseWithPipeline) {
     auto expCtx = getExpCtx();
-    NamespaceString nsToUnionWith(expCtx->ns.dbName(), "coll");
-    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+    NamespaceString nsToUnionWith = NamespaceString::createNamespaceString_forTest(
+        expCtx->getNamespaceString().dbName(), "coll");
+    expCtx->setResolvedNamespaces(StringMap<ResolvedNamespace>{
         {nsToUnionWith.coll().toString(), {nsToUnionWith, std::vector<BSONObj>()}}});
     auto bson =
         BSON("$unionWith" << BSON(
@@ -200,8 +198,9 @@ TEST_F(DocumentSourceUnionWithTest, SerializeAndParseWithPipeline) {
 
 TEST_F(DocumentSourceUnionWithTest, SerializeAndParseWithoutPipeline) {
     auto expCtx = getExpCtx();
-    NamespaceString nsToUnionWith(expCtx->ns.dbName(), "coll");
-    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+    NamespaceString nsToUnionWith = NamespaceString::createNamespaceString_forTest(
+        expCtx->getNamespaceString().dbName(), "coll");
+    expCtx->setResolvedNamespaces(StringMap<ResolvedNamespace>{
         {nsToUnionWith.coll().toString(), {nsToUnionWith, std::vector<BSONObj>()}}});
     auto bson = BSON("$unionWith" << nsToUnionWith.coll());
     auto desugaredBson =
@@ -219,8 +218,9 @@ TEST_F(DocumentSourceUnionWithTest, SerializeAndParseWithoutPipeline) {
 
 TEST_F(DocumentSourceUnionWithTest, SerializeAndParseWithoutPipelineExtraSubobject) {
     auto expCtx = getExpCtx();
-    NamespaceString nsToUnionWith(expCtx->ns.dbName(), "coll");
-    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+    NamespaceString nsToUnionWith = NamespaceString::createNamespaceString_forTest(
+        expCtx->getNamespaceString().dbName(), "coll");
+    expCtx->setResolvedNamespaces(StringMap<ResolvedNamespace>{
         {nsToUnionWith.coll().toString(), {nsToUnionWith, std::vector<BSONObj>()}}});
     auto bson = BSON("$unionWith" << BSON("coll" << nsToUnionWith.coll()));
     auto desugaredBson =
@@ -238,8 +238,9 @@ TEST_F(DocumentSourceUnionWithTest, SerializeAndParseWithoutPipelineExtraSubobje
 
 TEST_F(DocumentSourceUnionWithTest, ParseErrors) {
     auto expCtx = getExpCtx();
-    NamespaceString nsToUnionWith(expCtx->ns.dbName(), "coll");
-    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+    NamespaceString nsToUnionWith = NamespaceString::createNamespaceString_forTest(
+        expCtx->getNamespaceString().dbName(), "coll");
+    expCtx->setResolvedNamespaces(StringMap<ResolvedNamespace>{
         {nsToUnionWith.coll().toString(), {nsToUnionWith, std::vector<BSONObj>()}}});
     ASSERT_THROWS_CODE(
         DocumentSourceUnionWith::createFromBson(BSON("$unionWith" << false).firstElement(), expCtx),
@@ -251,7 +252,7 @@ TEST_F(DocumentSourceUnionWithTest, ParseErrors) {
                                .firstElement(),
                            expCtx),
                        AssertionException,
-                       40413);
+                       ErrorCodes::IDLDuplicateField);
     ASSERT_THROWS_CODE(
         DocumentSourceUnionWith::createFromBson(
             BSON("$unionWith" << BSON("coll" << nsToUnionWith.coll() << "pipeline"
@@ -261,7 +262,7 @@ TEST_F(DocumentSourceUnionWithTest, ParseErrors) {
                 .firstElement(),
             expCtx),
         AssertionException,
-        40413);
+        ErrorCodes::IDLDuplicateField);
     ASSERT_THROWS_CODE(
         DocumentSourceUnionWith::createFromBson(
             BSON("$unionWith" << BSON("coll" << nsToUnionWith.coll() << "pipeline"
@@ -271,7 +272,7 @@ TEST_F(DocumentSourceUnionWithTest, ParseErrors) {
                 .firstElement(),
             expCtx),
         AssertionException,
-        40415);
+        ErrorCodes::IDLUnknownField);
     ASSERT_THROWS_CODE(DocumentSourceUnionWith::createFromBson(
                            BSON("$unionWith" << BSON(
                                     "coll" << nsToUnionWith.coll() << "pipeline"
@@ -314,17 +315,13 @@ TEST_F(DocumentSourceUnionWithTest, PropagatePauses) {
                                            Document(),
                                            DocumentSource::GetNextResult::makePauseExecution()},
                                           getExpCtx());
-    const auto mockDequeOne = std::deque<DocumentSource::GetNextResult>{};
-    const auto mockDequeTwo = std::deque<DocumentSource::GetNextResult>{};
-    const auto mockCtxOne = getExpCtx()->copyWith({});
-    mockCtxOne->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockDequeOne);
-    const auto mockCtxTwo = getExpCtx()->copyWith({});
-    mockCtxTwo->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockDequeTwo);
+    const auto mockDeque = std::deque<DocumentSource::GetNextResult>{};
+    getExpCtx()->setMongoProcessInterface(std::make_unique<MockMongoInterface>(mockDeque));
     auto unionWithOne =
-        makeUnion(mockCtxOne,
+        makeUnion(getExpCtx(),
                   Pipeline::create(std::list<boost::intrusive_ptr<DocumentSource>>{}, getExpCtx()));
     auto unionWithTwo =
-        makeUnion(mockCtxTwo,
+        makeUnion(getExpCtx(),
                   Pipeline::create(std::list<boost::intrusive_ptr<DocumentSource>>{}, getExpCtx()));
     unionWithOne->setSource(mock.get());
     unionWithTwo->setSource(unionWithOne.get());
@@ -343,7 +340,7 @@ TEST_F(DocumentSourceUnionWithTest, ReturnEOFAfterBeingDisposed) {
     const auto mockInput = DocumentSourceMock::createForTest({Document(), Document()}, getExpCtx());
     const auto mockUnionInput = std::deque<DocumentSource::GetNextResult>{};
     const auto mockCtx = getExpCtx()->copyWith({});
-    mockCtx->mongoProcessInterface = std::make_unique<MockMongoInterface>(mockUnionInput);
+    mockCtx->setMongoProcessInterface(std::make_unique<MockMongoInterface>(mockUnionInput));
     auto unionWith = DocumentSourceUnionWith(
         mockCtx, Pipeline::create(std::list<boost::intrusive_ptr<DocumentSource>>{}, getExpCtx()));
     unionWith.setSource(mockInput.get());
@@ -397,16 +394,17 @@ TEST_F(DocumentSourceUnionWithTest, DependencyAnalysisReportsReferencedFieldsBef
 
 TEST_F(DocumentSourceUnionWithTest, RespectsViewDefinition) {
     auto expCtx = getExpCtx();
-    NamespaceString nsToUnionWith(expCtx->ns.dbName(), "coll");
-    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+    NamespaceString nsToUnionWith = NamespaceString::createNamespaceString_forTest(
+        expCtx->getNamespaceString().dbName(), "coll");
+    expCtx->setResolvedNamespaces(StringMap<ResolvedNamespace>{
         {nsToUnionWith.coll().toString(),
          {nsToUnionWith, std::vector<BSONObj>{fromjson("{$match: {_id: {$mod: [2, 0]}}}")}}}});
 
     // Mock out the foreign collection.
     std::deque<DocumentSource::GetNextResult> mockForeignContents{Document{{"_id", 1}},
                                                                   Document{{"_id", 2}}};
-    expCtx->mongoProcessInterface =
-        std::make_shared<MockMongoInterface>(std::move(mockForeignContents));
+    expCtx->setMongoProcessInterface(
+        std::make_shared<MockMongoInterface>(std::move(mockForeignContents)));
 
     const auto localMock =
         DocumentSourceMock::createForTest({Document{{"_id"_sd, "local"_sd}}}, getExpCtx());
@@ -427,17 +425,19 @@ TEST_F(DocumentSourceUnionWithTest, RespectsViewDefinition) {
 
 TEST_F(DocumentSourceUnionWithTest, ConcatenatesViewDefinitionToPipeline) {
     auto expCtx = getExpCtx();
-    NamespaceString viewNsToUnionWith(expCtx->ns.dbName(), "view");
-    NamespaceString nsToUnionWith(expCtx->ns.dbName(), "coll");
-    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+    NamespaceString viewNsToUnionWith = NamespaceString::createNamespaceString_forTest(
+        expCtx->getNamespaceString().dbName(), "view");
+    NamespaceString nsToUnionWith = NamespaceString::createNamespaceString_forTest(
+        expCtx->getNamespaceString().dbName(), "coll");
+    expCtx->setResolvedNamespaces(StringMap<ResolvedNamespace>{
         {viewNsToUnionWith.coll().toString(),
          {nsToUnionWith, std::vector<BSONObj>{fromjson("{$match: {_id: {$mod: [2, 0]}}}")}}}});
 
     // Mock out the foreign collection.
     std::deque<DocumentSource::GetNextResult> mockForeignContents{Document{{"_id", 1}},
                                                                   Document{{"_id", 2}}};
-    expCtx->mongoProcessInterface =
-        std::make_shared<MockMongoInterface>(std::move(mockForeignContents));
+    expCtx->setMongoProcessInterface(
+        std::make_shared<MockMongoInterface>(std::move(mockForeignContents)));
 
     const auto localMock =
         DocumentSourceMock::createForTest({Document{{"_id"_sd, "local"_sd}}}, getExpCtx());
@@ -463,11 +463,12 @@ TEST_F(DocumentSourceUnionWithTest, ConcatenatesViewDefinitionToPipeline) {
 
 TEST_F(DocumentSourceUnionWithTest, RejectUnionWhenDepthLimitIsExceeded) {
     auto expCtx = getExpCtx();
-    NamespaceString fromNs(boost::none, "test", "coll");
-    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
-        {fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
+    NamespaceString fromNs =
+        NamespaceString::createNamespaceString_forTest(boost::none, "test", "coll");
+    expCtx->setResolvedNamespaces(
+        StringMap<ResolvedNamespace>{{fromNs.coll().toString(), {fromNs, std::vector<BSONObj>()}}});
 
-    expCtx->subPipelineDepth = internalMaxSubPipelineViewDepth.load();
+    expCtx->setSubPipelineDepth(internalMaxSubPipelineViewDepth.load());
 
     ASSERT_THROWS_CODE(
         DocumentSourceUnionWith::createFromBson(
@@ -491,6 +492,7 @@ TEST_F(DocumentSourceUnionWithTest, ConstraintsWithoutPipelineAreCorrect) {
                                         StageConstraints::TransactionRequirement::kNotAllowed,
                                         StageConstraints::LookupRequirement::kAllowed,
                                         StageConstraints::UnionRequirement::kAllowed);
+    defaultConstraints.noFieldModifications = true;
     ASSERT_TRUE(emptyUnion->constraints(Pipeline::SplitState::kUnsplit) == defaultConstraints);
 }
 
@@ -504,6 +506,7 @@ TEST_F(DocumentSourceUnionWithTest, ConstraintsWithMixedSubPipelineAreCorrect) {
                                         StageConstraints::TransactionRequirement::kNotAllowed,
                                         StageConstraints::LookupRequirement::kNotAllowed,
                                         StageConstraints::UnionRequirement::kAllowed);
+    stricterConstraint.noFieldModifications = true;
     mock->mockConstraints = stricterConstraint;
     auto unionWithOne = DocumentSourceUnionWith(
         getExpCtx(),
@@ -513,7 +516,7 @@ TEST_F(DocumentSourceUnionWithTest, ConstraintsWithMixedSubPipelineAreCorrect) {
 
 TEST_F(DocumentSourceUnionWithTest, ConstraintsWithStrictSubPipelineAreCorrect) {
     const auto mockOne = DocumentSourceMock::createForTest(getExpCtx());
-    StageConstraints constraintTmpDataFacetLookupNotAllowed(
+    StageConstraints constraintTmpDataFacetLookupNotAllowedNoFieldMod(
         StageConstraints::StreamType::kStreaming,
         StageConstraints::PositionRequirement::kNone,
         StageConstraints::HostTypeRequirement::kAnyShard,
@@ -522,7 +525,10 @@ TEST_F(DocumentSourceUnionWithTest, ConstraintsWithStrictSubPipelineAreCorrect) 
         StageConstraints::TransactionRequirement::kAllowed,
         StageConstraints::LookupRequirement::kNotAllowed,
         StageConstraints::UnionRequirement::kAllowed);
-    mockOne->mockConstraints = constraintTmpDataFacetLookupNotAllowed;
+    // Since this is the only sub-constraint that marks noFieldModifications = true, the strict
+    // constraints should have noFieldModifications = false (which is the default).
+    constraintTmpDataFacetLookupNotAllowedNoFieldMod.noFieldModifications = true;
+    mockOne->mockConstraints = constraintTmpDataFacetLookupNotAllowedNoFieldMod;
     const auto mockTwo = DocumentSourceMock::createForTest(getExpCtx());
     StageConstraints constraintPermissive(StageConstraints::StreamType::kStreaming,
                                           StageConstraints::PositionRequirement::kNone,
@@ -559,6 +565,7 @@ TEST_F(DocumentSourceUnionWithTest, ConstraintsWithStrictSubPipelineAreCorrect) 
                             StageConstraints::UnionRequirement::kAllowed);
     ASSERT_TRUE(unionStage.constraints(Pipeline::SplitState::kUnsplit) == strict);
 }
+
 TEST_F(DocumentSourceUnionWithTest, StricterConstraintsFromSubSubPipelineAreInherited) {
     const auto mock = DocumentSourceMock::createForTest(getExpCtx());
     StageConstraints strictConstraint(StageConstraints::StreamType::kStreaming,
@@ -588,12 +595,107 @@ TEST_F(DocumentSourceUnionWithTest, StricterConstraintsFromSubSubPipelineAreInhe
     ASSERT_TRUE(unionStage.constraints(Pipeline::SplitState::kUnsplit) == expectedConstraints);
 }
 
+TEST_F(DocumentSourceUnionWithTest, IncrementNestedAggregateOpCounterOnCreateButNotOnCopy) {
+    auto testOpCounter = [&](const NamespaceString& nss, const int expectedIncrease) {
+        auto resolvedNss =
+            StringMap<ResolvedNamespace>{{nss.coll().toString(), {nss, std::vector<BSONObj>()}}};
+        auto countBeforeCreate = serviceOpCounters(getOpCtx()).getNestedAggregate()->load();
+
+        // Create a DocumentSourceUnionWith and verify that the counter increases by the expected
+        // amount.
+        auto originalExpCtx = make_intrusive<ExpressionContextForTest>(getOpCtx(), nss);
+        originalExpCtx->setResolvedNamespaces(resolvedNss);
+        auto docSource = DocumentSourceUnionWith::createFromBson(
+            BSON("$unionWith" << BSON("coll" << nss.coll() << "pipeline"
+                                             << BSON_ARRAY(BSON("$match" << BSON("x" << 1)))))
+                .firstElement(),
+            originalExpCtx);
+        auto originalUnionWith = static_cast<DocumentSourceUnionWith*>(docSource.get());
+        auto countAfterCreate = serviceOpCounters(getOpCtx()).getNestedAggregate()->load();
+        ASSERT_EQ(countAfterCreate - countBeforeCreate, expectedIncrease);
+
+        // Copy the DocumentSourceUnionWith and verify that the counter doesn't increase.
+        auto newExpCtx = make_intrusive<ExpressionContextForTest>(getOpCtx(), nss);
+        newExpCtx->setResolvedNamespaces(resolvedNss);
+        DocumentSourceUnionWith newUnionWith{*originalUnionWith, newExpCtx};
+        auto countAfterCopy = serviceOpCounters(getOpCtx()).getNestedAggregate()->load();
+        ASSERT_EQ(countAfterCopy - countAfterCreate, 0);
+    };
+
+    testOpCounter(NamespaceString::createNamespaceString_forTest("testDb", "testColl"), 1);
+    // $unionWith against internal databases should not cause the counter to get incremented.
+    testOpCounter(NamespaceString::createNamespaceString_forTest("config", "testColl"), 0);
+    testOpCounter(NamespaceString::createNamespaceString_forTest("admin", "testColl"), 0);
+    testOpCounter(NamespaceString::createNamespaceString_forTest("local", "testColl"), 0);
+}
+
+TEST_F(DocumentSourceUnionWithTest, RedactsCorrectlyBasic) {
+    auto expCtx = getExpCtx();
+    auto nsToUnionWith = NamespaceString::createNamespaceString_forTest(
+        expCtx->getNamespaceString().dbName(), "coll");
+    expCtx->setResolvedNamespaces(StringMap<ResolvedNamespace>{
+        {nsToUnionWith.coll().toString(), {nsToUnionWith, std::vector<BSONObj>()}}});
+
+    auto docSource = DocumentSourceUnionWith::createFromBson(
+        BSON("$unionWith" << nsToUnionWith.coll()).firstElement(), expCtx);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$unionWith": {
+                "coll": "HASH<coll>",
+                "pipeline": []
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(DocumentSourceUnionWithTest, RedactsCorrectlyWithPipeline) {
+    auto expCtx = getExpCtx();
+    auto nsToUnionWith = NamespaceString::createNamespaceString_forTest(
+        expCtx->getNamespaceString().dbName(), "coll");
+    expCtx->setResolvedNamespaces(StringMap<ResolvedNamespace>{
+        {nsToUnionWith.coll().toString(), {nsToUnionWith, std::vector<BSONObj>()}}});
+
+    BSONArrayBuilder pipeline;
+    pipeline << BSON("$match" << BSON("a" << 15));
+    pipeline << BSON("$project" << BSON("a" << 1 << "b" << 1));
+    auto docSource = DocumentSourceUnionWith::createFromBson(
+        BSON("$unionWith" << BSON("coll" << nsToUnionWith.coll() << "pipeline" << pipeline.arr()))
+            .firstElement(),
+        expCtx);
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$unionWith": {
+                "coll": "HASH<coll>",
+                "pipeline": [
+                    {
+                        "$match": {
+                            "HASH<a>": {
+                                "$eq": "?number"
+                            }
+                        }
+                    },
+                    {
+                        "$project": {
+                            "HASH<_id>": true,
+                            "HASH<a>": true,
+                            "HASH<b>": true
+                        }
+                    }
+                ]
+            }
+        })",
+        redact(*docSource));
+}
+
 using DocumentSourceUnionWithServerlessTest = ServerlessAggregationContextFixture;
 
 TEST_F(DocumentSourceUnionWithServerlessTest,
        LiteParsedDocumentSourceLookupContainsExpectedNamespacesInServerless) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+
     auto tenantId = TenantId(OID::gen());
-    NamespaceString nss(tenantId, "test", "testColl");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(tenantId, "test", "testColl");
     std::vector<BSONObj> pipeline;
 
     auto stageSpec = BSON("$unionWith"
@@ -602,7 +704,9 @@ TEST_F(DocumentSourceUnionWithServerlessTest,
         DocumentSourceUnionWith::LiteParsed::parse(nss, stageSpec.firstElement());
     auto namespaceSet = liteParsedLookup->getInvolvedNamespaces();
     ASSERT_EQ(1, namespaceSet.size());
-    ASSERT_EQ(1ul, namespaceSet.count(NamespaceString(tenantId, "test", "some_coll")));
+    ASSERT_EQ(1ul,
+              namespaceSet.count(
+                  NamespaceString::createNamespaceString_forTest(tenantId, "test", "some_coll")));
 
     stageSpec = BSON("$unionWith" << BSON("coll"
                                           << "some_coll"
@@ -610,16 +714,21 @@ TEST_F(DocumentSourceUnionWithServerlessTest,
     liteParsedLookup = DocumentSourceUnionWith::LiteParsed::parse(nss, stageSpec.firstElement());
     namespaceSet = liteParsedLookup->getInvolvedNamespaces();
     ASSERT_EQ(1, namespaceSet.size());
-    ASSERT_EQ(1ul, namespaceSet.count(NamespaceString(tenantId, "test", "some_coll")));
+    ASSERT_EQ(1ul,
+              namespaceSet.count(
+                  NamespaceString::createNamespaceString_forTest(tenantId, "test", "some_coll")));
 }
 
 TEST_F(DocumentSourceUnionWithServerlessTest,
        CreateFromBSONContainsExpectedNamespacesInServerless) {
-    auto expCtx = getExpCtx();
-    ASSERT(expCtx->ns.tenantId());
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
 
-    NamespaceString unionWithNs(expCtx->ns.tenantId(), "test", "some_coll");
-    expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
+    auto expCtx = getExpCtx();
+    ASSERT(expCtx->getNamespaceString().tenantId());
+
+    NamespaceString unionWithNs = NamespaceString::createNamespaceString_forTest(
+        expCtx->getNamespaceString().tenantId(), "test", "some_coll");
+    expCtx->setResolvedNamespaces(StringMap<ResolvedNamespace>{
         {unionWithNs.coll().toString(), {unionWithNs, std::vector<BSONObj>()}}});
 
     auto spec = BSON("$unionWith"

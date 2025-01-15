@@ -4,6 +4,9 @@
 3) remove shard
 4) topology time must increase
 */
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
 
 function assertTopologyGt(topologyTime1, topologyTime2, msg) {
     let msgError = `[${tojson(topologyTime1)} <= ${tojson(topologyTime2)}] ${msg}`;
@@ -29,10 +32,6 @@ function printConfigShards(st, msg) {
     print(msg, tojson(st.s.getDB("config").shards.find().toArray()));
 }
 
-(function() {
-
-'use strict';
-
 var st = new ShardingTest({shards: 1, rs: {nodes: 1}, config: 3});
 
 let initialTopology = getTopologyTime(st);
@@ -52,11 +51,9 @@ assertTopologyGt(topologyTimeAfterAddShard,
                  initialTopology,
                  "Current topologyTime should change after add shard, but it did not");
 
-assert.commandWorked(st.s.adminCommand({removeShard: "rs1"}));
-printConfigShards(st, "config.shards after first remove shard ");
+removeShard(st, "rs1");
 
-assert.commandWorked(st.s.adminCommand({removeShard: "rs1"}));
-printConfigShards(st, "config.shards after second remove shard ");
+printConfigShards(st, "config.shards after remove shard ");
 
 let topologyTimeAfterRemoveShard = getTopologyTime(st);
 
@@ -67,4 +64,3 @@ assertTopologyGt(topologyTimeAfterRemoveShard,
 
 rs.stopSet();
 st.stop();
-})();

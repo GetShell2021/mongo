@@ -3,10 +3,9 @@
  * changes. In this case the reconfig command would win the potential race.
  */
 
-(function() {
-"use strict";
-load("jstests/libs/parallel_shell_helpers.js");
-load("jstests/libs/write_concern_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = jsTestName();
 const rst = new ReplSetTest({
@@ -33,7 +32,8 @@ cfg.settings.getLastErrorModes = {
     multiCategory: {category: 2}
 };
 
-function runReconfigFn(cfg) {
+async function runReconfigFn(cfg) {
+    const {ReplSetTest} = await import("jstests/libs/replsettest.js");
     jsTestLog("Running reconfig");
     assert.commandWorked(
         db.adminCommand({replSetReconfig: cfg, maxTimeMS: ReplSetTest.kDefaultTimeoutMS}));
@@ -63,4 +63,3 @@ assert.commandWorked(coll.insert({a: 1}));
 rst.awaitReplication();
 
 rst.stopSet();
-})();

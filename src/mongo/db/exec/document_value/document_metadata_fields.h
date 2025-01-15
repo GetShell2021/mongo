@@ -30,10 +30,22 @@
 #pragma once
 
 #include <bitset>
+#include <cstddef>
+#include <iosfwd>
+#include <memory>
+#include <utility>
+
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/record_id.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 /**
@@ -67,10 +79,25 @@ public:
         kSearchScoreDetails,
         kTimeseriesBucketMinTime,
         kTimeseriesBucketMaxTime,
+        kSearchSortValues,
+        kVectorSearchScore,
+        kSearchSequenceToken,
+        kScore,
+        kScoreDetails,
+        kStream,
 
         // New fields must be added before the kNumFields sentinel.
         kNumFields
     };
+
+    /**
+     * Parses the MetaType from a given type name.
+     *
+     * Throws a user exception if the provided name is not a recognized name as argument to $meta.
+     */
+    static DocumentMetadataFields::MetaType parseMetaType(StringData name);
+
+    static StringData serializeMetaType(DocumentMetadataFields::MetaType type);
 
     /**
      * Reads serialized metadata out of 'buf', and uses it to populate 'out'. Expects 'buf' to have
@@ -138,6 +165,17 @@ public:
         return static_cast<bool>(_holder);
     }
 
+    /**
+     * Sets the given MetaType field to the Value provided.
+     *
+     * Throws a user exception if the type of the Value is not compatible with the type held in the
+     * metadata holder.
+     *
+     * The sort key cannot be set using this method since it must also be specified if the sort key
+     * is a single element sort key.
+     */
+    void setMetaFieldFromValue(MetaType type, Value val);
+
     bool hasTextScore() const {
         return _holder && _holder->metaFields.test(MetaType::kTextScore);
     }
@@ -148,12 +186,10 @@ public:
     }
 
     void setTextScore(double score) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-
-        _holder->metaFields.set(MetaType::kTextScore);
+        _setCommon(MetaType::kTextScore);
         _holder->textScore = score;
+        // The 'score' metadata field is also set, with the value of the 'textScore'.
+        setScore(score);
     }
 
     bool hasRandVal() const {
@@ -166,11 +202,7 @@ public:
     }
 
     void setRandVal(double val) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-
-        _holder->metaFields.set(MetaType::kRandVal);
+        _setCommon(MetaType::kRandVal);
         _holder->randVal = val;
     }
 
@@ -184,11 +216,7 @@ public:
     }
 
     void setSortKey(Value sortKey, bool isSingleElementKey) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-
-        _holder->metaFields.set(MetaType::kSortKey);
+        _setCommon(MetaType::kSortKey);
         _holder->isSingleElementKey = isSingleElementKey;
         _holder->sortKey = std::move(sortKey);
     }
@@ -207,11 +235,7 @@ public:
     }
 
     void setGeoNearDistance(double dist) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-
-        _holder->metaFields.set(MetaType::kGeoNearDist);
+        _setCommon(MetaType::kGeoNearDist);
         _holder->geoNearDistance = dist;
     }
 
@@ -225,11 +249,7 @@ public:
     }
 
     void setGeoNearPoint(Value point) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-
-        _holder->metaFields.set(MetaType::kGeoNearPoint);
+        _setCommon(MetaType::kGeoNearPoint);
         _holder->geoNearPoint = std::move(point);
     }
 
@@ -243,12 +263,10 @@ public:
     }
 
     void setSearchScore(double score) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-
-        _holder->metaFields.set(MetaType::kSearchScore);
+        _setCommon(MetaType::kSearchScore);
         _holder->searchScore = score;
+        // The 'score' metadata field is also set, with the value of the 'textScore'.
+        setScore(score);
     }
 
     bool hasSearchHighlights() const {
@@ -261,11 +279,7 @@ public:
     }
 
     void setSearchHighlights(Value highlights) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-
-        _holder->metaFields.set(MetaType::kSearchHighlights);
+        _setCommon(MetaType::kSearchHighlights);
         _holder->searchHighlights = highlights;
     }
 
@@ -279,11 +293,7 @@ public:
     }
 
     void setIndexKey(BSONObj indexKey) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-
-        _holder->metaFields.set(MetaType::kIndexKey);
+        _setCommon(MetaType::kIndexKey);
         _holder->indexKey = indexKey.getOwned();
     }
 
@@ -297,12 +307,8 @@ public:
     }
 
     void setRecordId(RecordId rid) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-
-        _holder->metaFields.set(MetaType::kRecordId);
-        _holder->recordId = rid;
+        _setCommon(MetaType::kRecordId);
+        _holder->recordId = std::move(rid);
     }
 
     bool hasSearchScoreDetails() const {
@@ -315,11 +321,11 @@ public:
     }
 
     void setSearchScoreDetails(BSONObj details) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-        _holder->metaFields.set(MetaType::kSearchScoreDetails);
+        _setCommon(MetaType::kSearchScoreDetails);
         _holder->searchScoreDetails = details.getOwned();
+        // The 'scoreDetails' metadata field is also set. The Value constructor takes an owned copy
+        // of details.
+        setScoreDetails(Value(details));
     }
 
     bool hasTimeseriesBucketMinTime() const {
@@ -327,15 +333,14 @@ public:
     }
 
     Date_t getTimeseriesBucketMinTime() const {
-        invariant(hasTimeseriesBucketMinTime());
+        tassert(6850100,
+                "Document must have timeseries bucket min time metadata field set",
+                hasTimeseriesBucketMinTime());
         return _holder->timeseriesBucketMinTime;
     }
 
     void setTimeseriesBucketMinTime(Date_t time) {
-        if (!_holder) {
-            _holder = std::make_unique<MetadataHolder>();
-        }
-        _holder->metaFields.set(MetaType::kTimeseriesBucketMinTime);
+        _setCommon(MetaType::kTimeseriesBucketMinTime);
         _holder->timeseriesBucketMinTime = time;
     }
 
@@ -344,20 +349,141 @@ public:
     }
 
     Date_t getTimeseriesBucketMaxTime() const {
-        invariant(hasTimeseriesBucketMaxTime());
+        tassert(6850101,
+                "Document must have timeseries bucket max time metadata field set",
+                hasTimeseriesBucketMaxTime());
         return _holder->timeseriesBucketMaxTime;
     }
 
     void setTimeseriesBucketMaxTime(Date_t time) {
+        _setCommon(MetaType::kTimeseriesBucketMaxTime);
+        _holder->timeseriesBucketMaxTime = time;
+    }
+
+    bool hasSearchSortValues() const {
+        return _holder && _holder->metaFields.test(MetaType::kSearchSortValues);
+    }
+
+    BSONObj getSearchSortValues() const {
+        tassert(7320401, "Document must have $searchSortValues set", hasSearchSortValues());
+        return _holder->searchSortValues;
+    }
+
+    void setSearchSortValues(BSONObj vals) {
+        _setCommon(MetaType::kSearchSortValues);
+        _holder->searchSortValues = vals.getOwned();
+    }
+
+    bool hasVectorSearchScore() const {
+        return _holder && _holder->metaFields.test(MetaType::kVectorSearchScore);
+    }
+
+    double getVectorSearchScore() const {
+        tassert(7828400, "vectorSearchScore must be present in metadata", hasVectorSearchScore());
+        return _holder->vectorSearchScore;
+    }
+
+    void setVectorSearchScore(double vectorSearchScore) {
+        _setCommon(MetaType::kVectorSearchScore);
+        _holder->vectorSearchScore = vectorSearchScore;
+        // The 'score' metadata field is also set, with the value of the 'textScore'.
+        setScore(vectorSearchScore);
+    }
+
+    bool hasSearchSequenceToken() const {
+        return _holder && _holder->metaFields.test(MetaType::kSearchSequenceToken);
+    }
+
+    Value getSearchSequenceToken() const {
+        invariant(hasSearchSequenceToken());
+        return _holder->searchSequenceToken;
+    }
+
+    void setSearchSequenceToken(Value details) {
+        _setCommon(MetaType::kSearchSequenceToken);
+        _holder->searchSequenceToken = details;
+    }
+
+    bool hasScore() const {
+        return _holder && _holder->metaFields.test(MetaType::kScore);
+    }
+
+    double getScore() const {
+        tassert(9484100, "score must be present in metadata", hasScore());
+        return _holder->score;
+    }
+
+    // TODO SERVER-85426 Remove all feature flag logic.
+    void setScore(double score, bool featureFlagAlreadyValidated = false) {
+        if (featureFlagAlreadyValidated ||
+            feature_flags::gFeatureFlagRankFusionFull.isEnabledUseLastLTSFCVWhenUninitialized(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+            _setCommon(MetaType::kScore);
+            _holder->score = score;
+        }
+    }
+
+    bool hasScoreDetails() const {
+        return _holder && _holder->metaFields.test(MetaType::kScoreDetails);
+    }
+
+    Value getScoreDetails() const {
+        tassert(9679301, "score details must be present in metadata", hasScoreDetails());
+        return _holder->scoreDetails;
+    }
+
+    // TODO SERVER-85426 Remove all feature flag logic.
+    void setScoreDetails(Value scoreDetails, bool featureFlagAlreadyValidated = false);
+
+    /**
+     * This sets 'scoreDetails' and retrieves the "value" field from 'scoreDetails' to set the
+     * 'score' meta field as well.
+     *
+     * This is the default way to set 'scoreDetails' (for example, this is used for
+     * {$setMetadata: kScoreDetails}), and will tassert if the "value" field isn't present.
+     * However, setting 'scoreDetails' via 'searchScoreDetails' will just go through
+     * setScoreDetails() without setting the 'score' too.
+     */
+    void setScoreAndScoreDetails(Value scoreDetails);
+
+    bool hasStream() const {
+        return _holder && _holder->metaFields.test(MetaType::kStream);
+    }
+
+    void setStream(Value value) {
+        _setCommon(MetaType::kStream);
+        _holder->stream = std::move(value);
+    }
+
+    Value getStream() const {
+        tassert(9484101, "stream must be present in metadata", hasStream());
+        return _holder->stream;
+    }
+
+    void serializeForSorter(BufBuilder& buf) const;
+
+    bool isModified() const {
+        return _modified;
+    }
+
+    /**
+     * Sets the 'modified' flag to the given value. Necessary for implementing a lazy load
+     * optimization for the contained mutable 'DocumentMetadataFields' instance inside the
+     * 'Document' class.
+     */
+    void setModified(bool newValue) {
+        _modified = newValue;
+    }
+
+private:
+    inline void _setCommon(MetaType mt) {
         if (!_holder) {
             _holder = std::make_unique<MetadataHolder>();
         }
-        _holder->metaFields.set(MetaType::kTimeseriesBucketMaxTime);
-        _holder->timeseriesBucketMaxTime = time;
+        _holder->metaFields.set(mt);
+        _modified = true;
     }
-    void serializeForSorter(BufBuilder& buf) const;
 
-private:
     // A simple data struct housing all possible metadata fields.
     struct MetadataHolder {
         std::bitset<MetaType::kNumFields> metaFields;
@@ -379,10 +505,24 @@ private:
         BSONObj searchScoreDetails;
         Date_t timeseriesBucketMinTime;
         Date_t timeseriesBucketMaxTime;
+        BSONObj searchSortValues;
+        double vectorSearchScore{0.0};
+        Value searchSequenceToken;
+        double score{0.0};
+        // scoreDetails expects a Document as the underlying type, but to avoid dependency cycles,
+        // it's easier to store as Value.
+        Value scoreDetails;
+        // Stream processing related metadata. Only set in Atlas Stream Processing.
+        Value stream;
     };
 
     // Null until the first setter is called, at which point a MetadataHolder struct is allocated.
     std::unique_ptr<MetadataHolder> _holder;
+
+    // This flag is set to true anytime a 'DocumentMetadataFields' instance is modified. It is used
+    // to optimize document conversion to BSON with metadata; i.e. if there are no modifications we
+    // can directly return the underlying BSON.
+    bool _modified{false};
 };
 
 using QueryMetadataBitSet = std::bitset<DocumentMetadataFields::MetaType::kNumFields>;

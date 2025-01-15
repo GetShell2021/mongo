@@ -29,19 +29,21 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
-class BSONObj;
-class BSONObjBuilder;
-class Date_t;
-class Client;
-class OperationContext;
+enum UseMultiServiceSchema : bool {};
 
 /**
  * BSON Collector interface
@@ -83,6 +85,57 @@ protected:
     FTDCCollectorInterface() = default;
 };
 
+class FTDCCollectorCollectionSet {
+public:
+    /**
+     * Returns the sequence of collectors for the specified `role`.
+     * The `role` must be exactly one of None, ShardServer, or RouterServer.
+     */
+    std::vector<std::unique_ptr<FTDCCollectorInterface>>& operator[](ClusterRole role) {
+        if (role.hasExclusively(ClusterRole::None))
+            return _none;
+        if (role.hasExclusively(ClusterRole::ShardServer))
+            return _shard;
+        if (role.hasExclusively(ClusterRole::RouterServer))
+            return _router;
+        MONGO_UNREACHABLE;
+    }
+
+private:
+    std::vector<std::unique_ptr<FTDCCollectorInterface>> _none;
+    std::vector<std::unique_ptr<FTDCCollectorInterface>> _shard;
+    std::vector<std::unique_ptr<FTDCCollectorInterface>> _router;
+};
+
+/**
+ * Collector filter, used to disable specific collectors at runtime,
+ * e.g. when a daemon takes an Arbiter role.
+ *
+ * The filter function is run every time stats are collected, and
+ * collection is skipped if the filter returns false.
+ */
+class FilteredFTDCCollector : public FTDCCollectorInterface {
+public:
+    FilteredFTDCCollector(std::function<bool()> pred, std::unique_ptr<FTDCCollectorInterface> coll)
+        : _pred(std::move(pred)), _coll(std::move(coll)) {}
+
+    std::string name() const override {
+        return _coll->name();
+    }
+
+    bool hasData() const override {
+        return _pred() && _coll->hasData();
+    }
+
+    void collect(OperationContext* opCtx, BSONObjBuilder& builder) override {
+        _coll->collect(opCtx, builder);
+    }
+
+private:
+    std::function<bool()> _pred;
+    std::unique_ptr<FTDCCollectorInterface> _coll;
+};
+
 /**
  * Manages the set of BSON collectors
  *
@@ -98,8 +151,13 @@ public:
     /**
      * Add a metric collector to the collection.
      * Must be called before collect. Cannot be called after collect is called.
+     *
+     * If the collector has characteristics of the process depending of the acting role, it requires
+     * passing a ClusterRole::ShardServer or a ClusterRole::RouterServer role. On the other hand, if
+     * the collector is composed by indicators that are specific to the underlying hardware or to
+     * the process, it requires a ClusterRole::None.
      */
-    void add(std::unique_ptr<FTDCCollectorInterface> collector);
+    void add(std::unique_ptr<FTDCCollectorInterface> collector, ClusterRole role);
 
     /**
      * Collect a sample from all collectors. Called after all adding is complete.
@@ -117,11 +175,11 @@ public:
      *    "end" : Date_t,      <- Time at which all collecting ended
      * }
      */
-    std::tuple<BSONObj, Date_t> collect(Client* client);
+    std::tuple<BSONObj, Date_t> collect(Client* client, UseMultiServiceSchema multiServiceSchema);
 
 private:
     // collection of collectors
-    std::vector<std::unique_ptr<FTDCCollectorInterface>> _collectors;
+    FTDCCollectorCollectionSet _collectors;
 };
 
 }  // namespace mongo

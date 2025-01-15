@@ -2,11 +2,13 @@
  * Tests that test-only replica-set only commands are truly test-only.
  *
  * @tags: [
+ *   # TODO (SERVER-80568): Re-enable this test in multiversion suites once it has been fixed.
+ *   DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE,
+ *   disables_test_commands,
  * ]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const cmdList = [
     {'replSetGetConfig': 1, '$_internalIncludeNewlyAdded': true},
@@ -16,7 +18,7 @@ const cmdList = [
 TestData.enableTestCommands = false;
 let rst = new ReplSetTest({nodes: 1});
 rst.startSet();
-rst.initiateWithAnyNodeAsPrimary(null, "replSetInitiate", {doNotWaitForNewlyAddedRemovals: true});
+rst.initiate(null, "replSetInitiate", {doNotWaitForNewlyAddedRemovals: true});
 
 let primary = rst.getPrimary();
 for (let cmd of cmdList) {
@@ -29,7 +31,7 @@ rst.stopSet();
 TestData.enableTestCommands = true;
 rst = new ReplSetTest({nodes: 1});
 rst.startSet();
-rst.initiateWithAnyNodeAsPrimary(null, "replSetInitiate", {doNotWaitForNewlyAddedRemovals: true});
+rst.initiate(null, "replSetInitiate", {doNotWaitForNewlyAddedRemovals: true});
 
 primary = rst.getPrimary();
 for (let cmd of cmdList) {
@@ -38,4 +40,3 @@ for (let cmd of cmdList) {
 
 rst.awaitReplication();
 rst.stopSet();
-})();

@@ -2,16 +2,25 @@
  * Tests that transaction records for retryable internal sessions are reaped eagerly when they are
  * reaped early from memory.
  *
- * @tags: [requires_fcv_60, uses_transactions]
+ * @tags: [
+ *    requires_fcv_60,
+ *    uses_transactions,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 1, config: 1});
 
 const kDbName = "testDb";
 const kCollName = "testColl";
 const mongosTestColl = st.s.getCollection(kDbName + "." + kCollName);
+// Reap all internal sessions to make sure the actual test case starts without anything added
+// implicitly from setting up the test collection.
+assert.commandWorked(
+    st.rs0.getPrimary().adminCommand({setParameter: 1, internalSessionsReapThreshold: 1}));
 assert.commandWorked(mongosTestColl.insert({x: 1}));  // Set up the collection.
 
 function assertNumEntries(conn,
@@ -164,7 +173,7 @@ function runTest(conn, shardConn) {
     parentLsid = {id: UUID()};
 
     runInternalTxn(conn, parentLsid);  // Non-retryable transaction.
-    assert.commandWorked(conn.getDB("test").runCommand({
+    assert.commandWorked(conn.getDB(kDbName).runCommand({
         insert: "foo",
         documents: [{x: 1}],
         lsid: parentLsid,
@@ -212,4 +221,3 @@ runTest(st.s, st.rs0.getPrimary());
 runParameterTest(st.s, st.rs0.getPrimary());
 
 st.stop();
-})();

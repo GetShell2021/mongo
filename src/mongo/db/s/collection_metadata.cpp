@@ -28,17 +28,26 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/s/collection_metadata.h"
-
+#include <boost/none.hpp>
 #include <fmt/format.h>
+#include <map>
+#include <set>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
@@ -56,7 +65,7 @@ bool CollectionMetadata::allowMigrations() const {
 }
 
 boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldForwardOps() const {
-    if (!isSharded())
+    if (!hasRoutingTable())
         return boost::none;
 
     const auto& reshardingFields = getReshardingFields();
@@ -71,12 +80,13 @@ boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldFor
 
     // Used a switch statement so that the compiler warns anyone who modifies the coordinator
     // states enum.
-    switch (reshardingFields.get().getState()) {
+    switch (reshardingFields.value().getState()) {
         case CoordinatorStateEnum::kUnused:
         case CoordinatorStateEnum::kInitializing:
         case CoordinatorStateEnum::kBlockingWrites:
         case CoordinatorStateEnum::kAborting:
         case CoordinatorStateEnum::kCommitting:
+        case CoordinatorStateEnum::kQuiesced:
         case CoordinatorStateEnum::kDone:
             return boost::none;
         case CoordinatorStateEnum::kPreparingToDonate:
@@ -97,25 +107,26 @@ boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldFor
 }
 
 void CollectionMetadata::throwIfReshardingInProgress(NamespaceString const& nss) const {
-    if (isSharded()) {
+    if (hasRoutingTable()) {
         const auto& reshardingFields = getReshardingFields();
         // Throw if the coordinator is not in states "aborting", "committing", or "done".
         if (reshardingFields && reshardingFields->getState() < CoordinatorStateEnum::kAborting) {
-            LOGV2(5277122, "reshardCollection in progress", "namespace"_attr = nss.toString());
+            LOGV2(5277122, "reshardCollection in progress", logAttrs(nss));
 
             uasserted(ErrorCodes::ReshardCollectionInProgress,
-                      "reshardCollection is in progress for namespace " + nss.toString());
+                      "reshardCollection is in progress for namespace " +
+                          nss.toStringForErrorMsg());
         }
     }
 }
 
-BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {
+BSONObj CollectionMetadata::extractDocumentKey(const ShardKeyPattern* shardKeyPattern,
+                                               const BSONObj& doc) {
     BSONObj key;
 
-    if (isSharded()) {
-        auto const& pattern = _cm->getShardKeyPattern();
-        key = dotted_path_support::extractElementsBasedOnTemplate(doc, pattern.toBSON());
-        if (pattern.hasId()) {
+    if (shardKeyPattern) {
+        key = dotted_path_support::extractElementsBasedOnTemplate(doc, shardKeyPattern->toBSON());
+        if (shardKeyPattern->hasId()) {
             return key;
         }
         // else, try to append an _id field from the document.
@@ -129,17 +140,22 @@ BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {
     return doc;
 }
 
+BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {
+    return extractDocumentKey(isSharded() ? &_cm->getShardKeyPattern() : nullptr, doc);
+}
+
 std::string CollectionMetadata::toStringBasic() const {
-    if (isSharded()) {
-        return str::stream() << "collection version: " << _cm->getVersion().toString()
-                             << ", shard version: " << getShardVersionForLogging().toString();
+    if (hasRoutingTable()) {
+        return str::stream() << "collection placement version: " << _cm->getVersion().toString()
+                             << ", shard placement version: "
+                             << getShardPlacementVersionForLogging().toString();
     } else {
-        return "collection version: <unsharded>";
+        return "collection placement version: <unsharded>";
     }
 }
 
 RangeMap CollectionMetadata::getChunks() const {
-    invariant(isSharded());
+    invariant(hasRoutingTable());
 
     RangeMap chunksMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>());
 
@@ -154,20 +170,19 @@ RangeMap CollectionMetadata::getChunks() const {
 }
 
 bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey, ChunkType* chunk) const {
-    invariant(isSharded());
+    invariant(hasRoutingTable());
 
     auto nextChunk = _cm->getNextChunkOnShard(lookupKey, _thisShardId);
     if (!nextChunk)
         return false;
 
-    chunk->setMin(nextChunk->getMin());
-    chunk->setMax(nextChunk->getMax());
+    chunk->setRange(nextChunk->getRange());
 
     return true;
 }
 
 bool CollectionMetadata::currentShardHasAnyChunks() const {
-    invariant(isSharded());
+    invariant(hasRoutingTable());
     std::set<ShardId> shards;
     _cm->getAllShardIds(&shards);
     return shards.find(_thisShardId) != shards.end();
@@ -243,7 +258,7 @@ boost::optional<ChunkRange> CollectionMetadata::getNextOrphanRange(
 }
 
 void CollectionMetadata::toBSONChunks(BSONArrayBuilder* builder) const {
-    if (!isSharded())
+    if (!hasRoutingTable())
         return;
 
     _cm->forEachChunk([this, &builder](const auto& chunk) {

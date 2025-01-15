@@ -29,10 +29,20 @@
 
 #include "mongo/client/sdam/topology_manager.h"
 
-#include <string>
+#include <memory>
+#include <mutex>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/oid.h"
+#include "mongo/client/sdam/server_description.h"
+#include "mongo/client/sdam/topology_description.h"
 #include "mongo/client/sdam/topology_state_machine.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/rpc/topology_version_gen.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
@@ -74,7 +84,7 @@ TopologyManagerImpl::TopologyManagerImpl(SdamConfiguration config,
       _topologyEventsPublisher(eventsPublisher) {}
 
 bool TopologyManagerImpl::onServerDescription(const HelloOutcome& helloOutcome) {
-    stdx::lock_guard<mongo::Mutex> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
 
     boost::optional<HelloRTT> lastRTT;
     boost::optional<TopologyVersion> lastTopologyVersion;
@@ -89,8 +99,6 @@ bool TopologyManagerImpl::onServerDescription(const HelloOutcome& helloOutcome) 
     boost::optional<TopologyVersion> newTopologyVersion = helloOutcome.getTopologyVersion();
     if (isStaleTopologyVersion(lastTopologyVersion, newTopologyVersion)) {
         LOGV2(23930,
-              "Ignoring this hello response because our topologyVersion: {lastTopologyVersion} is "
-              "fresher than the provided topologyVersion: {newTopologyVersion}",
               "Ignoring this hello response because our last topologyVersion is fresher than the "
               "new topologyVersion provided",
               "lastTopologyVersion"_attr = lastTopologyVersion->toBSON(),
@@ -119,13 +127,13 @@ bool TopologyManagerImpl::onServerDescription(const HelloOutcome& helloOutcome) 
 }
 
 std::shared_ptr<TopologyDescription> TopologyManagerImpl::getTopologyDescription() const {
-    stdx::lock_guard<mongo::Mutex> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     return _topologyDescription;
 }
 
 void TopologyManagerImpl::onServerRTTUpdated(HostAndPort hostAndPort, HelloRTT rtt) {
     {
-        stdx::lock_guard<mongo::Mutex> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
 
         auto oldServerDescription = _topologyDescription->findServerByAddress(hostAndPort);
         if (oldServerDescription) {
@@ -142,7 +150,6 @@ void TopologyManagerImpl::onServerRTTUpdated(HostAndPort hostAndPort, HelloRTT r
     }
     // otherwise, the server was removed from the topology. Nothing to do.
     LOGV2(4333201,
-          "Not updating RTT. Server {server} does not exist in {replicaSet}",
           "Not updating RTT. The server does not exist in the replica set",
           "server"_attr = hostAndPort,
           "replicaSet"_attr = getTopologyDescription()->getSetName());
@@ -150,7 +157,7 @@ void TopologyManagerImpl::onServerRTTUpdated(HostAndPort hostAndPort, HelloRTT r
 
 SemiFuture<std::vector<HostAndPort>> TopologyManagerImpl::executeWithLock(
     std::function<SemiFuture<std::vector<HostAndPort>>(const TopologyDescriptionPtr&)> func) {
-    stdx::lock_guard<mongo::Mutex> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     return func(_topologyDescription);
 }
 

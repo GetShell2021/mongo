@@ -27,26 +27,43 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/catalog/database.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/dbhelpers.h"
-#include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 #include "mongo/db/repl/oplog_buffer_collection.h"
-#include "mongo/db/repl/oplog_interface_local.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/barrier.h"
+#include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace {
 
@@ -102,7 +119,8 @@ Client* OplogBufferCollectionTest::getClient() const {
  */
 template <typename T>
 NamespaceString makeNamespace(const T& t, const char* suffix = "") {
-    return NamespaceString("local." + t.getSuiteName() + "_" + t.getTestName() + suffix);
+    return NamespaceString::createNamespaceString_forTest("local." + t.getSuiteName() + "_" +
+                                                          t.getTestName() + suffix);
 }
 
 /**
@@ -150,7 +168,9 @@ TEST_F(OplogBufferCollectionTest, StartupWithUserProvidedNamespaceCreatesCollect
 
 TEST_F(OplogBufferCollectionTest, StartupWithOplogNamespaceTriggersUassert) {
     ASSERT_THROWS_CODE(testStartupCreatesCollection(
-                           _opCtx.get(), _storageInterface, NamespaceString("local.oplog.Z")),
+                           _opCtx.get(),
+                           _storageInterface,
+                           NamespaceString::createNamespaceString_forTest("local.oplog.Z")),
                        DBException,
                        28838);
 }
@@ -245,7 +265,6 @@ TEST_F(OplogBufferCollectionTest, StartupWithExistingCollectionInitializesCorrec
     oplogBuffer.startup(_opCtx.get());
     ASSERT_EQUALS(oplogBuffer.getCount(), 1UL);
     ASSERT_NOT_EQUALS(oplogBuffer.getSize(), 0UL);
-    ASSERT_EQUALS(Timestamp(1, 1), oplogBuffer.getLastPushedTimestamp());
     ASSERT_EQUALS(Timestamp(0, 0), oplogBuffer.getLastPoppedTimestamp_forTest());
     _assertDocumentsInCollectionEquals(_opCtx.get(), nss, oplog);
 
@@ -275,7 +294,6 @@ TEST_F(OplogBufferCollectionTest, StartupWithEmptyExistingCollectionInitializesC
     oplogBuffer.startup(_opCtx.get());
     ASSERT_EQUALS(oplogBuffer.getCount(), 0UL);
     ASSERT_EQUALS(oplogBuffer.getSize(), 0UL);
-    ASSERT_EQUALS(Timestamp(0, 0), oplogBuffer.getLastPushedTimestamp());
     ASSERT_EQUALS(Timestamp(0, 0), oplogBuffer.getLastPoppedTimestamp_forTest());
     _assertDocumentsInCollectionEquals(_opCtx.get(), nss, {});
 
@@ -317,11 +335,7 @@ TEST_F(OplogBufferCollectionTest, ShutdownWithDropCollectionAtShutdownFalseDoesN
     ASSERT_EQUALS(oplogBuffer.getCount(), 1UL);
 }
 
-DEATH_TEST_REGEX_F(OplogBufferCollectionTest,
-                   StartupWithExistingCollectionFailsWhenEntryHasNoId,
-                   "Fatal assertion.*40348.*IndexNotFound: Index not found, "
-                   "ns:local.OplogBufferCollectionTest_"
-                   "StartupWithExistingCollectionFailsWhenEntryHasNoId, index: _id_") {
+TEST_F(OplogBufferCollectionTest, StartupWithExistingCollectionFailsWhenEntryHasNoId) {
     auto nss = makeNamespace(_agent);
     CollectionOptions collOpts;
     collOpts.setNoIdIndex();
@@ -334,7 +348,11 @@ DEATH_TEST_REGEX_F(OplogBufferCollectionTest,
     OplogBufferCollection::Options opts;
     opts.dropCollectionAtStartup = false;
     OplogBufferCollection oplogBuffer(_storageInterface, nss, opts);
-    oplogBuffer.startup(_opCtx.get());
+    ASSERT_THROWS_CODE_AND_WHAT(oplogBuffer.startup(_opCtx.get()),
+                                DBException,
+                                ErrorCodes::IndexNotFound,
+                                "Index not found, ns:local.OplogBufferCollectionTest_"
+                                "StartupWithExistingCollectionFailsWhenEntryHasNoId, index: _id_");
 }
 
 DEATH_TEST_REGEX_F(OplogBufferCollectionTest,
@@ -389,7 +407,6 @@ TEST_F(OplogBufferCollectionTest,
     oplogBuffer.startup(_opCtx.get());
     ASSERT_EQUALS(oplogBuffer.getCount(), 0UL);
     ASSERT_EQUALS(oplogBuffer.getSize(), 0UL);
-    ASSERT_EQUALS(Timestamp(0, 0), oplogBuffer.getLastPushedTimestamp());
     ASSERT_EQUALS(Timestamp(0, 0), oplogBuffer.getLastPoppedTimestamp_forTest());
     _assertDocumentsInCollectionEquals(_opCtx.get(), nss, {});
 }
@@ -663,14 +680,12 @@ TEST_F(OplogBufferCollectionTest, ClearClearsCollection) {
     oplogBuffer.startup(_opCtx.get());
     ASSERT_EQUALS(oplogBuffer.getCount(), 0UL);
     ASSERT_EQUALS(oplogBuffer.getSize(), 0UL);
-    ASSERT_EQUALS(Timestamp(), oplogBuffer.getLastPushedTimestamp());
     ASSERT_EQUALS(Timestamp(), oplogBuffer.getLastPoppedTimestamp_forTest());
 
     const std::vector<BSONObj> oplog = {makeOplogEntry(1)};
     oplogBuffer.push(_opCtx.get(), oplog.cbegin(), oplog.cend());
     ASSERT_EQUALS(oplogBuffer.getCount(), 1UL);
     ASSERT_EQUALS(oplogBuffer.getSize(), std::size_t(oplog[0].objsize()));
-    ASSERT_EQUALS(oplog[0]["ts"].timestamp(), oplogBuffer.getLastPushedTimestamp());
     ASSERT_EQUALS(Timestamp(), oplogBuffer.getLastPoppedTimestamp_forTest());
 
     _assertDocumentsInCollectionEquals(_opCtx.get(), nss, {oplog});
@@ -679,7 +694,6 @@ TEST_F(OplogBufferCollectionTest, ClearClearsCollection) {
     oplogBuffer.push(_opCtx.get(), oplog2.cbegin(), oplog2.cend());
     ASSERT_EQUALS(oplogBuffer.getCount(), 2UL);
     ASSERT_EQUALS(oplogBuffer.getSize(), std::size_t(oplog[0].objsize() + oplog2[0].objsize()));
-    ASSERT_EQUALS(oplog2[0]["ts"].timestamp(), oplogBuffer.getLastPushedTimestamp());
     ASSERT_EQUALS(Timestamp(), oplogBuffer.getLastPoppedTimestamp_forTest());
 
     _assertDocumentsInCollectionEquals(_opCtx.get(), nss, {oplog[0], oplog2[0]});
@@ -689,7 +703,6 @@ TEST_F(OplogBufferCollectionTest, ClearClearsCollection) {
     ASSERT_BSONOBJ_EQ(oplog[0], poppedDoc);
     ASSERT_EQUALS(oplogBuffer.getCount(), 1UL);
     ASSERT_EQUALS(oplogBuffer.getSize(), std::size_t(oplog2[0].objsize()));
-    ASSERT_EQUALS(oplog2[0]["ts"].timestamp(), oplogBuffer.getLastPushedTimestamp());
     ASSERT_EQUALS(oplog[0]["ts"].timestamp(), oplogBuffer.getLastPoppedTimestamp_forTest());
 
     _assertDocumentsInCollectionEquals(_opCtx.get(), nss, {oplog[0], oplog2[0]});
@@ -698,7 +711,6 @@ TEST_F(OplogBufferCollectionTest, ClearClearsCollection) {
     ASSERT_TRUE(AutoGetCollectionForReadCommand(_opCtx.get(), nss).getCollection());
     ASSERT_EQUALS(oplogBuffer.getCount(), 0UL);
     ASSERT_EQUALS(oplogBuffer.getSize(), 0UL);
-    ASSERT_EQUALS(Timestamp(), oplogBuffer.getLastPushedTimestamp());
     ASSERT_EQUALS(Timestamp(), oplogBuffer.getLastPoppedTimestamp_forTest());
 
     _assertDocumentsInCollectionEquals(_opCtx.get(), nss, {});
@@ -740,7 +752,7 @@ TEST_F(OplogBufferCollectionTest, WaitForDataBlocksAndFindsDocument) {
     std::size_t count = 0;
 
     stdx::thread peekingThread([&]() {
-        Client::initThread("peekingThread");
+        Client::initThread("peekingThread", getGlobalServiceContext()->getService());
         barrier.countDownAndWait();
         success = oplogBuffer.waitForData(Seconds(30));
         count = oplogBuffer.getCount();
@@ -771,14 +783,14 @@ TEST_F(OplogBufferCollectionTest, TwoWaitForDataInvocationsBlockAndFindSameDocum
     std::size_t count2 = 0;
 
     stdx::thread peekingThread1([&]() {
-        Client::initThread("peekingThread1");
+        Client::initThread("peekingThread1", getGlobalServiceContext()->getService());
         barrier.countDownAndWait();
         success1 = oplogBuffer.waitForData(Seconds(30));
         count1 = oplogBuffer.getCount();
     });
 
     stdx::thread peekingThread2([&]() {
-        Client::initThread("peekingThread2");
+        Client::initThread("peekingThread2", getGlobalServiceContext()->getService());
         barrier.countDownAndWait();
         success2 = oplogBuffer.waitForData(Seconds(30));
         count2 = oplogBuffer.getCount();
@@ -809,7 +821,7 @@ TEST_F(OplogBufferCollectionTest, WaitForDataBlocksAndTimesOutWhenItDoesNotFindD
     std::size_t count = 0;
 
     stdx::thread peekingThread([&]() {
-        Client::initThread("peekingThread");
+        Client::initThread("peekingThread", getGlobalServiceContext()->getService());
         success = oplogBuffer.waitForData(Seconds(1));
         count = oplogBuffer.getCount();
     });
@@ -851,7 +863,6 @@ TEST_F(OplogBufferCollectionTest, PreloadAllNonBlockingSucceeds) {
     oplogBuffer.preload(_opCtx.get(), oplog.begin(), oplog.end());
     ASSERT_EQUALS(oplogBuffer.getCount(), 2UL);
     ASSERT_NOT_EQUALS(oplogBuffer.getSize(), 0UL);
-    ASSERT_EQUALS(Timestamp(2, 2), oplogBuffer.getLastPushedTimestamp());
 }
 
 

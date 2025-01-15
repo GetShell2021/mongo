@@ -10,10 +10,8 @@
  * 5. Reset the active balancing window to a setting that overlaps the current time and make
  *    sure that some chunks are moved.
  */
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 /**
  * Simple representation for wall clock time. Hour and minutes should be integers.
@@ -45,7 +43,7 @@ var HourAndMinute = function(hour, minutes) {
     };
 };
 
-const st = new ShardingTest({shards: 2, other: {chunkSize: 1, enableAutoSplit: false}});
+const st = new ShardingTest({shards: 2, other: {chunkSize: 1}});
 const dbName = 'test';
 const collName = 'user';
 const ns = dbName + '.' + collName;
@@ -78,7 +76,7 @@ assert.commandWorked(
                              true));
 st.startBalancer();
 
-st.waitForBalancer(true, 60000);
+st.awaitBalancerRound();
 
 var shard0ChunksAfter =
     findChunksUtil.findChunksByNs(configDB, ns, {shard: st.shard0.shardName}).count();
@@ -93,11 +91,10 @@ assert.commandWorked(configDB.settings.update(
     },
     true));
 
-st.waitForBalancer(true, 60000);
+st.awaitBalancerRound();
 
 shard0ChunksAfter =
     findChunksUtil.findChunksByNs(configDB, ns, {shard: st.shard0.shardName}).count();
 assert.neq(shard0Chunks, shard0ChunksAfter);
 
 st.stop();
-})();

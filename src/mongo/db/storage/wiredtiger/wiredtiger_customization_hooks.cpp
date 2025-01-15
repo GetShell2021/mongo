@@ -27,15 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
-
 #include <memory>
+#include <utility>
 
-#include "mongo/base/init.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/base/string_data.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 namespace {
@@ -51,10 +51,10 @@ const auto getCustomizationHooks =
 }  // namespace
 
 void WiredTigerCustomizationHooks::set(ServiceContext* service,
-                                       std::unique_ptr<WiredTigerCustomizationHooks> custHooks) {
+                                       std::unique_ptr<WiredTigerCustomizationHooks> customHooks) {
     auto& hooks = getCustomizationHooks(service);
-    invariant(custHooks);
-    hooks = std::move(custHooks);
+    invariant(customHooks);
+    hooks = std::move(customHooks);
 }
 
 WiredTigerCustomizationHooks* WiredTigerCustomizationHooks::get(ServiceContext* service) {

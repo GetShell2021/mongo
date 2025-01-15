@@ -1,15 +1,10 @@
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-load("jstests/libs/feature_flag_util.js");
-
-var s = new ShardingTest(
-    {name: "migrateBig", shards: 2, other: {chunkSize: 1, enableAutoSplit: false}});
+var s = new ShardingTest({name: "migrateBig", shards: 2, other: {chunkSize: 1}});
 
 assert.commandWorked(
     s.config.settings.update({_id: "balancer"}, {$set: {_waitForDelete: true}}, true));
-assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
-s.ensurePrimaryShard('test', s.shard1.shardName);
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test", primaryShard: s.shard1.shardName}));
 assert.commandWorked(s.s0.adminCommand({shardcollection: "test.foo", key: {x: 1}}));
 
 var db = s.getDB("test");
@@ -64,4 +59,3 @@ s.startBalancer();
 s.awaitBalance('foo', 'test', 60 * 1000);
 
 s.stop();
-})();

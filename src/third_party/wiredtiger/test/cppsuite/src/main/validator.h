@@ -26,8 +26,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef VALIDATOR_H
-#define VALIDATOR_H
+#pragma once
 
 #include <map>
 #include <string>
@@ -45,7 +44,7 @@ struct key_state {
 typedef std::map<key_value_t, key_state> validation_collection;
 /* Class that defines a basic validation algorithm. */
 class validator {
-    public:
+public:
     /*
      * Validate the on disk data against what has been tracked during the test. This is done by
      * replaying the tracked operations so a representation in memory of the collections is created.
@@ -54,10 +53,10 @@ class validator {
      * - operation_table_name: Table that contains all the operations performed on keys.
      * - schema_table_name: Table that contains all the schema operations performed.
      */
-    void validate(const std::string &operation_table_name, const std::string &schema_table_name,
-      const std::vector<uint64_t> &known_collection_ids);
+    void validate(
+      const std::string &operation_table_name, const std::string &schema_table_name, database &db);
 
-    private:
+private:
     /*
      * Read the tracking table to retrieve the created and deleted collections during the test.
      * collection_name: collection that contains the operations on the different collections during
@@ -87,5 +86,3 @@ class validator {
       const std::string &key, const key_state &key_state);
 };
 } // namespace test_harness
-
-#endif

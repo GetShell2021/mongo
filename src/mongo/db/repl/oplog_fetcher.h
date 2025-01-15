@@ -31,19 +31,32 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/repl/abstract_async_component.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 namespace repl {
@@ -86,13 +99,10 @@ public:
      * The status will be Status::OK() if we have processed the last batch of operations from the
      * cursor.
      *
-     * rbid will be set to the rollback id of the oplog query metadata for the first batch fetched
-     * from the sync source.
-     *
      * This function will be called 0 times if startup() fails and at most once after startup()
      * returns success.
      */
-    using OnShutdownCallbackFn = std::function<void(const Status& shutdownStatus, int rbid)>;
+    using OnShutdownCallbackFn = std::function<void(const Status& shutdownStatus)>;
 
     /**
      * Container for BSON documents extracted from cursor results.
@@ -156,7 +166,7 @@ public:
 
         void fetchSuccessful(OplogFetcher* fetcher) final;
 
-        ~OplogFetcherRestartDecisionDefault(){};
+        ~OplogFetcherRestartDecisionDefault() override{};
 
     private:
         // Restarts since the last successful oplog query response.
@@ -174,18 +184,14 @@ public:
         Config(OpTime initialLastFetchedIn,
                HostAndPort sourceIn,
                ReplSetConfig replSetConfigIn,
-               int requiredRBIDIn,
                int batchSizeIn,
                RequireFresherSyncSource requireFresherSyncSourceIn =
-                   RequireFresherSyncSource::kRequireFresherSyncSource,
-               bool forTenantMigrationIn = false)
+                   RequireFresherSyncSource::kRequireFresherSyncSource)
             : initialLastFetched(initialLastFetchedIn),
               source(sourceIn),
               replSetConfig(replSetConfigIn),
-              requiredRBID(requiredRBIDIn),
               batchSize(batchSizeIn),
-              requireFresherSyncSource(requireFresherSyncSourceIn),
-              forTenantMigration(forTenantMigrationIn) {}
+              requireFresherSyncSource(requireFresherSyncSourceIn) {}
         // The OpTime, last oplog entry fetched in a previous run, or the optime to start fetching
         // from, depending on the startingPoint (below.).  If the startingPoint is kSkipFirstDoc,
         // this entry will be verified to exist, then discarded. If it is kEnqueueFirstDoc, it will
@@ -196,10 +202,6 @@ public:
         HostAndPort source;
 
         ReplSetConfig replSetConfig;
-
-        // Rollback ID that the sync source is required to have after the first batch. If the value
-        // is uninitialized, the oplog fetcher has not contacted the sync source yet.
-        int requiredRBID;
 
         int batchSize;
 
@@ -224,10 +226,6 @@ public:
         bool requestResumeToken = false;
 
         std::string name = "oplog fetcher";
-
-        // If true, the oplog fetcher will use an aggregation request with '$match' rather than
-        // a 'find' query.
-        bool forTenantMigration;
     };
 
     /**
@@ -240,7 +238,7 @@ public:
                  OnShutdownCallbackFn onShutdownCallbackFn,
                  Config config);
 
-    virtual ~OplogFetcher();
+    ~OplogFetcher() override;
 
     /**
      * Validates documents in current batch of results returned from tailing the remote oplog.
@@ -326,17 +324,17 @@ private:
     /**
      * Schedules the _runQuery function to run in a separate thread.
      */
-    Status _doStartup_inlock() noexcept override;
+    void _doStartup(WithLock) override;
 
     /**
      * Shuts down the DBClientCursor and DBClientConnection. Uses the connection's
      * shutdownAndDisallowReconnect function to interrupt it.
      */
-    void _doShutdown_inlock() noexcept override;
+    void _doShutdown(WithLock) noexcept override;
 
     void _preJoin() noexcept override {}
 
-    Mutex* _getMutex() noexcept override;
+    stdx::mutex* _getMutex() noexcept override;
 
     // ============= End AbstractAsyncComponent overrides ==============
 
@@ -365,11 +363,8 @@ private:
     void _setMetadataWriterAndReader();
 
     /**
-     * Does one of:
-     * 1. Executes a `find` query on the sync source's oplog and establishes a tailable, awaitData,
+     * Executes a `find` query on the sync source's oplog and establishes a tailable, awaitData,
      * exhaust cursor.
-     * 2. Executes a 'aggregate' query on the sync source's oplog. This is currently used in
-     * tenant migrations.
      *
      * Before running the query, it will set a RequestMetadataWriter to modify the request to
      * include $oplogQueryData and $replData. If will also set a ReplyMetadataReader to parse the
@@ -436,14 +431,12 @@ private:
      * Checks the first batch of results from query.
      * 'documents' are the first batch of results returned from tailing the remote oplog.
      * 'remoteLastOpApplied' is the last OpTime applied on the sync source.
-     * 'remoteRBID' is a RollbackId for the sync source returned in this oplog query.
      *
      * Returns TooStaleToSyncFromSource if we are too stale to sync from our source.
      * Returns OplogStartMissing if we should go into rollback.
      */
     Status _checkRemoteOplogStart(const OplogFetcher::Documents& documents,
-                                  OpTime remoteLastOpApplied,
-                                  int remoteRBID);
+                                  OpTime remoteLastOpApplied);
 
     /**
      * Distinguishes between needing to rollback and being too stale to sync from our sync source.
@@ -453,14 +446,10 @@ private:
     Status _checkTooStaleToSyncFromSource(OpTime lastFetched, OpTime firstOpTimeInBatch);
 
     // Protects member data of this OplogFetcher.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("OplogFetcher::_mutex");
+    mutable stdx::mutex _mutex;
 
     // Namespace of the oplog to read.
     const NamespaceString _nss = NamespaceString::kRsOplogNamespace;
-
-    // Rollback ID that the sync source had after the first batch. Initialized from
-    // the requiredRBID in the OplogFetcher::Config and passed to the onShutdown callback.
-    int _receivedRBID;
 
     // Indicates whether the current batch is the first received via this cursor.
     bool _firstBatch = true;

@@ -29,24 +29,64 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/collection_options_gen.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/collection_crud/capped_visibility.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/change_stream_pre_and_post_images_options_gen.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/bson_collection_catalog_entry.h"
+#include "mongo/db/storage/durable_catalog_entry.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/record_data.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/uuid.h"
+#include "mongo/util/version/releases.h"
 
 namespace mongo {
 
-class IndexConsistency;
-class CollectionCatalog;
-
 class CollectionImpl final : public Collection {
 public:
-    // TODO SERVER-56999: We should just need one API to create Collections
-    explicit CollectionImpl(OperationContext* opCtx,
-                            const NamespaceString& nss,
-                            RecordId catalogId,
-                            const CollectionOptions& options,
-                            std::unique_ptr<RecordStore> recordStore);
+    // Uses the collator factory to convert the BSON representation of a collator to a
+    // CollatorInterface. Returns null if the BSONObj is empty. We expect the stored collation to be
+    // valid, since it gets validated on collection create.
+    static std::unique_ptr<CollatorInterface> parseCollation(OperationContext* opCtx,
+                                                             const NamespaceString& nss,
+                                                             BSONObj collationSpec);
+
 
     explicit CollectionImpl(OperationContext* opCtx,
                             const NamespaceString& nss,
@@ -54,19 +94,12 @@ public:
                             std::shared_ptr<BSONCollectionCatalogEntry::MetaData> metadata,
                             std::unique_ptr<RecordStore> recordStore);
 
-    ~CollectionImpl();
+    ~CollectionImpl() override;
 
     std::shared_ptr<Collection> clone() const final;
 
     class FactoryImpl : public Factory {
     public:
-        // TODO SERVER-56999: We should just need one API to create Collections
-        std::shared_ptr<Collection> make(OperationContext* opCtx,
-                                         const NamespaceString& nss,
-                                         RecordId catalogId,
-                                         const CollectionOptions& options,
-                                         std::unique_ptr<RecordStore> rs) const final;
-
         std::shared_ptr<Collection> make(
             OperationContext* opCtx,
             const NamespaceString& nss,
@@ -78,9 +111,11 @@ public:
     SharedCollectionDecorations* getSharedDecorations() const final;
 
     void init(OperationContext* opCtx) final;
+    Status initFromExisting(OperationContext* opCtx,
+                            const std::shared_ptr<const Collection>& collection,
+                            const DurableCatalogEntry& catalogEntry,
+                            boost::optional<Timestamp> readTimestamp) final;
     bool isInitialized() const final;
-    bool isCommitted() const final;
-    void setCommitted(bool val) final;
 
     const NamespaceString& ns() const final {
         return _ns;
@@ -109,9 +144,11 @@ public:
     }
 
     std::shared_ptr<Ident> getSharedIdent() const final {
-        // Use shared_ptr's aliasing constructor so we can keep all shared state in a single
-        // reference counted object
-        return {_shared, _shared->_recordStore.get()};
+        return _shared->_recordStore->getSharedIdent();
+    }
+
+    void setIdent(std::shared_ptr<Ident> newIdent) final {
+        _shared->_recordStore->setIdent(std::move(newIdent));
     }
 
     BSONObj getValidatorDoc() const final {
@@ -121,10 +158,13 @@ public:
     std::pair<SchemaValidationResult, Status> checkValidation(OperationContext* opCtx,
                                                               const BSONObj& document) const final;
 
+    Status checkValidationAndParseResult(OperationContext* opCtx,
+                                         const BSONObj& document) const final;
+
     bool requiresIdIndex() const final;
 
-    Snapshotted<BSONObj> docFor(OperationContext* opCtx, RecordId loc) const final {
-        return Snapshotted<BSONObj>(opCtx->recoveryUnit()->getSnapshotId(),
+    Snapshotted<BSONObj> docFor(OperationContext* opCtx, const RecordId& loc) const final {
+        return Snapshotted<BSONObj>(shard_role_details::getRecoveryUnit(opCtx)->getSnapshotId(),
                                     _shared->_recordStore->dataFor(opCtx, loc).releaseToBson());
     }
 
@@ -132,128 +172,14 @@ public:
      * @param out - contents set to the right docs if exists, or nothing.
      * @return true iff loc exists
      */
-    bool findDoc(OperationContext* opCtx, RecordId loc, Snapshotted<BSONObj>* out) const final;
+    bool findDoc(OperationContext* opCtx,
+                 const RecordId& loc,
+                 Snapshotted<BSONObj>* out) const final;
 
     std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                     bool forward = true) const final;
 
-    /**
-     * Deletes the document with the given RecordId from the collection. For a description of
-     * the parameters, see the overloaded function below.
-     */
-    void deleteDocument(
-        OperationContext* opCtx,
-        StmtId stmtId,
-        RecordId loc,
-        OpDebug* opDebug,
-        bool fromMigrate = false,
-        bool noWarn = false,
-        Collection::StoreDeletedDoc storeDeletedDoc = Collection::StoreDeletedDoc::Off,
-        CheckRecordId checkRecordId = CheckRecordId::Off) const final;
-
-    /**
-     * Deletes the document from the collection.
-
-     * 'doc' the document to be deleted.
-     * 'stmtId' the statement id for this delete operation. Pass in kUninitializedStmtId if not
-     * applicable.
-     * 'fromMigrate' indicates whether the delete was induced by a chunk migration, and
-     * so should be ignored by the user as an internal maintenance operation and not a
-     * real delete.
-     * 'loc' key to uniquely identify a record in a collection.
-     * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
-     * 'noWarn' if unindexing the record causes an error, if noWarn is true the error
-     * will not be logged.
-     * 'storeDeletedDoc' whether to store the document deleted in the oplog.
-     * 'checkRecordId' whether to confirm the recordId matches the record we are removing when
-     * unindexing.
-     */
-    void deleteDocument(
-        OperationContext* opCtx,
-        Snapshotted<BSONObj> doc,
-        StmtId stmtId,
-        RecordId loc,
-        OpDebug* opDebug,
-        bool fromMigrate = false,
-        bool noWarn = false,
-        Collection::StoreDeletedDoc storeDeletedDoc = Collection::StoreDeletedDoc::Off,
-        CheckRecordId checkRecordId = CheckRecordId::Off) const final;
-
-    /*
-     * Inserts all documents inside one WUOW.
-     * Caller should ensure vector is appropriately sized for this.
-     * If any errors occur (including WCE), caller should retry documents individually.
-     *
-     * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
-     */
-    Status insertDocuments(OperationContext* opCtx,
-                           std::vector<InsertStatement>::const_iterator begin,
-                           std::vector<InsertStatement>::const_iterator end,
-                           OpDebug* opDebug,
-                           bool fromMigrate = false) const final;
-
-    /**
-     * this does NOT modify the doc before inserting
-     * i.e. will not add an _id field for documents that are missing it
-     *
-     * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
-     */
-    Status insertDocument(OperationContext* opCtx,
-                          const InsertStatement& doc,
-                          OpDebug* opDebug,
-                          bool fromMigrate = false) const final;
-
-    /**
-     * Callers must ensure no document validation is performed for this collection when calling
-     * this method.
-     */
-    Status insertDocumentsForOplog(OperationContext* opCtx,
-                                   std::vector<Record>* records,
-                                   const std::vector<Timestamp>& timestamps) const final;
-
-    /**
-     * Inserts a document into the record store for a bulk loader that manages the index building
-     * outside this Collection. The bulk loader is notified with the RecordId of the document
-     * inserted into the RecordStore.
-     *
-     * NOTE: It is up to caller to commit the indexes.
-     */
-    Status insertDocumentForBulkLoader(OperationContext* opCtx,
-                                       const BSONObj& doc,
-                                       const OnRecordInsertedFn& onRecordInserted) const final;
-
-    /**
-     * Updates the document @ oldLocation with newDoc.
-     *
-     * If the document fits in the old space, it is put there; if not, it is moved.
-     * Sets 'args.updatedDoc' to the updated version of the document with damages applied, on
-     * success.
-     * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
-     * @return the post update location of the doc (may or may not be the same as oldLocation)
-     */
-    RecordId updateDocument(OperationContext* opCtx,
-                            RecordId oldLocation,
-                            const Snapshotted<BSONObj>& oldDoc,
-                            const BSONObj& newDoc,
-                            bool indexesAffected,
-                            OpDebug* opDebug,
-                            CollectionUpdateArgs* args) const final;
-
     bool updateWithDamagesSupported() const final;
-
-    /**
-     * Not allowed to modify indexes.
-     * Illegal to call if updateWithDamagesSupported() returns false.
-     * Sets 'args.updatedDoc' to the updated version of the document with damages applied, on
-     * success.
-     * @return the contents of the updated record.
-     */
-    StatusWith<RecordData> updateDocumentWithDamages(OperationContext* opCtx,
-                                                     RecordId loc,
-                                                     const Snapshotted<RecordData>& oldRec,
-                                                     const char* damageSource,
-                                                     const mutablebson::DamageVector& damages,
-                                                     CollectionUpdateArgs* args) const final;
 
     // -----------
 
@@ -266,17 +192,6 @@ public:
      * on the collection.
      */
     Status truncate(OperationContext* opCtx) final;
-
-    /**
-     * Truncate documents newer than the document at 'end' from the capped
-     * collection.  The collection cannot be completely emptied using this
-     * function.  An assertion will be thrown if that is attempted.
-     * @param inclusive - Truncate 'end' as well iff true
-     *
-     * The caller should hold a collection X lock and ensure there are no index builds in progress
-     * on the collection.
-     */
-    void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) const final;
 
     /**
      * Returns a non-ok Status if validator is not legal for this collection.
@@ -316,9 +231,6 @@ public:
      */
     Status checkValidatorAPIVersionCompatability(OperationContext* opCtx) const final;
 
-    bool getRecordPreImages() const final;
-    void setRecordPreImages(OperationContext* opCtx, bool val) final;
-
     bool isChangeStreamPreAndPostImagesEnabled() const final;
     void setChangeStreamPreAndPostImages(OperationContext* opCtx,
                                          ChangeStreamPreAndPostImagesOptions val) final;
@@ -326,10 +238,22 @@ public:
     bool isTemporary() const final;
 
     boost::optional<bool> getTimeseriesBucketsMayHaveMixedSchemaData() const final;
+
     void setTimeseriesBucketsMayHaveMixedSchemaData(OperationContext* opCtx,
                                                     boost::optional<bool> setting) final;
 
-    bool doesTimeseriesBucketsDocContainMixedSchemaData(const BSONObj& bucketsDoc) const final;
+    boost::optional<bool> timeseriesBucketingParametersHaveChanged() const final;
+
+    void setTimeseriesBucketingParametersChanged(OperationContext* opCtx,
+                                                 boost::optional<bool> value) final;
+
+    StatusWith<bool> doesTimeseriesBucketsDocContainMixedSchemaData(
+        const BSONObj& bucketsDoc) const final;
+
+    bool getRequiresTimeseriesExtendedRangeSupport() const final;
+    void setRequiresTimeseriesExtendedRangeSupport(OperationContext* opCtx) const final;
+
+    bool areTimeseriesBucketsFixed() const final;
 
     /**
      * isClustered() relies on the object returned from getClusteredInfo(). If
@@ -344,24 +268,25 @@ public:
                             boost::optional<long long> newCappedSize,
                             boost::optional<long long> newCappedMax) final;
 
+    void unsetRecordIdsReplicated(OperationContext* opCtx) final;
+
     //
     // Stats
     //
+
+    bool areRecordIdsReplicated() const final;
 
     bool isCapped() const final;
     long long getCappedMaxDocs() const final;
     long long getCappedMaxSize() const final;
 
-    CappedCallback* getCappedCallback() final;
-    const CappedCallback* getCappedCallback() const final;
-
-    /**
-     * Get a pointer to a capped insert notifier object. The caller can wait on this object
-     * until it is notified of a new insert into the capped collection.
-     *
-     * It is invalid to call this method unless the collection is capped.
-     */
-    std::shared_ptr<CappedInsertNotifier> getCappedInsertNotifier() const final;
+    bool usesCappedSnapshots() const final;
+    std::vector<RecordId> reserveCappedRecordIds(OperationContext* opCtx, size_t nIds) const final;
+    void registerCappedInserts(OperationContext* opCtx,
+                               const RecordId& minRecord,
+                               const RecordId& maxRecord) const final;
+    CappedVisibilityObserver* getCappedVisibilityObserver() const final;
+    CappedVisibilitySnapshot takeCappedVisibilitySnapshot() const final;
 
     long long numRecords(OperationContext* opCtx) const final;
 
@@ -377,7 +302,7 @@ public:
      */
     bool isEmpty(OperationContext* opCtx) const final;
 
-    inline int averageObjectSize(OperationContext* opCtx) const {
+    inline int averageObjectSize(OperationContext* opCtx) const override {
         uint64_t n = numRecords(opCtx);
 
         if (n == 0)
@@ -391,19 +316,15 @@ public:
 
     uint64_t getIndexFreeStorageBytes(OperationContext* opCtx) const final;
 
-    /**
-     * If return value is not boost::none, reads with majority read concern using an older snapshot
-     * must error.
-     */
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() const final {
-        return _minVisibleSnapshot;
+    boost::optional<Timestamp> getMinimumValidSnapshot() const final {
+        return _minValidSnapshot;
     }
 
     /**
-     * Updates the minimum visible snapshot. The 'newMinimumVisibleSnapshot' is ignored if it would
-     * set the minimum visible snapshot backwards in time.
+     * Updates the minimum valid snapshot. The 'newMinimumValidSnapshot' is ignored if it would
+     * set the minimum valid snapshot backwards in time.
      */
-    void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
+    void setMinimumValidSnapshot(Timestamp newMinimumValidSnapshot) final;
 
     boost::optional<TimeseriesOptions> getTimeseriesOptions() const final;
     void setTimeseriesOptions(OperationContext* opCtx, const TimeseriesOptions& tsOptions) final;
@@ -416,19 +337,13 @@ public:
 
     const CollectionOptions& getCollectionOptions() const final;
 
+    StatusWith<BSONObj> addCollationDefaultsToIndexSpecsForCreate(
+        OperationContext* opCtx, const BSONObj& indexSpecs) const final;
     StatusWith<std::vector<BSONObj>> addCollationDefaultsToIndexSpecsForCreate(
         OperationContext* opCtx, const std::vector<BSONObj>& indexSpecs) const final;
 
-    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
-        OperationContext* opCtx,
-        const CollectionPtr& yieldableCollection,
-        PlanYieldPolicy::YieldPolicy yieldPolicy,
-        ScanDirection scanDirection,
-        boost::optional<RecordId> resumeAfterRecordId) const final;
-
     void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) final;
 
-    void establishOplogCollectionForLogging(OperationContext* opCtx) const final;
     void onDeregisterFromCatalog(OperationContext* opCtx) final;
 
     StatusWith<int> checkMetaDataForIndex(const std::string& indexName,
@@ -454,8 +369,7 @@ public:
 
     Status prepareForIndexBuild(OperationContext* opCtx,
                                 const IndexDescriptor* spec,
-                                boost::optional<UUID> buildUUID,
-                                bool isBackgroundSecondaryBuild) final;
+                                boost::optional<UUID> buildUUID) final;
 
     boost::optional<UUID> getIndexBuildUUID(StringData indexName) const final;
 
@@ -491,28 +405,13 @@ public:
     void replaceMetadata(OperationContext* opCtx,
                          std::shared_ptr<BSONCollectionCatalogEntry::MetaData> md) final;
 
+    bool isMetadataEqual(const BSONObj& otherMetadata) const final;
+
+    bool needsCappedLock() const final;
+
+    bool isCappedAndNeedsDelete(OperationContext* opCtx) const final;
+
 private:
-    Status _insertDocuments(OperationContext* opCtx,
-                            std::vector<InsertStatement>::const_iterator begin,
-                            std::vector<InsertStatement>::const_iterator end,
-                            OpDebug* opDebug,
-                            bool fromMigrate) const;
-
-    /**
-     * Checks whether the collection is capped and if the current data size or number of records
-     * exceeds _cappedMaxSize or _cappedMaxDocs respectively.
-     */
-    bool _cappedAndNeedDelete(OperationContext* opCtx) const;
-
-
-    /**
-     * Deletes records from this capped collection while _cappedMaxDocs or _cappedMaxSize is
-     * exceeded. Generates oplog entries for the deleted records in FCV >= 5.0.
-     */
-    void _cappedDeleteAsNeeded(OperationContext* opCtx, const RecordId& justInserted) const;
-
-    Status _checkValidationAndParseResult(OperationContext* opCtx, const BSONObj& document) const;
-
     /**
      * Writes metadata to the DurableCatalog. Func should have the function signature
      * 'void(BSONCollectionCatalogEntry::MetaData&)'
@@ -521,38 +420,30 @@ private:
     void _writeMetadata(OperationContext* opCtx, Func func);
 
     /**
-     * Holder of shared state between CollectionImpl clones. Also implements CappedCallback, a
-     * pointer to which is given to the RecordStore, so that the CappedCallback logic can always be
-     * performed on the latest CollectionImpl instance without needing to know about copy-on-write
-     * on CollectionImpl instances.
+     * Helper for init() and initFromExisting() to initialize shared state.
      */
-    struct SharedState : public CappedCallback {
-        SharedState(CollectionImpl* collection,
+    void _initShared(OperationContext* opCtx, const CollectionOptions& options);
+
+    /**
+     * Helper for init() and initFromExisting() to initialize common state.
+     */
+    void _initCommon(OperationContext* opCtx);
+
+    /**
+     * Helper to set the _metadata field. Every set must check for the storageEngine option to work
+     * around the issue described in SERVER-91193 and SERVER-91194.
+     */
+    void _setMetadata(std::shared_ptr<BSONCollectionCatalogEntry::MetaData>&& metadata);
+
+    /**
+     * Holder of shared state between CollectionImpl clones
+     */
+    struct SharedState {
+        SharedState(OperationContext* opCtx,
+                    CollectionImpl* collection,
                     std::unique_ptr<RecordStore> recordStore,
                     const CollectionOptions& options);
         ~SharedState();
-
-        /**
-         * The Collection instance that need to be notified through the CappedCallback changes when
-         * the Collection is cloned for a write. When the constructor and destructor is run for
-         * CollectionImpl it notifies this class through this interface so we can keep track of the
-         * most recent Collection instance to be used when implementing CappedCallback.
-         */
-        void instanceCreated(CollectionImpl* collection);
-        void instanceDeleted(CollectionImpl* collection);
-
-        bool haveCappedWaiters() const final;
-        void notifyCappedWaitersIfNeeded() const final;
-        Status aboutToDeleteCapped(OperationContext* opCtx,
-                                   const RecordId& loc,
-                                   RecordData data) final;
-
-        // As we're holding a MODE_X lock when cloning Collections we may have up to two current
-        // Collection instances at the same time if there's a pending clone that is not commited to
-        // the catalog yet. We need to keep track of the previous instance in case of a rollback.
-        // When we delete from capped, operate on the latest collection.
-        CollectionImpl* _collectionLatest = nullptr;
-        CollectionImpl* _collectionPrev = nullptr;
 
         // The RecordStore may be null during a repair operation.
         std::unique_ptr<RecordStore> _recordStore;
@@ -569,31 +460,32 @@ private:
         // default collation is simple binary compare.
         std::unique_ptr<CollatorInterface> _collator;
 
-        // Notifier object for awaitData. Threads polling a capped collection for new data can wait
-        // on this object until notified of the arrival of new data.
-        //
-        // This is non-null if and only if the collection is a capped collection.
-        const std::shared_ptr<CappedInsertNotifier> _cappedNotifier;
-
         const bool _needCappedLock;
 
-        AtomicWord<bool> _committed{true};
+        // Tracks in-progress capped inserts to inform visibility for forward scans so that no
+        // uncommitted records are skipped.
+        CappedVisibilityObserver _cappedObserver;
 
-        // Capped information.
-        const bool _isCapped;
+        // This mutex synchronizes allocating and registering RecordIds for uncommited writes on
+        // capped collections that accept concurrent writes (i.e. usesCappedSnapshots()).
+        mutable stdx::mutex _registerCappedIdsMutex;
 
-        // For capped deletes performed on collections where '_needCappedLock' is false, the mutex
-        // below protects '_cappedFirstRecord'. Otherwise, when '_needCappedLock' is true, the
-        // exclusive metadata resource protects '_cappedFirstRecord'.
-        mutable Mutex _cappedFirstRecordMutex =
-            MONGO_MAKE_LATCH("CollectionImpl::SharedState::_cappedFirstRecordMutex");
-        RecordId _cappedFirstRecord;
+        // Time-series collections are allowed to contain measurements with arbitrary dates;
+        // however, many of our query optimizations only work properly with dates that can be stored
+        // as an offset in seconds from the Unix epoch within 31 bits (roughly 1970-2038). When this
+        // flag is set to true, these optimizations will be disabled. It must be set to true if the
+        // collection contains any measurements with dates outside this normal range.
+        //
+        // This is set from the write path where we only hold an IX lock, so we want to be able to
+        // set it from a const method on the Collection. In order to do this, we need to make it
+        // mutable. Given that the value may only transition from false to true, but never back
+        // again, and that we store and retrieve it atomically, this should be safe.
+        mutable AtomicWord<bool> _requiresTimeseriesExtendedRangeSupport{false};
     };
 
     NamespaceString _ns;
     RecordId _catalogId;
     UUID _uuid;
-    bool _cachedCommitted = true;
     std::shared_ptr<SharedState> _shared;
 
     // Collection metadata cached from the DurableCatalog. Is kept separate from the SharedState
@@ -607,8 +499,9 @@ private:
     Validator _validator;
 
     // The earliest snapshot that is allowed to use this collection.
-    boost::optional<Timestamp> _minVisibleSnapshot;
+    boost::optional<Timestamp> _minValidSnapshot;
 
     bool _initialized = false;
 };
+
 }  // namespace mongo

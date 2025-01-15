@@ -30,45 +30,15 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/crypto/fle_field_schema.idl"
+    - "mongo/crypto/fle_stats.idl"
 
 structs:
-    ECOCStats:
-        description: "Stats about records in ECOC compact touched"
-        fields:
-            read:
-                type: exactInt64
-                default: 0
-            deleted:
-                type: exactInt64
-                default: 0
-
-    ECStats:
-        description: "Stats about records in ECC & ESC compact touched"
-        fields:
-            read:
-                type: exactInt64
-                default: 0
-            inserted:
-                type: exactInt64
-                default: 0
-            updated:
-                type: exactInt64
-                default: 0
-            deleted:
-                type: exactInt64
-                default: 0
-
-    CompactStats:
-        description: "Stats about records in ECC, ECOC, and ESC compact touched"
-        fields:
-           ecoc: ECOCStats
-           ecc: ECStats
-           esc: ECStats
-
     CompactStructuredEncryptionDataCommandReply:
-        description: "Reply from the {compactStructuredEncryptedData: ...} command"
+        description: "Reply from the {compactStructuredEncryptionData: ...} command"
         strict: true
+        is_command_reply: true
         fields:
             stats: CompactStats
 
@@ -82,5 +52,23 @@ commands:
         reply_type: CompactStructuredEncryptionDataCommandReply
         fields:
             compactionTokens:
-                description: "Map of field path to EOCToken"
+                description: |-
+                    Map of field path to ECOCToken.
+                    Dictionary key/value pairs in the form: { fieldName: "ecocToken" }
+                    or { fieldName: { ecoc: "ecocToken", anchorPaddingToken: "anchorPaddingToken" } }
                 type: object
+            anchorPaddingFactor:
+                description: |-
+                    Controls number of padding anchors inserted during compaction.
+                    Percentage between 0.0 and 1.0 which is multiplied against the number of
+                    anchors being compacted in a single compaction for a given
+                    field/value/contention factor for range fields.
+                type: double
+                optional: true
+                validator:
+                    gte: 0.0
+                    lte: 1.0
+            encryptionInformation:
+                description: The encryptedField schema for the collection.
+                type: EncryptionInformation
+                optional: true

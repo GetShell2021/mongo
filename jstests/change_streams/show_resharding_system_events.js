@@ -4,9 +4,6 @@
  * operate in a sharded cluster.
  *
  * @tags: [
- *  requires_fcv_61,
- *  featureFlagChangeStreamsVisibility,
- *  featureFlagChangeStreamsFurtherEnrichedEvents,
  *  requires_sharding,
  *  uses_change_streams,
  *  change_stream_does_not_expect_txns,
@@ -14,15 +11,17 @@
  *  assumes_read_preference_unchanged,
  * ]
  */
-(function() {
-"use strict";
-
-load('jstests/libs/change_stream_util.js');  // For 'assertChangeStreamEventEq'.
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {assertChangeStreamEventEq} from "jstests/libs/query/change_stream_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Create a single-shard cluster for this test.
 const st = new ShardingTest({
     shards: 1,
-    rs: {nodes: 1, setParameter: {writePeriodicNoops: true, periodicNoopIntervalSecs: 1}}
+    rs: {nodes: 1, setParameter: {writePeriodicNoops: true, periodicNoopIntervalSecs: 1}},
+    other: {
+        configOptions: {setParameter: {reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000}}
+    }
 });
 
 const testDB = st.s.getDB(jsTestName());
@@ -54,6 +53,7 @@ const oldUUID = getCollectionUuid(testColl);
 assert.commandWorked(st.s.adminCommand({
     reshardCollection: testColl.getFullName(),
     key: {a: 1},
+    numInitialChunks: 1,
 }));
 
 // Get the UUID of the collection after resharding.
@@ -72,7 +72,7 @@ const origNs = {
     db: testDB.getName(),
     coll: testColl.getName()
 };
-const expectedReshardingEvents = [
+let expectedReshardingEvents = [
     {ns: reshardingNs, collectionUUID: newUUID, operationType: "create"},
     {
         ns: reshardingNs,
@@ -104,8 +104,13 @@ const expectedReshardingEvents = [
         ns: origNs,
         collectionUUID: oldUUID,
         operationType: "reshardCollection",
-        operationDescription:
-            {reshardUUID: newUUID, shardKey: {a: 1}, oldShardKey: {_id: 1}, unique: false}
+        operationDescription: {
+            reshardUUID: newUUID,
+            shardKey: {a: 1},
+            oldShardKey: {_id: 1},
+            unique: false,
+            numInitialChunks: NumberLong(1)
+        }
     },
     {
         ns: origNs,
@@ -115,6 +120,69 @@ const expectedReshardingEvents = [
         documentKey: {a: 2, _id: 2}
     },
 ];
+
+if (FeatureFlagUtil.isEnabled(st.s, "ReshardingImprovements")) {
+    expectedReshardingEvents = [
+        {ns: reshardingNs, collectionUUID: newUUID, operationType: "create"},
+        {
+            ns: reshardingNs,
+            collectionUUID: newUUID,
+            operationType: "shardCollection",
+            operationDescription: {shardKey: {a: 1}}
+        },
+        {
+            ns: reshardingNs,
+            collectionUUID: newUUID,
+            operationType: "insert",
+            fullDocument: {_id: 0, a: 0},
+            documentKey: {a: 0, _id: 0}
+        },
+        {
+            ns: reshardingNs,
+            collectionUUID: newUUID,
+            operationType: "insert",
+            fullDocument: {_id: 1, a: 1},
+            documentKey: {a: 1, _id: 1}
+        },
+        {
+            operationType: "endOfTransaction",
+        },
+        {
+            ns: reshardingNs,
+            collectionUUID: newUUID,
+            operationType: "startIndexBuild",
+            operationDescription: {indexes: [{v: 2, key: {a: 1}, name: "a_1"}]},
+        },
+        {
+            ns: reshardingNs,
+            collectionUUID: newUUID,
+            operationType: "createIndexes",
+            operationDescription: {indexes: [{v: 2, key: {a: 1}, name: "a_1"}]}
+        },
+        {
+            ns: origNs,
+            collectionUUID: oldUUID,
+            operationType: "reshardCollection",
+            operationDescription: {
+                reshardUUID: newUUID,
+                shardKey: {a: 1},
+                oldShardKey: {_id: 1},
+                unique: false,
+                numInitialChunks: NumberLong(1)
+            }
+        },
+        {
+            ns: origNs,
+            collectionUUID: newUUID,
+            operationType: "insert",
+            fullDocument: {_id: 2, a: 2},
+            documentKey: {a: 2, _id: 2}
+        },
+    ];
+    if (!FeatureFlagUtil.isEnabled(st.s, "EndOfTransactionChangeEvent"))
+        expectedReshardingEvents = expectedReshardingEvents.filter(
+            (event) => (event.operationType !== "endOfTransaction"));
+}
 
 // Helper to confirm the sequence of events observed in the change stream.
 function assertChangeStreamEventSequence(csConfig, expectedEvents) {
@@ -135,8 +203,7 @@ assertChangeStreamEventSequence({showSystemEvents: true}, expectedReshardingEven
 
 // With showSystemEvents set to false, we expect to only see events on the original namespace.
 const nonSystemEvents =
-    expectedReshardingEvents.filter((event) => (event.ns.coll === testColl.getName()));
+    expectedReshardingEvents.filter((event) => (event.ns && event.ns.coll === testColl.getName()));
 assertChangeStreamEventSequence({showSystemEvents: false}, nonSystemEvents);
 
 st.stop();
-}());

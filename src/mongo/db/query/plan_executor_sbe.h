@@ -29,28 +29,70 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <deque>
+#include <memory>
 #include <queue>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/expressions/runtime_environment.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
-#include "mongo/db/query/optimizer/explain_interface.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_explainer.h"
 #include "mongo/db/query/plan_explainer_sbe.h"
 #include "mongo/db/query/plan_yield_policy_sbe.h"
+#include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/restore_context.h"
 #include "mongo/db/query/sbe_plan_ranker.h"
-#include "mongo/db/query/sbe_runtime_planner.h"
-#include "mongo/db/query/sbe_stage_builder.h"
+#include "mongo/db/query/stage_builder/sbe/builder_data.h"
+#include "mongo/db/query/write_ops/update_result.h"
+#include "mongo/db/record_id.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 class PlanExecutorSBE final : public PlanExecutor {
 public:
+    struct MetaDataAccessor {
+        template <typename BSONTraits = BSONObj::DefaultSizeTrait>
+        BSONObj appendToBson(BSONObj doc) const;
+        Document appendToDocument(Document doc) const;
+        // Only for $search queries, holds the metadata returned from mongot.
+        sbe::value::SlotAccessor* metadataSearchScore{nullptr};
+        sbe::value::SlotAccessor* metadataSearchHighlights{nullptr};
+        sbe::value::SlotAccessor* metadataSearchDetails{nullptr};
+        sbe::value::SlotAccessor* metadataSearchSortValues{nullptr};
+        sbe::value::SlotAccessor* metadataSearchSequenceToken{nullptr};
+
+        sbe::value::SlotAccessor* sortKey{nullptr};
+        bool isSingleSortKey{true};
+    };
+
     PlanExecutorSBE(OperationContext* opCtx,
                     std::unique_ptr<CanonicalQuery> cq,
-                    std::unique_ptr<optimizer::AbstractABTPrinter> optimizerData,
-                    sbe::CandidatePlans candidates,
+                    sbe::plan_ranker::CandidatePlan plan,
                     bool returnOwnedBson,
                     NamespaceString nss,
                     bool isOpen,
-                    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy);
+                    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy,
+                    boost::optional<size_t> cachedPlanHash,
+                    std::unique_ptr<RemoteCursorMap> remoteCursors,
+                    std::unique_ptr<RemoteExplainVector> remoteExplains,
+                    std::unique_ptr<MultiPlanStage> classicRuntimePlannerStage);
 
     CanonicalQuery* getCanonicalQuery() const override {
         return _cq.get();
@@ -68,16 +110,16 @@ public:
         return _opCtx;
     }
 
-    void saveState();
-    void restoreState(const RestoreContext& context);
+    void saveState() override;
+    void restoreState(const RestoreContext& context) override;
 
-    void detachFromOperationContext();
-    void reattachToOperationContext(OperationContext* opCtx);
+    void detachFromOperationContext() override;
+    void reattachToOperationContext(OperationContext* opCtx) override;
 
     ExecState getNext(BSONObj* out, RecordId* dlOut) override;
     ExecState getNextDocument(Document* objOut, RecordId* dlOut) override;
 
-    bool isEOF() override {
+    bool isEOF() const override {
         return isMarkedAsKilled() || (_stash.empty() && _root->getCommonStats()->isEOF);
     }
 
@@ -86,36 +128,30 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    UpdateResult executeUpdate() override {
-        // Using SBE to execute an update command is not yet supported.
-        MONGO_UNREACHABLE;
-    }
     UpdateResult getUpdateResult() const override {
         // Using SBE to execute an update command is not yet supported.
         MONGO_UNREACHABLE;
     }
-
-    long long executeDelete() override {
+    long long getDeleteResult() const override {
         // Using SBE to execute a delete command is not yet supported.
         MONGO_UNREACHABLE;
     }
-
     BatchedDeleteStats getBatchedDeleteStats() override {
         // Using SBE to execute a batched delete command is not yet supported.
         MONGO_UNREACHABLE;
     }
 
-    void markAsKilled(Status killStatus);
+    void markAsKilled(Status killStatus) override;
 
-    void dispose(OperationContext* opCtx);
+    void dispose(OperationContext* opCtx) override;
 
-    void stashResult(const BSONObj& obj);
+    void stashResult(const BSONObj& obj) override;
 
     bool isMarkedAsKilled() const override {
         return !_killStatus.isOK();
     }
 
-    Status getKillStatus() override {
+    Status getKillStatus() const override {
         invariant(isMarkedAsKilled());
         return _killStatus;
     }
@@ -147,9 +183,30 @@ public:
         return _isSaveRecoveryUnitAcrossCommandsEnabled;
     }
 
+    PlanExecutor::QueryFramework getQueryFramework() const final {
+        return PlanExecutor::QueryFramework::kSBEOnly;
+    }
+
+    void setReturnOwnedData(bool returnOwnedData) final {
+        _mustReturnOwnedBson = returnOwnedData;
+    }
+
+    bool usesCollectionAcquisitions() const final;
+
+    /**
+     * For queries that have multiple executors, this can be used to differentiate between them.
+     */
+    boost::optional<StringData> getExecutorType() const final {
+        return CursorType_serializer(_cursorType);
+    }
+
 private:
     template <typename ObjectType>
     ExecState getNextImpl(ObjectType* out, RecordId* dlOut);
+
+    void initializeAccessors(MetaDataAccessor& accessor,
+                             const stage_builder::PlanStageMetadataSlots& metadataSlots,
+                             const QueryMetadataBitSet& metadataBit);
 
     enum class State { kClosed, kOpened };
 
@@ -161,7 +218,7 @@ private:
 
     // Vector of secondary namespaces.
     std::vector<NamespaceStringOrUUID> _secondaryNssVector{};
-    const bool _mustReturnOwnedBson;
+    bool _mustReturnOwnedBson;
 
     // CompileCtx owns the instance pointed by _env, so we must keep it around.
     const std::unique_ptr<sbe::PlanStage> _root;
@@ -174,7 +231,17 @@ private:
     sbe::value::Value _valLastRecordId{0};
     sbe::RuntimeEnvironment::Accessor* _oplogTs{nullptr};
 
+    // Only for a resumed scan ("seek"). Slot holding the TypeTags::RecordId of the record to resume
+    // the scan from. '_seekRecordId' is the RecordId value, initialized from the slot at runtime.
     boost::optional<sbe::value::SlotId> _resumeRecordIdSlot;
+
+    // Only for clustered collection scans, holds the minimum record ID of the scan, if applicable.
+    boost::optional<sbe::value::SlotId> _minRecordIdSlot;
+
+    // Only for clustered collection scans, holds the maximum record ID of the scan, if applicable.
+    boost::optional<sbe::value::SlotId> _maxRecordIdSlot;
+
+    MetaDataAccessor _metadataAccessors;
 
     // NOTE: '_stash' stores documents as BSON. Currently, one of the '_stash' is usages is to store
     // documents received from the plan during multiplanning. This means that the documents
@@ -205,6 +272,15 @@ private:
     bool _isDisposed{false};
 
     bool _isSaveRecoveryUnitAcrossCommandsEnabled = false;
+
+    /**
+     * For commands that return multiple cursors, this value will contain the type of cursor.
+     * Default to a regular result cursor.
+     */
+    CursorTypeEnum _cursorType = CursorTypeEnum::DocumentResult;
+
+    std::unique_ptr<RemoteCursorMap> _remoteCursors;
+    std::unique_ptr<RemoteExplainVector> _remoteExplains;
 };
 
 /**
@@ -214,7 +290,11 @@ private:
  *
  * This common logic can be used by various consumers which need to fetch data using an SBE
  * PlanStage tree, such as PlanExecutor or RuntimePlanner.
+ *
+ * BSONTraits template parameter can be set to BSONObj::LargeSizeTrait if we want to allow resulting
+ * BSONObj to be larged than 16 MB.
  */
+template <typename BSONTraits = BSONObj::DefaultSizeTrait>
 sbe::PlanState fetchNext(sbe::PlanStage* root,
                          sbe::value::SlotAccessor* resultSlot,
                          sbe::value::SlotAccessor* recordIdSlot,

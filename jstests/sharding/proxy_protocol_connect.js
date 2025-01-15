@@ -1,20 +1,20 @@
 /**
  * Validate we can connect over the proxy protocol port with the protocol appended.
- * @tags: [requires_fcv_52]
+ * @tags: [
+ *   requires_fcv_52,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
 
-(function() {
 if (_isWindows()) {
-    // The proxy protocol python package currently doesn't support Windows.
-    return;
+    quit();
 }
-load("jstests/libs/logv2_helpers.js");
-load("jstests/sharding/libs/proxy_protocol.js");
+import {ProxyProtocolServer} from "jstests/sharding/libs/proxy_protocol.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Test that you can connect to the load balancer port over a proxy.
 function testProxyProtocolConnect(ingressPort, egressPort, version) {
-    'use strict';
-
     let proxy_server = new ProxyProtocolServer(ingressPort, egressPort, version);
     proxy_server.start();
 
@@ -31,15 +31,13 @@ function testProxyProtocolConnect(ingressPort, egressPort, version) {
 
 // Test that you can't connect to the load balancer port without being proxied.
 function testProxyProtocolConnectFailure(lbPort, sendLoadBalanced) {
-    'use strict';
-
     let st = new ShardingTest(
         {shards: 1, mongos: 1, mongosOptions: {setParameter: {"loadBalancerPort": lbPort}}});
 
     const hostName = st.s.host.substring(0, st.s.host.indexOf(":"));
     const uri = `mongodb://${hostName}:${lbPort}/?loadBalanced=${sendLoadBalanced}`;
     try {
-        var conn = new Mongo(uri);
+        new Mongo(uri);
         assert(false, 'Client was unable to connect to the load balancer port');
     } catch (err) {
         assert(checkLog.checkContainsOnceJsonStringMatch(
@@ -49,11 +47,10 @@ function testProxyProtocolConnectFailure(lbPort, sendLoadBalanced) {
     st.stop();
 }
 
-const ingressPort = 21234;
-const egressPort = 21235;
+const ingressPort = allocatePort();
+const egressPort = allocatePort();
 
 testProxyProtocolConnect(ingressPort, egressPort, 1);
 testProxyProtocolConnect(ingressPort, egressPort, 2);
 testProxyProtocolConnectFailure(egressPort, "true");
 testProxyProtocolConnectFailure(egressPort, "false");
-})();

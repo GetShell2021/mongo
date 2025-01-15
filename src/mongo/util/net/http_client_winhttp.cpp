@@ -57,7 +57,7 @@ namespace mongo {
 namespace {
 
 const LPCWSTR kAcceptTypes[] = {
-    L"application/octet-stream",
+    L"*/*",
     nullptr,
 };
 
@@ -162,6 +162,15 @@ public:
                 break;
             case HttpMethod::kPUT:
                 method = L"PUT";
+                break;
+            case HttpMethod::kPATCH:
+                method = L"PATCH";
+                break;
+            case HttpMethod::kDELETE:
+                uassert(ErrorCodes::BadValue,
+                        "DELETE requests do not support content",
+                        cdrData.length() == 0);
+                method = L"DELETE";
                 break;
             default:
                 MONGO_UNREACHABLE;
@@ -285,7 +294,7 @@ public:
                                        WinHttpReadData(request, buffer.data(), len, &len));
 
             ConstDataRange cdr(buffer.data(), len);
-            ret.writeAndAdvance(cdr);
+            uassertStatusOK(ret.writeAndAdvance(cdr));
         }
 
         DataBuilder headers(4096);
@@ -304,7 +313,7 @@ public:
                                                            &buffer[0],
                                                            &len,
                                                            WINHTTP_NO_HEADER_INDEX));
-            headers.writeAndAdvance(ConstDataRange(buffer.data(), len));
+            uassertStatusOK(headers.writeAndAdvance(ConstDataRange(buffer.data(), len)));
         }
 
         return HttpReply(statusCode, std::move(headers), std::move(ret));
@@ -327,6 +336,11 @@ public:
 
     std::unique_ptr<HttpClient> createWithoutConnectionPool() final {
         return std::make_unique<WinHttpClient>();
+    }
+
+    std::unique_ptr<HttpClient> createWithFirewall(
+        [[maybe_unused]] const std::vector<CIDR>& cidrDenyList) final {
+        MONGO_UNIMPLEMENTED;
     }
 
     BSONObj getServerStatus() final {

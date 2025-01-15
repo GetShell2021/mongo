@@ -27,23 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
+#include <algorithm>
+#include <memory>
 #include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_bucket.h"
 #include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -79,7 +84,8 @@ public:
 
         // Serialize the DocumentSourceGroup and DocumentSourceSort from $bucket so that we can
         // check the explain output to make sure $group and $sort have the correct fields.
-        auto explain = ExplainOptions::Verbosity::kQueryPlanner;
+        auto explain = SerializationOptions{
+            .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)};
         vector<Value> explainedStages;
         groupStage->serializeToArray(explainedStages, explain);
         sortStage->serializeToArray(explainedStages, explain);
@@ -225,6 +231,21 @@ TEST_F(BucketReturnsGroupAndSort, BucketSucceedsWithMultipleBoundaryValues) {
                        "{$const : 1}}]}}, count : {$sum : {$const : 1}}}"));
 
     testCreateFromBsonResult(spec, expectedGroupExplain);
+}
+
+TEST_F(BucketReturnsGroupAndSort, BucketWithEmptyGroupByStrDoesNotAccessPastEndOfString) {
+    // Verify that {groupBy: ''} is rejected _without_ attempting to read past the end of the empty
+    // string.
+    const auto spec =
+        fromjson("{$bucket : {groupBy : '', boundaries : [ 1, 5, 8 ], default : 'other'}}");
+
+    // Under a debug build, this would previously fail if an empty str for groupBy led to access
+    // past the end of the string, with pos() > size() in StringData::operator[].
+    // Verify that this reaches the intended uassert, rejecting the empty string, _without_ first
+    // trying to read past the end of the string.
+    ASSERT_THROWS_CODE(DocumentSourceBucket::createFromBson(spec.firstElement(), getExpCtx()),
+                       AssertionException,
+                       40202);
 }
 
 class InvalidBucketSpec : public AggregationContextFixture {

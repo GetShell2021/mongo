@@ -27,28 +27,66 @@
  *    it in the license file.
  */
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/crypto/fle_crypto.h"
 #include "mongo/db/auth/authorization_checks.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/create_gen.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/timeseries/timeseries_options.h"
+#include "mongo/db/views/view.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
-
 namespace mongo {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(preImagesEnabledOnAllCollectionsByDefault);
 
 constexpr auto kCreateCommandHelp =
     "explicitly creates a collection or view\n"
@@ -71,6 +109,140 @@ constexpr auto kCreateCommandHelp =
     "  writeConcern: <document: write concern expression for the operation>]\n"
     "}"_sd;
 
+BSONObj pipelineAsBsonObj(const std::vector<BSONObj>& pipeline) {
+    BSONArrayBuilder builder;
+    for (const auto& stage : pipeline) {
+        builder.append(stage);
+    }
+    return builder.obj();
+}
+
+/**
+ * Compares the provided `CollectionOptions` to the the options for the provided `NamespaceString`
+ * in the storage catalog.
+ * If the options match, does nothing.
+ * If the options do not match, throws an exception indicating what doesn't match.
+ * If `ns` is not found in the storage catalog (because it was dropped between checking for its
+ * existence and calling this function), throws the original `NamespaceExists` exception.
+ */
+void checkCollectionOptions(OperationContext* opCtx,
+                            const Status& originalStatus,
+                            const NamespaceString& ns,
+                            const CollectionOptions& options) {
+    AutoGetDb autoDb(opCtx, ns.dbName(), MODE_IS);
+    Lock::CollectionLock collLock(opCtx, ns, MODE_IS);
+
+    auto collatorFactory = CollatorFactoryInterface::get(opCtx->getServiceContext());
+
+    const auto catalog = CollectionCatalog::get(opCtx);
+    const auto coll = catalog->lookupCollectionByNamespace(opCtx, ns);
+    if (coll) {
+        auto actualOptions = coll->getCollectionOptions();
+        uassert(ErrorCodes::NamespaceExists,
+                str::stream() << "namespace " << ns.toStringForErrorMsg()
+                              << " already exists, but with different options: "
+                              << actualOptions.toBSON(),
+                options.matchesStorageOptions(actualOptions, collatorFactory));
+        return;
+    }
+
+    const auto view = catalog->lookupView(opCtx, ns);
+    if (!view) {
+        // If the collection/view disappeared in between attempting to create it
+        // and retrieving the options, just propagate the original error.
+        uassertStatusOK(originalStatus);
+        // The assertion above should always fail, as this function should only ever be called
+        // if the original attempt to create the collection failed.
+        MONGO_UNREACHABLE;
+    }
+
+    auto fullNewNamespace = NamespaceStringUtil::deserialize(ns.dbName(), options.viewOn);
+    uassert(ErrorCodes::NamespaceExists,
+            str::stream() << "namespace " << ns.toStringForErrorMsg()
+                          << " already exists, but is a view on "
+                          << view->viewOn().toStringForErrorMsg() << " rather than "
+                          << fullNewNamespace.toStringForErrorMsg(),
+            view->viewOn() == fullNewNamespace);
+
+    auto existingPipeline = pipelineAsBsonObj(view->pipeline());
+    uassert(ErrorCodes::NamespaceExists,
+            str::stream() << "namespace " << ns.toStringForErrorMsg()
+                          << " already exists, but with pipeline " << existingPipeline
+                          << " rather than " << options.pipeline,
+            existingPipeline.woCompare(options.pipeline) == 0);
+
+    // Note: the server can add more values to collation options which were not
+    // specified in the original user request. Use the collator to check for
+    // equivalence.
+    auto newCollator = options.collation.isEmpty()
+        ? nullptr
+        : uassertStatusOK(collatorFactory->makeFromBSON(options.collation));
+
+    if (!CollatorInterface::collatorsMatch(view->defaultCollator(), newCollator.get())) {
+        const auto defaultCollatorSpecBSON =
+            view->defaultCollator() ? view->defaultCollator()->getSpec().toBSON() : BSONObj();
+        uasserted(ErrorCodes::NamespaceExists,
+                  str::stream() << "namespace " << ns.toStringForErrorMsg()
+                                << " already exists, but with collation: "
+                                << defaultCollatorSpecBSON << " rather than " << options.collation);
+    }
+}
+
+void checkTimeseriesBucketsCollectionOptions(OperationContext* opCtx,
+                                             const Status& error,
+                                             const NamespaceString& bucketsNs,
+                                             CollectionOptions& options) {
+    auto coll = acquireCollectionMaybeLockFree(
+        opCtx,
+        // TODO (SERVER-82072): Do not skip shard version checks.
+        CollectionAcquisitionRequest{bucketsNs,
+                                     PlacementConcern{},
+                                     repl::ReadConcernArgs::get(opCtx),
+                                     AcquisitionPrerequisites::OperationType::kRead});
+    uassert(error.code(), error.reason(), coll.exists());
+
+    auto existingOptions = coll.getCollectionPtr()->getCollectionOptions();
+    uassert(error.code(), error.reason(), existingOptions.timeseries);
+
+    uassertStatusOK(timeseries::validateAndSetBucketingParameters(*options.timeseries));
+
+    // When checking that the options for the buckets collection are the same, filter out the
+    // options that were internally generated upon time-series collection creation (i.e. were not
+    // specified by the user).
+    uassert(error.code(),
+            error.reason(),
+            options.matchesStorageOptions(
+                uassertStatusOK(CollectionOptions::parse(existingOptions.toBSON(
+                    false /* includeUUID */, timeseries::kAllowedCollectionCreationOptions))),
+                CollatorFactoryInterface::get(opCtx->getServiceContext())));
+}
+
+void checkTimeseriesViewOptions(OperationContext* opCtx,
+                                const Status& error,
+                                const NamespaceString& viewNs,
+                                const CollectionOptions& options) {
+    auto acquisition =
+        acquireCollectionOrViewMaybeLockFree(opCtx,
+                                             CollectionOrViewAcquisitionRequest::fromOpCtx(
+                                                 opCtx,
+                                                 viewNs,
+                                                 AcquisitionPrerequisites::OperationType::kRead,
+                                                 AcquisitionPrerequisites::ViewMode::kCanBeView));
+    uassert(error.code(), error.reason(), acquisition.isView());
+    const auto& view = acquisition.getView().getViewDefinition();
+
+    uassert(error.code(), error.reason(), view.viewOn() == viewNs.makeTimeseriesBucketsNamespace());
+    uassert(error.code(),
+            error.reason(),
+            CollatorInterface::collatorsMatch(
+                view.defaultCollator(),
+                !options.collation.isEmpty()
+                    ? uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                          ->makeFromBSON(options.collation))
+                          .get()
+                    : nullptr));
+}
+
 class CmdCreate final : public CreateCmdVersion1Gen<CmdCreate> {
 public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
@@ -79,6 +251,10 @@ public:
 
     bool adminOnly() const final {
         return false;
+    }
+
+    bool allowedWithSecurityToken() const final {
+        return true;
     }
 
     bool collectsResourceConsumptionMetrics() const final {
@@ -101,6 +277,10 @@ public:
             return true;
         }
 
+        bool isSubjectToIngressAdmissionControl() const override {
+            return true;
+        }
+
         void doCheckAuthorization(OperationContext* opCtx) const final {
             uassertStatusOK(auth::checkAuthForCreate(
                 opCtx, AuthorizationSession::get(opCtx->getClient()), request(), false));
@@ -111,14 +291,15 @@ public:
         }
 
         CreateCommandReply typedRun(OperationContext* opCtx) final {
+            // Intentional copy of request made here, as request object can be modified below.
             auto cmd = request();
 
             CreateCommandReply reply;
             if (cmd.getAutoIndexId()) {
-#define DEPR_23800 "The autoIndexId option is deprecated and will be removed in a future release"
-                LOGV2_WARNING(23800, DEPR_23800);
-                reply.setNote(StringData(DEPR_23800));
-#undef DEPR_23800
+                constexpr const char depr_23800[] =
+                    "The autoIndexId option is deprecated and will be removed in a future release";
+                LOGV2_WARNING(23800, depr_23800);
+                reply.setNote(std::string(depr_23800));
             }
 
             if (!cmd.getClusteredIndex()) {
@@ -141,28 +322,7 @@ public:
                 }
             } else {
                 // Clustered collection.
-                if (cmd.getCapped()) {
-                    uassert(ErrorCodes::Error(6127800),
-                            "Clustered capped collection only available with 'enableTestCommands' "
-                            "server parameter",
-                            getTestCommandsEnabled());
-                }
-
-                uassert(ErrorCodes::Error(6049200),
-                        str::stream() << "'size' field for capped collections is not "
-                                         "allowed on clustered collections. "
-                                      << "Did you mean 'capped: true' with 'expireAfterSeconds'?",
-                        !cmd.getSize());
-                uassert(ErrorCodes::Error(6049204),
-                        str::stream() << "'max' field for capped collections is not "
-                                         "allowed on clustered collections. "
-                                      << "Did you mean 'capped: true' with 'expireAfterSeconds'?",
-                        !cmd.getMax());
-                if (cmd.getCapped()) {
-                    uassert(ErrorCodes::Error(6049201),
-                            "A capped clustered collection requires the 'expireAfterSeconds' field",
-                            cmd.getExpireAfterSeconds());
-                }
+                clustered_util::checkCreationOptions(cmd);
             }
 
             // The 'temp' field is only allowed to be used internally and isn't available to
@@ -171,8 +331,7 @@ public:
                 uassert(ErrorCodes::InvalidOptions,
                         str::stream() << "the 'temp' field is an invalid option",
                         opCtx->getClient()->isInDirectClient() ||
-                            (opCtx->getClient()->session()->getTags() &
-                             transport::Session::kInternalClient));
+                            (opCtx->getClient()->isInternalClient()));
             }
 
             if (cmd.getPipeline()) {
@@ -192,12 +351,36 @@ public:
 
                 uassert(6346402,
                         "Encrypted collections are not supported on standalone",
-                        repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() ==
-                            repl::ReplicationCoordinator::Mode::modeReplSet);
+                        repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet());
+
+                uassert(8575605,
+                        "Cannot create a collection with an encrypted field with query "
+                        "type rangePreview, as it is deprecated",
+                        !hasQueryType(cmd.getEncryptedFields().get(),
+                                      QueryTypeEnum::RangePreviewDeprecated));
+
+                if (!gFeatureFlagQETextSearchPreview.isEnabledUseLastLTSFCVWhenUninitialized(
+                        serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+                    uassert(9783415,
+                            "Cannot create a collection with an encrypted field with query type "
+                            "substringPreview unless featureFlagQETextSearchPreview is enabled",
+                            !hasQueryType(cmd.getEncryptedFields().get(),
+                                          QueryTypeEnum::SubstringPreview));
+                    uassert(9783416,
+                            "Cannot create a collection with an encrypted field with query type "
+                            "suffixPreview unless featureFlagQETextSearchPreview is enabled",
+                            !hasQueryType(cmd.getEncryptedFields().get(),
+                                          QueryTypeEnum::SuffixPreview));
+                    uassert(9783417,
+                            "Cannot create a collection with an encrypted field with query type "
+                            "prefixPreview unless featureFlagQETextSearchPreview is enabled",
+                            !hasQueryType(cmd.getEncryptedFields().get(),
+                                          QueryTypeEnum::PrefixPreview));
+                }
             }
 
             if (auto timeseries = cmd.getTimeseries()) {
-                for (auto&& option : cmd.toBSON({})) {
+                for (auto&& option : cmd.toBSON()) {
                     auto fieldName = option.fieldNameStringData();
 
                     if (fieldName == CreateCommand::kCommandName) {
@@ -220,18 +403,19 @@ public:
 
                     uassert(ErrorCodes::InvalidOptions,
                             str::stream()
-                                << cmd.getNamespace() << ": 'timeseries' is not allowed with '"
-                                << fieldName << "'",
-                            timeseries::kAllowedCollectionCreationOptions.contains(fieldName));
+                                << cmd.getNamespace().toStringForErrorMsg()
+                                << ": 'timeseries' is not allowed with '" << fieldName << "'",
+                            timeseries::kAllowedCollectionCreationOptions.contains(fieldName) ||
+                                isGenericArgument(fieldName));
                 }
 
                 auto hasDot = [](StringData field) -> bool {
                     return field.find('.') != std::string::npos;
                 };
                 auto mustBeTopLevel = [&cmd](StringData field) -> std::string {
-                    return str::stream()
-                        << cmd.getNamespace() << ": '" << field << "' must be a top-level field "
-                        << "and not contain a '.'";
+                    return str::stream() << cmd.getNamespace().toStringForErrorMsg() << ": '"
+                                         << field << "' must be a top-level field "
+                                         << "and not contain a '.'";
                 };
                 uassert(ErrorCodes::InvalidOptions,
                         mustBeTopLevel("timeField"),
@@ -251,19 +435,10 @@ public:
             }
 
             if (cmd.getExpireAfterSeconds()) {
-                if (feature_flags::gClusteredIndexes.isEnabled(
-                        serverGlobalParams.featureCompatibility)) {
-                    uassert(ErrorCodes::InvalidOptions,
-                            "'expireAfterSeconds' is only supported on time-series collections or "
-                            "when the 'clusteredIndex' option is specified",
-                            cmd.getTimeseries() || cmd.getClusteredIndex());
-                } else {
-                    uassert(ErrorCodes::InvalidOptions,
-                            "'expireAfterSeconds' is only supported on time-series collections",
-                            cmd.getTimeseries() ||
-                                (cmd.getClusteredIndex() &&
-                                 cmd.getNamespace().isTimeseriesBucketsCollection()));
-                }
+                uassert(ErrorCodes::InvalidOptions,
+                        "'expireAfterSeconds' is only supported on time-series collections or "
+                        "when the 'clusteredIndex' option is specified",
+                        cmd.getTimeseries() || cmd.getClusteredIndex());
             }
 
             // Validate _id index spec and fill in missing fields.
@@ -302,7 +477,7 @@ public:
                                               ->makeFromBSON(collationElem.Obj());
                     // validateIndexSpecCollation() should have checked that the _id index collation
                     // spec is valid.
-                    invariant(collatorStatus.isOK());
+                    invariant(collatorStatus.getStatus());
                     idIndexCollator = std::move(collatorStatus.getValue());
                 }
                 if (!CollatorInterface::collatorsMatch(defaultCollator.get(),
@@ -311,33 +486,67 @@ public:
                               "'idIndex' must have the same collation as the collection.");
                 }
 
-                cmd.setIdIndex(idIndexSpec);
+                cmd.getCreateCollectionRequest().setIdIndex(idIndexSpec);
             }
 
-            const auto isChangeStreamPreAndPostImagesEnabled =
-                (cmd.getChangeStreamPreAndPostImages() &&
-                 cmd.getChangeStreamPreAndPostImages()->getEnabled());
-
-            if (feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
-                const auto isRecordPreImagesEnabled = cmd.getRecordPreImages().get_value_or(false);
+            if (cmd.getValidator() || cmd.getValidationLevel() || cmd.getValidationAction()) {
+                // Check for config.settings in the user command since a validator is allowed
+                // internally on this collection but the user may not modify the validator.
                 uassert(ErrorCodes::InvalidOptions,
-                        "'recordPreImages' and 'changeStreamPreAndPostImages.enabled' can not be "
-                        "set to true simultaneously",
-                        !(isChangeStreamPreAndPostImagesEnabled && isRecordPreImagesEnabled));
-            } else {
-                uassert(ErrorCodes::InvalidOptions,
-                        "BSON field 'changeStreamPreAndPostImages' is an unknown field.",
-                        !cmd.getChangeStreamPreAndPostImages().has_value());
+                        str::stream() << "Document validators not allowed on system collection "
+                                      << ns().toStringForErrorMsg(),
+                        ns() != NamespaceString::kConfigSettingsNamespace);
+            }
+            if (cmd.getValidationAction() == ValidationActionEnum::errorAndLog) {
+                uassert(
+                    ErrorCodes::InvalidOptions,
+                    "Validation action 'errorAndLog' is not supported with current FCV",
+                    gFeatureFlagErrorAndLogValidationAction.isEnabledUseLastLTSFCVWhenUninitialized(
+                        serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
             }
 
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(opCtx);
-            uassertStatusOK(createCollection(opCtx, cmd.getNamespace(), cmd));
+
+            preImagesEnabledOnAllCollectionsByDefault.execute([&](const auto&) {
+                if (!cmd.getViewOn() && !cmd.getTimeseries() &&
+                    validateChangeStreamPreAndPostImagesOptionIsPermitted(cmd.getNamespace())
+                        .isOK()) {
+                    cmd.getCreateCollectionRequest().setChangeStreamPreAndPostImages(
+                        ChangeStreamPreAndPostImagesOptions{true});
+                }
+            });
+
+            const auto createStatus = createCollection(opCtx, cmd);
+            // NamespaceExists will cause multi-document transactions to implicitly abort, so
+            // in that case we should surface the error to the client. Otherwise, return success
+            // if a collection with identical options already exists.
+            if (createStatus == ErrorCodes::NamespaceExists &&
+                !opCtx->inMultiDocumentTransaction()) {
+                auto options = CollectionOptions::fromCreateCommand(cmd);
+                if (options.timeseries) {
+                    const auto& bucketNss = cmd.getNamespace().isTimeseriesBucketsCollection()
+                        ? cmd.getNamespace()
+                        : cmd.getNamespace().makeTimeseriesBucketsNamespace();
+                    checkTimeseriesBucketsCollectionOptions(
+                        opCtx, createStatus, bucketNss, options);
+
+                    if (!cmd.getNamespace().isTimeseriesBucketsCollection()) {
+                        checkTimeseriesViewOptions(
+                            opCtx, createStatus, cmd.getNamespace(), options);
+                    }
+                } else {
+                    checkCollectionOptions(opCtx, createStatus, cmd.getNamespace(), options);
+                }
+            } else {
+                uassertStatusOK(createStatus);
+            }
+
             return reply;
         }
     };
-} cmdCreate;
+};
+MONGO_REGISTER_COMMAND(CmdCreate).forShard();
 
 }  // namespace
 }  // namespace mongo

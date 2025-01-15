@@ -1,15 +1,8 @@
 // Test $filter aggregation expression.
-//
-// @tags: [
-//   # Can't set the 'failOnPoisonedFieldLookup' failpoint on mongos.
-//   assumes_against_mongod_not_mongos,
-// ]
 
-load('jstests/aggregation/extras/utils.js');        // For assertErrorCode.
-load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-(function() {
-'use strict';
+import {assertArrayEq, assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 function runAndAssert(filterSpec, expectedResult) {
     const actualResult = coll.aggregate([{$project: {b: filterSpec}}, {$sort: {_id: 1}}]).toArray();
@@ -80,27 +73,17 @@ runAndAssert(filterDoc, expectedResults);
 // The 'limit' argument must be greater than zero and fit into int32 type. Otherwise, we throw an
 // error.
 filterDoc = {input: '$a', as: 'x', cond: true, limit: 0.5};
-let projectSpec = {$project: {b: {$filter: filterDoc}}};
 runAndAssertThrows(filterDoc, 327391);
 
 filterDoc = {input: '$a', as: 'x', cond: true, limit: 0};
-projectSpec = {
-    $project: {b: {$filter: filterDoc}}
-};
 runAndAssertThrows(filterDoc, 327392);
 
 filterDoc = {input: '$a', as: 'x', cond: true, limit: -100};
-projectSpec = {
-    $project: {b: {$filter: filterDoc}}
-};
 runAndAssertThrows(filterDoc, 327392);
 
 // Passing 'maxInt32 + 1' value for the 'limit' argument should throw an exception
 filterDoc = {
     input: '$a', as: 'x', cond: true, limit: 2147483648
-};
-projectSpec = {
-    $project: {b: {$filter: filterDoc}}
 };
 runAndAssertThrows(filterDoc, 327391);
 
@@ -120,7 +103,7 @@ expectedResults = [
 runAndAssert(filterDoc, expectedResults);
 
 // Create filter with path expressions inside $let expression.
-filterDoc = 
+filterDoc =
     {
                 $let: {
                     vars: {
@@ -326,7 +309,7 @@ expectedResults = [
 
 filterDoc = {$filter: {
     input: "$items",
-    limit: {$add: ["$maxSaleItems", 1]}, 
+    limit: {$add: ["$maxSaleItems", 1]},
     as: "item",
     cond: { $gte: [ "$$item.price", 100 ] }
  }};
@@ -405,29 +388,24 @@ runAndAssert(filterDoc, expectedResults);
 
 // Test short-circuiting in $and and $or inside $filter expression.
 coll.drop();
-assert.commandWorked(coll.insert({_id: 0, a: [-1, -2, -3, -4]}));
-try {
-    // Lookup of '$POISON' field will always fail with this fail point enabled.
-    assert.commandWorked(
-        db.adminCommand({configureFailPoint: "failOnPoisonedFieldLookup", mode: "alwaysOn"}));
+assert.commandWorked(coll.insert({_id: 0, a: [-1, -2, -3, -4], zero: 0}));
+// Create filter with $and expression containing $divide by zero operation in it.
+expectedResults = [
+    {_id: 0, b: []},
+];
+filterDoc = {
+    $filter: {input: '$a', cond: {$and: [{$gt: ['$$this', 0]}, {$divide: [1, '$zero']}]}}
+};
+runAndAssert(filterDoc, expectedResults);
 
-    // Create filter with $and expression containing '$POISON' in it.
-    expectedResults = [
-        {_id: 0, b: []},
-    ];
-    filterDoc = {$filter: {input: '$a', cond: {$and: [{$gt: ['$$this', 0]}, '$POISON']}}};
-    runAndAssert(filterDoc, expectedResults);
-
-    // Create filter with $or expression containing '$POISON' in it.
-    expectedResults = [
-        {_id: 0, b: [-1, -2, -3, -4]},
-    ];
-    filterDoc = {$filter: {input: '$a', cond: {$or: [{$lt: ['$$this', 0]}, '$POISON']}}};
-    runAndAssert(filterDoc, expectedResults);
-} finally {
-    assert.commandWorked(
-        db.adminCommand({configureFailPoint: "failOnPoisonedFieldLookup", mode: "off"}));
-}
+// Create filter with $or expression containing $divide by zero operation in it.
+expectedResults = [
+    {_id: 0, b: [-1, -2, -3, -4]},
+];
+filterDoc = {
+    $filter: {input: '$a', cond: {$or: [{$lte: ['$$this', 0]}, {$divide: [1, '$zero']}]}}
+};
+runAndAssert(filterDoc, expectedResults);
 
 // Create filter with $and expression containing invalid call to $ln in it.
 expectedResults = [
@@ -446,4 +424,3 @@ filterDoc = {
     $filter: {input: '$a', cond: {$or: [{$lt: ['$$this', 0]}, {$ln: '$$this'}]}}
 };
 runAndAssert(filterDoc, expectedResults);
-}());

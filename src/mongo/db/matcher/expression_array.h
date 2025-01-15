@@ -29,13 +29,29 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <memory>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/clonable_ptr.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_path.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/matcher/match_details.h"
+#include "mongo/db/matcher/path.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -46,7 +62,7 @@ namespace mongo {
 class ArrayMatchingMatchExpression : public PathMatchExpression {
 public:
     ArrayMatchingMatchExpression(MatchType matchType,
-                                 StringData path,
+                                 boost::optional<StringData> path,
                                  clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : PathMatchExpression(matchType,
                               path,
@@ -72,39 +88,42 @@ public:
 
 class ElemMatchObjectMatchExpression final : public ArrayMatchingMatchExpression {
 public:
-    ElemMatchObjectMatchExpression(StringData path,
+    ElemMatchObjectMatchExpression(boost::optional<StringData> path,
                                    std::unique_ptr<MatchExpression> sub,
                                    clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    bool matchesArray(const BSONObj& anArray, MatchDetails* details) const;
+    bool matchesArray(const BSONObj& anArray, MatchDetails* details) const override;
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+    std::unique_ptr<MatchExpression> clone() const override {
         std::unique_ptr<ElemMatchObjectMatchExpression> e =
             std::make_unique<ElemMatchObjectMatchExpression>(
-                path(), _sub->shallowClone(), _errorAnnotation);
+                path(), _sub->clone(), _errorAnnotation);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
         return e;
     }
 
-    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
+    void debugString(StringBuilder& debug, int indentationLevel) const override;
 
-    BSONObj getSerializedRightHandSide() const final;
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
 
     std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;
     }
 
-    virtual size_t numChildren() const {
+    size_t numChildren() const override {
         return 1;
     }
 
-    virtual MatchExpression* getChild(size_t i) const {
+    MatchExpression* getChild(size_t i) const override {
+        tassert(6400204, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
         return _sub.get();
     }
 
-    virtual void resetChild(size_t i, MatchExpression* other) {
+    void resetChild(size_t i, MatchExpression* other) override {
         tassert(6329401, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
         _sub.reset(other);
     }
@@ -133,21 +152,21 @@ private:
 
 class ElemMatchValueMatchExpression final : public ArrayMatchingMatchExpression {
 public:
-    ElemMatchValueMatchExpression(StringData path,
+    ElemMatchValueMatchExpression(boost::optional<StringData> path,
                                   std::unique_ptr<MatchExpression> sub,
                                   clonable_ptr<ErrorAnnotation> annotation = nullptr);
-    explicit ElemMatchValueMatchExpression(StringData path,
+    explicit ElemMatchValueMatchExpression(boost::optional<StringData> path,
                                            clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     void add(std::unique_ptr<MatchExpression> sub);
 
-    bool matchesArray(const BSONObj& anArray, MatchDetails* details) const;
+    bool matchesArray(const BSONObj& anArray, MatchDetails* details) const override;
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+    std::unique_ptr<MatchExpression> clone() const override {
         std::unique_ptr<ElemMatchValueMatchExpression> e =
             std::make_unique<ElemMatchValueMatchExpression>(path(), _errorAnnotation);
         for (size_t i = 0; i < _subs.size(); ++i) {
-            e->add(_subs[i]->shallowClone());
+            e->add(_subs[i]->clone());
         }
         if (getTag()) {
             e->setTag(getTag()->clone());
@@ -155,23 +174,26 @@ public:
         return e;
     }
 
-    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
+    void debugString(StringBuilder& debug, int indentationLevel) const override;
 
-    BSONObj getSerializedRightHandSide() const final;
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
 
     std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return &_subs;
     }
 
-    virtual size_t numChildren() const {
+    size_t numChildren() const override {
         return _subs.size();
     }
 
-    virtual MatchExpression* getChild(size_t i) const {
+    MatchExpression* getChild(size_t i) const override {
+        tassert(6400205, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
         return _subs[i].get();
     }
 
-    virtual void resetChild(size_t i, MatchExpression* other) override {
+    void resetChild(size_t i, MatchExpression* other) override {
         tassert(6329402, "Out-of-bounds access to child of MatchExpression.", i < numChildren());
         _subs[i].reset(other);
     }
@@ -194,11 +216,11 @@ private:
 
 class SizeMatchExpression : public ArrayMatchingMatchExpression {
 public:
-    SizeMatchExpression(StringData path,
+    SizeMatchExpression(boost::optional<StringData> path,
                         int size,
                         clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<SizeMatchExpression> e =
             std::make_unique<SizeMatchExpression>(path(), _size, _errorAnnotation);
         if (getTag()) {
@@ -215,6 +237,7 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const override {
+        tassert(6400206, "SizeMatchExpression does not have any children.", i < numChildren());
         return nullptr;
     }
 
@@ -226,13 +249,15 @@ public:
         return nullptr;
     }
 
-    virtual bool matchesArray(const BSONObj& anArray, MatchDetails* details) const;
+    bool matchesArray(const BSONObj& anArray, MatchDetails* details) const override;
 
-    virtual void debugString(StringBuilder& debug, int indentationLevel) const;
+    void debugString(StringBuilder& debug, int indentationLevel) const override;
 
-    BSONObj getSerializedRightHandSide() const final;
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
 
-    virtual bool equivalent(const MatchExpression* other) const;
+    bool equivalent(const MatchExpression* other) const override;
 
     int getData() const {
         return _size;
@@ -246,7 +271,7 @@ public:
         visitor->visit(this);
     }
 
-    void setInputParamId(InputParamId paramId) {
+    void setInputParamId(boost::optional<InputParamId> paramId) {
         _inputParamId = paramId;
     }
 
@@ -255,8 +280,10 @@ public:
     }
 
 private:
-    virtual ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+    ExpressionOptimizerFunc getOptimizer() const final {
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     int _size;  // >= 0 real, < 0, nothing will match

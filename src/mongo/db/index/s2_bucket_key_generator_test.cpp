@@ -28,23 +28,40 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/index/expression_keys_private.h"
-
 #include <algorithm>
+#include <ostream>
+#include <s2cell.h>
+#include <s2latlng.h>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "third_party/s2/s2cell.h"
-#include "third_party/s2/s2latlng.h"
+#include <boost/container/flat_set.hpp>
+#include <boost/container/small_vector.hpp>
+#include <boost/container/vector.hpp>
+#include <s2cellid.h>
 
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/expression_params.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index/s2_common.h"
-#include "mongo/db/json.h"
+#include "mongo/db/index/s2_key_generator.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/shared_buffer_fragment.h"
 #include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -58,7 +75,7 @@ std::string dumpKeyset(const KeyStringSet& keyStrings) {
     std::stringstream ss;
     ss << "[ ";
     for (auto& keyString : keyStrings) {
-        auto key = KeyString::toBson(keyString, Ordering::make(BSONObj()));
+        auto key = key_string::toBson(keyString, Ordering::make(BSONObj()));
         ss << key.toString() << " ";
     }
     ss << "]";
@@ -112,12 +129,12 @@ void assertMultikeyPathsEqual(const MultikeyPaths& expectedMultikeyPaths,
 
 struct S2BucketKeyGeneratorTest : public unittest::Test {
     using PointSet = std::set<std::pair<long, long>>;
-    SharedBufferFragmentBuilder allocator{KeyString::HeapBuilder::kHeapAllocatorDefaultBytes};
+    SharedBufferFragmentBuilder allocator{key_string::HeapBuilder::kHeapAllocatorDefaultBytes};
 
     void verifySetIsCoveredByKeys(const KeyStringSet& keys, const PointSet& points) const {
         std::vector<S2Cell> cells;
         for (const auto& key : keys) {
-            auto obj = KeyString::toBson(key, Ordering::make(BSONObj()));
+            auto obj = key_string::toBson(key, Ordering::make(BSONObj()));
             cells.emplace_back(S2CellId(obj.firstElement().Long()));
         }
 
@@ -146,19 +163,19 @@ TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeys) {
     BSONObj infoObj = fromjson("{key: {'data.geo': '2dsphere_bucket'}, '2dsphereIndexVersion': 3}");
     S2IndexingParams params;
     CollatorInterfaceMock* collator = nullptr;
-    ExpressionParams::initialize2dsphereParams(infoObj, collator, &params);
+    index2dsphere::initialize2dsphereParams(infoObj, collator, &params);
 
     KeyStringSet actualKeys;
     MultikeyPaths actualMultikeyPaths;
-    ExpressionKeysPrivate::getS2Keys(allocator,
-                                     genKeysFrom,
-                                     keyPattern,
-                                     params,
-                                     &actualKeys,
-                                     &actualMultikeyPaths,
-                                     KeyString::Version::kLatestVersion,
-                                     SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
-                                     Ordering::make(BSONObj()));
+    index2dsphere::getS2Keys(allocator,
+                             genKeysFrom,
+                             keyPattern,
+                             params,
+                             &actualKeys,
+                             &actualMultikeyPaths,
+                             key_string::Version::kLatestVersion,
+                             SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
+                             Ordering::make(BSONObj()));
 
     PointSet set{{0, 0}, {3, 3}};
     verifySetIsCoveredByKeys(actualKeys, set);
@@ -175,19 +192,19 @@ TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeysSubField) {
         fromjson("{key: {'data.geo.sub': '2dsphere_bucket'}, '2dsphereIndexVersion': 3}");
     S2IndexingParams params;
     CollatorInterfaceMock* collator = nullptr;
-    ExpressionParams::initialize2dsphereParams(infoObj, collator, &params);
+    index2dsphere::initialize2dsphereParams(infoObj, collator, &params);
 
     KeyStringSet actualKeys;
     MultikeyPaths actualMultikeyPaths;
-    ExpressionKeysPrivate::getS2Keys(allocator,
-                                     genKeysFrom,
-                                     keyPattern,
-                                     params,
-                                     &actualKeys,
-                                     &actualMultikeyPaths,
-                                     KeyString::Version::kLatestVersion,
-                                     SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
-                                     Ordering::make(BSONObj()));
+    index2dsphere::getS2Keys(allocator,
+                             genKeysFrom,
+                             keyPattern,
+                             params,
+                             &actualKeys,
+                             &actualMultikeyPaths,
+                             key_string::Version::kLatestVersion,
+                             SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
+                             Ordering::make(BSONObj()));
 
     PointSet set{{0, 0}, {3, 3}};
     verifySetIsCoveredByKeys(actualKeys, set);
@@ -204,19 +221,19 @@ TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeysDeepSubField) {
         "{key: {'data.geo.sub1.sub2.sub3': '2dsphere_bucket'}, '2dsphereIndexVersion': 3}");
     S2IndexingParams params;
     CollatorInterfaceMock* collator = nullptr;
-    ExpressionParams::initialize2dsphereParams(infoObj, collator, &params);
+    index2dsphere::initialize2dsphereParams(infoObj, collator, &params);
 
     KeyStringSet actualKeys;
     MultikeyPaths actualMultikeyPaths;
-    ExpressionKeysPrivate::getS2Keys(allocator,
-                                     genKeysFrom,
-                                     keyPattern,
-                                     params,
-                                     &actualKeys,
-                                     &actualMultikeyPaths,
-                                     KeyString::Version::kLatestVersion,
-                                     SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
-                                     Ordering::make(BSONObj()));
+    index2dsphere::getS2Keys(allocator,
+                             genKeysFrom,
+                             keyPattern,
+                             params,
+                             &actualKeys,
+                             &actualMultikeyPaths,
+                             key_string::Version::kLatestVersion,
+                             SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
+                             Ordering::make(BSONObj()));
 
     PointSet set{{0, 0}, {3, 3}};
     verifySetIsCoveredByKeys(actualKeys, set);
@@ -238,19 +255,19 @@ TEST_F(S2BucketKeyGeneratorTest, GetS2BucketKeysSubFieldSomeMissing) {
         fromjson("{key: {'data.geo.sub': '2dsphere_bucket'}, '2dsphereIndexVersion': 3}");
     S2IndexingParams params;
     CollatorInterfaceMock* collator = nullptr;
-    ExpressionParams::initialize2dsphereParams(infoObj, collator, &params);
+    index2dsphere::initialize2dsphereParams(infoObj, collator, &params);
 
     KeyStringSet actualKeys;
     MultikeyPaths actualMultikeyPaths;
-    ExpressionKeysPrivate::getS2Keys(allocator,
-                                     genKeysFrom,
-                                     keyPattern,
-                                     params,
-                                     &actualKeys,
-                                     &actualMultikeyPaths,
-                                     KeyString::Version::kLatestVersion,
-                                     SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
-                                     Ordering::make(BSONObj()));
+    index2dsphere::getS2Keys(allocator,
+                             genKeysFrom,
+                             keyPattern,
+                             params,
+                             &actualKeys,
+                             &actualMultikeyPaths,
+                             key_string::Version::kLatestVersion,
+                             SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
+                             Ordering::make(BSONObj()));
 
     PointSet set{{0, 0}, {3, 3}, {5, 5}};
     verifySetIsCoveredByKeys(actualKeys, set);

@@ -1,14 +1,20 @@
 """Subcommands for test discovery."""
+
 from typing import List, Optional
 
 import yaml
 from pydantic import BaseModel
 
-from buildscripts.resmokelib import configure_resmoke
-from buildscripts.resmokelib import suitesconfig
-from buildscripts.resmokelib.multiversion.multiversion_service import MultiversionService, MongoReleases, MongoVersion
+from buildscripts.resmokelib import configure_resmoke, suitesconfig
+from buildscripts.resmokelib.multiversion.multiversion_service import (
+    MongoReleases,
+    MongoVersion,
+    MultiversionService,
+)
 from buildscripts.resmokelib.plugin import PluginInterface, Subcommand
 from buildscripts.resmokelib.testing.suite import Suite
+
+__all__ = ["MultiversionService", "MongoReleases", "MongoVersion"]
 
 TEST_DISCOVERY_SUBCOMMAND = "test-discovery"
 SUITECONFIG_SUBCOMMAND = "suiteconfig"
@@ -89,15 +95,28 @@ class DiscoveryPlugin(PluginInterface):
 
         :param subparsers: argparse subparsers
         """
-        parser = subparsers.add_parser(TEST_DISCOVERY_SUBCOMMAND,
-                                       help="Discover what tests are run by a suite.")
+        parser = subparsers.add_parser(
+            TEST_DISCOVERY_SUBCOMMAND, help="Discover what tests are run by a suite."
+        )
+        parser.add_argument("--suite", metavar="SUITE", help="Suite to run against.")
+        parser.add_argument(
+            "--skipTestsCoveredByMoreComplexSuites",
+            dest="skip_tests_covered_by_more_complex_suites",
+            action="store_true",
+            help=(
+                "Excludes tests from running on some suite_A if a more complex"
+                " suite_A_B will also run the same tests."
+            ),
+        )
+
+        parser = subparsers.add_parser(
+            SUITECONFIG_SUBCOMMAND, help="Display configuration of a test suite."
+        )
         parser.add_argument("--suite", metavar="SUITE", help="Suite to run against.")
 
-        parser = subparsers.add_parser(SUITECONFIG_SUBCOMMAND,
-                                       help="Display configuration of a test suite.")
-        parser.add_argument("--suite", metavar="SUITE", help="Suite to run against.")
-
-    def parse(self, subcommand, parser, parsed_args, **kwargs) -> Optional[Subcommand]:
+    def parse(
+        self, subcommand, parser, parsed_args, should_configure_otel=True, **kwargs
+    ) -> Optional[Subcommand]:
         """
         Resolve command-line options to a Subcommand or None.
 
@@ -107,9 +126,10 @@ class DiscoveryPlugin(PluginInterface):
         :param kwargs: additional args.
         :return: None or a Subcommand.
         """
-        configure_resmoke.validate_and_update_config(parser, parsed_args)
         if subcommand == TEST_DISCOVERY_SUBCOMMAND:
+            configure_resmoke.validate_and_update_config(parser, parsed_args, should_configure_otel)
             return TestDiscoverySubcommand(parsed_args.suite)
         if subcommand == SUITECONFIG_SUBCOMMAND:
+            configure_resmoke.validate_and_update_config(parser, parsed_args, should_configure_otel)
             return SuiteConfigSubcommand(parsed_args.suite)
         return None

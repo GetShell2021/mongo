@@ -27,15 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
 #include <string>
 
-#include "mongo/db/pipeline/accumulation_statement.h"
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
-#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/feature_compatibility_version_documentation.h"
+#include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/query/allowed_contexts.h"
 #include "mongo/db/stats/counters.h"
@@ -53,17 +54,16 @@ namespace {
 static StringMap<AccumulationStatement::ParserRegistration> parserMap;
 }  // namespace
 
-void AccumulationStatement::registerAccumulator(
-    std::string name,
-    AccumulationStatement::Parser parser,
-    AllowedWithApiStrict allowedWithApiStrict,
-    AllowedWithClientType allowedWithClientType,
-    boost::optional<multiversion::FeatureCompatibilityVersion> requiredMinVersion) {
+void AccumulationStatement::registerAccumulator(std::string name,
+                                                AccumulationStatement::Parser parser,
+                                                AllowedWithApiStrict allowedWithApiStrict,
+                                                AllowedWithClientType allowedWithClientType,
+                                                boost::optional<FeatureFlag> featureFlag) {
     auto it = parserMap.find(name);
     massert(28722,
             str::stream() << "Duplicate accumulator (" << name << ") registered.",
             it == parserMap.end());
-    parserMap[name] = {parser, allowedWithApiStrict, allowedWithClientType, requiredMinVersion};
+    parserMap[name] = {parser, allowedWithApiStrict, allowedWithClientType, featureFlag};
     operatorCountersGroupAccumulatorExpressions.addCounter(name);
 }
 
@@ -95,7 +95,8 @@ AccumulationStatement AccumulationStatement::parseAccumulationStatement(
             fieldName[0] != '$');
 
     uassert(40238,
-            str::stream() << "The field '" << fieldName << "' must specify one accumulator",
+            str::stream() << "The field '" << fieldName
+                          << "' must specify one accumulator: " << elem,
             elem.Obj().nFields() == 1);
 
     auto specElem = elem.Obj().firstElement();
@@ -104,22 +105,18 @@ AccumulationStatement AccumulationStatement::parseAccumulationStatement(
             str::stream() << "The " << accName << " accumulator is a unary operator",
             specElem.type() != BSONType::Array);
 
-    auto&& [parser, allowedWithApiStrict, allowedWithClientType, requiredMinVersion] =
+    auto&& [parser, allowedWithApiStrict, allowedWithClientType, featureFlag] =
         AccumulationStatement::getParser(accName);
-    auto allowedMaxVersion = expCtx->maxFeatureCompatibilityVersion;
-    uassert(ErrorCodes::QueryFeatureNotAllowed,
-            // We would like to include the current version and the required minimum version in this
-            // error message, but using FeatureCompatibilityVersion::toString() would introduce a
-            // dependency cycle (see SERVER-31968).
-            str::stream() << accName
-                          << " is not allowed in the current feature compatibility version. See "
-                          << feature_compatibility_version_documentation::kCompatibilityLink
-                          << " for more information.",
-            !requiredMinVersion || !allowedMaxVersion || *requiredMinVersion <= *allowedMaxVersion);
 
-    tassert(5837900, "Accumulators should only appear in a user operation", expCtx->opCtx);
-    assertLanguageFeatureIsAllowed(
-        expCtx->opCtx, accName.toString(), allowedWithApiStrict, allowedWithClientType);
+    expCtx->throwIfFeatureFlagIsNotEnabledOnFCV(accName, featureFlag);
+
+    tassert(5837900,
+            "Accumulators should only appear in a user operation",
+            expCtx->getOperationContext());
+    assertLanguageFeatureIsAllowed(expCtx->getOperationContext(),
+                                   accName.toString(),
+                                   allowedWithApiStrict,
+                                   allowedWithClientType);
 
     expCtx->incrementGroupAccumulatorExprCounter(accName);
     auto accExpr = parser(expCtx, specElem, vps);

@@ -5,14 +5,13 @@
  * ]
  */
 
-(function() {
-"use strict";
-load("jstests/replsets/rslib.js");
-load('jstests/libs/fail_point_util.js');
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {assertVoteCount, isMemberNewlyAdded} from "jstests/replsets/rslib.js";
 
 const rst = new ReplSetTest({name: jsTestName(), nodes: 1});
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const primary = rst.getPrimary();
 
@@ -156,9 +155,9 @@ assert.commandWorked(
 assert.commandWorked(
     thirdNewNode.adminCommand({configureFailPoint: "initialSyncHangBeforeFinish", mode: "off"}));
 
-rst.waitForState(firstNewNode, ReplSetTest.State.SECONDARY);
-rst.waitForState(secondNewNode, ReplSetTest.State.SECONDARY);
-rst.waitForState(thirdNewNode, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [firstNewNode]);
+rst.awaitSecondaryNodes(null, [secondNewNode]);
+rst.awaitSecondaryNodes(null, [thirdNewNode]);
 
 jsTestLog("Making sure the set can accept writes with write concerns");
 assert.commandWorked(primaryColl.insert({"steady": "state"}, {writeConcern: {w: 4}}));
@@ -174,4 +173,3 @@ assertVoteCount(primary, {
 });
 
 rst.stopSet();
-})();

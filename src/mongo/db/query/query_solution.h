@@ -29,22 +29,63 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <iosfwd>
+#include <iterator>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/clustered_collection_options_gen.h"
+#include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/exec/eof.h"
 #include "mongo/db/fts/fts_query.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_hasher.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/query/classic_plan_cache.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/window_function/window_function_statement.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/eof_node_type.h"
 #include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/index_hint.h"
 #include "mongo/db/query/interval_evaluation_tree.h"
-#include "mongo/db/query/plan_enumerator_explain_info.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_enumerator/plan_enumerator_explain_info.h"
+#include "mongo/db/query/projection.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/record_id_bound.h"
 #include "mongo/db/query/stage_types.h"
+#include "mongo/db/query/timeseries/bucket_spec.h"
+#include "mongo/db/record_id.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/hash_utils.h"
 #include "mongo/util/id_generator.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
@@ -147,7 +188,7 @@ struct QuerySolutionNode {
     std::string toString() const;
 
     /**
-     * What stage should this be transcribed to?  See stage_types.h.
+     * What stage should this node be transcribed to?  See stage_types.h.
      */
     virtual StageType getType() const = 0;
 
@@ -254,14 +295,57 @@ struct QuerySolutionNode {
     bool hasNode(StageType type) const;
 
     /**
+     * True, if this node, and all of it's children are eligible to be cached.
+     */
+    bool isEligibleForPlanCache() const;
+
+    /**
+     * True, if later stages won't need more metadata from input. The return value should be aligned
+     * with corresponding DocumentSource's DepsTracker::State, true for EXHAUSTIVE_META or
+     * EXHAUSTIVE_ALL.
+     */
+    virtual bool metadataExhausted() const {
+        return false;
+    }
+
+    /**
      * Returns the id associated with this node. Each node in a 'QuerySolution' tree is assigned a
      * unique identifier, which are assigned as sequential positive integers starting from 1.  An id
      * of 0 means that no id was explicitly assigned during construction of the QuerySolution.
      *
-     * The identifiers are unique within the tree, but not across trees.
+     * The identifiers are unique within the tree, but not across trees. The identifiers are
+     * assigned from bottom to top: id of a parent is always greater than
+     * id of a child.
      */
     PlanNodeId nodeId() const {
         return _nodeId;
+    }
+
+    template <typename H>
+    friend H AbslHashValue(H state, const QuerySolutionNode& c) {
+        c.hash(absl::HashState::Create(&state));
+        return state;
+    }
+
+    /**
+     * Hashes a QuerySolutionNode using parameter IDs rather than concrete values wherever
+     * parameters are present. This allows us to determine whether different query solutions, when
+     * parameterized, correspond to the same solution. Used for populating "isCached" in explain.
+     */
+    virtual void hash(absl::HashState state) const {
+        state = absl::HashState::combine(std::move(state), getType());
+        if (filter) {
+            // When hashing the filter, we need to use parameter IDs rather than the concrete values
+            // from the query.
+            state = absl::HashState::combine(
+                std::move(state),
+                MatchExpressionHasher{MatchExpressionHashParams{
+                    20 /*maxNumberOfInElementsToHash*/,
+                    HashValuesOrParams::kHashParamIds /* hashValuesOrParams*/}}(filter.get()));
+        }
+        for (const auto& child : children) {
+            state = absl::HashState::combine(std::move(state), *child.get());
+        }
     }
 
     std::vector<std::unique_ptr<QuerySolutionNode>> children;
@@ -271,6 +355,14 @@ struct QuerySolutionNode {
     std::unique_ptr<MatchExpression> filter;
 
     bool hitScanLimit = false;
+
+    /**
+     * Returns a pair consisting of:
+     *  - First node of the specified type found by pre-order traversal. If node was not found, this
+     *    pair element is nullptr.
+     *  - Total number of nodes with the specified type in tree.
+     */
+    std::pair<const QuerySolutionNode*, size_t> getFirstNodeByType(StageType type) const;
 
 protected:
     /**
@@ -292,9 +384,11 @@ protected:
             other->children.push_back(this->children[i]->clone());
         }
         if (nullptr != this->filter) {
-            other->filter = this->filter->shallowClone();
+            other->filter = this->filter->clone();
         }
     }
+
+    bool eligibleForPlanCache = true;
 
 private:
     // Allows the QuerySolution constructor to set '_nodeId'.
@@ -345,9 +439,16 @@ public:
     }
 
     /**
+     * Return true if all nodes in the solution tree can be cached.
+     */
+    bool isEligibleForPlanCache() const {
+        return !_root || _root->isEligibleForPlanCache();
+    }
+
+    /**
      * Output a human-readable std::string representing the plan.
      */
-    std::string toString() {
+    std::string toString() const {
         if (!_root) {
             return "empty query solution";
         }
@@ -369,7 +470,8 @@ public:
     /**
      * Extends the solution's tree by attaching it to the tree rooted at 'extensionRoot'. The
      * extension tree must contain exactly one 'SentinelNode' node that denotes the attachment
-     * point. The sentinel node will be replaces with the '_root' node.
+     * point. The sentinel node will be replaced with the '_root' node. Sets _unextendedRootId to
+     * the nodeId of the old root.
      */
     void extendWith(std::unique_ptr<QuerySolutionNode> extensionRoot);
 
@@ -381,16 +483,31 @@ public:
     void setRoot(std::unique_ptr<QuerySolutionNode> root);
 
     /**
-     * Extracts the root of the QuerySolutionNode rooted at `_root`.
-     */
-    std::unique_ptr<QuerySolutionNode> extractRoot();
-
-    /**
      * Returns a vector containing all of the secondary namespaces referenced by this tree, except
      * for 'mainNss'. This vector is used to track which secondary namespaces we should acquire
      * locks for. Note that the namespaces are returned in sorted order.
      */
     std::vector<NamespaceStringOrUUID> getAllSecondaryNamespaces(const NamespaceString& mainNss);
+
+    size_t hash() const {
+        return absl::Hash<QuerySolutionNode>()(*_root);
+    }
+
+    /**
+     * Returns a pair consisting of:
+     *  - First node of the specified type found by pre-order traversal. If node was not found, this
+     *    pair element is nullptr.
+     *  - Total number of nodes with the specified type in tree.
+     */
+    std::pair<const QuerySolutionNode*, size_t> getFirstNodeByType(StageType type) const;
+
+    /**
+     * If the solution was extended via extendWith() method, returns nodeId of the node that used to
+     * be root before extension. Otherwise, returns kEmptyPlanNodeId.
+     */
+    PlanNodeId unextendedRootId() const {
+        return _unextendedRootId;
+    }
 
     // There are two known scenarios in which a query solution might potentially block:
     //
@@ -403,6 +520,7 @@ public:
     // we would want to fall back on an alternate non-blocking solution.
     bool hasBlockingStage{false};
 
+    // TODO: SERVER-88503 Remove Index Filters feature.
     // Runner executing this solution might be interested in knowing
     // if the planning process for this solution was based on filtered indices.
     bool indexFilterApplied{false};
@@ -424,26 +542,27 @@ private:
     void assignNodeIds(QsnIdGenerator& idGenerator, QuerySolutionNode& node);
 
     std::unique_ptr<QuerySolutionNode> _root;
+    PlanNodeId _unextendedRootId{kEmptyPlanNodeId};
 };
 
 struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
     CollectionScanNode();
-    virtual ~CollectionScanNode() {}
+    ~CollectionScanNode() override {}
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_COLLSCAN;
     }
 
-    virtual void computeProperties() override;
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void computeProperties() override;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return true;
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return FieldAvailability::kFullyProvided;
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         // It's possible this is overly conservative. By definition
         // a collection scan is sorted by its record ids, so if
         // we're scanning forward this might be true. However,
@@ -452,10 +571,26 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
         return false;
     }
 
+    // Tells whether this scan will be performed as a clustered collection scan in SBE.
+    bool doClusteredCollectionScanSbe() const {
+        return (isClustered && !isOplog && (minRecord || maxRecord || resumeScanPoint));
+    }
+
+    // Tells whether this scan will be performed as a clustered collection scan in classic.
+    bool doClusteredCollectionScanClassic() const {
+        return (isClustered && !isOplog && (minRecord || maxRecord));
+    }
+
+    void markNotEligibleForPlanCache() {
+        eligibleForPlanCache = false;
+    }
+
+    IndexBounds getIndexBounds() const;
+
     std::unique_ptr<QuerySolutionNode> clone() const final;
 
     // Name of the namespace.
-    std::string name;
+    NamespaceString nss;
 
     // If present, this parameter sets the start point of a forward scan or the end point of a
     // reverse scan.
@@ -475,23 +610,34 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
     // If true, the collection scan will return a token that can be used to resume the scan.
     bool requestResumeToken = false;
 
-    // If present, the collection scan will seek to the exact RecordId, or return KeyNotFound if it
-    // does not exist. Must only be set on forward collection scans.
-    // This field cannot be used in conjunction with 'minRecord' or 'maxRecord'.
-    boost::optional<RecordId> resumeAfterRecordId;
+    // If present, collection scan will seek to the exact RecordId.
+    // - If 'tolerateKeyNotFound' is false, and if the RecordId does not exist, it will raise
+    // KeyNotFound.
+    // - If 'tolerateKeyNotFound' is true, and if the RecordId does not exist, it will seek to the
+    // next valid one.
+    // This field must only be set on forward collection scans and cannot be used in conjunction
+    // with 'minRecord' or 'maxRecord'.
+    boost::optional<ResumeScanPoint> resumeScanPoint;
 
     // Should we make a tailable cursor?
     bool tailable;
 
-    // Should we keep track of the timestamp of the latest oplog entry we've seen? This information
-    // is needed to merge cursors from the oplog in order of operation time when reading the oplog
-    // across a sharded cluster.
+    // Should we keep track of the timestamp of the latest oplog or change collection entry we've
+    // seen? This information is needed to merge cursors from the oplog in order of operation time
+    // when reading the oplog across a sharded cluster.
     bool shouldTrackLatestOplogTimestamp = false;
 
-    // Assert that the specified timestamp has not fallen off the oplog.
+    // Assert that the specified timestamp has not fallen off the oplog or change collection.
     boost::optional<Timestamp> assertTsHasNotFallenOff = boost::none;
 
+    // Scan direction: 1 means forward; -1 means reverse.
     int direction{1};
+
+    // Tells whether the collection is clustered (which includes oplog collections).
+    bool isClustered = false;
+
+    // Tells whether the collection is an oplog.
+    bool isOplog = false;
 
     // By default, includes the minRecord and maxRecord when present.
     CollectionScanParams::ScanBoundInclusion boundInclusion =
@@ -501,72 +647,8 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
     bool shouldWaitForOplogVisibility = false;
 
     // Once the first matching document is found, assume that all documents after it must match.
+    // This is useful for oplog queries where we know we will see records ordered by the ts field.
     bool stopApplyingFilterAfterFirstMatch = false;
-};
-
-struct ColumnIndexScanNode : public QuerySolutionNode {
-    ColumnIndexScanNode(ColumnIndexEntry,
-                        std::set<std::string> outputFields,
-                        std::set<std::string> matchFields,
-                        StringMap<std::unique_ptr<MatchExpression>> filtersByPath,
-                        std::unique_ptr<MatchExpression> postAssemblyFilter);
-
-    virtual StageType getType() const {
-        return STAGE_COLUMN_SCAN;
-    }
-
-    void appendToString(str::stream* ss, int indent) const override;
-
-    bool fetched() const {
-        return false;
-    }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
-        return allFields.find(field) != allFields.end() ? FieldAvailability::kFullyProvided
-                                                        : FieldAvailability::kNotProvided;
-    }
-    bool sortedByDiskLoc() const {
-        return true;
-    }
-
-    const ProvidedSortSet& providedSorts() const {
-        return kEmptySet;
-    }
-
-    std::unique_ptr<QuerySolutionNode> clone() const final {
-        StringMap<std::unique_ptr<MatchExpression>> clonedFiltersByPath;
-        for (auto&& [path, filter] : filtersByPath) {
-            clonedFiltersByPath[path] = filter->shallowClone();
-        }
-        return std::make_unique<ColumnIndexScanNode>(indexEntry,
-                                                     outputFields,
-                                                     matchFields,
-                                                     std::move(clonedFiltersByPath),
-                                                     postAssemblyFilter->shallowClone());
-    }
-
-    ColumnIndexEntry indexEntry;
-
-    // The fields we need to output. Dot separated path names.
-    std::set<std::string> outputFields;
-
-    // The fields which are referenced by any and all filters - either in 'filtersByPath' or
-    // 'postAssemblyFilter'.
-    std::set<std::string> matchFields;
-
-    // A column scan can apply a filter to the columns directly while scanning, or to a document
-    // assembled from the scanned columns.
-
-    // Filters to apply to a column directly while scanning. Maps the path to the filter for that
-    // column. Empty if there are none.
-    StringMap<std::unique_ptr<MatchExpression>> filtersByPath;
-
-    // An optional filter to apply after assembling a document from all scanned columns. For
-    // example: {$or: [{a: 2}, {b: 2}]}.
-    std::unique_ptr<MatchExpression> postAssemblyFilter;
-
-    // A cached copy of the union of the above two field sets which we expect to be frequently asked
-    // for.
-    std::set<std::string> allFields;
 };
 
 /**
@@ -582,16 +664,16 @@ struct VirtualScanNode : public QuerySolutionNodeWithSortSet {
                     bool hasRecordId,
                     BSONObj indexKeyPattern = {});
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_VIRTUAL_SCAN;
     }
 
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return scanType == ScanType::kCollScan;
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         if (scanType == ScanType::kCollScan) {
             return FieldAvailability::kFullyProvided;
         } else {
@@ -599,7 +681,7 @@ struct VirtualScanNode : public QuerySolutionNodeWithSortSet {
                                                    : FieldAvailability::kNotProvided;
         }
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return false;
     }
 
@@ -631,20 +713,20 @@ struct VirtualScanNode : public QuerySolutionNodeWithSortSet {
 
 struct AndHashNode : public QuerySolutionNode {
     AndHashNode();
-    virtual ~AndHashNode();
+    ~AndHashNode() override;
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_AND_HASH;
     }
 
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const;
-    FieldAvailability getFieldAvailability(const std::string& field) const;
-    bool sortedByDiskLoc() const {
+    bool fetched() const override;
+    FieldAvailability getFieldAvailability(const std::string& field) const override;
+    bool sortedByDiskLoc() const override {
         return false;
     }
-    const ProvidedSortSet& providedSorts() const {
+    const ProvidedSortSet& providedSorts() const override {
         return children.back()->providedSorts();
     }
 
@@ -653,17 +735,17 @@ struct AndHashNode : public QuerySolutionNode {
 
 struct AndSortedNode : public QuerySolutionNodeWithSortSet {
     AndSortedNode();
-    virtual ~AndSortedNode();
+    ~AndSortedNode() override;
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_AND_SORTED;
     }
 
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const;
-    FieldAvailability getFieldAvailability(const std::string& field) const;
-    bool sortedByDiskLoc() const {
+    bool fetched() const override;
+    FieldAvailability getFieldAvailability(const std::string& field) const override;
+    bool sortedByDiskLoc() const override {
         return true;
     }
 
@@ -672,17 +754,17 @@ struct AndSortedNode : public QuerySolutionNodeWithSortSet {
 
 struct OrNode : public QuerySolutionNodeWithSortSet {
     OrNode();
-    virtual ~OrNode();
+    ~OrNode() override;
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_OR;
     }
 
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const;
-    FieldAvailability getFieldAvailability(const std::string& field) const;
-    bool sortedByDiskLoc() const {
+    bool fetched() const override;
+    FieldAvailability getFieldAvailability(const std::string& field) const override;
+    bool sortedByDiskLoc() const override {
         // Even if our children are sorted by their diskloc or other fields, we don't maintain
         // any order on the output.
         return false;
@@ -695,23 +777,23 @@ struct OrNode : public QuerySolutionNodeWithSortSet {
 
 struct MergeSortNode : public QuerySolutionNodeWithSortSet {
     MergeSortNode();
-    virtual ~MergeSortNode();
+    ~MergeSortNode() override;
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_SORT_MERGE;
     }
 
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const;
-    FieldAvailability getFieldAvailability(const std::string& field) const;
-    bool sortedByDiskLoc() const {
+    bool fetched() const override;
+    FieldAvailability getFieldAvailability(const std::string& field) const override;
+    bool sortedByDiskLoc() const override {
         return false;
     }
 
     std::unique_ptr<QuerySolutionNode> clone() const final;
 
-    virtual void computeProperties() {
+    void computeProperties() override {
         for (size_t i = 0; i < children.size(); ++i) {
             children[i]->computeProperties();
         }
@@ -725,24 +807,24 @@ struct MergeSortNode : public QuerySolutionNodeWithSortSet {
 struct FetchNode : public QuerySolutionNode {
     FetchNode() {}
     FetchNode(std::unique_ptr<QuerySolutionNode> child) : QuerySolutionNode(std::move(child)) {}
-    virtual ~FetchNode() {}
+    ~FetchNode() override {}
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_FETCH;
     }
 
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return true;
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return FieldAvailability::kFullyProvided;
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return children[0]->sortedByDiskLoc();
     }
-    const ProvidedSortSet& providedSorts() const {
+    const ProvidedSortSet& providedSorts() const override {
         return children[0]->providedSorts();
     }
 
@@ -751,21 +833,21 @@ struct FetchNode : public QuerySolutionNode {
 
 struct IndexScanNode : public QuerySolutionNodeWithSortSet {
     IndexScanNode(IndexEntry index);
-    virtual ~IndexScanNode() {}
+    ~IndexScanNode() override {}
 
-    virtual void computeProperties();
+    void computeProperties() override;
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_IXSCAN;
     }
 
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return false;
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const;
-    bool sortedByDiskLoc() const;
+    FieldAvailability getFieldAvailability(const std::string& field) const override;
+    bool sortedByDiskLoc() const override;
 
     std::unique_ptr<QuerySolutionNode> clone() const final;
 
@@ -778,6 +860,16 @@ struct IndexScanNode : public QuerySolutionNodeWithSortSet {
      */
     static std::set<StringData> getFieldsWithStringBounds(const IndexBounds& bounds,
                                                           const BSONObj& indexKeyPattern);
+
+    void hash(absl::HashState h) const override {
+        h = absl::HashState::combine(
+            std::move(h), index.identifier.catalogName, index.identifier.disambiguator);
+        if (iets.empty()) {
+            h = absl::HashState::combine(std::move(h), bounds);
+        }
+        h = absl::HashState::combine_contiguous(std::move(h), iets.data(), iets.size());
+        QuerySolutionNode::hash(std::move(h));
+    }
 
     IndexEntry index;
 
@@ -809,7 +901,7 @@ struct ReturnKeyNode : public QuerySolutionNode {
                   std::vector<FieldPath> sortKeyMetaFields)
         : QuerySolutionNode(std::move(child)), sortKeyMetaFields(std::move(sortKeyMetaFields)) {}
 
-    StageType getType() const final {
+    StageType getType() const override {
         return STAGE_RETURN_KEY;
     }
 
@@ -834,6 +926,128 @@ struct ReturnKeyNode : public QuerySolutionNode {
 };
 
 /**
+ * MatchNode is used for $match aggregation stages that are pushed down to SBE.
+ */
+struct MatchNode : public QuerySolutionNode {
+    MatchNode(std::unique_ptr<QuerySolutionNode> child, std::unique_ptr<MatchExpression> filter)
+        : QuerySolutionNode(std::move(child)) {
+        this->filter = std::move(filter);
+    }
+
+    StageType getType() const override {
+        return STAGE_MATCH;
+    }
+
+    /**
+     * Data from the match node is considered fetched iff the child provides fetched data.
+     */
+    bool fetched() const override {
+        return children[0]->fetched();
+    }
+
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
+        return children[0]->getFieldAvailability(field);
+    }
+
+    bool sortedByDiskLoc() const override {
+        return children[0]->sortedByDiskLoc();
+    }
+
+    const ProvidedSortSet& providedSorts() const override {
+        return children[0]->providedSorts();
+    }
+
+    void appendToString(str::stream* ss, int indent) const final;
+    std::unique_ptr<QuerySolutionNode> clone() const final;
+};
+
+/**
+ * UnwindNode is used for $unwind aggregation stages that are pushed down to SBE.
+ */
+struct UnwindNode : public QuerySolutionNode {
+    UnwindNode(std::unique_ptr<QuerySolutionNode> child,
+               const FieldPath& fieldPath,
+               bool preserveNullAndEmptyArrays,
+               const boost::optional<FieldPath>& indexPath)
+        : QuerySolutionNode(std::move(child)),
+          fieldPath{fieldPath},
+          preserveNullAndEmptyArrays{preserveNullAndEmptyArrays},
+          indexPath(indexPath) {}
+
+    StageType getType() const override {
+        return STAGE_UNWIND;
+    }
+
+    /**
+     * Data from the unwind node is considered fetched iff the child provides fetched data.
+     */
+    bool fetched() const override {
+        return children[0]->fetched();
+    }
+
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
+        return children[0]->getFieldAvailability(field);
+    }
+
+    bool sortedByDiskLoc() const override {
+        return children[0]->sortedByDiskLoc();
+    }
+
+    const ProvidedSortSet& providedSorts() const override {
+        return children[0]->providedSorts();
+    }
+
+    void appendToString(str::stream* ss, int indent) const final;
+    std::unique_ptr<QuerySolutionNode> clone() const final;
+
+    // Path in the document to the field to unwind.
+    FieldPath fieldPath;
+
+    // Iff true, then if the path is null, missing, or an empty array, unwind outputs the document.
+    bool preserveNullAndEmptyArrays;
+
+    // Optional output path in which to return the array index unwound to this output doc.
+    const boost::optional<FieldPath>& indexPath;
+};  // struct UnwindNode
+
+/**
+ * ReplaceRootNode is used for $replaceRoot aggregation stages that are pushed down to SBE.
+ */
+struct ReplaceRootNode : public QuerySolutionNode {
+    ReplaceRootNode(std::unique_ptr<QuerySolutionNode> child,
+                    boost::intrusive_ptr<Expression> newRoot)
+        : QuerySolutionNode(std::move(child)), newRoot(newRoot) {}
+
+    StageType getType() const override {
+        return STAGE_REPLACE_ROOT;
+    }
+
+    /**
+     * Data from the replaceRoot node is considered fetched iff the child provides fetched data.
+     */
+    bool fetched() const override {
+        return children[0]->fetched();
+    }
+
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
+        return FieldAvailability::kNotProvided;
+    }
+
+    bool sortedByDiskLoc() const override {
+        return children[0]->sortedByDiskLoc();
+    }
+
+    const ProvidedSortSet& providedSorts() const override {
+        return children[0]->providedSorts();
+    }
+
+    void appendToString(str::stream* ss, int indent) const final;
+    std::unique_ptr<QuerySolutionNode> clone() const final;
+
+    boost::intrusive_ptr<Expression> newRoot;
+};
+
+/**
  * We have a few implementations of the projection functionality. They are chosen by constructing
  * a type derived from this abstract struct. The most general implementation 'ProjectionNodeDefault'
  * is much slower than the fast-path implementations. We only really have all the information
@@ -841,7 +1055,7 @@ struct ReturnKeyNode : public QuerySolutionNode {
  */
 struct ProjectionNode : public QuerySolutionNodeWithSortSet {
     ProjectionNode(std::unique_ptr<QuerySolutionNode> child,
-                   const MatchExpression& fullExpression,
+                   const MatchExpression* fullExpression,
                    projection_ast::Projection proj)
         : QuerySolutionNodeWithSortSet(std::move(child)),
           fullExpression(fullExpression),
@@ -854,11 +1068,11 @@ struct ProjectionNode : public QuerySolutionNodeWithSortSet {
     /**
      * Data from the projection node is considered fetch iff the child provides fetched data.
      */
-    bool fetched() const {
+    bool fetched() const override {
         return children[0]->fetched();
     }
 
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         // If we were to construct a plan where the input to the project stage was a hashed value,
         // and that field was retained exactly, then we would mistakenly return 'kFullyProvided'.
         // The important point here is that we are careful to construct plans where we fetch before
@@ -868,7 +1082,7 @@ struct ProjectionNode : public QuerySolutionNodeWithSortSet {
                                                               : FieldAvailability::kNotProvided;
     }
 
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         // Projections destroy the RecordId.  By returning true here, this kind of implies that a
         // fetch could still be done upstream.
         //
@@ -886,9 +1100,9 @@ public:
      */
     virtual StringData projectionImplementationTypeToString() const = 0;
 
-    // The full query tree.  Needed when we have positional operators.
-    // Owned in the CanonicalQuery, not here.
-    const MatchExpression& fullExpression;
+    // The full query tree. Needed when we have positional operators. Owned in the CanonicalQuery,
+    // not here, so here this is a native pointer, not a std_unique, to avoid having to clone it.
+    const MatchExpression* fullExpression;
 
     projection_ast::Projection proj;
 };
@@ -899,7 +1113,7 @@ public:
 struct ProjectionNodeDefault final : ProjectionNode {
     using ProjectionNode::ProjectionNode;
 
-    StageType getType() const final {
+    StageType getType() const override {
         return STAGE_PROJECTION_DEFAULT;
     }
 
@@ -915,13 +1129,13 @@ struct ProjectionNodeDefault final : ProjectionNode {
  */
 struct ProjectionNodeCovered final : ProjectionNode {
     ProjectionNodeCovered(std::unique_ptr<QuerySolutionNode> child,
-                          const MatchExpression& fullExpression,
+                          const MatchExpression* fullExpression,
                           projection_ast::Projection proj,
                           BSONObj coveredKeyObj)
         : ProjectionNode(std::move(child), fullExpression, std::move(proj)),
           coveredKeyObj(std::move(coveredKeyObj)) {}
 
-    StageType getType() const final {
+    StageType getType() const override {
         return STAGE_PROJECTION_COVERED;
     }
 
@@ -942,7 +1156,7 @@ struct ProjectionNodeCovered final : ProjectionNode {
 struct ProjectionNodeSimple final : ProjectionNode {
     using ProjectionNode::ProjectionNode;
 
-    StageType getType() const final {
+    StageType getType() const override {
         return STAGE_PROJECTION_SIMPLE;
     }
 
@@ -954,7 +1168,7 @@ struct ProjectionNodeSimple final : ProjectionNode {
 };
 
 struct SortKeyGeneratorNode : public QuerySolutionNode {
-    StageType getType() const final {
+    StageType getType() const override {
         return STAGE_SORT_KEY_GENERATOR;
     }
 
@@ -982,24 +1196,40 @@ struct SortKeyGeneratorNode : public QuerySolutionNode {
     BSONObj sortSpec;
 };
 
+/**
+ * This enum is used to mark which limit and skip values should be parameterized. Currently we only
+ * support parameterization of limit and skip that are part of find command or became a part of find
+ * command after agg pushdown. Parameterization of limits and skips that remained a part of agg
+ * pipeline is not supported.
+ */
+enum class LimitSkipParameterization : bool { Enabled = true, Disabled = false };
+
 struct SortNode : public QuerySolutionNodeWithSortSet {
-    SortNode() : limit(0) {}
+    SortNode(std::unique_ptr<QuerySolutionNode> child,
+             BSONObj pattern,
+             size_t limit,
+             LimitSkipParameterization canBeParameterized)
+        : QuerySolutionNodeWithSortSet(std::move(child)),
+          pattern(std::move(pattern)),
+          limit(limit),
+          canBeParameterized(canBeParameterized) {}
+    SortNode(const SortNode& other);
 
-    virtual ~SortNode() {}
+    ~SortNode() override {}
 
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return children[0]->fetched();
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return children[0]->getFieldAvailability(field);
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return false;
     }
 
-    virtual void computeProperties() {
+    void computeProperties() override {
         for (size_t i = 0; i < children.size(); ++i) {
             children[i]->computeProperties();
         }
@@ -1010,6 +1240,9 @@ struct SortNode : public QuerySolutionNodeWithSortSet {
 
     // Sum of both limit and skip count in the parsed query.
     size_t limit;
+    // Enables or disables parameterization of limit value. Must be enabled iff this is a part of
+    // find command (possibly after agg pushdown).
+    LimitSkipParameterization canBeParameterized;
 
     bool addSortKeyMetadata = false;
 
@@ -1029,7 +1262,9 @@ private:
  * Represents sort algorithm that can handle any kind of input data.
  */
 struct SortNodeDefault final : public SortNode {
-    virtual StageType getType() const override {
+    using SortNode::SortNode;
+
+    StageType getType() const override {
         return STAGE_SORT_DEFAULT;
     }
 
@@ -1047,7 +1282,9 @@ struct SortNodeDefault final : public SortNode {
  *  - The record id can be discarded.
  */
 struct SortNodeSimple final : public SortNode {
-    virtual StageType getType() const {
+    using SortNode::SortNode;
+
+    StageType getType() const override {
         return STAGE_SORT_SIMPLE;
     }
 
@@ -1059,78 +1296,96 @@ struct SortNodeSimple final : public SortNode {
 };
 
 struct LimitNode : public QuerySolutionNode {
-    LimitNode() {}
-    virtual ~LimitNode() {}
+    LimitNode(std::unique_ptr<QuerySolutionNode> child,
+              long long limit,
+              LimitSkipParameterization canBeParameterized)
+        : QuerySolutionNode(std::move(child)),
+          limit(limit),
+          canBeParameterized(canBeParameterized) {}
+    LimitNode(const LimitNode& other);
 
-    virtual StageType getType() const {
+    ~LimitNode() override {}
+
+    StageType getType() const override {
         return STAGE_LIMIT;
     }
 
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return children[0]->fetched();
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return children[0]->getFieldAvailability(field);
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return children[0]->sortedByDiskLoc();
     }
-    const ProvidedSortSet& providedSorts() const {
+    const ProvidedSortSet& providedSorts() const override {
         return children[0]->providedSorts();
     }
 
     std::unique_ptr<QuerySolutionNode> clone() const final;
 
     long long limit;
+    // Enables or disables parameterization of limit value. Must be enabled iff this is a part of
+    // find command (possibly after agg pushdown).
+    LimitSkipParameterization canBeParameterized;
 };
 
 struct SkipNode : public QuerySolutionNode {
-    SkipNode() {}
-    virtual ~SkipNode() {}
+    SkipNode(std::unique_ptr<QuerySolutionNode> child,
+             long long skip,
+             LimitSkipParameterization canBeParameterized)
+        : QuerySolutionNode(std::move(child)), skip(skip), canBeParameterized(canBeParameterized) {}
+    SkipNode(const SkipNode& other);
 
-    virtual StageType getType() const {
+    ~SkipNode() override {}
+
+    StageType getType() const override {
         return STAGE_SKIP;
     }
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return children[0]->fetched();
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return children[0]->getFieldAvailability(field);
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return children[0]->sortedByDiskLoc();
     }
-    const ProvidedSortSet& providedSorts() const {
+    const ProvidedSortSet& providedSorts() const override {
         return children[0]->providedSorts();
     }
 
     std::unique_ptr<QuerySolutionNode> clone() const final;
 
     long long skip;
+    // Enables or disables parameterization of limit value. Must be enabled iff this is a part of
+    // find command (possibly after agg pushdown).
+    LimitSkipParameterization canBeParameterized;
 };
 
 struct GeoNear2DNode : public QuerySolutionNodeWithSortSet {
     GeoNear2DNode(IndexEntry index)
         : index(std::move(index)), addPointMeta(false), addDistMeta(false) {}
 
-    virtual ~GeoNear2DNode() {}
+    ~GeoNear2DNode() override {}
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_GEO_NEAR_2D;
     }
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return true;
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return FieldAvailability::kFullyProvided;
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return false;
     }
 
@@ -1149,20 +1404,20 @@ struct GeoNear2DSphereNode : public QuerySolutionNodeWithSortSet {
     GeoNear2DSphereNode(IndexEntry index)
         : index(std::move(index)), addPointMeta(false), addDistMeta(false) {}
 
-    virtual ~GeoNear2DSphereNode() {}
+    ~GeoNear2DSphereNode() override {}
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_GEO_NEAR_2DSPHERE;
     }
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return true;
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return FieldAvailability::kFullyProvided;
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return false;
     }
 
@@ -1189,23 +1444,23 @@ struct GeoNear2DSphereNode : public QuerySolutionNodeWithSortSet {
  */
 struct ShardingFilterNode : public QuerySolutionNode {
     ShardingFilterNode() {}
-    virtual ~ShardingFilterNode() {}
+    ~ShardingFilterNode() override {}
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_SHARDING_FILTER;
     }
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return children[0]->fetched();
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return children[0]->getFieldAvailability(field);
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return children[0]->sortedByDiskLoc();
     }
-    const ProvidedSortSet& providedSorts() const {
+    const ProvidedSortSet& providedSorts() const override {
         return children[0]->providedSorts();
     }
 
@@ -1219,19 +1474,19 @@ struct ShardingFilterNode : public QuerySolutionNode {
 struct DistinctNode : public QuerySolutionNodeWithSortSet {
     DistinctNode(IndexEntry index) : index(std::move(index)) {}
 
-    virtual ~DistinctNode() {}
+    ~DistinctNode() override {}
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_DISTINCT_SCAN;
     }
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
     // This stage is created "on top" of normal planning and as such the properties
     // below don't really matter.
-    bool fetched() const {
-        return false;
+    bool fetched() const override {
+        return isFetching;
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         // The distinct scan can return collation keys, but we can still consider the field fully
         // provided. This is because the logic around when the index bounds might incorporate
         // collation keys does not rely on 'getFieldAvailability()'. As a future improvement, we
@@ -1239,13 +1494,13 @@ struct DistinctNode : public QuerySolutionNodeWithSortSet {
         return index.keyPattern[field].eoo() ? FieldAvailability::kNotProvided
                                              : FieldAvailability::kFullyProvided;
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return false;
     }
 
     std::unique_ptr<QuerySolutionNode> clone() const final;
 
-    virtual void computeProperties();
+    void computeProperties() override;
 
     IndexEntry index;
     IndexBounds bounds;
@@ -1255,29 +1510,31 @@ struct DistinctNode : public QuerySolutionNodeWithSortSet {
     // We are distinct-ing over the 'fieldNo'-th field of 'index.keyPattern'.
     int fieldNo{0};
     int direction{1};
+
+    bool isShardFiltering = false;
+    bool isFetching = false;
 };
 
 /**
- * Some count queries reduce to counting how many keys are between two entries in a
- * Btree.
+ * Some count queries reduce to counting how many keys are between two entries in a Btree.
  */
 struct CountScanNode : public QuerySolutionNodeWithSortSet {
     CountScanNode(IndexEntry index) : index(std::move(index)) {}
 
-    virtual ~CountScanNode() {}
+    ~CountScanNode() override {}
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_COUNT_SCAN;
     }
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return false;
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return FieldAvailability::kFullyProvided;
     }
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return false;
     }
 
@@ -1290,30 +1547,37 @@ struct CountScanNode : public QuerySolutionNodeWithSortSet {
 
     BSONObj endKey;
     bool endKeyInclusive;
+
+    /**
+     * A vector of Interval Evaluation Trees (IETs) with the same ordering as the index key pattern.
+     */
+    std::vector<interval_evaluation_tree::IET> iets;
 };
 
 struct EofNode : public QuerySolutionNodeWithSortSet {
-    EofNode() {}
+    EofNode(eof_node::EOFType type) : type(type) {}
 
-    virtual StageType getType() const {
+    StageType getType() const override {
         return STAGE_EOF;
     }
 
-    virtual void appendToString(str::stream* ss, int indent) const;
+    void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return false;
     }
 
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return FieldAvailability::kNotProvided;
     }
 
-    bool sortedByDiskLoc() const {
+    bool sortedByDiskLoc() const override {
         return false;
     }
 
     std::unique_ptr<QuerySolutionNode> clone() const final;
+
+    eof_node::EOFType type;
 };
 
 struct TextOrNode : public OrNode {
@@ -1338,10 +1602,10 @@ struct TextMatchNode : public QuerySolutionNodeWithSortSet {
     void appendToString(str::stream* ss, int indent) const override;
 
     // Text's return is LOC_AND_OBJ so it's fetched and has all fields.
-    bool fetched() const {
+    bool fetched() const override {
         return true;
     }
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return FieldAvailability::kFullyProvided;
     }
     bool sortedByDiskLoc() const override {
@@ -1374,23 +1638,25 @@ struct GroupNode : public QuerySolutionNode {
               boost::intrusive_ptr<Expression> groupByExpression,
               std::vector<AccumulationStatement> accs,
               bool merging,
+              bool willBeMerged,
               bool shouldProduceBson)
         : QuerySolutionNode(std::move(child)),
           groupByExpression(groupByExpression),
           accumulators(std::move(accs)),
           doingMerge(merging),
+          willBeMerged(willBeMerged),
           shouldProduceBson(shouldProduceBson) {
         // Use the DepsTracker to extract the fields that the 'groupByExpression' and accumulator
         // expressions depend on.
-        for (auto& groupByExprField : groupByExpression->getDependencies().fields) {
-            requiredFields.insert(groupByExprField);
-        }
+        DepsTracker deps;
+        expression::addDependencies(groupByExpression.get(), &deps);
         for (auto&& acc : accumulators) {
-            auto argExpr = acc.expr.argument;
-            for (auto& argExprField : argExpr->getDependencies().fields) {
-                requiredFields.insert(argExprField);
-            }
+            expression::addDependencies(acc.expr.argument.get(), &deps);
         }
+
+        requiredFields = std::move(deps.fields);
+        needWholeDocument = deps.needWholeDocument;
+        needsAnyMetadata = deps.getNeedsAnyMetadata();
     }
 
     StageType getType() const override {
@@ -1399,11 +1665,11 @@ struct GroupNode : public QuerySolutionNode {
 
     void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return true;
     }
 
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         // All fields are available, but none of them map to original document.
         return FieldAvailability::kNotProvided;
     }
@@ -1417,14 +1683,21 @@ struct GroupNode : public QuerySolutionNode {
 
     std::unique_ptr<QuerySolutionNode> clone() const final;
 
+    bool metadataExhausted() const final {
+        return true;
+    }
+
     boost::intrusive_ptr<Expression> groupByExpression;
     std::vector<AccumulationStatement> accumulators;
     bool doingMerge;
+    bool willBeMerged;
 
     // Carries the fields this GroupNode depends on. Namely, 'requiredFields' contains the union of
     // the fields in the 'groupByExpressions' and the fields in the input Expressions of the
     // 'accumulators'.
-    StringSet requiredFields;
+    OrderedPathSet requiredFields;
+    bool needWholeDocument = false;
+    bool needsAnyMetadata = false;
 
     // If set to true, generated SBE plan will produce result as BSON object. If false,
     // 'sbe::Object' is produced instead.
@@ -1474,13 +1747,14 @@ struct EqLookupNode : public QuerySolutionNode {
     }
 
     EqLookupNode(std::unique_ptr<QuerySolutionNode> child,
-                 const std::string& foreignCollection,
+                 const NamespaceString& foreignCollection,
                  const FieldPath& joinFieldLocal,
                  const FieldPath& joinFieldForeign,
                  const FieldPath& joinField,
                  EqLookupNode::LookupStrategy lookupStrategy,
                  boost::optional<IndexEntry> idxEntry,
-                 bool shouldProduceBson)
+                 bool shouldProduceBson,
+                 NaturalOrderHint::Direction scanDirection = NaturalOrderHint::Direction::kForward)
         : QuerySolutionNode(std::move(child)),
           foreignCollection(foreignCollection),
           joinFieldLocal(joinFieldLocal),
@@ -1488,7 +1762,8 @@ struct EqLookupNode : public QuerySolutionNode {
           joinField(joinField),
           lookupStrategy(lookupStrategy),
           idxEntry(std::move(idxEntry)),
-          shouldProduceBson(shouldProduceBson) {}
+          shouldProduceBson(shouldProduceBson),
+          scanDirection(scanDirection) {}
 
     StageType getType() const override {
         return STAGE_EQ_LOOKUP;
@@ -1496,11 +1771,11 @@ struct EqLookupNode : public QuerySolutionNode {
 
     void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return children[0]->fetched();
     }
 
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         if (field == joinField) {
             // This field is available, but isn't mapped to the original document.
             return FieldAvailability::kNotProvided;
@@ -1514,18 +1789,17 @@ struct EqLookupNode : public QuerySolutionNode {
     }
 
     const ProvidedSortSet& providedSorts() const final {
-        // TODO SERVER-62815: The ProvidedSortSet will need to be computed here in order to allow
-        // sort optimization. The "joinField" field overwrites the field in the result outer
-        // document, this can affect the provided sort. For now, use conservative kEmptySet.
+        // Right now, we conservatively return kEmptySet. A future optimization could theoretically
+        // take the "joinField" into account when deciding whether this provides a sort or not.
         return kEmptySet;
     }
 
     std::unique_ptr<QuerySolutionNode> clone() const final;
 
     /**
-     * The foreign (inner) collection namespace name.
+     * The foreign (inner) collection namespace string.
      */
-    std::string foreignCollection;
+    NamespaceString foreignCollection;
 
     /**
      * The local (outer) join field.
@@ -1561,10 +1835,135 @@ struct EqLookupNode : public QuerySolutionNode {
      * 'sbe::Object' is produced instead.
      */
     bool shouldProduceBson;
-};
+
+    /**
+     * Scan direction if hinted, default forward.
+     */
+    NaturalOrderHint::Direction scanDirection;
+};  // struct EqLookupNode
+
+/**
+ * EqLookupUnwindNode is used for $LU ($lookup + $unwind) macro aggregation stages that are pushed
+ * down to SBE, where the $unwind always unwinds the "as" output array of the $lookup. These act
+ * like SQL join stages. They are more like $lookup than $unwind.
+ */
+struct EqLookupUnwindNode : public QuerySolutionNode {
+    EqLookupUnwindNode(
+        std::unique_ptr<QuerySolutionNode> child,
+        // Shared data members.
+        const FieldPath& joinField,
+        // $lookup-specific data members.
+        const NamespaceString& foreignCollection,
+        const FieldPath& joinFieldLocal,
+        const FieldPath& joinFieldForeign,
+        EqLookupNode::LookupStrategy lookupStrategy,
+        boost::optional<IndexEntry> idxEntry,
+        bool shouldProduceBson,
+        // $unwind-specific data members.
+        bool preserveNullAndEmptyArrays,
+        const boost::optional<FieldPath>& indexPath,
+        NaturalOrderHint::Direction scanDirection = NaturalOrderHint::Direction::kForward)
+        : QuerySolutionNode(std::move(child)),
+          // Shared data members.
+          joinField{joinField},
+          // $lookup-specific data members.
+          foreignCollection(foreignCollection),
+          joinFieldLocal(joinFieldLocal),
+          joinFieldForeign(joinFieldForeign),
+          lookupStrategy(lookupStrategy),
+          idxEntry(std::move(idxEntry)),
+          shouldProduceBson(shouldProduceBson),
+          // $unwind-specific data members.
+          unwindNode{nullptr /* child */,
+                     joinField /* fieldPath */,
+                     preserveNullAndEmptyArrays,
+                     indexPath},
+          scanDirection(scanDirection) {}
+
+    StageType getType() const override {
+        return STAGE_EQ_LOOKUP_UNWIND;
+    }
+
+    void appendToString(str::stream* ss, int indent) const final;
+    std::unique_ptr<QuerySolutionNode> clone() const final;
+
+    /**
+     * Data from the LU node is considered fetched iff the child provides fetched data.
+     */
+    bool fetched() const override {
+        return children[0]->fetched();
+    }
+
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
+        if (field == joinField) {
+            // This field is available, but isn't mapped to the original document.
+            return FieldAvailability::kNotProvided;
+        } else {
+            return children[0]->getFieldAvailability(field);
+        }
+    }
+
+    bool sortedByDiskLoc() const override {
+        return children[0]->sortedByDiskLoc();
+    }
+
+    const ProvidedSortSet& providedSorts() const final {
+        // Right now, we conservatively return kEmptySet. A future optimization could theoretically
+        // take the "joinField" into account when deciding whether this provides a sort or not.
+        return kEmptySet;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // $lookup and $unwind shared data members
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // The "as" field for the $lookup output field that would be added to local (outer) document
+    // containing the array of all matched foreign (inner) documents, except that this stage will
+    // unwind it instead. Same as $unwind's field to unwind. If the field already exists in the
+    // local (outer) document, the field will be overwritten.
+    FieldPath joinField;
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // $lookup-specific data members
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // The foreign (inner) collection namespace string.
+    NamespaceString foreignCollection;
+
+    // The local (outer) join field.
+    FieldPath joinFieldLocal;
+
+    // The foreign (inner) join field.
+    FieldPath joinFieldForeign;
+
+    // The algorithm that will be used to execute this 'EqLookupUnwindNode'. Defaults to nested loop
+    // join as it's applicable independent of collection sizes or the availability of indexes.
+    EqLookupNode::LookupStrategy lookupStrategy = EqLookupNode::LookupStrategy::kNestedLoopJoin;
+
+    // The index to be used if we can answer the join predicate with an index on the foreign
+    // collection. Set to 'boost::none' by default and if a non-indexed strategy is chosen.
+    boost::optional<IndexEntry> idxEntry = boost::none;
+
+    // If set to true, generated SBE plan will produce result as BSON object. If false,
+    // 'sbe::Object' is produced instead.
+    bool shouldProduceBson;
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // $unwind-specific data members
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Represents the absorbed $unwind stage, which may be used in the stage builder for this $LU
+    // node. Its 'child' member is set to nullptr to avoid an unwanted recursion to the current $LU,
+    // which is conceptually the $unwind's parent.
+    struct UnwindNode unwindNode;
+
+    /**
+     * Scan direction if hinted, default forward.
+     */
+    NaturalOrderHint::Direction scanDirection;
+};  // struct EqLookupUnwindNode
 
 struct SentinelNode : public QuerySolutionNode {
-
     SentinelNode() {}
 
     StageType getType() const override {
@@ -1573,11 +1972,11 @@ struct SentinelNode : public QuerySolutionNode {
 
     void appendToString(str::stream* ss, int indent) const override;
 
-    bool fetched() const {
+    bool fetched() const override {
         return true;
     }
 
-    FieldAvailability getFieldAvailability(const std::string& field) const {
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
         return FieldAvailability::kFullyProvided;
     }
     bool sortedByDiskLoc() const override {
@@ -1589,5 +1988,199 @@ struct SentinelNode : public QuerySolutionNode {
     }
 
     std::unique_ptr<QuerySolutionNode> clone() const final;
+};
+
+struct SearchNode : public QuerySolutionNode {
+    SearchNode() = default;
+
+    SearchNode(bool isSearchMeta,
+               BSONObj searchQuery,
+               boost::optional<long long> limit,
+               boost::optional<BSONObj> sortSpec,
+               size_t remoteCursorId,
+               boost::optional<BSONObj> remoteCursorVars)
+        : isSearchMeta(isSearchMeta),
+          searchQuery(searchQuery),
+          limit(limit),
+          sortSpec(sortSpec),
+          remoteCursorId(remoteCursorId),
+          remoteCursorVars(remoteCursorVars) {}
+
+    static std::unique_ptr<SearchNode> getSearchNode(DocumentSource* stage);
+
+    StageType getType() const override {
+        return STAGE_SEARCH;
+    }
+
+    void appendToString(str::stream* ss, int indent) const override;
+
+    bool fetched() const override {
+        return true;
+    }
+
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
+        return FieldAvailability::kFullyProvided;
+    }
+
+    bool sortedByDiskLoc() const override {
+        return false;
+    }
+
+    const ProvidedSortSet& providedSorts() const final {
+        return kEmptySet;
+    }
+
+    std::unique_ptr<QuerySolutionNode> clone() const final;
+
+    /**
+     * True for $searchMeta, False for $search query.
+     */
+    bool isSearchMeta;
+
+    const BSONObj searchQuery;
+
+    /**
+     * This will populate the docsRequested field of the cursorOptions document sent as part of the
+     * command to mongot in the case where the query has an extractable limit that can guide the
+     * number of documents that mongot returns to mongod.
+     */
+    boost::optional<long long> limit;
+
+    boost::optional<BSONObj> sortSpec;
+    size_t remoteCursorId;
+    boost::optional<BSONObj> remoteCursorVars;
+};
+
+/**
+ * Represents a node to unpack time-series buckets into measurements. Currently we only support
+ * unpacking buckets with a statically known set of fields in SBE.
+ */
+struct UnpackTsBucketNode : public QuerySolutionNode {
+    UnpackTsBucketNode(std::unique_ptr<QuerySolutionNode> child,
+                       const timeseries::BucketSpec& spec,
+                       std::unique_ptr<MatchExpression> eventFilter,
+                       std::unique_ptr<MatchExpression> wholeBucketFilter,
+                       bool includeMeta)
+        : QuerySolutionNode(std::move(child)),
+          bucketSpec(spec),
+          eventFilter(std::move(eventFilter)),
+          wholeBucketFilter(std::move(wholeBucketFilter)),
+          includeMeta(includeMeta) {
+        tassert(7969700,
+                "Only support unpacking with a statically known set of fields.",
+                bucketSpec.behavior() == timeseries::BucketSpec::Behavior::kInclude);
+    }
+
+    StageType getType() const override {
+        return STAGE_UNPACK_TS_BUCKET;
+    }
+
+    void appendToString(str::stream* ss, int indent) const override {
+        *ss << "UNPACK_TS_BUCKET\n";
+    }
+
+    bool fetched() const override {
+        return children[0]->fetched();
+    }
+
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
+        if (bucketSpec.fieldSet().contains(field)) {
+            // The 'bucketSpec' has a statically known set of fields which include the computed meta
+            // projections and so, are fully provided.
+            return FieldAvailability::kFullyProvided;
+        } else {
+            return FieldAvailability::kNotProvided;
+        }
+    }
+
+    bool sortedByDiskLoc() const override {
+        return children[0]->sortedByDiskLoc();
+    }
+
+    // The inputs to 'UnpackTsBucketNode' are buckets that might be sorted on bucket-level fields
+    // such as metaField, timeField or any of the control fields. When unpacking, only sort order on
+    // the metaField is preserved (as the field's value is the same for all docs in a bucket).
+    // TODO SERVER-83621: Consider checking the provided sort of the child stage and returning the
+    // meta field here, if appropriate.
+    const ProvidedSortSet& providedSorts() const final {
+        return kEmptySet;
+    }
+
+    std::unique_ptr<QuerySolutionNode> clone() const final {
+        return std::make_unique<UnpackTsBucketNode>(children[0]->clone(),
+                                                    bucketSpec,
+                                                    eventFilter->clone(),
+                                                    wholeBucketFilter->clone(),
+                                                    includeMeta);
+    }
+
+    bool metadataExhausted() const final {
+        return true;
+    }
+
+    timeseries::BucketSpec bucketSpec;
+    std::unique_ptr<MatchExpression> eventFilter = nullptr;
+    std::unique_ptr<MatchExpression> wholeBucketFilter = nullptr;
+    bool includeMeta = false;
+};
+
+struct WindowNode : public QuerySolutionNode {
+    WindowNode(std::unique_ptr<QuerySolutionNode> child,
+               boost::optional<boost::intrusive_ptr<Expression>> partitionByArg,
+               boost::optional<SortPattern> sortByArg,
+               std::vector<WindowFunctionStatement> outputFieldsArg)
+        : QuerySolutionNode(std::move(child)),
+          partitionBy(std::move(partitionByArg)),
+          sortBy(std::move(sortByArg)),
+          outputFields(std::move(outputFieldsArg)) {
+        DepsTracker partitionByDeps;
+        if (partitionBy) {
+            expression::addDependencies(partitionBy->get(), &partitionByDeps);
+        }
+        partitionByRequiredFields = std::move(partitionByDeps.fields);
+
+        DepsTracker sortByDeps;
+        if (sortBy) {
+            sortBy->addDependencies(&sortByDeps);
+        }
+        sortByRequiredFields = std::move(sortByDeps.fields);
+
+        DepsTracker outputDeps;
+        for (auto& outputField : outputFields) {
+            outputField.addDependencies(&outputDeps);
+        }
+        outputRequiredFields = std::move(outputDeps.fields);
+    }
+
+    StageType getType() const override {
+        return STAGE_WINDOW;
+    }
+
+    void appendToString(str::stream* ss, int indent) const override;
+
+    bool fetched() const override {
+        return true;
+    }
+
+    FieldAvailability getFieldAvailability(const std::string& field) const override {
+        return FieldAvailability::kFullyProvided;
+    }
+    bool sortedByDiskLoc() const override {
+        return false;
+    }
+
+    const ProvidedSortSet& providedSorts() const final {
+        return children.back()->providedSorts();
+    }
+
+    std::unique_ptr<QuerySolutionNode> clone() const final;
+
+    boost::optional<boost::intrusive_ptr<Expression>> partitionBy;
+    boost::optional<SortPattern> sortBy;
+    std::vector<WindowFunctionStatement> outputFields;
+
+    OrderedPathSet partitionByRequiredFields;
+    OrderedPathSet sortByRequiredFields;
+    OrderedPathSet outputRequiredFields;
 };
 }  // namespace mongo

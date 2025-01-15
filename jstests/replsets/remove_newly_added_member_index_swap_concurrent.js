@@ -7,11 +7,13 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/replsets/rslib.js');
+import {configureFailPoint, kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    assertVoteCount,
+    isMemberNewlyAdded,
+    waitForNewlyAddedRemovalForNodeToBeCommitted,
+} from "jstests/replsets/rslib.js";
 
 const testName = jsTestName();
 const dbName = "testdb";
@@ -19,7 +21,7 @@ const collName = "testcoll";
 
 const rst = new ReplSetTest({name: testName, nodes: 1, settings: {chainingAllowed: false}});
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const primary = rst.getPrimary();
 const primaryDb = primary.getDB(dbName);
@@ -78,7 +80,7 @@ jsTestLog("Allowing primary to initiate the 'newlyAdded' field removal for the f
 let hangDuringAutomaticReconfigFP = configureFailPoint(primaryDb, "hangDuringAutomaticReconfig");
 assert.commandWorked(
     newNodeOne.adminCommand({configureFailPoint: "initialSyncHangBeforeFinish", mode: "off"}));
-rst.waitForState(newNodeOne, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [newNodeOne]);
 
 hangDuringAutomaticReconfigFP.wait();
 
@@ -121,7 +123,7 @@ assert(configOnDisk.members[1]["newlyAdded"], configOnDisk);
 jsTestLog("Letting the other secondary node finish initial sync");
 assert.commandWorked(
     newNodeTwo.adminCommand({configureFailPoint: "initialSyncHangBeforeFinish", mode: "off"}));
-rst.waitForState(newNodeTwo, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [newNodeTwo]);
 
 jsTestLog("Waiting for the second 'newlyAdded' field to be removed (_id 2, index 1)");
 waitForNewlyAddedRemovalForNodeToBeCommitted(primary, 1 /* memberIndex */);
@@ -143,4 +145,3 @@ assert.commandWorked(primaryColl.insert({"steady": "state"}, {writeConcern: {w: 
 
 rst.awaitReplication();
 rst.stopSet();
-})();

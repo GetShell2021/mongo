@@ -29,11 +29,25 @@
 
 #include "mongo/idl/cluster_server_parameter_initializer.h"
 
+#include <memory>
+#include <set>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
 #include "mongo/base/string_data.h"
-#include "mongo/db/audit.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/multitenancy_gen.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/idl/cluster_parameter_synchronization_helpers.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/decorable.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
@@ -59,121 +73,40 @@ ClusterServerParameterInitializer* ClusterServerParameterInitializer::get(
     return &getInstance(serviceContext);
 }
 
-void ClusterServerParameterInitializer::updateParameter(OperationContext* opCtx,
-                                                        BSONObj doc,
-                                                        StringData mode) {
-    auto nameElem = doc[kIdField];
-    if (nameElem.type() != String) {
-        LOGV2_DEBUG(6226301,
-                    1,
-                    "Update with invalid cluster server parameter name",
-                    "mode"_attr = mode,
-                    "_id"_attr = nameElem);
+void ClusterServerParameterInitializer::onConsistentDataAvailable(OperationContext* opCtx,
+                                                                  bool isMajority,
+                                                                  bool isRollback) {
+    // TODO (SERVER-91506): Determine if we should reload in-memory states on rollback.
+    if (isRollback) {
         return;
     }
-
-    auto name = nameElem.valueStringData();
-    auto* sp = ServerParameterSet::getClusterParameterSet()->getIfExists(name);
-    if (!sp) {
-        LOGV2_DEBUG(6226300,
-                    3,
-                    "Update to unknown cluster server parameter",
-                    "mode"_attr = mode,
-                    "name"_attr = name);
-        return;
-    }
-
-    auto cptElem = doc[kCPTField];
-    if ((cptElem.type() != mongo::Date) && (cptElem.type() != bsonTimestamp)) {
-        LOGV2_DEBUG(6226302,
-                    1,
-                    "Update to cluster server parameter has invalid clusterParameterTime",
-                    "mode"_attr = mode,
-                    "name"_attr = name,
-                    "clusterParameterTime"_attr = cptElem);
-        return;
-    }
-
-    BSONObjBuilder oldValueBob;
-    sp->append(opCtx, oldValueBob, name.toString());
-    audit::logUpdateCachedClusterParameter(opCtx->getClient(), oldValueBob.obj(), doc);
-
-    uassertStatusOK(sp->set(doc));
+    synchronizeAllParametersFromDisk(opCtx);
 }
 
-void ClusterServerParameterInitializer::clearParameter(OperationContext* opCtx,
-                                                       ServerParameter* sp) {
-    if (sp->getClusterParameterTime() == LogicalTime::kUninitialized) {
-        // Nothing to clear.
-        return;
-    }
-
-    BSONObjBuilder oldValueBob;
-    sp->append(opCtx, oldValueBob, sp->name());
-
-    uassertStatusOK(sp->reset());
-
-    BSONObjBuilder newValueBob;
-    sp->append(opCtx, newValueBob, sp->name());
-
-    audit::logUpdateCachedClusterParameter(
-        opCtx->getClient(), oldValueBob.obj(), newValueBob.obj());
-}
-
-void ClusterServerParameterInitializer::clearParameter(OperationContext* opCtx, StringData id) {
-    auto* sp = ServerParameterSet::getClusterParameterSet()->getIfExists(id);
-    if (!sp) {
-        LOGV2_DEBUG(6226303,
-                    5,
-                    "oplog event deletion of unknown cluster server parameter",
-                    "name"_attr = id);
-        return;
-    }
-
-    clearParameter(opCtx, sp);
-}
-
-void ClusterServerParameterInitializer::clearAllParameters(OperationContext* opCtx) {
-    const auto& params = ServerParameterSet::getClusterParameterSet()->getMap();
-    for (const auto& it : params) {
-        clearParameter(opCtx, it.second);
-    }
-}
-
-void ClusterServerParameterInitializer::initializeAllParametersFromDisk(OperationContext* opCtx) {
-    doLoadAllParametersFromDisk(
-        opCtx, "initializing"_sd, [this](OperationContext* opCtx, BSONObj doc, StringData mode) {
-            updateParameter(opCtx, doc, mode);
-        });
-}
-
-void ClusterServerParameterInitializer::resynchronizeAllParametersFromDisk(
-    OperationContext* opCtx) {
-    const auto& allParams = ServerParameterSet::getClusterParameterSet()->getMap();
-    std::set<std::string> unsetSettings;
-    for (const auto& it : allParams) {
-        unsetSettings.insert(it.second->name());
-    }
-
-    doLoadAllParametersFromDisk(
-        opCtx,
-        "resynchronizing"_sd,
-        [this, &unsetSettings](OperationContext* opCtx, BSONObj doc, StringData mode) {
-            unsetSettings.erase(doc[kIdField].str());
-            updateParameter(opCtx, doc, mode);
-        });
-
-    // For all known settings which were not present in this resync,
-    // explicitly clear any value which may be present in-memory.
-    for (const auto& setting : unsetSettings) {
-        clearParameter(opCtx, setting);
-    }
-}
-
-void ClusterServerParameterInitializer::onInitialDataAvailable(OperationContext* opCtx,
-                                                               bool isMajorityDataAvailable) {
+void ClusterServerParameterInitializer::synchronizeAllParametersFromDisk(OperationContext* opCtx) {
     LOGV2_INFO(6608200, "Initializing cluster server parameters from disk");
-    initializeAllParametersFromDisk(opCtx);
+
+    auto initializeTenantParameters = [opCtx](const boost::optional<TenantId>& tenantId) {
+        AutoGetCollectionForRead coll{opCtx, NamespaceString::makeClusterParametersNSS(tenantId)};
+        if (coll.getCollection()) {
+            cluster_parameters::initializeAllTenantParametersFromCollection(
+                opCtx, *coll.getCollection().get());
+        }
+    };
+
+    if (gMultitenancySupport) {
+        std::set<TenantId> tenantIds;
+        auto catalog = CollectionCatalog::get(opCtx);
+        {
+            Lock::GlobalLock lk(opCtx, MODE_IS);
+            tenantIds = catalog->getAllTenants();
+        }
+
+        for (const auto& tenantId : tenantIds) {
+            initializeTenantParameters(tenantId);
+        }
+    }
+    initializeTenantParameters(boost::none);
 }
 
 }  // namespace mongo

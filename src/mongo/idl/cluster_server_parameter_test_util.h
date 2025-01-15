@@ -29,16 +29,31 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/change_stream_options_manager.h"
+#include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/multitenancy_gen.h"
+#include "mongo/db/query/query_settings/query_settings_manager.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/idl/cluster_server_parameter_gen.h"
 #include "mongo/idl/cluster_server_parameter_test_gen.h"
 #include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -48,87 +63,10 @@ constexpr auto kCSPTest = "cspTest"_sd;
 constexpr auto kConfigDB = "config"_sd;
 const auto kNilCPT = LogicalTime::kUninitialized;
 
-void upsert(BSONObj doc) {
-    const auto kMajorityWriteConcern = BSON("writeConcern" << BSON("w"
-                                                                   << "majority"));
-
-    auto uniqueOpCtx = cc().makeOperationContext();
-    auto* opCtx = uniqueOpCtx.get();
-
-    BSONObj res;
-    DBDirectClient client(opCtx);
-
-    client.runCommand(
-        kConfigDB.toString(),
-        [&] {
-            write_ops::UpdateCommandRequest updateOp(NamespaceString::kClusterParametersNamespace);
-            updateOp.setUpdates({[&] {
-                write_ops::UpdateOpEntry entry;
-                entry.setQ(BSON(ClusterServerParameter::k_idFieldName << kCSPTest));
-                entry.setU(
-                    write_ops::UpdateModification::parseFromClassicUpdate(BSON("$set" << doc)));
-                entry.setMulti(false);
-                entry.setUpsert(true);
-                return entry;
-            }()});
-            return updateOp.toBSON(kMajorityWriteConcern);
-        }(),
-        res);
-
-    BatchedCommandResponse response;
-    std::string errmsg;
-    if (!response.parseBSON(res, &errmsg)) {
-        uasserted(ErrorCodes::FailedToParse, str::stream() << "Failure: " << errmsg);
-    }
-
-    uassertStatusOK(response.toStatus());
-    uassert(ErrorCodes::OperationFailed, "No documents upserted", response.getN());
-}
-
-void remove() {
-    auto uniqueOpCtx = cc().makeOperationContext();
-    auto* opCtx = uniqueOpCtx.get();
-
-    BSONObj res;
-    DBDirectClient(opCtx).runCommand(
-        kConfigDB.toString(),
-        [] {
-            write_ops::DeleteCommandRequest deleteOp(NamespaceString::kClusterParametersNamespace);
-            deleteOp.setDeletes({[] {
-                write_ops::DeleteOpEntry entry;
-                entry.setQ(BSON(ClusterServerParameter::k_idFieldName << kCSPTest));
-                entry.setMulti(true);
-                return entry;
-            }()});
-            return deleteOp.toBSON({});
-        }(),
-        res);
-
-    BatchedCommandResponse response;
-    std::string errmsg;
-    if (!response.parseBSON(res, &errmsg)) {
-        uasserted(ErrorCodes::FailedToParse,
-                  str::stream() << "Failed to parse reply to delete command: " << errmsg);
-    }
-    uassertStatusOK(response.toStatus());
-}
-
-BSONObj makeClusterParametersDoc(const LogicalTime& cpTime, int intValue, StringData strValue) {
-    ClusterServerParameter csp;
-    csp.set_id(kCSPTest);
-    csp.setClusterParameterTime(cpTime);
-
-    ClusterServerParameterTest cspt;
-    cspt.setClusterServerParameter(std::move(csp));
-    cspt.setIntValue(intValue);
-    cspt.setStrValue(strValue);
-
-    return cspt.toBSON();
-}
-
 class ClusterServerParameterTestBase : public ServiceContextMongoDTest {
 public:
-    virtual void setUp() override {
+    void setUp() override {
+        gMultitenancySupport = true;
         // Set up mongod.
         ServiceContextMongoDTest::setUp();
 
@@ -145,15 +83,22 @@ public:
         // Set up the ChangeStreamOptionsManager so that it can be retrieved/set.
         ChangeStreamOptionsManager::create(service);
 
+        // Set up the QuerySettingsManager so that it can be retrieved/set.
+        query_settings::QuerySettingsManager::create(service, {}, {});
+
         // Ensure that we are primary.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx.get());
         ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
     }
 
     static constexpr auto kInitialIntValue = 123;
+    static constexpr auto kInitialTenantIntValue = 456;
     static constexpr auto kDefaultIntValue = 42;
     static constexpr auto kInitialStrValue = "initialState"_sd;
+    static constexpr auto kInitialTenantStrValue = "initialStateTenant"_sd;
     static constexpr auto kDefaultStrValue = ""_sd;
+
+    static const TenantId kTenantId;
 
 private:
     static repl::ReplSettings createReplSettings() {
@@ -163,6 +108,13 @@ private:
         return settings;
     }
 };
+
+void upsert(BSONObj doc, const boost::optional<TenantId>& tenantId = boost::none);
+void remove(const boost::optional<TenantId>& tenantId = boost::none);
+BSONObj makeClusterParametersDoc(const LogicalTime& cpTime,
+                                 int intValue,
+                                 StringData strValue,
+                                 StringData parameterName = kCSPTest);
 
 }  // namespace cluster_server_parameter_test_util
 }  // namespace mongo

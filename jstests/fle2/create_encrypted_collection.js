@@ -2,18 +2,13 @@
 
 /**
  * @tags: [
- * requires_fcv_60,
- * assumes_unsharded_collection
+ * assumes_unsharded_collection,
+ * requires_fcv_70
  * ]
  */
-load("jstests/fle2/libs/encrypted_client_util.js");
-
-(function() {
-'use strict';
-
 let dbTest = db.getSiblingDB('create_encrypted_collection_db');
 
-dbTest.basic.drop();
+dbTest.dropDatabase();
 
 const sampleEncryptedFields = {
     "fields": [
@@ -63,7 +58,6 @@ assert.commandWorked(dbTest.createCollection("basic", {encryptedFields: sampleEn
 const result = dbTest.getCollectionInfos({name: "basic"});
 const ef = result[0].options.encryptedFields;
 assert.eq(ef.escCollection, "enxcol_.basic.esc");
-assert.eq(ef.eccCollection, "enxcol_.basic.ecc");
 assert.eq(ef.ecocCollection, "enxcol_.basic.ecoc");
 
 assert.commandWorked(dbTest.createCollection("basic_int64_cf", {
@@ -87,4 +81,3 @@ assert.commandWorked(dbTest.createCollection("basic_int32_cf", {
         }]
     }
 }));
-}());

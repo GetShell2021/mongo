@@ -28,11 +28,23 @@
  */
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <deque>
+#include <memory>
+#include <vector>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/process_health/fault_facet.h"
+#include "mongo/db/process_health/fault_manager_config.h"
 #include "mongo/db/service_context.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace process_health {
@@ -108,7 +120,7 @@ private:
     ClockSource* const _clockSource;
     const Date_t _startTime;
 
-    mutable Mutex _mutex = MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "Fault::_mutex");
+    mutable stdx::mutex _mutex;
     // We don't need a map by type because we expect to have only few facets.
     // Linear search is much faster, we want to avoid any lock contention here.
     std::deque<FaultFacetPtr> _facets;

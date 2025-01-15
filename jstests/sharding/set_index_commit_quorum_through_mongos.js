@@ -3,10 +3,10 @@
  *
  * @tags: [requires_fcv_51]
  */
-(function() {
-"use strict";
-load("jstests/libs/fail_point_util.js");
-load("jstests/sharding/libs/create_sharded_collection_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {CreateShardedCollectionUtil} from "jstests/sharding/libs/create_sharded_collection_util.js";
 
 const st = new ShardingTest({shards: 2, mongos: 1, rs: {nodes: 2}});
 const dbName = "testDB";
@@ -46,8 +46,8 @@ const extractShardReplyFromResponse = (shard, mongosResponse) => {
     return mongosResponse.raw[shardURL];
 };
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 jsTest.log("Testing setIndexCommitQuorum from a mongos can succeed");
 // Create a sharded collection where only shard0 owns chunks.
@@ -105,4 +105,3 @@ createIndexFailpoint.off();
 createIndexThread.join();
 
 st.stop();
-}());

@@ -5,9 +5,8 @@
  *
  * @tags: [uses_transactions, requires_majority_read_concern]
  */
-(function() {
-"use strict";
-load("jstests/libs/write_concern_util.js");  // For stopServerReplication
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const dbName = "test";
 const collName = "speculative_transaction";
@@ -125,4 +124,3 @@ function runTest(sessionOptions) {
 runTest({causalConsistency: false});
 runTest({causalConsistency: true});
 rst.stopSet();
-}());

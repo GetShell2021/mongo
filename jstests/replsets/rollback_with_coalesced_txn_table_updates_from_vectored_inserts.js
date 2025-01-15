@@ -7,9 +7,9 @@
  * @tags: [requires_persistence]
  */
 
-(function() {
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({
     nodes: {
@@ -41,11 +41,39 @@ const [secondary1, secondary2] = rst.getSecondaries();
 // Disable replication partway into the retryable write on all of the secondaries. The idea is that
 // while the primary will apply all of the writes in a single storage transaction, the secondaries
 // will only apply up to insertBatchMajorityCommitted oplog entries.
-const insertBatchTotal = 20;
-const insertBatchMajorityCommitted = insertBatchTotal - 2;
-const stopReplProducerOnDocumentFailpoints = [secondary1, secondary2].map(
-    conn => configureFailPoint(
-        conn, 'stopReplProducerOnDocument', {document: {"_id": insertBatchMajorityCommitted + 1}}));
+
+let insertBatchTotal;
+let insertBatchMajorityCommitted;
+let stopReplProducerOnDocumentFailpoints;
+let oplogFilterForMajority;
+
+// When ReplicateVectoredInsertsTransactionally is enabled, inserts are batched into applyOps
+// entries, so we need to insert more documents and stop on a different one.
+if (FeatureFlagUtil.isPresentAndEnabled(primary, "ReplicateVectoredInsertsTransactionally")) {
+    // Set the batch size to 2 so we're testing batching but don't have to insert a huge number
+    // of documents
+    assert.commandWorked(primary.adminCommand({setParameter: 1, internalInsertMaxBatchSize: 2}));
+    // Using an odd number tests that the short batch (which should be an 'i', not an applyOps)
+    // works.
+    insertBatchTotal = 41;
+    insertBatchMajorityCommitted = insertBatchTotal - 3;
+    stopReplProducerOnDocumentFailpoints = [secondary1, secondary2].map(
+        conn => configureFailPoint(conn, 'stopReplProducerOnDocument', {
+            document: {"o.applyOps.o._id": insertBatchMajorityCommitted + 1}
+        }));
+    oplogFilterForMajority = {
+        "o.applyOps.ns": ns,
+        "o.applyOps.o._id": insertBatchMajorityCommitted
+    };
+} else {
+    insertBatchTotal = 20;
+    insertBatchMajorityCommitted = insertBatchTotal - 2;
+    stopReplProducerOnDocumentFailpoints = [secondary1, secondary2].map(
+        conn => configureFailPoint(conn,
+                                   'stopReplProducerOnDocument',
+                                   {document: {"_id": insertBatchMajorityCommitted + 1}}));
+    oplogFilterForMajority = {ns: ns, "o._id": insertBatchMajorityCommitted};
+}
 
 const lsid = ({id: UUID()});
 
@@ -56,7 +84,7 @@ assert.commandWorked(primary.getCollection(ns).runCommand("insert", {
 }));
 
 const stmtMajorityCommitted =
-    primary.getCollection("local.oplog.rs").findOne({ns, "o._id": insertBatchMajorityCommitted});
+    primary.getCollection("local.oplog.rs").findOne(oplogFilterForMajority);
 assert.neq(null, stmtMajorityCommitted);
 
 // Wait for the primary to have advanced its stable_timestamp.
@@ -90,15 +118,15 @@ assert.commandWorked(secondary1.adminCommand({replSetStepUp: 1}));
 rst.freeze(primary);
 rst.awaitNodesAgreeOnPrimary(undefined, undefined, secondary1);
 
-for (const fp of stopReplProducerOnDocumentFailpoints) {
-    fp.off();
-}
-
 rst.getPrimary();  // Wait for secondary1 to be a writable primary.
 
 // Do a write which becomes majority committed and wait for the old primary to have completed its
 // rollback.
 assert.commandWorked(secondary1.getCollection("test.dummy").insert({}, {writeConcern: {w: 3}}));
+
+for (const fp of stopReplProducerOnDocumentFailpoints) {
+    fp.off();
+}
 
 // Reconnect to the primary after it completes its rollback and step it up to be the primary again.
 rst.awaitNodesAgreeOnPrimary(undefined, undefined, secondary1);
@@ -118,4 +146,3 @@ assert.commandWorked(primary.getCollection(ns).runCommand("insert", {
 }));
 
 rst.stopSet();
-})();

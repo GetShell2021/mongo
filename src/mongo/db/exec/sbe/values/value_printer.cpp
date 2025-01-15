@@ -26,10 +26,34 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/db/exec/sbe/values/value_printer.h"
-#include "mongo/db/exec/sbe/values/sort_spec.h"
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <fmt/format.h>
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/exec/sbe/makeobj_spec.h"
+#include "mongo/db/exec/sbe/sort_spec.h"
+#include "mongo/db/exec/sbe/values/block_interface.h"
 #include "mongo/db/exec/sbe/values/value.h"
-#include "mongo/platform/basic.h"
+#include "mongo/db/exec/sbe/values/value_printer.h"
+#include "mongo/db/fts/fts_matcher.h"
+#include "mongo/db/fts/fts_query_impl.h"
+#include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/hex.h"
+#include "mongo/util/pcre.h"
 #include "mongo/util/pcre_util.h"
 
 namespace mongo::sbe::value {
@@ -79,8 +103,14 @@ void ValuePrinter<T>::writeTagToStream(TypeTags tag) {
         case TypeTags::ArraySet:
             stream << "ArraySet";
             break;
+        case TypeTags::ArrayMultiSet:
+            stream << "ArrayMultiSet";
+            break;
         case TypeTags::Object:
             stream << "Object";
+            break;
+        case TypeTags::MultiMap:
+            stream << "MultiMap";
             break;
         case TypeTags::ObjectId:
             stream << "ObjectId";
@@ -115,7 +145,7 @@ void ValuePrinter<T>::writeTagToStream(TypeTags tag) {
         case TypeTags::bsonUndefined:
             stream << "bsonUndefined";
             break;
-        case TypeTags::ksValue:
+        case TypeTags::keyString:
             stream << "KeyString";
             break;
         case TypeTags::pcreRegex:
@@ -154,11 +184,26 @@ void ValuePrinter<T>::writeTagToStream(TypeTags tag) {
         case TypeTags::sortSpec:
             stream << "sortSpec";
             break;
+        case TypeTags::makeObjSpec:
+            stream << "makeObjSpec";
+            break;
         case TypeTags::indexBounds:
             stream << "indexBounds";
             break;
-        case TypeTags::classicMatchExpresion:
-            stream << "classicMatchExpression";
+        case TypeTags::inList:
+            stream << "inList";
+            break;
+        case TypeTags::sortKeyComponentVector:
+            stream << "SortKeyComponentVector";
+            break;
+        case TypeTags::timeZone:
+            stream << "TimeZone";
+            break;
+        case TypeTags::valueBlock:
+            stream << "ValueBlock";
+            break;
+        case TypeTags::cellBlock:
+            stream << "CellBlock";
             break;
         default:
             stream << "unknown tag";
@@ -167,18 +212,18 @@ void ValuePrinter<T>::writeTagToStream(TypeTags tag) {
 }
 
 template <typename T>
-void ValuePrinter<T>::writeStringDataToStream(StringData sd, bool isJavaScript) {
-    if (!isJavaScript) {
+void ValuePrinter<T>::writeStringDataToStream(StringData sd, bool addQuotes) {
+    if (addQuotes) {
         stream << '"';
     }
     if (sd.size() <= options.stringMaxDisplayLength()) {
         stream << sd;
-        if (!isJavaScript) {
+        if (addQuotes) {
             stream << '"';
         }
     } else {
         stream << sd.substr(0, options.stringMaxDisplayLength());
-        if (!isJavaScript) {
+        if (addQuotes) {
             stream << "\"...";
         } else {
             stream << "...";
@@ -195,12 +240,51 @@ void ValuePrinter<T>::writeArrayToStream(TypeTags tag, Value val, size_t depth) 
         while (iter < options.arrayObjectOrNestingMaxDepth() &&
                depth < options.arrayObjectOrNestingMaxDepth()) {
             auto [aeTag, aeVal] = ae.getViewOfValue();
-            if (aeTag == TypeTags::Array || aeTag == TypeTags::Object) {
+            if (value::isContainer(aeTag)) {
                 ++depth;
             }
             writeValueToStream(aeTag, aeVal, depth);
             ae.advance();
             if (ae.atEnd()) {
+                shouldTruncate = false;
+                break;
+            }
+            stream << ", ";
+            ++iter;
+        }
+        if (shouldTruncate || depth > options.arrayObjectOrNestingMaxDepth()) {
+            stream << "...";
+        }
+    }
+    stream << ']';
+}
+
+template <typename T>
+void ValuePrinter<T>::writeSortedArraySetToStream(TypeTags tag, Value val, size_t depth) {
+    std::vector<std::pair<TypeTags, Value>> items;
+    for (auto ae = ArrayEnumerator{tag, val}; !ae.atEnd(); ae.advance()) {
+        items.push_back(ae.getViewOfValue());
+    }
+    std::sort(items.begin(),
+              items.end(),
+              [&](std::pair<TypeTags, Value> lhs, std::pair<TypeTags, Value> rhs) {
+                  auto [tagCmp, valCmp] =
+                      compareValue(lhs.first, lhs.second, rhs.first, rhs.second);
+                  return tagCmp == TypeTags::NumberInt32 && bitcastTo<int32_t>(valCmp) < 0;
+              });
+    stream << '[';
+    auto shouldTruncate = true;
+    size_t iter = 0;
+    if (auto it = items.begin(); it != items.end()) {
+        while (iter < options.arrayObjectOrNestingMaxDepth() &&
+               depth < options.arrayObjectOrNestingMaxDepth()) {
+            auto [aeTag, aeVal] = *it;
+            if (value::isContainer(aeTag)) {
+                ++depth;
+            }
+            writeValueToStream(aeTag, aeVal, depth);
+            it++;
+            if (it == items.end()) {
                 shouldTruncate = false;
                 break;
             }
@@ -224,7 +308,7 @@ void ValuePrinter<T>::writeObjectToStream(TypeTags tag, Value val, size_t depth)
                depth < options.arrayObjectOrNestingMaxDepth()) {
             stream << "\"" << oe.getFieldName() << "\" : ";
             auto [oeTag, oeVal] = oe.getViewOfValue();
-            if (oeTag == TypeTags::Array || oeTag == TypeTags::Object) {
+            if (value::isContainer(oeTag)) {
                 ++depth;
             }
             writeValueToStream(oeTag, oeVal, depth);
@@ -248,6 +332,48 @@ void ValuePrinter<T>::writeObjectToStream(TypeTags tag, Value val, size_t depth)
 template <typename T>
 void ValuePrinter<T>::writeObjectToStream(const BSONObj& obj) {
     writeObjectToStream(TypeTags::bsonObject, bitcastFrom<const char*>(obj.objdata()));
+}
+
+template <typename T>
+void ValuePrinter<T>::writeMultiMapToStream(TypeTags tag, Value val, size_t depth) {
+    stream << '[';
+
+    auto multiMap = getMultiMapView(val);
+
+    size_t valueIndex = 0;
+    for (const auto& [key, value] : multiMap->values()) {
+        if (valueIndex != 0) {
+            stream << ", ";
+        }
+        valueIndex++;
+
+        if (valueIndex > options.arrayObjectOrNestingMaxDepth() ||
+            depth > options.arrayObjectOrNestingMaxDepth()) {
+            stream << "...";
+            break;
+        }
+
+        auto keyDepth = depth;
+        auto valueDepth = depth;
+
+        stream << "{k : ";
+        if (value::isContainer(key.first)) {
+            keyDepth++;
+            depth = keyDepth;
+        }
+        writeValueToStream(key.first, key.second, keyDepth);
+
+        stream << ", v : ";
+
+        if (value::isContainer(value.first)) {
+            valueDepth++;
+            depth = valueDepth;
+        }
+        writeValueToStream(value.first, value.second, valueDepth);
+
+        stream << "}";
+    }
+    stream << ']';
 }
 
 template <typename T>
@@ -282,6 +408,14 @@ void ValuePrinter<T>::writeBsonRegexToStream(const BsonRegex& regex) {
 }
 
 template <typename T>
+void ValuePrinter<T>::writeNormalizedDouble(double value) {
+    std::stringstream ss;
+    ss.precision(std::numeric_limits<double>::max_digits10);
+    ss << value;
+    stream << ss.str();
+}
+
+template <typename T>
 void ValuePrinter<T>::writeValueToStream(TypeTags tag, Value val, size_t depth) {
     switch (tag) {
         case TypeTags::NumberInt32:
@@ -294,7 +428,11 @@ void ValuePrinter<T>::writeValueToStream(TypeTags tag, Value val, size_t depth) 
             }
             break;
         case TypeTags::NumberDouble:
-            stream << bitcastTo<double>(val);
+            if (options.normalizeOutput()) {
+                writeNormalizedDouble(bitcastTo<double>(val));
+            } else {
+                stream << bitcastTo<double>(val);
+            }
             if (options.useTagForAmbiguousValues()) {
                 stream << "L";
             }
@@ -336,13 +474,23 @@ void ValuePrinter<T>::writeValueToStream(TypeTags tag, Value val, size_t depth) 
             stream << ')';
             break;
         case TypeTags::Array:
-        case TypeTags::ArraySet:
         case TypeTags::bsonArray:
             writeArrayToStream(tag, val, depth);
+            break;
+        case TypeTags::ArraySet:
+        case TypeTags::ArrayMultiSet:
+            if (options.normalizeOutput()) {
+                writeSortedArraySetToStream(tag, val, depth);
+            } else {
+                writeArrayToStream(tag, val, depth);
+            }
             break;
         case TypeTags::Object:
         case TypeTags::bsonObject:
             writeObjectToStream(tag, val, depth);
+            break;
+        case TypeTags::MultiMap:
+            writeMultiMapToStream(tag, val, depth);
             break;
         case TypeTags::ObjectId:
         case TypeTags::bsonObjectId:
@@ -387,27 +535,16 @@ void ValuePrinter<T>::writeValueToStream(TypeTags tag, Value val, size_t depth) 
         case TypeTags::LocalLambda:
             stream << "LocalLambda";
             break;
-        case TypeTags::ksValue: {
-            auto ks = getKeyStringView(val);
-            stream << "KS(" << ks->toString() << ")";
+        case TypeTags::keyString: {
+            auto ks = getKeyString(val);
+            stream << "KS(";
+            writeStringDataToStream(ks->toString(), false /*addQuotes*/);
+            stream << ")";
             break;
         }
         case TypeTags::Timestamp: {
-            if (options.useTagForAmbiguousValues()) {
-                writeTagToStream(tag);
-                stream << "(";
-            }
             Timestamp ts{bitcastTo<uint64_t>(val)};
             stream << ts.toString();
-            if (options.useTagForAmbiguousValues()) {
-                stream << ")";
-            }
-            break;
-        }
-        case TypeTags::pcreRegex: {
-            auto regex = getPcreRegexView(val);
-            stream << "PcreRegex(/" << regex->pattern() << "/"
-                   << pcre_util::optionsToFlags(regex->options()) << ")";
             break;
         }
         case TypeTags::timeZoneDB: {
@@ -417,14 +554,9 @@ void ValuePrinter<T>::writeValueToStream(TypeTags tag, Value val, size_t depth) 
             break;
         }
         case TypeTags::RecordId:
-            stream << "RecordId(" << getRecordIdView(val)->toString() << ")";
-            break;
-        case TypeTags::jsFunction:
-            // TODO: Also include code.
-            stream << "jsFunction";
-            break;
-        case TypeTags::shardFilterer:
-            stream << "ShardFilterer";
+            stream << "RecordId(";
+            writeStringDataToStream(getRecordIdView(val)->toString(), false /*addQuotes*/);
+            stream << ")";
             break;
         case TypeTags::collator:
             writeCollatorToStream(getCollatorView(val));
@@ -435,7 +567,7 @@ void ValuePrinter<T>::writeValueToStream(TypeTags tag, Value val, size_t depth) 
         }
         case TypeTags::bsonJavascript:
             stream << "Javascript(";
-            writeStringDataToStream(getStringView(TypeTags::StringBig, val), true);
+            writeStringDataToStream(getStringView(TypeTags::StringBig, val), false /*addQuotes*/);
             stream << ")";
             break;
         case TypeTags::bsonDBPointer: {
@@ -454,31 +586,36 @@ void ValuePrinter<T>::writeValueToStream(TypeTags tag, Value val, size_t depth) 
             stream << ')';
             break;
         }
-        case value::TypeTags::ftsMatcher: {
-            auto ftsMatcher = getFtsMatcherView(val);
-            stream << "FtsMatcher(";
-            writeObjectToStream(ftsMatcher->query().toBSON());
-            stream << ')';
-            break;
-        }
-        case TypeTags::sortSpec:
-            stream << "SortSpec(";
-            writeObjectToStream(getSortSpecView(val)->getPattern());
-            stream << ')';
-            break;
-        case TypeTags::indexBounds:
-            // When calling toString() we don't know if the index has a non-simple collation or
-            // not. Passing false could produce invalid UTF-8, which is not acceptable when we are
-            // going to put the resulting string into a BSON object and return it across the wire.
-            // While passing true may be misleading in cases when the index has no collation, it is
-            // safer to do so.
-            stream << "IndexBounds(";
-            writeStringDataToStream(
-                getIndexBoundsView(val)->toString(true /* hasNonSimpleCollation */));
+        case TypeTags::sortKeyComponentVector:
+            stream << "SortKeyComponentVector(";
+            for (const auto& elt : getSortKeyComponentVectorView(val)->elts) {
+                stream << elt << ", ";
+            }
             stream << ")";
             break;
-        case TypeTags::classicMatchExpresion:
-            stream << "ClassicMatcher(" << getClassicMatchExpressionView(val)->toString() << ")";
+        case TypeTags::timeZone:
+            stream << getTimeZoneView(val)->toString();
+            break;
+        case TypeTags::valueBlock: {
+            auto* valueBlock = getValueBlock(val);
+            stream << valueBlock->extract();
+            break;
+        }
+        case TypeTags::cellBlock: {
+            auto* cellBlock = getCellBlock(val);
+            stream << "CellBlock: " << cellBlock->getValueBlock().extract();
+            break;
+        }
+
+        case TypeTags::pcreRegex:
+        case TypeTags::jsFunction:
+        case TypeTags::shardFilterer:
+        case TypeTags::ftsMatcher:
+        case TypeTags::sortSpec:
+        case TypeTags::makeObjSpec:
+        case TypeTags::indexBounds:
+        case TypeTags::inList:
+            stream << getExtendedTypeOps(tag)->print(val);
             break;
         default:
             MONGO_UNREACHABLE;

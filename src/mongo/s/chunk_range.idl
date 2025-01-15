@@ -31,10 +31,10 @@
 global:
     cpp_namespace: "mongo"
     cpp_includes:
-        - "mongo/s/catalog/type_chunk.h"
+        - "mongo/s/catalog/type_chunk_range.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 types:
     # Note that in order to use this type for a non-optional field, you must add the IDL struct as a
@@ -45,4 +45,6 @@ types:
         bson_serialization_type: object
         cpp_type: "mongo::ChunkRange"
         serializer: "mongo::ChunkRange::toBSON"
-        deserializer: "mongo::ChunkRange::fromBSONThrowing"
+        deserializer: "mongo::ChunkRange::fromBSON"
+        # Deserializer uses getOwned.
+        is_view: false

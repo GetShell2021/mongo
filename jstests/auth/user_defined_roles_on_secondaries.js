@@ -35,12 +35,11 @@
  * @tags: [requires_replication]
  */
 
-(function() {
-
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {setLogVerbosity} from "jstests/replsets/rslib.js";
 
 var name = 'user_defined_roles_on_secondaries';
-var m0, m1;
+var m0;
 
 function assertListContainsRole(list, role, msg) {
     var i;
@@ -48,7 +47,7 @@ function assertListContainsRole(list, role, msg) {
         if (list[i].role == role.role && list[i].db == role.db)
             return;
     }
-    doassert("Could not find value " + tojson(val) + " in " + tojson(list) +
+    doassert("Could not find value " + tojson(role) + " in " + tojson(list) +
              (msg ? ": " + msg : ""));
 }
 
@@ -208,7 +207,7 @@ assert.commandWorked(rstest.getPrimary().getDB("admin").runCommand({
         {
             op: "u",
             ns: "admin.system.roles",
-            o: {$set: {roles: [{role: "readWrite", db: "db1"}]}},
+            o: {$v: 2, diff: {u: {roles: [{role: "readWrite", db: "db1"}]}}},
             o2: {_id: "db1.t2"}
         }
     ]
@@ -221,7 +220,7 @@ rstest.nodes.forEach(function(node) {
     assert.eq(1, role.roles.length, tojson(node));
     assertListContainsRole(role.roles, {role: "read", db: "db1"}, node);
 
-    var role = node.getDB("db1").getRole("t2");
+    role = node.getDB("db1").getRole("t2");
     assert.eq(1, role.roles.length, tojson(node));
     assertListContainsRole(role.roles, {role: "readWrite", db: "db1"}, node);
 });
@@ -237,4 +236,3 @@ rstest.nodes.forEach(function(node) {
 });
 
 rstest.stopSet();
-}());

@@ -27,9 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <limits>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
 #include "mongo/db/fle_query_interface_mock.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -53,19 +68,30 @@ uint64_t FLEQueryInterfaceMock::countDocuments(const NamespaceString& nss) {
     return uassertStatusOK(_storage->getCollectionCount(_opCtx, nss));
 }
 
-StatusWith<write_ops::InsertCommandReply> FLEQueryInterfaceMock::insertDocument(
+std::vector<std::vector<FLEEdgeCountInfo>> FLEQueryInterfaceMock::getTags(
     const NamespaceString& nss,
-    BSONObj obj,
+    const std::vector<std::vector<FLEEdgePrfBlock>>& tokensSets,
+    FLETagQueryInterface::TagQueryType type) {
+
+    return getTagsFromStorage(_opCtx, nss, tokensSets, type);
+}
+
+StatusWith<write_ops::InsertCommandReply> FLEQueryInterfaceMock::insertDocuments(
+    const NamespaceString& nss,
+    std::vector<BSONObj> objs,
     StmtId* pStmtId,
     bool translateDuplicateKey,
     bool bypassDocumentValidation) {
-    repl::TimestampedBSONObj tb;
-    tb.obj = obj;
 
-    auto status = _storage->insertDocument(_opCtx, nss, tb, 0);
+    for (auto& obj : objs) {
+        repl::TimestampedBSONObj tb;
+        tb.obj = obj;
 
-    if (!status.isOK()) {
-        return status;
+        auto status = _storage->insertDocument(_opCtx, nss, tb, 0);
+
+        if (!status.isOK()) {
+            return status;
+        }
     }
 
     return write_ops::InsertCommandReply();
@@ -100,6 +126,11 @@ std::pair<write_ops::DeleteCommandReply, BSONObj> FLEQueryInterfaceMock::deleteW
     }
 
     return {write_ops::DeleteCommandReply(), uassertStatusOK(swDoc)};
+}
+
+write_ops::DeleteCommandReply FLEQueryInterfaceMock::deleteDocument(
+    const NamespaceString& nss, int32_t stmtId, write_ops::DeleteCommandRequest& deleteRequest) {
+    return deleteWithPreimage(nss, {}, deleteRequest).first;
 }
 
 std::pair<write_ops::UpdateCommandReply, BSONObj> FLEQueryInterfaceMock::updateWithPreimage(

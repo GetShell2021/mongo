@@ -29,11 +29,19 @@
 
 #pragma once
 
+#include <string>
+#include <type_traits>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/s/metrics/sharding_data_transform_instance_metrics.h"
+#include "mongo/db/s/metrics/sharding_data_transform_metrics.h"
 #include "mongo/db/s/resharding/coordinator_document_gen.h"
 #include "mongo/db/s/resharding/donor_document_gen.h"
 #include "mongo/db/s/resharding/recipient_document_gen.h"
-#include "mongo/db/s/sharding_data_transform_instance_metrics.h"
-#include <type_traits>
+#include "mongo/db/service_context.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -41,10 +49,14 @@ namespace resharding_metrics {
 
 template <class T>
 inline constexpr bool isStateDocument =
-    std::disjunction<std::is_same<T, ReshardingRecipientDocument>,
-                     std::is_same<T, ReshardingCoordinatorDocument>,
-                     std::is_same<T, ReshardingDonorDocument>>::value;
+    std::disjunction_v<std::is_same<T, ReshardingRecipientDocument>,
+                       std::is_same<T, ReshardingCoordinatorDocument>,
+                       std::is_same<T, ReshardingDonorDocument>>;
 
+template <typename T>
+inline constexpr bool isState = std::disjunction_v<std::is_same<T, RecipientStateEnum>,
+                                                   std::is_same<T, CoordinatorStateEnum>,
+                                                   std::is_same<T, DonorStateEnum>>;
 
 template <typename T>
 inline constexpr auto getState(const T& document) {
@@ -79,17 +91,17 @@ std::string getMetricsPrefix() {
 }
 
 template <typename T>
-std::string getIntervalPrefix(const StringData& intervalFieldName) {
+std::string getIntervalPrefix(StringData intervalFieldName) {
     return getMetricsPrefix<T>() + intervalFieldName + ".";
 }
 
 template <typename T>
-std::string getIntervalStartFieldName(const StringData& intervalFieldName) {
+std::string getIntervalStartFieldName(StringData intervalFieldName) {
     return getIntervalPrefix<T>(intervalFieldName) + ReshardingMetricsTimeInterval::kStartFieldName;
 }
 
 template <typename T>
-std::string getIntervalEndFieldName(const StringData& intervalFieldName) {
+std::string getIntervalEndFieldName(StringData intervalFieldName) {
     return getIntervalPrefix<T>(intervalFieldName) + ReshardingMetricsTimeInterval::kStopFieldName;
 }
 

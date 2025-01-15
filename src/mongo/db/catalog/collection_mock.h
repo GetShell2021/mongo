@@ -31,6 +31,8 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/assert_util.h"
 
@@ -50,31 +52,43 @@ public:
                    std::unique_ptr<IndexCatalog> indexCatalog)
         : _uuid(uuid), _nss(nss), _indexCatalog(std::move(indexCatalog)) {}
     CollectionMock(const NamespaceString& nss, RecordId catalogId)
-        : _nss(nss), _catalogId(catalogId) {}
-    ~CollectionMock() = default;
+        : _nss(nss), _catalogId(std::move(catalogId)) {}
+    ~CollectionMock() override = default;
 
-    std::shared_ptr<Collection> clone() const {
-        return std::make_shared<CollectionMock>(*this);
+    std::shared_ptr<Collection> clone() const override {
+        std::unique_ptr<IndexCatalog> indexCatalogCopy =
+            _indexCatalog ? _indexCatalog->clone() : nullptr;
+        auto copy = std::make_shared<CollectionMock>(_uuid, _nss, std::move(indexCatalogCopy));
+        copy->_catalogId = _catalogId;
+        copy->_committed = _committed;
+        copy->_options = _options;
+        return copy;
     }
 
-
-    SharedCollectionDecorations* getSharedDecorations() const {
-        return nullptr;
+    SharedCollectionDecorations* getSharedDecorations() const override {
+        return &_sharedCollectionDecorations;
     }
 
-    void init(OperationContext* opCtx) {
+    void init(OperationContext* opCtx) override {
         MONGO_UNREACHABLE;
     }
 
-    RecordId getCatalogId() const {
+    Status initFromExisting(OperationContext* opCtx,
+                            const std::shared_ptr<const Collection>& collection,
+                            const DurableCatalogEntry& catalogEntry,
+                            boost::optional<Timestamp> readTimestamp) override {
+        MONGO_UNREACHABLE;
+    }
+
+    RecordId getCatalogId() const override {
         return _catalogId;
     }
 
     void setCatalogId(RecordId catalogId) {
-        _catalogId = catalogId;
+        _catalogId = std::move(catalogId);
     }
 
-    const NamespaceString& ns() const {
+    const NamespaceString& ns() const override {
         return _nss;
     }
 
@@ -83,124 +97,65 @@ public:
         return Status::OK();
     }
 
-    const IndexCatalog* getIndexCatalog() const {
+    const IndexCatalog* getIndexCatalog() const override {
         return _indexCatalog.get();
     }
-    IndexCatalog* getIndexCatalog() {
+    IndexCatalog* getIndexCatalog() override {
         return _indexCatalog.get();
     }
 
-    RecordStore* getRecordStore() const {
+    RecordStore* getRecordStore() const override {
         MONGO_UNREACHABLE;
     }
-    std::shared_ptr<Ident> getSharedIdent() const {
-        MONGO_UNREACHABLE;
+    std::shared_ptr<Ident> getSharedIdent() const override {
+        return std::make_shared<Ident>(_nss.toString_forTest());
     }
-
-    BSONObj getValidatorDoc() const {
-        MONGO_UNREACHABLE;
-    }
-
-    std::pair<SchemaValidationResult, Status> checkValidation(OperationContext* opCtx,
-                                                              const BSONObj& document) const {
+    void setIdent(std::shared_ptr<Ident> newIdent) override {
         MONGO_UNREACHABLE;
     }
 
-    bool requiresIdIndex() const {
+    BSONObj getValidatorDoc() const override {
+        return BSONObj();
+    }
+
+    std::pair<SchemaValidationResult, Status> checkValidation(
+        OperationContext* opCtx, const BSONObj& document) const override {
         MONGO_UNREACHABLE;
     }
 
-    Snapshotted<BSONObj> docFor(OperationContext* opCtx, RecordId loc) const {
+    Status checkValidationAndParseResult(OperationContext* opCtx,
+                                         const BSONObj& document) const override {
         MONGO_UNREACHABLE;
     }
 
-    bool findDoc(OperationContext* opCtx, RecordId loc, Snapshotted<BSONObj>* out) const {
+    bool requiresIdIndex() const override {
         MONGO_UNREACHABLE;
     }
 
-    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx, bool forward) const {
+    Snapshotted<BSONObj> docFor(OperationContext* opCtx, const RecordId& loc) const override {
         MONGO_UNREACHABLE;
     }
 
-    void deleteDocument(OperationContext* opCtx,
-                        StmtId stmtId,
-                        RecordId loc,
-                        OpDebug* opDebug,
-                        bool fromMigrate,
-                        bool noWarn,
-                        Collection::StoreDeletedDoc storeDeletedDoc,
-                        CheckRecordId checkRecordId) const {
+    bool findDoc(OperationContext* opCtx,
+                 const RecordId& loc,
+                 Snapshotted<BSONObj>* out) const override {
         MONGO_UNREACHABLE;
     }
 
-    void deleteDocument(
-        OperationContext* opCtx,
-        Snapshotted<BSONObj> doc,
-        StmtId stmtId,
-        RecordId loc,
-        OpDebug* opDebug,
-        bool fromMigrate = false,
-        bool noWarn = false,
-        Collection::StoreDeletedDoc storeDeletedDoc = Collection::StoreDeletedDoc::Off,
-        CheckRecordId checkRecordId = CheckRecordId::Off) const {
+    std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
+                                                    bool forward) const override {
         MONGO_UNREACHABLE;
     }
 
-    Status insertDocuments(OperationContext* opCtx,
-                           std::vector<InsertStatement>::const_iterator begin,
-                           std::vector<InsertStatement>::const_iterator end,
-                           OpDebug* opDebug,
-                           bool fromMigrate) const {
+    bool updateWithDamagesSupported() const override {
         MONGO_UNREACHABLE;
     }
 
-    Status insertDocument(OperationContext* opCtx,
-                          const InsertStatement& doc,
-                          OpDebug* opDebug,
-                          bool fromMigrate) const {
+    Status truncate(OperationContext* opCtx) override {
         MONGO_UNREACHABLE;
     }
 
-    Status insertDocumentsForOplog(OperationContext* opCtx,
-                                   std::vector<Record>* records,
-                                   const std::vector<Timestamp>& timestamps) const {
-        MONGO_UNREACHABLE;
-    }
-
-    Status insertDocumentForBulkLoader(OperationContext* opCtx,
-                                       const BSONObj& doc,
-                                       const OnRecordInsertedFn& onRecordInserted) const {
-        MONGO_UNREACHABLE;
-    }
-
-    RecordId updateDocument(OperationContext* opCtx,
-                            RecordId oldLocation,
-                            const Snapshotted<BSONObj>& oldDoc,
-                            const BSONObj& newDoc,
-                            bool indexesAffected,
-                            OpDebug* opDebug,
-                            CollectionUpdateArgs* args) const {
-        MONGO_UNREACHABLE;
-    }
-
-    bool updateWithDamagesSupported() const {
-        MONGO_UNREACHABLE;
-    }
-
-    StatusWith<RecordData> updateDocumentWithDamages(OperationContext* opCtx,
-                                                     RecordId loc,
-                                                     const Snapshotted<RecordData>& oldRec,
-                                                     const char* damageSource,
-                                                     const mutablebson::DamageVector& damages,
-                                                     CollectionUpdateArgs* args) const {
-        MONGO_UNREACHABLE;
-    }
-
-    Status truncate(OperationContext* opCtx) {
-        MONGO_UNREACHABLE;
-    }
-
-    void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) const {
+    void cappedTruncateAfter(OperationContext* opCtx, const RecordId& end, bool inclusive) const {
         MONGO_UNREACHABLE;
     }
 
@@ -208,32 +163,32 @@ public:
                              const BSONObj& validator,
                              MatchExpressionParser::AllowedFeatureSet allowedFeatures,
                              boost::optional<multiversion::FeatureCompatibilityVersion>
-                                 maxFeatureCompatibilityVersion) const {
+                                 maxFeatureCompatibilityVersion) const override {
         MONGO_UNREACHABLE;
     }
 
-    void setValidator(OperationContext* opCtx, Validator validator) {
+    void setValidator(OperationContext* opCtx, Validator validator) override {
         MONGO_UNREACHABLE;
     }
 
-    Status setValidationLevel(OperationContext* opCtx, ValidationLevelEnum newLevel) {
+    Status setValidationLevel(OperationContext* opCtx, ValidationLevelEnum newLevel) override {
         MONGO_UNREACHABLE;
     }
-    Status setValidationAction(OperationContext* opCtx, ValidationActionEnum newAction) {
+    Status setValidationAction(OperationContext* opCtx, ValidationActionEnum newAction) override {
         MONGO_UNREACHABLE;
     }
 
-    boost::optional<ValidationLevelEnum> getValidationLevel() const {
+    boost::optional<ValidationLevelEnum> getValidationLevel() const override {
         MONGO_UNREACHABLE;
     }
-    boost::optional<ValidationActionEnum> getValidationAction() const {
+    boost::optional<ValidationActionEnum> getValidationAction() const override {
         MONGO_UNREACHABLE;
     }
 
     Status updateValidator(OperationContext* opCtx,
                            BSONObj newValidator,
                            boost::optional<ValidationLevelEnum> newLevel,
-                           boost::optional<ValidationActionEnum> newAction) {
+                           boost::optional<ValidationActionEnum> newAction) override {
         MONGO_UNREACHABLE;
     }
 
@@ -241,222 +196,244 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    bool isTemporary() const {
+    bool isTemporary() const override {
         MONGO_UNREACHABLE;
     }
 
-    boost::optional<bool> getTimeseriesBucketsMayHaveMixedSchemaData() const {
+    boost::optional<bool> getTimeseriesBucketsMayHaveMixedSchemaData() const override {
         MONGO_UNREACHABLE;
     }
 
     void setTimeseriesBucketsMayHaveMixedSchemaData(OperationContext* opCtx,
-                                                    boost::optional<bool> setting) {
+                                                    boost::optional<bool> setting) override {
         MONGO_UNREACHABLE;
     }
 
-    bool doesTimeseriesBucketsDocContainMixedSchemaData(const BSONObj& bucketsDoc) const {
+    boost::optional<bool> timeseriesBucketingParametersHaveChanged() const override {
         MONGO_UNREACHABLE;
     }
 
-    bool isClustered() const {
+    void setTimeseriesBucketingParametersChanged(OperationContext* opCtx,
+                                                 boost::optional<bool> value) override {
+        MONGO_UNREACHABLE;
+    }
+
+    StatusWith<bool> doesTimeseriesBucketsDocContainMixedSchemaData(
+        const BSONObj& bucketsDoc) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool getRequiresTimeseriesExtendedRangeSupport() const override {
+        MONGO_UNREACHABLE;
+    }
+
+    void setRequiresTimeseriesExtendedRangeSupport(OperationContext* opCtx) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool areTimeseriesBucketsFixed() const override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool isClustered() const override {
         return false;
     }
 
-    boost::optional<ClusteredCollectionInfo> getClusteredInfo() const {
+    boost::optional<ClusteredCollectionInfo> getClusteredInfo() const override {
         MONGO_UNREACHABLE;
     }
 
     void updateClusteredIndexTTLSetting(OperationContext* opCtx,
-                                        boost::optional<int64_t> expireAfterSeconds) {
+                                        boost::optional<int64_t> expireAfterSeconds) override {
         MONGO_UNREACHABLE;
     }
 
     Status updateCappedSize(OperationContext* opCtx,
                             boost::optional<long long> newCappedSize,
-                            boost::optional<long long> newCappedMax) {
+                            boost::optional<long long> newCappedMax) override {
         MONGO_UNREACHABLE;
     }
 
-    bool getRecordPreImages() const {
+    void unsetRecordIdsReplicated(OperationContext* opCtx) final {
         MONGO_UNREACHABLE;
     }
 
-    void setRecordPreImages(OperationContext* opCtx, bool val) {
-        MONGO_UNREACHABLE;
-    }
-
-    bool isChangeStreamPreAndPostImagesEnabled() const {
+    bool isChangeStreamPreAndPostImagesEnabled() const override {
         MONGO_UNREACHABLE;
     }
 
     void setChangeStreamPreAndPostImages(OperationContext* opCtx,
-                                         ChangeStreamPreAndPostImagesOptions val) {
+                                         ChangeStreamPreAndPostImagesOptions val) override {
         MONGO_UNREACHABLE;
     }
 
-    bool isCapped() const {
+    bool areRecordIdsReplicated() const override {
         return false;
     }
 
-    long long getCappedMaxDocs() const {
+    bool isCapped() const override {
+        return false;
+    }
+
+    long long getCappedMaxDocs() const override {
         MONGO_UNREACHABLE;
     }
 
-    long long getCappedMaxSize() const {
+    long long getCappedMaxSize() const override {
         MONGO_UNREACHABLE;
     }
 
-    CappedCallback* getCappedCallback() {
-        MONGO_UNREACHABLE;
+    bool usesCappedSnapshots() const override {
+        return false;
     }
-    const CappedCallback* getCappedCallback() const {
+
+    std::vector<RecordId> reserveCappedRecordIds(OperationContext* opCtx, size_t nIds) const final {
         MONGO_UNREACHABLE;
     }
 
-    std::shared_ptr<CappedInsertNotifier> getCappedInsertNotifier() const {
+    void registerCappedInserts(OperationContext* opCtx,
+                               const RecordId& minRecord,
+                               const RecordId& maxRecord) const override {
+        std::abort();
+    }
+
+    CappedVisibilityObserver* getCappedVisibilityObserver() const override {
+        std::abort();
+    }
+
+    CappedVisibilitySnapshot takeCappedVisibilitySnapshot() const override {
+        std::abort();
+    }
+
+    long long numRecords(OperationContext* opCtx) const override {
+        return 0LL;
+    }
+
+    long long dataSize(OperationContext* opCtx) const override {
         MONGO_UNREACHABLE;
     }
 
-    long long numRecords(OperationContext* opCtx) const {
+    bool isEmpty(OperationContext* opCtx) const override {
         MONGO_UNREACHABLE;
     }
 
-    long long dataSize(OperationContext* opCtx) const {
+    int averageObjectSize(OperationContext* const opCtx) const override {
         MONGO_UNREACHABLE;
     }
 
-    bool isEmpty(OperationContext* opCtx) const {
+    uint64_t getIndexSize(OperationContext* opCtx,
+                          BSONObjBuilder* details,
+                          int scale) const override {
         MONGO_UNREACHABLE;
     }
 
-    int averageObjectSize(OperationContext* const opCtx) const {
+    uint64_t getIndexFreeStorageBytes(OperationContext* const opCtx) const override {
         MONGO_UNREACHABLE;
     }
 
-    uint64_t getIndexSize(OperationContext* opCtx, BSONObjBuilder* details, int scale) const {
+    boost::optional<Timestamp> getMinimumValidSnapshot() const override {
         MONGO_UNREACHABLE;
     }
 
-    uint64_t getIndexFreeStorageBytes(OperationContext* const opCtx) const {
+    void setMinimumValidSnapshot(Timestamp name) override {
+        // no-op, called by unittests
+    }
+
+    boost::optional<TimeseriesOptions> getTimeseriesOptions() const override {
+        return boost::none;
+    }
+
+    void setTimeseriesOptions(OperationContext* opCtx,
+                              const TimeseriesOptions& tsOptions) override {
         MONGO_UNREACHABLE;
     }
 
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() const {
+    const CollatorInterface* getDefaultCollator() const override {
         MONGO_UNREACHABLE;
     }
 
-    void setMinimumVisibleSnapshot(Timestamp name) {
-        MONGO_UNREACHABLE;
+    const CollectionOptions& getCollectionOptions() const override {
+        return _options;
     }
 
-    boost::optional<TimeseriesOptions> getTimeseriesOptions() const {
-        MONGO_UNREACHABLE;
-    }
-
-    void setTimeseriesOptions(OperationContext* opCtx, const TimeseriesOptions& tsOptions) {
-        MONGO_UNREACHABLE;
-    }
-
-    const CollatorInterface* getDefaultCollator() const {
-        MONGO_UNREACHABLE;
-    }
-
-    const CollectionOptions& getCollectionOptions() const {
+    StatusWith<BSONObj> addCollationDefaultsToIndexSpecsForCreate(
+        OperationContext* opCtx, const BSONObj& indexSpecs) const override {
         MONGO_UNREACHABLE;
     }
 
     StatusWith<std::vector<BSONObj>> addCollationDefaultsToIndexSpecsForCreate(
-        OperationContext* opCtx, const std::vector<BSONObj>& indexSpecs) const {
+        OperationContext* opCtx, const std::vector<BSONObj>& indexSpecs) const override {
         MONGO_UNREACHABLE;
     }
 
-    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
-        OperationContext* opCtx,
-        const CollectionPtr& yieldableCollection,
-        PlanYieldPolicy::YieldPolicy yieldPolicy,
-        ScanDirection scanDirection,
-        boost::optional<RecordId> resumeAfterRecordId) const {
-        MONGO_UNREACHABLE;
-    }
+    void onDeregisterFromCatalog(OperationContext* opCtx) override {}
 
-    void establishOplogCollectionForLogging(OperationContext* opCtx) const {
-        MONGO_UNREACHABLE;
-    }
-
-    void onDeregisterFromCatalog(OperationContext* opCtx) {}
-
-    UUID uuid() const {
+    UUID uuid() const override {
         return _uuid;
     }
 
-    bool isCommitted() const final {
-        return _committed;
-    }
-
-    void setCommitted(bool val) final {
-        _committed = val;
-    }
-
-    void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) {
+    void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) override {
         MONGO_UNREACHABLE;
     }
 
-    StatusWith<int> checkMetaDataForIndex(const std::string& indexName, const BSONObj& spec) const {
+    StatusWith<int> checkMetaDataForIndex(const std::string& indexName,
+                                          const BSONObj& spec) const override {
+        return 1;
+    }
+
+    void updateTTLSetting(OperationContext* opCtx,
+                          StringData idxName,
+                          long long newExpireSeconds) override {
         MONGO_UNREACHABLE;
     }
 
-    void updateTTLSetting(OperationContext* opCtx, StringData idxName, long long newExpireSeconds) {
+    void updateHiddenSetting(OperationContext* opCtx, StringData idxName, bool hidden) override {
         MONGO_UNREACHABLE;
     }
 
-    void updateHiddenSetting(OperationContext* opCtx, StringData idxName, bool hidden) {
-        MONGO_UNREACHABLE;
-    }
-
-    void updateUniqueSetting(OperationContext* opCtx, StringData idxName, bool unique) {
+    void updateUniqueSetting(OperationContext* opCtx, StringData idxName, bool unique) override {
         MONGO_UNREACHABLE;
     }
 
     void updatePrepareUniqueSetting(OperationContext* opCtx,
                                     StringData idxName,
-                                    bool prepareUnique) {
+                                    bool prepareUnique) override {
         MONGO_UNREACHABLE;
     }
 
-    std::vector<std::string> repairInvalidIndexOptions(OperationContext* opCtx) {
+    std::vector<std::string> repairInvalidIndexOptions(OperationContext* opCtx) override {
         MONGO_UNREACHABLE;
     }
 
-    void setIsTemp(OperationContext* opCtx, bool isTemp) {
+    void setIsTemp(OperationContext* opCtx, bool isTemp) override {
         MONGO_UNREACHABLE;
     }
 
-    void removeIndex(OperationContext* opCtx, StringData indexName) {
+    void removeIndex(OperationContext* opCtx, StringData indexName) override {
         MONGO_UNREACHABLE;
     }
 
     Status prepareForIndexBuild(OperationContext* opCtx,
                                 const IndexDescriptor* spec,
-                                boost::optional<UUID> buildUUID,
-                                bool isBackgroundSecondaryBuild) {
+                                boost::optional<UUID> buildUUID) override {
         MONGO_UNREACHABLE;
     }
 
-    boost::optional<UUID> getIndexBuildUUID(StringData indexName) const {
+    boost::optional<UUID> getIndexBuildUUID(StringData indexName) const override {
         MONGO_UNREACHABLE;
     }
 
     bool isIndexMultikey(OperationContext* opCtx,
                          StringData indexName,
                          MultikeyPaths* multikeyPaths,
-                         int indexOffset) const {
+                         int indexOffset) const override {
         MONGO_UNREACHABLE;
     }
 
     bool setIndexIsMultikey(OperationContext* opCtx,
                             StringData indexName,
                             const MultikeyPaths& multikeyPaths,
-                            int indexOffset) const {
+                            int indexOffset) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -467,36 +444,48 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    int getTotalIndexCount() const {
+    int getTotalIndexCount() const override {
         MONGO_UNREACHABLE;
     }
 
-    int getCompletedIndexCount() const {
+    int getCompletedIndexCount() const override {
         MONGO_UNREACHABLE;
     }
 
-    BSONObj getIndexSpec(StringData indexName) const {
+    BSONObj getIndexSpec(StringData indexName) const override {
         MONGO_UNREACHABLE;
     }
 
-    void getAllIndexes(std::vector<std::string>* names) const {
+    void getAllIndexes(std::vector<std::string>* names) const override {
         MONGO_UNREACHABLE;
     }
 
-    void getReadyIndexes(std::vector<std::string>* names) const {
+    void getReadyIndexes(std::vector<std::string>* names) const override {
         MONGO_UNREACHABLE;
     }
 
-    bool isIndexPresent(StringData indexName) const {
+    bool isIndexPresent(StringData indexName) const override {
         MONGO_UNREACHABLE;
     }
 
-    bool isIndexReady(StringData indexName) const {
-        MONGO_UNREACHABLE;
+    bool isIndexReady(StringData indexName) const override {
+        return true;
     }
 
     void replaceMetadata(OperationContext* opCtx,
-                         std::shared_ptr<BSONCollectionCatalogEntry::MetaData> md) {
+                         std::shared_ptr<BSONCollectionCatalogEntry::MetaData> md) override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool isMetadataEqual(const BSONObj& otherMetadata) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool needsCappedLock() const override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool isCappedAndNeedsDelete(OperationContext* opCtx) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -506,6 +495,8 @@ private:
     RecordId _catalogId{0};
     clonable_ptr<IndexCatalog> _indexCatalog;
     bool _committed = true;
+    CollectionOptions _options;
+    mutable SharedCollectionDecorations _sharedCollectionDecorations;
 };
 
 }  // namespace mongo

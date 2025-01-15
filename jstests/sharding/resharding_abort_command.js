@@ -4,11 +4,10 @@
  *
  * @tags: [uses_atclustertime]
  */
-(function() {
-"use strict";
-load("jstests/libs/discover_topology.js");
-load("jstests/libs/parallelTester.js");
-load("jstests/sharding/libs/resharding_test_fixture.js");
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const originalCollectionNs = "reshardingDb.coll";
 const enterAbortFailpointName = "reshardingPauseCoordinatorBeforeStartingErrorFlow";
@@ -39,6 +38,7 @@ let getConnStringsFromNodeType = (nodeType, reshardingTest, topology) => {
             connStrings.push(topology.shards[recipient].primary);
         }
     } else if (nodeType == nodeTypeEnum.NO_EXTRA_FAILPOINTS_SENTINEL) {
+        //
     } else {
         throw 'unsupported node type in resharding abort test';
     }
@@ -172,12 +172,6 @@ const runAbortWithFailpoint = (failpointName, failpointNodeType, abortLocation, 
     const mongos = sourceCollection.getMongo();
     const topology = DiscoverTopology.findConnectedNodes(mongos);
     const configsvr = new Mongo(topology.configsvr.nodes[0]);
-
-    const status = configsvr.getDB('admin').serverStatus({});
-    // Resharding has not been attempted yet, so resharding metrics will not be reported. This means
-    // shardingStatistics will be empty, and thus not reported. So we assert that the serverStatus
-    // does not have shardingStatistics yet.
-    assert(!status.hasOwnProperty('shardingStatistics'), status);
 
     let expectedAbortErrorCodes = ErrorCodes.OK;
     let expectedReshardingErrorCode = ErrorCodes.ReshardCollectionAborted;
@@ -356,7 +350,7 @@ runAbortWithFailpoint(
 let recipientFailpoints = [];
 runAbortWithFailpoint(
     null, nodeTypeEnum.NO_EXTRA_FAILPOINTS_SENTINEL, abortLocationEnum.BEFORE_DECISION_PERSISTED, {
-        executeBeforeReshardingStartsFn: (reshardingTest, topology, mongos, ns) => {
+        executeBeforeReshardingStartsFn: (reshardingTest, topology) => {
             recipientFailpoints =
                 generateFailpoints("reshardingPauseRecipientDuringOplogApplication",
                                    nodeTypeEnum.RECIPIENT,
@@ -386,10 +380,9 @@ runAbortWithFailpoint(
                 }
             });
         },
-        executeAfterAbortingFn: (reshardingTest, topology, mongos, ns) => {
+        executeAfterAbortingFn: () => {
             for (let failpoint of recipientFailpoints) {
                 failpoint.off();
             }
         }
     });
-})();

@@ -83,12 +83,11 @@
  *
  */
 
-#include "mongo/platform/basic.h"
-
 #ifdef _WIN32
 
 #include <conio.h>
 #include <io.h>
+
 #define strcasecmp _stricmp
 #define strdup _strdup
 #define isatty _isatty
@@ -97,29 +96,42 @@
 
 #else /* _WIN32 */
 
-#include <signal.h>
-#include <stdlib.h>
-#include <string.h>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
 #include <sys/ioctl.h>
-#include <sys/types.h>
 #include <termios.h>
-#include <unistd.h>
 
 #endif /* _WIN32 */
 
-#include "linenoise.h"
-#include "linenoise_utf8.h"
-#include "mk_wcwidth.h"
+#ifdef __linux__
+#include <features.h>
+#include <strings.h>
+#endif
+
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
 #include <cwctype>
-#include <errno.h>
 #include <fcntl.h>
 #include <memory>
 #include <sstream>
-#include <stdio.h>
 #include <string>
+#include <system_error>
 #include <vector>
+// IWYU pragma: no_include "ext/alloc_traits.h"
 
+#include "mongo/base/data_view.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/shell/linenoise.h"
+#include "mongo/shell/linenoise_utf8.h"
+#include "mongo/shell/mk_wcwidth.h"
 #include "mongo/util/errno_util.h"
+
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
+#include <unistd.h>
+#endif
 
 using std::string;
 using std::vector;
@@ -129,7 +141,6 @@ using std::unique_ptr;
 using linenoise_utf8::copyString32;
 using linenoise_utf8::copyString32to8;
 using linenoise_utf8::copyString8to32;
-using linenoise_utf8::strlen32;
 using linenoise_utf8::strncmp32;
 using linenoise_utf8::UChar32;
 using linenoise_utf8::UChar8;
@@ -352,7 +363,7 @@ public:
         }
         Utf32String killedText(text, textLen);
         if (lastAction == actionKill && size > 0) {
-            int slot = indexToSlot[0];
+            int slot = mongo::ConstDataView(&indexToSlot[0]).read<uint8_t>();
             int currentLen = theRing[slot].length();
             int resultLen = currentLen + textLen;
             Utf32String temp(resultLen + 1);
@@ -375,7 +386,7 @@ public:
                 size++;
                 theRing.push_back(killedText);
             } else {
-                int slot = indexToSlot[capacity - 1];
+                int slot = mongo::ConstDataView(&indexToSlot[capacity - 1]).read<uint8_t>();
                 theRing[slot] = killedText;
                 memmove(&indexToSlot[1], &indexToSlot[0], capacity - 1);
                 indexToSlot[0] = slot;

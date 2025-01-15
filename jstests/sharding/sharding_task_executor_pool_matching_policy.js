@@ -2,10 +2,13 @@
 // "automatic" value is used for the ShardingTaskExecutorPoolReplicaSetMatching parameter (on
 // mongos, "matchPrimaryNode" should be set; on mongod, the policy should be "disabled").
 //
-// @tags: [sets_replica_set_matching_strategy]
+// @tags: [
+//   sets_replica_set_matching_strategy,
+//   # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+//   embedded_router_incompatible,
+// ]
 
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Helper function to check the matching policy of a node, given the output of the connPoolStats
 // command run against the node and the expected policy.
@@ -29,7 +32,7 @@ function checkGetParameterOutputIsAuto(dbConn) {
 // Setup test fixture; get connection to mongos and each mongod.
 let paramsDoc = {
     mongosOptions: {setParameter: {ShardingTaskExecutorPoolReplicaSetMatching: "automatic"}},
-    shardOptions: {setParameter: {ShardingTaskExecutorPoolReplicaSetMatching: "automatic"}}
+    rsOptions: {setParameter: {ShardingTaskExecutorPoolReplicaSetMatching: "automatic"}}
 };
 let st = new ShardingTest({shards: 2, mongos: 1, other: paramsDoc});
 let mongos = st.s;
@@ -54,4 +57,3 @@ checkSTEPReplicaSetMatchingPolicy(mongosStats, "matchPrimaryNode");
 checkSTEPReplicaSetMatchingPolicy(mongodStats, "disabled");
 checkSTEPReplicaSetMatchingPolicy(otherMongodStats, "disabled");
 st.stop();
-})();

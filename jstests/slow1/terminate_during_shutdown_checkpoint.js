@@ -11,14 +11,13 @@
  *
  * @tags: [requires_wiredtiger, requires_persistence, requires_replication]
  */
-(function() {
-"use strict";
 
 // This test triggers an unclean shutdown, which may cause inaccurate fast counts.
 TestData.skipEnforceFastCountOnValidate = true;
 
-load("jstests/libs/parallel_shell_helpers.js");  // For startParallelShell
-load('jstests/libs/parallelTester.js');          // For Thread
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const kSeparator = "/";
 const copyDataFiles = function(src, dest) {
@@ -39,8 +38,6 @@ const copyDataFiles = function(src, dest) {
 
 // Multi-document prepared transaction workload executed by the client threads.
 const threadWorkload = function(host, threadId, start, end) {
-    load("jstests/core/txns/libs/prepare_helpers.js");
-
     try {
         const conn = new Mongo(host);
 
@@ -170,7 +167,7 @@ while (numUncleanShutdowns < kNumUncleanShutdowns) {
     }, primary.port);
 
     assert.soon(() => {
-        const logContents = rawMongoProgramOutput();
+        const logContents = rawMongoProgramOutput(".*");
         return logContents.indexOf("close_ckpt") > 0;
     });
 
@@ -205,4 +202,3 @@ while (numUncleanShutdowns < kNumUncleanShutdowns) {
 }
 
 rst.stopSet();
-}());

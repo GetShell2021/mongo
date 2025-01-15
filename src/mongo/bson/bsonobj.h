@@ -29,8 +29,19 @@
 
 #pragma once
 
+#include <array>
 #include <bitset>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstring>
+#include <fmt/format.h>
+#include <functional>
+#include <iosfwd>
+#include <iterator>
+#include <limits>
 #include <list>
+#include <memory>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -38,22 +49,31 @@
 #include <vector>
 
 #include "mongo/base/data_type.h"
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_view.h"
+#include "mongo/base/static_assert.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/base/string_data_comparator_interface.h"
+#include "mongo/base/string_data_comparator.h"
 #include "mongo/bson/bson_comparator_interface_base.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/bufreader.h"
+#include "mongo/util/modules.h"
 #include "mongo/util/shared_buffer.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
 class BSONObjBuilder;
+
 class BSONObjStlIterator;
 class ExtendedCanonicalV200Generator;
 class ExtendedRelaxedV200Generator;
@@ -98,7 +118,7 @@ class LegacyStrictGenerator;
  Code With Scope: <total size><String><Object>
  \endcode
  */
-class BSONObj {
+class MONGO_MOD_PUB BSONObj {
 public:
     struct DefaultSizeTrait {
         constexpr static int MaxSize = BSONObjMaxInternalSize;
@@ -123,6 +143,7 @@ public:
     using ComparisonRulesSet = BSONComparatorInterfaceBase<BSONObj>::ComparisonRulesSet;
 
     static constexpr char kMinBSONLength = 5;
+    static const BSONObj kEmptyObject;
 
     /**
      * Construct an empty BSONObj -- that is, {}.
@@ -223,7 +244,7 @@ public:
      */
     BSONObj& shareOwnershipWith(ConstSharedBuffer buffer) & {
         invariant(buffer);
-        _ownedBuffer = buffer;
+        _ownedBuffer = std::move(buffer);
         return *this;
     }
     BSONObj& shareOwnershipWith(const BSONObj& other) & {
@@ -231,7 +252,7 @@ public:
         return *this;
     }
     BSONObj&& shareOwnershipWith(ConstSharedBuffer buffer) && {
-        return std::move(shareOwnershipWith(buffer));
+        return std::move(shareOwnershipWith(std::move(buffer)));
     }
     BSONObj&& shareOwnershipWith(const BSONObj& other) && {
         return std::move(shareOwnershipWith(other));
@@ -265,9 +286,19 @@ public:
     BSONObj copy() const;
 
     /**
+     * If the data buffer is not under the control of this BSONObj, allocate
+     * a separate copy and make this object a fully owned one.
+     */
+    void makeOwned();
+
+    enum class RedactLevel : int8_t { all, encryptedAndSensitive, sensitiveOnly };
+
+    /**
      * @return a new full (and owned) redacted copy of the object.
      */
-    BSONObj redact(bool onlyEncryptedFields = false) const;
+    BSONObj redact(
+        RedactLevel level = RedactLevel::all,
+        std::function<std::string(const BSONElement&)> fieldNameRedactor = nullptr) const;
 
     /**
      * Readable representation of a BSON object in an extended JSON-style notation.
@@ -341,7 +372,6 @@ public:
     /**
      * Remove specified fields and return a new object with the remaining fields.
      */
-    BSONObj removeFields(const std::set<std::string>& fields) const;
     BSONObj removeFields(const StringDataSet& fields) const;
 
     /**
@@ -359,17 +389,12 @@ public:
     /**
      * Get the field of the specified name. eoo() is true on the returned
      * element if not found.
+     *
+     * BSONElement will point to data which may only be owned by `this`.
+     * Thus, this BSONObj must outlive the returned BSONElement, hence the lifetime bound
+     * annotation.
      */
-    BSONElement getField(StringData name) const;
-
-    /**
-     * Get several fields at once. This is faster than separate getField() calls as the size of
-     * elements iterated can then be calculated only once each.
-     * @param n number of fieldNames, and number of elements in the fields array
-     * @param fields if a field is found its element is stored in its corresponding position in
-     *          this array. if not found the array element is unchanged.
-     */
-    void getFields(unsigned n, const char** fieldNames, BSONElement* fields) const;
+    BSONElement getField(StringData name) const MONGO_COMPILER_LIFETIME_BOUND;
 
     /**
      * Get several fields at once. This is faster than separate getField() calls as the size of
@@ -389,10 +414,9 @@ public:
     }
 
     BSONElement operator[](int field) const {
-        StringBuilder ss;
-        ss << field;
-        std::string s = ss.str();
-        return getField(s.c_str());
+        if (field < 0)
+            return BSONElement();
+        return getField(ItoA(field));
     }
 
     /**
@@ -447,8 +471,6 @@ public:
 
     BSONObj filterFieldsUndotted(const BSONObj& filter, bool inFilter) const;
     void filterFieldsUndotted(BSONObjBuilder* b, const BSONObj& filter, bool inFilter) const;
-
-    BSONElement getFieldUsingIndexNames(StringData fieldName, const BSONObj& indexKey) const;
 
     /**
      * arrays are bson objects with numeric and increasing field names
@@ -526,12 +548,12 @@ public:
     int woCompare(const BSONObj& r,
                   const Ordering& o,
                   ComparisonRulesSet rules = ComparisonRules::kConsiderFieldName,
-                  const StringData::ComparatorInterface* comparator = nullptr) const;
+                  const StringDataComparator* comparator = nullptr) const;
 
     int woCompare(const BSONObj& r,
                   const BSONObj& ordering = BSONObj(),
                   ComparisonRulesSet rules = ComparisonRules::kConsiderFieldName,
-                  const StringData::ComparatorInterface* comparator = nullptr) const;
+                  const StringDataComparator* comparator = nullptr) const;
 
     DeferredComparison operator<(const BSONObj& other) const {
         return DeferredComparison(DeferredComparison::Type::kLT, *this, other);
@@ -608,16 +630,8 @@ public:
 
     BSONType firstElementType() const {
         const char* p = objdata() + 4;
-        return (BSONType)*p;
+        return BSONType(*p);
     }
-
-    /**
-     * Get the _id field from the object.  For good performance drivers should
-     * assure that _id is the first element of the object; however, correct operation
-     * is assured regardless.
-     * @return true if found
-     */
-    bool getObjectID(BSONElement& e) const;
 
     /**
      * Return a version of this object where top level elements of types
@@ -636,11 +650,6 @@ public:
     static BSONObj stripFieldNames(const BSONObj& obj);
 
     bool hasFieldNames() const;
-
-    /**
-     * Returns true if this object is valid and returns false otherwise.
-     */
-    bool valid() const;
 
     /**
      * add all elements of the object to the specified vector
@@ -673,7 +682,7 @@ public:
     iterator end() const;
 
     void appendSelfToBufBuilder(BufBuilder& b) const {
-        verify(objsize());
+        MONGO_verify(objsize());
         b.appendBuf(objdata(), objsize());
     }
 
@@ -693,6 +702,10 @@ public:
     int memUsageForSorter() const {
         // TODO consider ownedness?
         return sizeof(BSONObj) + objsize();
+    }
+
+    ConstDataRange asDataRange() const {
+        return ConstDataRange(objdata(), objsize());
     }
 
 private:
@@ -762,14 +775,20 @@ public:
     /**
      * Constructs an iterator pointing to the first element in obj or EOO if it is empty.
      */
-    explicit BSONObjStlIterator(const BSONObj& obj) : BSONObjStlIterator(obj.firstElement()) {}
+    explicit BSONObjStlIterator(const BSONObj& obj) {
+        auto ptr = obj.objdata() + sizeof(int32_t);
+        _cur._data = ptr;
+        while (*ptr)
+            ++ptr;
+        _cur._fieldNameSize = ptr - _cur._data;
+    }
 
     /**
      * Returns an iterator pointing to the EOO element in obj.
      */
     static BSONObjStlIterator endOf(const BSONObj& obj) {
         auto eooElem = BSONElement();
-        eooElem.data = (obj.objdata() + obj.objsize() - 1);
+        eooElem._data = obj.objdata() + obj.objsize() - 1;
         dassert(eooElem.eoo());  // This is checked in the BSONObj constructor.
         return BSONObjStlIterator(eooElem);
     }
@@ -778,8 +797,15 @@ public:
      * pre-increment
      */
     BSONObjStlIterator& operator++() {
-        dassert(!_cur.eoo());
-        *this = BSONObjStlIterator(BSONElement(_cur.rawdata() + _cur.size()));
+        dassert(*_cur._data);                          // Must not be EOO
+        auto ptr = _cur._data + _cur.fieldNameSize();  // ptr points to the 0 byte ending the name
+
+        ptr += _cur.valuesize() + 1;  // Skip the value and the 0 byte
+        _cur._data = ptr;
+        while (*ptr)
+            ++ptr;
+
+        _cur._fieldNameSize = ptr - _cur._data;
         return *this;
     }
 
@@ -817,8 +843,8 @@ private:
  *
  * For simple loops over BSONObj, do this instead: for (auto&& elem : obj) { ... }
  *
- * Note each BSONObj ends with an EOO element: so you will get moreWithEOO() on an empty
- * object, although more() will be false and next().eoo() will be true.
+ * Note each BSONObj ends with an EOO element.
+ * For iterator over an empty object, `more() == false`, and `next().eoo() == true`.
  *
  * The BSONObj must stay in scope for the duration of the iterator's execution.
  */
@@ -853,8 +879,6 @@ public:
 
     /**
      * Return true if the current element is equal to 'otherElement'.
-     * Do *not* use with moreWithEOO() as the function will return false if the current element and
-     * 'otherElement' are EOO.
      */
     bool currentElementBinaryEqual(const BSONElement& otherElement) {
         auto sz = otherElement.size();
@@ -868,16 +892,8 @@ public:
         return _pos < _theend;
     }
 
-    /**
-     * @return true if more elements exist to be enumerated INCLUDING the EOO element which is
-     * always at the end.
-     */
-    bool moreWithEOO() const {
-        return _pos <= _theend;
-    }
-
     BSONElement next() {
-        verify(_pos <= _theend);
+        dassert(_pos <= _theend);
         BSONElement e(_pos);
         _pos += e.size();
         return e;
@@ -901,7 +917,7 @@ public:
     }
 
     BSONElement operator*() {
-        verify(_pos <= _theend);
+        dassert(_pos <= _theend);
         return BSONElement(_pos);
     }
 
@@ -927,37 +943,27 @@ class BSONIteratorSorted {
     BSONIteratorSorted& operator=(const BSONIteratorSorted&) = delete;
 
 public:
-    ~BSONIteratorSorted() {
-        verify(_fields);
-    }
-
     bool more() {
-        return _cur < _nfields;
+        return _cur < static_cast<int>(_fields.size());
     }
 
     BSONElement next() {
-        verify(_fields);
-        if (_cur < _nfields) {
-            const auto& element = _fields[_cur++];
-            return BSONElement(element.fieldName.rawData() - 1,  // Include type byte
-                               element.fieldName.size() + 1,     // Add null terminator
-                               element.totalSize);
+        if (_cur < static_cast<int>(_fields.size())) {
+            const auto& fieldName = _fields.at(_cur++);
+            return BSONElement(fieldName.rawData() - 1,  // Include type byte
+                               fieldName.size() + 1,     // Add null terminator
+                               BSONElement::TrustedInitTag{});
         }
 
         return BSONElement();
     }
 
 protected:
-    class ElementFieldCmp;
-    BSONIteratorSorted(const BSONObj& o, const ElementFieldCmp& cmp);
+    class FieldNameCmp;
+    BSONIteratorSorted(const BSONObj& o, const FieldNameCmp& cmp);
 
 private:
-    const int _nfields;
-    struct Field {
-        StringData fieldName;
-        int totalSize;
-    };
-    const std::unique_ptr<Field[]> _fields;
+    std::vector<StringData> _fields;
     int _cur;
 };
 
@@ -985,13 +991,6 @@ inline BSONObj::iterator BSONObj::begin() const {
 inline BSONObj::iterator BSONObj::end() const {
     return BSONObj::iterator::endOf(*this);
 }
-
-/**
- * Similar to BOOST_FOREACH
- *
- * DEPRECATED: Use range-based for loops now.
- */
-#define BSONForEach(elemName, obj) for (BSONElement elemName : (obj))
 
 template <>
 struct DataType::Handler<BSONObj> {

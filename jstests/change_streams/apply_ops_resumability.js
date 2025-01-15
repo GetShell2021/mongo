@@ -2,13 +2,10 @@
 // that we can resume from any point within the transaction.
 // @tags: [uses_transactions, requires_snapshot_read, requires_majority_read_concern]
 
-(function() {
-"use strict";
-
-load("jstests/libs/auto_retry_transaction_in_sharding.js");  // For withTxnAndAutoRetryOnMongos.
-load("jstests/libs/change_stream_util.js");                  // For ChangeStreamTest.
-load("jstests/libs/collection_drop_recreate.js");            // For assert[Drop|Create]Collection.
-load("jstests/libs/fixture_helpers.js");                     // For FixtureHelpers.isMongos.
+import {withTxnAndAutoRetryOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ChangeStreamTest} from "jstests/libs/query/change_stream_util.js";
 
 const coll = assertDropAndRecreateCollection(db, "change_stream_apply_ops");
 const otherCollName = "change_stream_apply_ops_2";
@@ -138,18 +135,8 @@ let expectedChanges = [
         ],
         collection: 1
     });
-    // If we are running in a sharded passthrough, then this may have been a multi-shard txn. Change
-    // streams will interleave the txn events from across the shards in (clusterTime, txnOpIndex)
-    // order, and so may not reflect the ordering of writes in the test. The ordering of events is
-    // important for later tests, so if we are running on mongoS we verify that exactly the expected
-    // set of events are observed, and then we adopt the order in which they were returned.
-    if (FixtureHelpers.isMongos(db)) {
-        expectedChanges = wholeClusterCST.assertNextChangesEqualUnordered(
-            {cursor: wholeClusterCursor, expectedChanges: expectedChanges});
-    } else {
-        expectedChanges = wholeClusterCST.assertNextChangesEqual(
-            {cursor: wholeClusterCursor, expectedChanges: expectedChanges});
-    }
+    expectedChanges = wholeClusterCST.assertNextChangesEqualWithDeploymentAwareness(
+        {cursor: wholeClusterCursor, expectedChanges: expectedChanges});
 })();
 
 // Helper function to find the first non-transaction event and the first two transaction events in
@@ -265,4 +252,3 @@ cst.assertNextChangesEqual(
     {cursor: changeStream, expectedChanges: expectedChanges.slice(secondTxnIdx + 1)});
 
 cst.cleanUp();
-}());

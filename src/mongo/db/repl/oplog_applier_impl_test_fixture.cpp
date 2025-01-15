@@ -27,37 +27,70 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <utility>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/health_log.h"
+#include "mongo/db/catalog/health_log_interface.h"
+#include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
-#include "mongo/db/curop.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
+#include "mongo/db/index_builds/index_builds_manager.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/multi_key_path_tracker.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/pipeline/change_stream_pre_and_post_images_options_gen.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/drop_pending_collection_reaper.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/repl/replication_process.h"
-#include "mongo/db/repl/replication_recovery_mock.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_mutable.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/str.h"
+#include "mongo/util/version/releases.h"
 
 namespace mongo {
 namespace repl {
 
 void OplogApplierImplOpObserver::onInserts(OperationContext* opCtx,
-                                           const NamespaceString& nss,
-                                           const UUID& uuid,
+                                           const CollectionPtr& coll,
                                            std::vector<InsertStatement>::const_iterator begin,
                                            std::vector<InsertStatement>::const_iterator end,
-                                           bool fromMigrate) {
+                                           const std::vector<RecordId>& recordIds,
+                                           std::vector<bool> fromMigrate,
+                                           bool defaultFromMigrate,
+                                           OpStateAccumulator* opAccumulator) {
     if (!onInsertsFn) {
         return;
     }
@@ -66,22 +99,25 @@ void OplogApplierImplOpObserver::onInserts(OperationContext* opCtx,
         const InsertStatement& insertStatement = *it;
         docs.push_back(insertStatement.doc.getOwned());
     }
-    onInsertsFn(opCtx, nss, docs);
+    onInsertsFn(opCtx, coll->ns(), docs);
 }
 
 void OplogApplierImplOpObserver::onDelete(OperationContext* opCtx,
-                                          const NamespaceString& nss,
-                                          const UUID& uuid,
+                                          const CollectionPtr& coll,
                                           StmtId stmtId,
-                                          const OplogDeleteEntryArgs& args) {
+                                          const BSONObj& doc,
+                                          const DocumentKey& documentKey,
+                                          const OplogDeleteEntryArgs& args,
+                                          OpStateAccumulator* opAccumulator) {
     if (!onDeleteFn) {
         return;
     }
-    onDeleteFn(opCtx, nss, uuid, stmtId, args);
+    onDeleteFn(opCtx, coll, stmtId, doc, args);
 }
 
 void OplogApplierImplOpObserver::onUpdate(OperationContext* opCtx,
-                                          const OplogUpdateEntryArgs& args) {
+                                          const OplogUpdateEntryArgs& args,
+                                          OpStateAccumulator* opAccumulator) {
     if (!onUpdateFn) {
         return;
     }
@@ -107,12 +143,19 @@ void OplogApplierImplOpObserver::onRenameCollection(OperationContext* opCtx,
                                                     const UUID& uuid,
                                                     const boost::optional<UUID>& dropTargetUUID,
                                                     std::uint64_t numRecords,
-                                                    bool stayTemp) {
+                                                    bool stayTemp,
+                                                    bool markFromMigrate) {
     if (!onRenameCollectionFn) {
         return;
     }
-    onRenameCollectionFn(
-        opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
+    onRenameCollectionFn(opCtx,
+                         fromCollection,
+                         toCollection,
+                         uuid,
+                         dropTargetUUID,
+                         numRecords,
+                         stayTemp,
+                         markFromMigrate);
 }
 
 void OplogApplierImplOpObserver::onCreateIndex(OperationContext* opCtx,
@@ -161,8 +204,11 @@ void OplogApplierImplTest::setUp() {
 
     StorageInterface::set(serviceContext, std::make_unique<StorageInterfaceImpl>());
 
-    DropPendingCollectionReaper::set(
-        serviceContext, std::make_unique<DropPendingCollectionReaper>(getStorageInterface()));
+    MongoDSessionCatalog::set(
+        serviceContext,
+        std::make_unique<MongoDSessionCatalog>(
+            std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+
     repl::createOplog(_opCtx.get());
 
     _consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();
@@ -177,19 +223,26 @@ void OplogApplierImplTest::setUp() {
     // test fixture does not create a featureCompatibilityVersion document from which to initialize
     // the server parameter.
     // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-    serverGlobalParams.mutableFeatureCompatibility.setVersion(multiversion::GenericFCV::kLatest);
+    serverGlobalParams.mutableFCV.setVersion(multiversion::GenericFCV::kLatest);
 
     // This is necessary to generate ghost timestamps for index builds that are not 0, since 0 is an
     // invalid timestamp.
     VectorClockMutable::get(_opCtx.get())->tickClusterTimeTo(LogicalTime(Timestamp(1, 0)));
+
+    HealthLogInterface::set(serviceContext, std::make_unique<HealthLog>());
+    HealthLogInterface::get(serviceContext)->startup();
 }
 
 void OplogApplierImplTest::tearDown() {
+    HealthLogInterface::get(serviceContext)->shutdown();
     _opCtx.reset();
     _consistencyMarkers = {};
-    DropPendingCollectionReaper::set(serviceContext, {});
     StorageInterface::set(serviceContext, {});
     ServiceContextMongoDTest::tearDown();
+
+    for (auto serverParamController : _serverParamControllers) {
+        serverParamController.reset();
+    }
 }
 
 ReplicationConsistencyMarkers* OplogApplierImplTest::getConsistencyMarkers() const {
@@ -213,56 +266,73 @@ Status OplogApplierImplTest::_applyOplogEntryOrGroupedInsertsWrapper(
 }
 
 void OplogApplierImplTest::_testApplyOplogEntryOrGroupedInsertsCrudOperation(
-    ErrorCodes::Error expectedError, const OplogEntry& op, bool expectedApplyOpCalled) {
-    bool applyOpCalled = false;
+    ErrorCodes::Error expectedError,
+    const OplogEntry& op,
+    const NamespaceString& targetNss,
+    bool expectedApplyOpCalled) {
+    auto applyOpCalled = std::make_shared<Atomic<bool>>(false);
 
-    auto checkOpCtx = [](OperationContext* opCtx) {
+    auto checkOpCtx = [&targetNss](OperationContext* opCtx) {
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode("test", MODE_IX));
-        ASSERT_FALSE(opCtx->lockState()->isDbLockedForMode("test", MODE_X));
         ASSERT_TRUE(
-            opCtx->lockState()->isCollectionLockedForMode(NamespaceString("test.t"), MODE_IX));
+            shard_role_details::getLocker(opCtx)->isDbLockedForMode(targetNss.dbName(), MODE_IX));
+        ASSERT_FALSE(
+            shard_role_details::getLocker(opCtx)->isDbLockedForMode(targetNss.dbName(), MODE_X));
+        ASSERT_TRUE(
+            shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(targetNss, MODE_IX));
         ASSERT_FALSE(opCtx->writesAreReplicated());
         ASSERT_TRUE(DocumentValidationSettings::get(opCtx).isSchemaValidationDisabled());
     };
 
     _opObserver->onInsertsFn =
-        [&](OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
-            applyOpCalled = true;
+        [op, targetNss, applyOpCalled, checkOpCtx](
+            OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
+            // Other threads may be calling into the opObserver. Only assert if we are writing to
+            // the target ns, otherwise skip these asserts.
+            if (targetNss != nss) {
+                return;
+            }
+
+            applyOpCalled->store(true);
             checkOpCtx(opCtx);
-            ASSERT_EQUALS(NamespaceString("test.t"), nss);
             ASSERT_EQUALS(1U, docs.size());
             // For upserts we don't know the intended value of the document.
             if (op.getOpType() == repl::OpTypeEnum::kInsert) {
                 ASSERT_BSONOBJ_EQ(op.getObject(), docs[0]);
             }
-            return Status::OK();
         };
 
     _opObserver->onDeleteFn = [&](OperationContext* opCtx,
-                                  const NamespaceString& nss,
-                                  const boost::optional<UUID>& uuid,
+                                  const CollectionPtr& coll,
                                   StmtId stmtId,
+                                  const BSONObj& doc,
                                   const OplogDeleteEntryArgs& args) {
-        applyOpCalled = true;
+        // Other threads may be calling into the opObserver. Only assert if we are writing to
+        // the target ns, otherwise skip these asserts.
+        if (targetNss != coll->ns()) {
+            return;
+        }
+
+        applyOpCalled->store(true);
         checkOpCtx(opCtx);
-        ASSERT_EQUALS(NamespaceString("test.t"), nss);
-        ASSERT(args.deletedDoc);
-        ASSERT_BSONOBJ_EQ(op.getObject(), *(args.deletedDoc));
-        return Status::OK();
+        ASSERT_BSONOBJ_EQ(op.getObject(), doc);
     };
 
     _opObserver->onUpdateFn = [&](OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
-        applyOpCalled = true;
+        // Other threads may be calling into the opObserver. Only assert if we are writing to
+        // the target ns, otherwise skip these asserts.
+        if (targetNss != args.coll->ns()) {
+            return;
+        }
+
+        applyOpCalled->store(true);
         checkOpCtx(opCtx);
-        ASSERT_EQUALS(NamespaceString("test.t"), args.nss);
-        return Status::OK();
     };
 
     ASSERT_EQ(_applyOplogEntryOrGroupedInsertsWrapper(
-                  _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+                  _opCtx.get(), ApplierOperation{&op}, OplogApplication::Mode::kSecondary),
               expectedError);
-    ASSERT_EQ(applyOpCalled, expectedApplyOpCalled);
+    ASSERT_EQ(applyOpCalled->load(), expectedApplyOpCalled);
 }
 
 Status failedApplyCommand(OperationContext* opCtx,
@@ -280,10 +350,10 @@ Status OplogApplierImplTest::runOpsSteadyState(std::vector<OplogEntry> ops) {
     TestApplyOplogGroupApplier oplogApplier(
         getConsistencyMarkers(),
         getStorageInterface(),
-        repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary));
-    std::vector<const OplogEntry*> opsPtrs;
+        repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary, false));
+    std::vector<ApplierOperation> opsPtrs;
     for (auto& op : ops) {
-        opsPtrs.push_back(&op);
+        opsPtrs.emplace_back(&op);
     }
     WorkerMultikeyPathInfo pathInfo;
     const bool dataIsConsistent = true;
@@ -298,7 +368,7 @@ Status OplogApplierImplTest::runOpInitialSync(const OplogEntry& op) {
 Status OplogApplierImplTest::runOpsInitialSync(std::vector<OplogEntry> ops) {
     NoopOplogApplierObserver observer;
     auto storageInterface = getStorageInterface();
-    auto writerPool = makeReplWriterPool();
+    auto workerPool = makeReplWorkerPool();
     OplogApplierImpl oplogApplier(
         nullptr,  // executor
         nullptr,  // oplogBuffer
@@ -307,7 +377,7 @@ Status OplogApplierImplTest::runOpsInitialSync(std::vector<OplogEntry> ops) {
         getConsistencyMarkers(),
         storageInterface,
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kInitialSync),
-        writerPool.get());
+        workerPool.get());
     // Idempotency tests apply the same batch of oplog entries multiple times in a loop, which would
     // result in out-of-order oplog inserts. So we truncate the oplog collection first before
     // calling applyOplogBatch.
@@ -353,8 +423,7 @@ void checkTxnTable(OperationContext* opCtx,
                                  BSON(SessionTxnRecord::kSessionIdFieldName << lsid.toBSON()));
     ASSERT_FALSE(result.isEmpty());
 
-    auto txnRecord =
-        SessionTxnRecord::parse(IDLParserErrorContext("parse txn record for test"), result);
+    auto txnRecord = SessionTxnRecord::parse(IDLParserContext("parse txn record for test"), result);
 
     ASSERT_EQ(txnNum, txnRecord.getTxnNum());
     ASSERT_EQ(expectedOpTime, txnRecord.getLastWriteOpTime());
@@ -374,7 +443,7 @@ CollectionReader::CollectionReader(OperationContext* opCtx, const NamespaceStrin
     : _collToScan(opCtx, nss),
       _exec(InternalPlanner::collectionScan(opCtx,
                                             &_collToScan.getCollection(),
-                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                            PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                             InternalPlanner::FORWARD)) {}
 
 StatusWith<BSONObj> CollectionReader::next() {
@@ -383,7 +452,8 @@ StatusWith<BSONObj> CollectionReader::next() {
     auto state = _exec->getNext(&obj, nullptr);
     if (state == PlanExecutor::IS_EOF) {
         return {ErrorCodes::CollectionIsEmpty,
-                str::stream() << "no more documents in " << _collToScan.getNss()};
+                str::stream() << "no more documents in "
+                              << _collToScan.getNss().toStringForErrorMsg()};
     }
 
     // PlanExecutors that do not yield should only return ADVANCED or EOF.
@@ -415,26 +485,28 @@ OplogEntry makeOplogEntry(OpTime opTime,
                           const boost::optional<UUID>& uuid,
                           BSONObj o,
                           boost::optional<BSONObj> o2,
-                          boost::optional<bool> fromMigrate) {
+                          boost::optional<bool> fromMigrate,
+                          OperationSessionInfo sessionInfo,
+                          boost::optional<RetryImageEnum> needsRetryImage) {
     return {DurableOplogEntry(opTime,                     // optime
-                              boost::none,                // hash
                               opType,                     // opType
-                              std::move(nss),             // namespace
+                              nss,                        // namespace
                               uuid,                       // uuid
                               fromMigrate,                // fromMigrate
+                              boost::none,                // checkExistenceForDiffInsert
                               OplogEntry::kOplogVersion,  // version
                               o,                          // o
                               o2,                         // o2
-                              {},                         // sessionInfo
+                              sessionInfo,                // sessionInfo
                               boost::none,                // upsert
                               Date_t(),                   // wall clock time
                               {},                         // statement ids
-                              boost::none,    // optime of previous write within same transaction
-                              boost::none,    // pre-image optime
-                              boost::none,    // post-image optime
-                              boost::none,    // ShardId of resharding recipient
-                              boost::none,    // _id
-                              boost::none)};  // needsRetryImage
+                              boost::none,  // optime of previous write within same transaction
+                              boost::none,  // pre-image optime
+                              boost::none,  // post-image optime
+                              boost::none,  // ShardId of resharding recipient
+                              boost::none,  // _id
+                              needsRetryImage)};  // needsRetryImage
 }
 
 OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, boost::optional<UUID> uuid) {
@@ -449,20 +521,20 @@ CollectionOptions createOplogCollectionOptions() {
     return options;
 }
 
-CollectionOptions createRecordPreImageCollectionOptions() {
+CollectionOptions createRecordChangeStreamPreAndPostImagesCollectionOptions() {
     CollectionOptions options;
-    options.recordPreImages = true;
+    options.changeStreamPreAndPostImagesOptions.setEnabled(true);
     return options;
 }
 
 void createCollection(OperationContext* opCtx,
                       const NamespaceString& nss,
                       const CollectionOptions& options) {
-    writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
+    writeConflictRetry(opCtx, "createCollection", nss, [&] {
         Lock::DBLock dbLk(opCtx, nss.dbName(), MODE_IX);
         Lock::CollectionLock collLk(opCtx, nss, MODE_X);
 
-        OldClientContext ctx(opCtx, nss.ns());
+        OldClientContext ctx(opCtx, nss);
         auto db = ctx.db();
         ASSERT_TRUE(db);
 
@@ -477,21 +549,21 @@ UUID createCollectionWithUuid(OperationContext* opCtx, const NamespaceString& ns
     CollectionOptions options;
     options.uuid = UUID::gen();
     createCollection(opCtx, nss, options);
-    return options.uuid.get();
+    return options.uuid.value();
 }
 
 void createDatabase(OperationContext* opCtx, StringData dbName) {
     Lock::GlobalWrite globalLock(opCtx);
     bool justCreated;
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    const DatabaseName tenantDbName(boost::none, dbName);
+    const DatabaseName tenantDbName = DatabaseName::createDatabaseName_forTest(boost::none, dbName);
     auto db = databaseHolder->openDb(opCtx, tenantDbName, &justCreated);
     ASSERT_TRUE(db);
     ASSERT_TRUE(justCreated);
 }
 
 bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
-    return AutoGetCollectionForRead(opCtx, nss).getCollection() != nullptr;
+    return static_cast<bool>(AutoGetCollectionForRead(opCtx, nss).getCollection());
 }
 
 void createIndex(OperationContext* opCtx,
@@ -501,6 +573,10 @@ void createIndex(OperationContext* opCtx,
     Lock::DBLock dbLk(opCtx, nss.dbName(), MODE_IX);
     Lock::CollectionLock collLk(opCtx, nss, MODE_X);
     auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
+    // This fixture sets up some replication, but notably omits installing an OpObserverImpl. This
+    // state causes collection creation to timestamp catalog writes, but secondary index creation
+    // does not. We use an UnreplicatedWritesBlock to avoid timestamping any of the catalog setup.
+    repl::UnreplicatedWritesBlock noRep(opCtx);
     indexBuildsCoord->createIndex(
         opCtx, collUUID, spec, IndexBuildsManager::IndexConstraints::kEnforce, false);
 }

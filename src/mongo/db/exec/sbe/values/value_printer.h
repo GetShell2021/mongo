@@ -29,10 +29,14 @@
 
 #pragma once
 
+#include <cstddef>
 #include <ostream>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/exec/sbe/util/print_options.h"
 #include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/platform/basic.h"
 #include "mongo/util/str.h"
 
@@ -64,13 +68,16 @@ class ValuePrinter {
 
 public:
     void writeTagToStream(TypeTags tag);
-    void writeStringDataToStream(StringData sd, bool isJavaScript = false);
+    void writeStringDataToStream(StringData sd, bool addQuotes = true);
     void writeArrayToStream(TypeTags tag, Value val, size_t depth = 1);
+    void writeSortedArraySetToStream(TypeTags tag, Value val, size_t depth = 1);
     void writeObjectToStream(TypeTags tag, Value val, size_t depth = 1);
+    void writeMultiMapToStream(TypeTags tag, Value val, size_t depth = 1);
     void writeObjectToStream(const BSONObj& obj);
     void writeObjectIdToStream(TypeTags tag, Value val);
     void writeCollatorToStream(const CollatorInterface* collator);
     void writeBsonRegexToStream(const BsonRegex& regex);
+    void writeNormalizedDouble(double value);
     void writeValueToStream(TypeTags tag, Value val, size_t depth = 1);
 
 public:

@@ -95,24 +95,24 @@ class test_backup10(backup_base):
         self.assertFalse(log4 in dup_set)
 
         # Test a few error cases now.
-        # - We cannot make multiple duplcate backup cursors.
+        # - We cannot make multiple duplicate backup cursors.
         # - We cannot duplicate the duplicate backup cursor.
         # - We must use the log target.
         msg = "/already a duplicate backup cursor open/"
         # Test multiple duplicate backup cursors.
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda:self.assertEquals(self.session.open_cursor(None,
+            lambda:self.assertEqual(self.session.open_cursor(None,
             bkup_c, config), 0), msg)
         # Test duplicate of duplicate backup cursor.
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda:self.assertEquals(self.session.open_cursor(None,
+            lambda:self.assertEqual(self.session.open_cursor(None,
             dupc, config), 0), msg)
         dupc.close()
 
         # Test we must use the log target.
         msg = "/must be for /"
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda:self.assertEquals(self.session.open_cursor(None,
+            lambda:self.assertEqual(self.session.open_cursor(None,
             bkup_c, None), 0), msg)
 
         bkup_c.close()
@@ -120,6 +120,3 @@ class test_backup10(backup_base):
         # After the full backup, open and recover the backup database.
         backup_conn = self.wiredtiger_open(self.dir)
         backup_conn.close()
-
-if __name__ == '__main__':
-    wttest.run()

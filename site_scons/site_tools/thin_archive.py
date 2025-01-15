@@ -20,14 +20,14 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 
-import SCons
-
 import re
 import subprocess
 
+import SCons
+
 
 def exists(env):
-    if not "AR" in env:
+    if "AR" not in env:
         return False
 
     ar = env.subst(env["AR"])
@@ -36,7 +36,7 @@ def exists(env):
 
     # If the user has done anything confusing with ARFLAGS, bail out. We want to find
     # an item in ARFLAGS of the exact form 'rc'.
-    if not "rc" in env["ARFLAGS"]:
+    if "rc" not in env["ARFLAGS"]:
         return False
 
     pipe = SCons.Action._subproc(
@@ -102,7 +102,8 @@ def generate(env):
         return
 
     env["ARFLAGS"] = SCons.Util.CLVar(
-        [arflag if arflag != "rc" else "rcsTD" for arflag in env["ARFLAGS"]])
+        [arflag if arflag != "rc" else "rcsTD" for arflag in env["ARFLAGS"]]
+    )
 
     # Disable running ranlib, since we added 's' above
     env["RANLIBCOM"] = ""

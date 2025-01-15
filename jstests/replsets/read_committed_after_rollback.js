@@ -6,10 +6,8 @@
  * @tags: [requires_majority_read_concern, requires_fcv_53]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 function doCommittedRead(coll) {
     var res = coll.runCommand('find', {"readConcern": {"level": "majority"}, "maxTimeMS": 10000});
@@ -25,8 +23,7 @@ function doDirtyRead(coll) {
 
 // Set up a set and grab things for later.
 var name = "read_committed_after_rollback";
-var replTest = new ReplSetTest(
-    {name: name, nodes: 5, useBridge: true, nodeOptions: {enableMajorityReadConcern: ''}});
+var replTest = new ReplSetTest({name: name, nodes: 5, useBridge: true});
 replTest.startSet({setParameter: {allowMultipleArbiters: true}});
 
 var nodes = replTest.nodeList();
@@ -44,7 +41,7 @@ var config = {
     ]
 };
 
-replTest.initiate(config);
+replTest.initiate(config, null, {initiateWithDefaultElectionTimeout: true});
 
 // Get connections.
 var oldPrimary = replTest.getPrimary();
@@ -62,6 +59,7 @@ var newPrimaryColl = newPrimary.getCollection(collName);
 // Set up initial state.
 assert.commandWorked(oldPrimaryColl.insert({_id: 1, state: 'old'},
                                            {writeConcern: {w: 'majority', wtimeout: 30000}}));
+replTest.awaitReplication();
 assert.eq(doDirtyRead(oldPrimaryColl), 'old');
 assert.eq(doCommittedRead(oldPrimaryColl), 'old');
 assert.eq(doDirtyRead(newPrimaryColl), 'old');
@@ -125,16 +123,15 @@ restartServerReplication(pureSecondary);
 // Do a write to the new primary so that the old primary can establish a sync source to learn
 // about the new commit.
 assert.commandWorked(newPrimary.getDB(name).unrelatedCollection.insert(
-    {a: 1}, {writeConcern: {w: 'majority', wtimeout: replTest.kDefaultTimeoutMS}}));
+    {a: 1}, {writeConcern: {w: 'majority', wtimeout: replTest.timeoutMS}}));
 assert.eq(doCommittedRead(newPrimaryColl), 'new');
 // Do another write to the new primary so that the old primary can be sure to receive the
 // new committed optime.
 assert.commandWorked(newPrimary.getDB(name).unrelatedCollection.insert(
-    {a: 2}, {writeConcern: {w: 'majority', wtimeout: replTest.kDefaultTimeoutMS}}));
+    {a: 2}, {writeConcern: {w: 'majority', wtimeout: replTest.timeoutMS}}));
 assert.eq(doCommittedRead(oldPrimaryColl), 'new');
 
 // Verify data consistency between nodes.
 replTest.checkReplicatedDataHashes();
 replTest.checkOplogs();
 replTest.stopSet();
-}());

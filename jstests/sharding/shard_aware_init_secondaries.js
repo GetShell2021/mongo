@@ -4,15 +4,15 @@
  * @tags: [requires_persistence]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 1});
 
 var replTest = new ReplSetTest({nodes: 2});
 replTest.startSet({shardsvr: ''});
 var nodeList = replTest.nodeList();
-replTest.initiateWithHighElectionTimeout({
+replTest.initiate({
     _id: replTest.name,
     members: [{_id: 0, host: nodeList[0], priority: 1}, {_id: 1, host: nodeList[1], priority: 0}]
 });
@@ -69,4 +69,3 @@ assert.soon(() => shardIdentityDoc.configsvrConnectionString ==
 replTest.stopSet();
 
 st.stop();
-})();

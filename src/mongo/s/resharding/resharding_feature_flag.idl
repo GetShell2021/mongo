@@ -32,19 +32,64 @@ global:
     cpp_namespace: "mongo::resharding"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 feature_flags:
-    featureFlagResharding:
-        description: When enabled, allows users to reshard their sharded collections.
-        cpp_varname: gFeatureFlagResharding
+    featureFlagReshardingImprovements:
+        description: "Feature flag for applying improvements on resharding to make it faster and
+        support same-key resharding."
+        cpp_varname: gFeatureFlagReshardingImprovements
         default: true
-        version: 5.0
-
-    featureFlagRecoverableShardsvrReshardCollectionCoordinator:
-        description: When enabled, the db primary shard will use a recoverable
-            ShardingDDLCoordinator that ensures proper serialization of resharding and other DDL
-            operations even in the event of primary shard stepdowns.
-        cpp_varname: gFeatureFlagRecoverableShardsvrReshardCollectionCoordinator
+        version: 7.2
+        shouldBeFCVGated: true
+    featureFlagMoveCollection:
+        description: "Feature flag for implementing online move collection."
+        cpp_varname: gFeatureFlagMoveCollection
         default: true
-        version: 5.3
+        version: 8.0
+        shouldBeFCVGated: true
+    featureFlagUnshardCollection:
+        description: "Feature flag for implementing unshard collection."
+        cpp_varname: gFeatureFlagUnshardCollection
+        default: true
+        version: 8.0
+        shouldBeFCVGated: true
+    featureFlagReshardingForTimeseries:
+        description: "Feature flag for enabling resharding a timeseries collection."
+        cpp_varname: gFeatureFlagReshardingForTimeseries
+        default: true
+        version: 8.0
+        shouldBeFCVGated: true
+    featureFlagRelaxedMode:
+        description: "Feature flag for implmenting relaxed resharding mode."
+        cpp_varname: gFeatureFlagReshardingRelaxedMode
+        default: true
+        version: 8.1
+        shouldBeFCVGated: true
+    featureFlagReshardingSkipCloningAndApplyingIfApplicable:
+        description: "Feature flag to make recipient shards that are not going to own any chunks for
+                      the collection after resharding only clone the options and indexes for the
+                      collection (i.e. skip cloning the documents and fetch/apply the oplog entries
+                      for it). Currently, only the primary shard can be such a recipient shard."
+        cpp_varname: gFeatureFlagReshardingSkipCloningAndApplyingIfApplicable
+        default: false
+        shouldBeFCVGated: true
+    featureFlagReshardingStoreOplogFetcherProgress:
+        description: "Feature flag to make recipient shards store the count of oplog entries fetched
+                      in a progress document and use this count instead of the fast count to recover
+                      metrics upon recovery."
+        cpp_varname: gFeatureFlagReshardingStoreOplogFetcherProgress
+        default: false
+        shouldBeFCVGated: true
+    featureFlagReshardingNumSamplesPerChunk:
+        description: "Feature flag for adding numSamplesPerChunk as a field in reshardCollection."
+        cpp_varname: gfeatureFlagReshardingNumSamplesPerChunk
+        default: true
+        version: 8.1
+        shouldBeFCVGated: true
+    featureFlagReshardingVerification:
+        description: "Feature flag to enable data loss and consistency verification steps during
+                      resharding to ensure correctness."
+        cpp_varname: gFeatureFlagReshardingVerification
+        default: false
+        shouldBeFCVGated: true

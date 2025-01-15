@@ -28,10 +28,16 @@
  */
 
 #include "mongo/db/pipeline/window_function/window_function_covariance.h"
-#include "mongo/db/pipeline/window_function/window_function_sum.h"
 
-#include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/expression.h"
+#include <limits>
+#include <vector>
+
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/expression/evaluate.h"
+#include "mongo/db/pipeline/window_function/window_function_sum.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -47,7 +53,7 @@ bool validateValue(const Value& val) {
 Value convertNonFiniteInputValue(Value value) {
     int posCnt = 0, negCnt = 0, nanCnt = 0;
     bool isDecimal = false;
-    for (auto val : value.getArray()) {
+    for (const auto& val : value.getArray()) {
         if (val.isNaN()) {
             nanCnt++;
         } else if (val.getType() == NumberDecimal) {
@@ -80,10 +86,10 @@ Value convertNonFiniteInputValue(Value value) {
 
 WindowFunctionCovariance::WindowFunctionCovariance(ExpressionContext* const expCtx, bool isSamp)
     : WindowFunctionState(expCtx), _isSamp(isSamp), _meanX(expCtx), _meanY(expCtx), _cXY(expCtx) {
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
 }
 
-Value WindowFunctionCovariance::getValue() const {
+Value WindowFunctionCovariance::getValue(boost::optional<Value> current) const {
     if (_count == 1 && !_isSamp)
         return Value(0.0);
 
@@ -93,7 +99,7 @@ Value WindowFunctionCovariance::getValue() const {
 
     auto output = _cXY.getValue();
     if (output.getType() == NumberDecimal) {
-        output = uassertStatusOK(ExpressionDivide::apply(output, Value(adjustedCount)));
+        output = uassertStatusOK(exec::expression::evaluateDivide(output, Value(adjustedCount)));
     } else if (output.numeric()) {
         output = Value(output.coerceToDouble() / adjustedCount);
     }
@@ -119,11 +125,11 @@ void WindowFunctionCovariance::add(Value value) {
     // Update covariance and means.
     // This is an implementation of the following algorithm:
     // https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online
-    auto deltaX = uassertStatusOK(ExpressionSubtract::apply(arr[0], _meanX.getValue()));
+    auto deltaX = uassertStatusOK(exec::expression::evaluateSubtract(arr[0], _meanX.getValue()));
     _meanX.add(arr[0]);
     _meanY.add(arr[1]);
-    auto deltaY = uassertStatusOK(ExpressionSubtract::apply(arr[1], _meanY.getValue()));
-    auto deltaCXY = uassertStatusOK(ExpressionMultiply::apply(deltaX, deltaY));
+    auto deltaY = uassertStatusOK(exec::expression::evaluateSubtract(arr[1], _meanY.getValue()));
+    auto deltaCXY = uassertStatusOK(exec::expression::evaluateMultiply(deltaX, deltaY));
     _cXY.add(deltaCXY);
 }
 
@@ -147,9 +153,9 @@ void WindowFunctionCovariance::remove(Value value) {
     }
 
     _meanX.remove(arr[0]);
-    auto deltaX = uassertStatusOK(ExpressionSubtract::apply(arr[0], _meanX.getValue()));
-    auto deltaY = uassertStatusOK(ExpressionSubtract::apply(arr[1], _meanY.getValue()));
-    auto deltaCXY = uassertStatusOK(ExpressionMultiply::apply(deltaX, deltaY));
+    auto deltaX = uassertStatusOK(exec::expression::evaluateSubtract(arr[0], _meanX.getValue()));
+    auto deltaY = uassertStatusOK(exec::expression::evaluateSubtract(arr[1], _meanY.getValue()));
+    auto deltaCXY = uassertStatusOK(exec::expression::evaluateMultiply(deltaX, deltaY));
     _cXY.remove(deltaCXY);
     _meanY.remove(arr[1]);
 }

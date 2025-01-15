@@ -4,8 +4,7 @@
  * @tags: [requires_replication]
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rs = new ReplSetTest({nodes: 2});
 rs.startSet();
@@ -96,4 +95,3 @@ invalidArgAndError.forEach(
     argAndError => assert.throwsWithCode(() => benchRun(argAndError.benchArg), argAndError.error));
 
 rs.stopSet();
-})();

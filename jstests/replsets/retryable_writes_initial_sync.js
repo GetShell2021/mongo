@@ -5,10 +5,7 @@
  * This setParameter behavior does not yet exist on earlier versions.
  * @tags: [multiversion_incompatible]
  */
-(function() {
-'use strict';
-
-load('jstests/replsets/rslib.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // A secondary cannot compute retryable images during initial sync. Thus we skip db hash checks as
 // its expected for config.image_collection to not match.
@@ -17,7 +14,7 @@ TestData.skipCheckDBHashes = true;
 // Start a single node replica set.
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const dbName = jsTest.name();
 const primary = rst.getPrimary();
@@ -81,7 +78,7 @@ jsTestLog({
 jsTestLog("Resuming initial sync.");
 assert.commandWorked(
     node1.adminCommand({configureFailPoint: "initialSyncHangAfterDataCloning", mode: 'off'}));
-rst.waitForState(node1, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [node1]);
 
 let initialSyncedNode = rst.getSecondary();
 rst.stepUp(initialSyncedNode);
@@ -130,4 +127,3 @@ assert.eq(2,
               {invalidatedReason: "initial sync"}));
 
 rst.stopSet();
-}());

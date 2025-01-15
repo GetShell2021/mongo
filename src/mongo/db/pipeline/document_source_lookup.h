@@ -29,16 +29,54 @@
 
 #pragma once
 
+#include <absl/container/node_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstddef>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_sequential_document_cache.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/lookup_set_cache.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/sequential_document_cache.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -55,15 +93,6 @@ public:
     static constexpr StringData kPipelineField = "pipeline"_sd;
     static constexpr StringData kAsField = "as"_sd;
 
-    struct LetVariable {
-        LetVariable(std::string name, boost::intrusive_ptr<Expression> expression, Variables::Id id)
-            : name(std::move(name)), expression(std::move(expression)), id(id) {}
-
-        std::string name;
-        boost::intrusive_ptr<Expression> expression;
-        Variables::Id id;
-    };
-
     class LiteParsed final : public LiteParsedDocumentSourceNestedPipelines {
     public:
         static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
@@ -71,34 +100,27 @@ public:
 
         LiteParsed(std::string parseTimeName,
                    NamespaceString foreignNss,
-                   boost::optional<LiteParsedPipeline> pipeline,
-                   bool hasInternalCollation)
+                   boost::optional<LiteParsedPipeline> pipeline)
             : LiteParsedDocumentSourceNestedPipelines(
-                  std::move(parseTimeName), std::move(foreignNss), std::move(pipeline)),
-              _hasInternalCollation(hasInternalCollation) {}
+                  std::move(parseTimeName), std::move(foreignNss), std::move(pipeline)) {}
 
         /**
          * Lookup from a sharded collection may not be allowed.
          */
-        bool allowShardedForeignCollection(NamespaceString nss,
-                                           bool inMultiDocumentTransaction) const override final {
-            const bool foreignShardedAllowed = feature_flags::gFeatureFlagShardedLookup.isEnabled(
-                serverGlobalParams.featureCompatibility);
-            if (foreignShardedAllowed && !inMultiDocumentTransaction) {
-                return true;
+        Status checkShardedForeignCollAllowed(const NamespaceString& nss,
+                                              bool inMultiDocumentTransaction) const final {
+            const auto fcvSnapshot = serverGlobalParams.mutableFCV.acquireFCVSnapshot();
+            if (!inMultiDocumentTransaction ||
+                gFeatureFlagAllowAdditionalParticipants.isEnabled(fcvSnapshot)) {
+                return Status::OK();
             }
             auto involvedNss = getInvolvedNamespaces();
-            return (involvedNss.find(nss) == involvedNss.end());
-        }
-
-        void assertPermittedInAPIVersion(const APIParameters& apiParameters) const final {
-            if (apiParameters.getAPIVersion() && *apiParameters.getAPIVersion() == "1" &&
-                apiParameters.getAPIStrict().value_or(false)) {
-                uassert(
-                    ErrorCodes::APIStrictError,
-                    "The _internalCollation argument to $lookup is not supported in API Version 1",
-                    !_hasInternalCollation);
+            if (involvedNss.find(nss) == involvedNss.end()) {
+                return Status::OK();
             }
+
+            return Status(ErrorCodes::NamespaceCannotBeSharded,
+                          "Sharded $lookup is not allowed within a multi-document transaction");
         }
 
         void getForeignExecutionNamespaces(
@@ -112,10 +134,7 @@ public:
         }
 
         PrivilegeVector requiredPrivileges(bool isMongos,
-                                           bool bypassDocumentValidation) const override final;
-
-    private:
-        bool _hasInternalCollation = false;
+                                           bool bypassDocumentValidation) const final;
     };
 
     /**
@@ -125,9 +144,13 @@ public:
                          const boost::intrusive_ptr<ExpressionContext>&);
 
     const char* getSourceName() const final;
-    void serializeToArray(
-        std::vector<Value>& array,
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kLookUp;
+    }
+
+    void serializeToArray(std::vector<Value>& array,
+                          const SerializationOptions& opts = SerializationOptions{}) const final;
 
     /**
      * Returns the 'as' path, and possibly fields modified by an absorbed $unwind.
@@ -142,6 +165,8 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
     void addInvolvedCollections(stdx::unordered_set<NamespaceString>* collectionNames) const final;
@@ -149,6 +174,8 @@ public:
     void detachFromOperationContext() final;
 
     void reattachToOperationContext(OperationContext* opCtx) final;
+
+    bool validateOperationContext(const OperationContext* opCtx) const final;
 
     bool usedDisk() final;
 
@@ -167,6 +194,12 @@ public:
         static_cast<DocumentSourceLookUp*>(dsLookup.get())->reInitializeCache(maxCacheSizeBytes);
         return dsLookup;
     }
+
+    void resolvedPipelineHelper(
+        NamespaceString fromNs,
+        std::vector<BSONObj> pipeline,
+        boost::optional<std::pair<std::string, std::string>> localForeignFields,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
      * Builds the BSONObj used to query the foreign collection and wraps it in a $match.
@@ -242,27 +275,74 @@ public:
     }
 
     std::unique_ptr<Pipeline, PipelineDeleter> getSubPipeline_forTest(const Document& inputDoc) {
-        return buildPipeline(inputDoc);
+        return buildPipeline(_fromExpCtx, inputDoc);
     }
 
     boost::intrusive_ptr<DocumentSource> clone(
         const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const final;
 
-    bool sbeCompatible() const {
-        return _sbeCompatible;
+    SbeCompatibility sbeCompatibility() const {
+        return _sbeCompatibility;
     }
 
     const NamespaceString& getFromNs() const {
         return _fromNs;
     }
 
+    const boost::intrusive_ptr<DocumentSourceUnwind>& getUnwindSource() const {
+        return _unwindSrc;
+    }
+
+    const boost::optional<BSONObj>& getAdditionalFilter() const {
+        return _additionalFilter;
+    }
+
+    /*
+     * Indicates whether this $lookup stage has absorbed an immediately following $unwind stage that
+     * unwinds the lookup result array.
+     */
+    bool hasUnwindSrc() const {
+        return _unwindSrc ? true : false;
+    }
+
+    /**
+     * Builds the $lookup pipeline and resolves any variables using the passed 'inputDoc', adding a
+     * cursor and/or cache source as appropriate.
+     */
+    // TODO SERVER-84208: Refactor this method so as to clearly separate the logic for the streams
+    // engine from the logic for the classic $lookup..
+    template <bool isStreamsEngine = false>
+    PipelinePtr buildPipeline(const boost::intrusive_ptr<ExpressionContext>& fromExpCtx,
+                              const Document& inputDoc);
+
+    /**
+     * Rebuilds the _resolvedPipeline from the _resolvedIntrospectionPipeline. This is required for
+     * server rewrites for FLE2. The server rewrite code operates on DocumentSources of a parsed
+     * pipeline, which we obtain from DocumentSourceLookUp::_resolvedIntrospectionPipeline.
+     * However, we use _resolvedPipeline to execute each iteration of doGetNext(). This method is
+     * called exclusively from rewriteLookUp (server_rewrite.cpp) once the pipeline has been
+     * rewritten for FLE2.
+     */
+    void rebuildResolvedPipeline();
+
+    /**
+     * Returns the expression context associated with foreign collection namespace and/or
+     * sub-pipeline.
+     */
+    boost::intrusive_ptr<ExpressionContext> getSubpipelineExpCtx() {
+        return _fromExpCtx;
+    }
+
 protected:
     GetNextResult doGetNext() final;
     void doDispose() final;
+    boost::optional<ShardId> computeMergeShardId() const final;
 
     /**
-     * Attempts to combine with a subsequent $unwind stage, setting the internal '_unwindSrc'
-     * field.
+     * Attempts to combine with an immediately following $unwind stage that unwinds the $lookup's
+     * "as" field, setting the '_unwindSrc' member to the absorbed $unwind stage. If this is done
+     * it may also absorb one or more $match stages that immediately followed the $unwind, setting
+     * the resulting combined $match in the '_matchSrc' member.
      */
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
@@ -274,7 +354,6 @@ private:
      */
     DocumentSourceLookUp(NamespaceString fromNs,
                          std::string as,
-                         boost::optional<std::unique_ptr<CollatorInterface>> fromCollator,
                          const boost::intrusive_ptr<ExpressionContext>& expCtx);
     /**
      * Constructor used for a $lookup stage specified using the {from: ..., localField: ...,
@@ -284,7 +363,6 @@ private:
                          std::string as,
                          std::string localField,
                          std::string foreignField,
-                         boost::optional<std::unique_ptr<CollatorInterface>> fromCollator,
                          const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
@@ -296,17 +374,20 @@ private:
                          std::string as,
                          std::vector<BSONObj> pipeline,
                          BSONObj letVariables,
-                         boost::optional<std::unique_ptr<CollatorInterface>> fromCollator,
                          boost::optional<std::pair<std::string, std::string>> localForeignFields,
                          const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
      * Should not be called; use serializeToArray instead.
      */
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
-        MONGO_UNREACHABLE;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final {
+        MONGO_UNREACHABLE_TASSERT(7484304);
     }
 
+    /**
+     * Delegate of doGetNext() in the case where an $unwind stage has been absorbed into _unwindSrc.
+     * This returns the next record resulting from unwinding the lookup's "as" field.
+     */
     GetNextResult unwindResult();
 
     /**
@@ -326,14 +407,7 @@ private:
      * 'foreign' join.
      */
     std::unique_ptr<Pipeline, PipelineDeleter> buildPipelineFromViewDefinition(
-        std::vector<BSONObj> serializedPipeline,
-        ExpressionContext::ResolvedNamespace resolvedNamespace);
-
-    /**
-     * Builds the $lookup pipeline and resolves any variables using the passed 'inputDoc', adding a
-     * cursor and/or cache source as appropriate.
-     */
-    std::unique_ptr<Pipeline, PipelineDeleter> buildPipeline(const Document& inputDoc);
+        std::vector<BSONObj> serializedPipeline, ResolvedNamespace resolvedNamespace);
 
     /**
      * Reinitialize the cache with a new max size. May only be called if this DSLookup was created
@@ -359,21 +433,34 @@ private:
     void appendSpecificExecStats(MutableDocument& doc) const;
 
     /**
-     * Returns true if 'featureFlagShardedLookup' is enabled and we are not in a transaction.
+     * Returns true if we are not in a transaction.
      */
     bool foreignShardedLookupAllowed() const;
 
     /**
-     * Checks conditions necessary for SBE compatibility and sets _sbeCompatible flag. Note: when
-     * optimizing the pipeline the flag might be modified.
+     * Checks conditions necessary for SBE compatibility and sets '_sbeCompatibility' enum. Note:
+     * when optimizing the pipeline the flag might be modified.
      */
     void determineSbeCompatibility();
+
+    /**
+     * Sets '_sbeCompatibility' enum to 'maxCompatibility' iff that *reduces* the compatibility.
+     */
+    inline void downgradeSbeCompatibility(SbeCompatibility maxCompatibility) {
+        if (maxCompatibility < _sbeCompatibility) {
+            _sbeCompatibility = maxCompatibility;
+        }
+    }
 
     DocumentSourceLookupStats _stats;
 
     NamespaceString _fromNs;
     NamespaceString _resolvedNs;
+    bool _fromNsIsAView;
+
+    // Path to the "as" field of the $lookup where the matches output array will be created.
     FieldPath _as;
+
     boost::optional<BSONObj> _additionalFilter;
 
     // For use when $lookup is specified with localField/foreignField syntax.
@@ -398,14 +485,8 @@ private:
     // namespace.
     boost::intrusive_ptr<ExpressionContext> _fromExpCtx;
 
-    // When a `_internalCollation` has been specified on a $lookup stage, we will set that collation
-    // on `_fromExpCtx`. An explicit simple collation however is represented in the same way as the
-    // default binary collation. We need to differentiate between the two to avoid serializing the
-    // collation when not set explicitly.
-    bool _hasExplicitCollation = false;
-
     // Can this $lookup be pushed down into SBE?
-    bool _sbeCompatible = false;
+    SbeCompatibility _sbeCompatibility = SbeCompatibility::notCompatible;
 
     // The aggregation pipeline to perform against the '_resolvedNs' namespace. Referenced view
     // namespaces have been resolved.
@@ -417,6 +498,8 @@ private:
     // functions. If sub-$lookup stages are present, their pipelines are constructed recursively.
     std::unique_ptr<Pipeline, PipelineDeleter> _resolvedIntrospectionPipeline;
 
+    // Holds 'let' variables defined in $lookup stage. 'let' variables are stored in the vector in
+    // order to ensure the stability in the query shape serialization.
     std::vector<LetVariable> _letVariables;
 
     boost::intrusive_ptr<DocumentSourceMatch> _matchSrc;
@@ -425,9 +508,9 @@ private:
     // The following members are used to hold onto state across getNext() calls when '_unwindSrc' is
     // not null.
     long long _cursorIndex = 0;
-    std::unique_ptr<Pipeline, PipelineDeleter> _pipeline;
+    PipelinePtr _pipeline;
     boost::optional<Document> _input;
     boost::optional<Document> _nextValue;
-};
+};  // class DocumentSourceLookUp
 
 }  // namespace mongo

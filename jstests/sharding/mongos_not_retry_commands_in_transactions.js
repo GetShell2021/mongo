@@ -1,10 +1,11 @@
 /**
  * Tests that mongos doesn't retry commands with startTransaction=true.
  * @tags: [
+ *     # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *     embedded_router_incompatible,
  * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const setCommandToFail = (nodeConnection, command, namespace) => {
     return nodeConnection.adminCommand({
@@ -73,4 +74,3 @@ assert.commandWorked(mongosDB.runCommand(
     {insert: kCollName, documents: [kDoc1], txnNumber: NumberLong(transactionNumber++)}));
 
 st.stop();
-})();

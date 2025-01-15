@@ -28,52 +28,71 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <functional>
+#include <memory>
+#include <type_traits>
+#include <utility>
 
 #include "initial_syncer.h"
 
-#include <algorithm>
-#include <memory>
-#include <utility>
-
-#include "mongo/base/counter.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/fetcher.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_retry_scheduler.h"
-#include "mongo/db/commands/feature_compatibility_version_parser.h"
-#include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/client.h"
+#include "mongo/db/feature_compatibility_version_parser.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/all_database_cloner.h"
+#include "mongo/db/repl/collection_cloner.h"
+#include "mongo/db/repl/database_cloner.h"
 #include "mongo/db/repl/initial_sync_state.h"
 #include "mongo/db/repl/initial_syncer_common_stats.h"
 #include "mongo/db/repl/initial_syncer_factory.h"
-#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_applier_batcher.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_source_selector.h"
-#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
-#include "mongo/db/session_txn_record_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
-#include "mongo/rpc/metadata/repl_set_metadata.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
-#include "mongo/util/system_clock_source.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/version/releases.h"
@@ -83,12 +102,6 @@
 
 namespace mongo {
 namespace repl {
-
-// Failpoint for initial sync
-MONGO_FAIL_POINT_DEFINE(failInitialSyncWithBadHost);
-
-// Failpoint which fails initial sync and leaves an oplog entry in the buffer.
-MONGO_FAIL_POINT_DEFINE(failInitSyncWithBufferedEntriesLeft);
 
 // Failpoint which causes the initial sync function to hang after getting the oldest active
 // transaction timestamp from the sync source.
@@ -134,6 +147,9 @@ MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeChoosingSyncSource);
 // Failpoint which causes the initial sync function to hang after finishing.
 MONGO_FAIL_POINT_DEFINE(initialSyncHangAfterFinish);
 
+// Failpoint which causes the initial sync function to hang after resetting the in-memory FCV.
+MONGO_FAIL_POINT_DEFINE(initialSyncHangAfterResettingFCV);
+
 // Failpoints for synchronization, shared with cloners.
 extern FailPoint initialSyncFuzzerSynchronizationPoint1;
 extern FailPoint initialSyncFuzzerSynchronizationPoint2;
@@ -144,8 +160,8 @@ using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using Event = executor::TaskExecutor::EventHandle;
 using Handle = executor::TaskExecutor::CallbackHandle;
 using QueryResponseStatus = StatusWith<Fetcher::QueryResponse>;
-using UniqueLock = stdx::unique_lock<Latch>;
-using LockGuard = stdx::lock_guard<Latch>;
+using UniqueLock = stdx::unique_lock<stdx::mutex>;
+using LockGuard = stdx::lock_guard<stdx::mutex>;
 
 // Used to reset the oldest timestamp during initial sync to a non-null timestamp.
 const Timestamp kTimestampOne(0, 1);
@@ -194,13 +210,13 @@ ServiceContext::ConstructorActionRegisterer initialSyncerRegisterer(
             "logical",
             [](InitialSyncerInterface::Options opts,
                std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
-               ThreadPool* writerPool,
+               ThreadPool* workerPool,
                StorageInterface* storage,
                ReplicationProcess* replicationProcess,
                const InitialSyncerInterface::OnCompletionFn& onCompletion) {
                 return std::make_shared<InitialSyncer>(opts,
                                                        std::move(dataReplicatorExternalState),
-                                                       writerPool,
+                                                       workerPool,
                                                        storage,
                                                        replicationProcess,
                                                        onCompletion);
@@ -210,7 +226,7 @@ ServiceContext::ConstructorActionRegisterer initialSyncerRegisterer(
 InitialSyncer::InitialSyncer(
     InitialSyncerInterface::Options opts,
     std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
-    ThreadPool* writerPool,
+    ThreadPool* workerPool,
     StorageInterface* storage,
     ReplicationProcess* replicationProcess,
     const OnCompletionFn& onCompletion)
@@ -219,7 +235,7 @@ InitialSyncer::InitialSyncer(
       _dataReplicatorExternalState(std::move(dataReplicatorExternalState)),
       _exec(_dataReplicatorExternalState->getSharedTaskExecutor()),
       _clonerExec(_exec),
-      _writerPool(writerPool),
+      _workerPool(workerPool),
       _storage(storage),
       _replicationProcess(replicationProcess),
       _onCompletion(onCompletion),
@@ -244,11 +260,11 @@ InitialSyncer::~InitialSyncer() {
 }
 
 bool InitialSyncer::isActive() const {
-    stdx::lock_guard<Latch> lock(_mutex);
-    return _isActive_inlock();
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _isActive(lock);
 }
 
-bool InitialSyncer::_isActive_inlock() const {
+bool InitialSyncer::_isActive(WithLock lk) const {
     return State::kRunning == _state || State::kShuttingDown == _state;
 }
 
@@ -261,7 +277,7 @@ Status InitialSyncer::startup(OperationContext* opCtx,
     invariant(opCtx);
     invariant(initialSyncMaxAttempts >= 1U);
 
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     switch (_state) {
         case State::kPreStart:
             _state = State::kRunning;
@@ -274,7 +290,7 @@ Status InitialSyncer::startup(OperationContext* opCtx,
             return Status(ErrorCodes::ShutdownInProgress, "initial syncer completed");
     }
 
-    _setUp_inlock(opCtx, initialSyncMaxAttempts);
+    _setUp(lock, opCtx, initialSyncMaxAttempts);
 
     // Start first initial sync attempt.
     std::uint32_t initialSyncAttempt = 0;
@@ -282,8 +298,9 @@ Status InitialSyncer::startup(OperationContext* opCtx,
         _exec, Status(ErrorCodes::CallbackCanceled, "Initial Sync Attempt Canceled"));
     _clonerAttemptExec = std::make_unique<executor::ScopedTaskExecutor>(
         _clonerExec, Status(ErrorCodes::CallbackCanceled, "Initial Sync Attempt Canceled"));
-    auto status = _scheduleWorkAndSaveHandle_inlock(
-        [=](const executor::TaskExecutor::CallbackArgs& args) {
+    auto status = _scheduleWorkAndSaveHandle(
+        lock,
+        [=, this](const executor::TaskExecutor::CallbackArgs& args) {
             _startInitialSyncAttemptCallback(args, initialSyncAttempt, initialSyncMaxAttempts);
         },
         &_startInitialSyncAttemptHandle,
@@ -298,7 +315,7 @@ Status InitialSyncer::startup(OperationContext* opCtx,
 }
 
 Status InitialSyncer::shutdown() {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     switch (_state) {
         case State::kPreStart:
             // Transition directly from PreStart to Complete if not started yet.
@@ -313,19 +330,19 @@ Status InitialSyncer::shutdown() {
             return Status::OK();
     }
 
-    _cancelRemainingWork_inlock();
+    _cancelRemainingWork(lock);
 
     return Status::OK();
 }
 
 void InitialSyncer::cancelCurrentAttempt() {
     stdx::lock_guard lk(_mutex);
-    if (_isActive_inlock()) {
+    if (_isActive(lk)) {
         LOGV2_DEBUG(4427201,
                     1,
                     "Cancelling the current initial sync attempt.",
                     "currentAttempt"_attr = _stats.failedInitialSyncAttempts + 1);
-        _cancelRemainingWork_inlock();
+        _cancelRemainingWork(lk);
     } else {
         LOGV2_DEBUG(4427202,
                     1,
@@ -334,14 +351,14 @@ void InitialSyncer::cancelCurrentAttempt() {
     }
 }
 
-void InitialSyncer::_cancelRemainingWork_inlock() {
-    _cancelHandle_inlock(_startInitialSyncAttemptHandle);
-    _cancelHandle_inlock(_chooseSyncSourceHandle);
-    _cancelHandle_inlock(_getBaseRollbackIdHandle);
-    _cancelHandle_inlock(_getLastRollbackIdHandle);
-    _cancelHandle_inlock(_getNextApplierBatchHandle);
+void InitialSyncer::_cancelRemainingWork(WithLock lk) {
+    _cancelHandle(lk, _startInitialSyncAttemptHandle);
+    _cancelHandle(lk, _chooseSyncSourceHandle);
+    _cancelHandle(lk, _getBaseRollbackIdHandle);
+    _cancelHandle(lk, _getLastRollbackIdHandle);
+    _cancelHandle(lk, _getNextApplierBatchHandle);
 
-    _shutdownComponent_inlock(_oplogFetcher);
+    _shutdownComponent(lk, _oplogFetcher);
     if (_sharedData) {
         // We actually hold the required lock, but the lock object itself is not passed through.
         _clearRetriableError(WithLock::withoutLock());
@@ -352,32 +369,32 @@ void InitialSyncer::_cancelRemainingWork_inlock() {
     if (_client) {
         _client->shutdownAndDisallowReconnect();
     }
-    _shutdownComponent_inlock(_applier);
-    _shutdownComponent_inlock(_fCVFetcher);
-    _shutdownComponent_inlock(_lastOplogEntryFetcher);
-    _shutdownComponent_inlock(_beginFetchingOpTimeFetcher);
+    _shutdownComponent(lk, _applier);
+    _shutdownComponent(lk, _fCVFetcher);
+    _shutdownComponent(lk, _lastOplogEntryFetcher);
+    _shutdownComponent(lk, _beginFetchingOpTimeFetcher);
     (*_attemptExec)->shutdown();
     (*_clonerAttemptExec)->shutdown();
     _attemptCanceled = true;
 }
 
 void InitialSyncer::join() {
-    stdx::unique_lock<Latch> lk(_mutex);
-    _stateCondition.wait(lk, [this]() { return !_isActive_inlock(); });
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    _stateCondition.wait(lk, [&]() { return !_isActive(lk); });
 }
 
 InitialSyncer::State InitialSyncer::getState_forTest() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _state;
 }
 
 Date_t InitialSyncer::getWallClockTime_forTest() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _lastApplied.wallTime;
 }
 
 void InitialSyncer::setAllowedOutageDuration_forTest(Milliseconds allowedOutageDuration) {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _allowedOutageDuration = allowedOutageDuration;
     if (_sharedData) {
         stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
@@ -386,11 +403,11 @@ void InitialSyncer::setAllowedOutageDuration_forTest(Milliseconds allowedOutageD
 }
 
 bool InitialSyncer::_isShuttingDown() const {
-    stdx::lock_guard<Latch> lock(_mutex);
-    return _isShuttingDown_inlock();
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    return _isShuttingDown(lock);
 }
 
-bool InitialSyncer::_isShuttingDown_inlock() const {
+bool InitialSyncer::_isShuttingDown(WithLock lk) const {
     return State::kShuttingDown == _state;
 }
 
@@ -399,8 +416,8 @@ std::string InitialSyncer::getDiagnosticString() const {
     str::stream out;
     out << "InitialSyncer -"
         << " oplogFetcher: " << _oplogFetcher->toString()
-        << " opsBuffered: " << _oplogBuffer->getSize() << " active: " << _isActive_inlock()
-        << " shutting down: " << _isShuttingDown_inlock();
+        << " opsBuffered: " << _oplogBuffer->getSize() << " active: " << _isActive(lk)
+        << " shutting down: " << _isShuttingDown(lk);
     if (_initialSyncState) {
         out << " opsAppied: " << _initialSyncState->appliedOps;
     }
@@ -420,10 +437,10 @@ BSONObj InitialSyncer::getInitialSyncProgress() const {
     if (!_initialSyncState && initial_sync_common_stats::initialSyncCompletes.get() > 0) {
         return BSONObj();
     }
-    return _getInitialSyncProgress_inlock();
+    return _getInitialSyncProgress(lk);
 }
 
-void InitialSyncer::_appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob) const {
+void InitialSyncer::_appendInitialSyncProgressMinimal(WithLock lk, BSONObjBuilder* bob) const {
     bob->append("method", "logical");
     _stats.append(bob);
     if (!_initialSyncState) {
@@ -434,8 +451,8 @@ void InitialSyncer::_appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob
         const auto approxTotalDataSize = allDbClonerStats.dataSize;
         bob->appendNumber("approxTotalDataSize", approxTotalDataSize);
         long long approxTotalBytesCopied = 0;
-        for (auto dbClonerStats : allDbClonerStats.databaseStats) {
-            for (auto collClonerStats : dbClonerStats.collectionStats) {
+        for (auto&& dbClonerStats : allDbClonerStats.databaseStats) {
+            for (auto&& collClonerStats : dbClonerStats.collectionStats) {
                 approxTotalBytesCopied += collClonerStats.approxBytesCopied;
             }
         }
@@ -477,10 +494,10 @@ void InitialSyncer::_appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob
     }
 }
 
-BSONObj InitialSyncer::_getInitialSyncProgress_inlock() const {
+BSONObj InitialSyncer::_getInitialSyncProgress(WithLock lk) const {
     try {
         BSONObjBuilder bob;
-        _appendInitialSyncProgressMinimal_inlock(&bob);
+        _appendInitialSyncProgressMinimal(lk, &bob);
         if (_initialSyncState) {
             if (_initialSyncState->allDatabaseCloner) {
                 BSONObjBuilder dbsBuilder(bob.subobjStart("databases"));
@@ -490,13 +507,10 @@ BSONObj InitialSyncer::_getInitialSyncProgress_inlock() const {
         }
         return bob.obj();
     } catch (const DBException& e) {
-        LOGV2(21161,
-              "Error creating initial sync progress object: {error}",
-              "Error creating initial sync progress object",
-              "error"_attr = e.toString());
+        LOGV2(21161, "Error creating initial sync progress object", "error"_attr = e.toString());
     }
     BSONObjBuilder bob;
-    _appendInitialSyncProgressMinimal_inlock(&bob);
+    _appendInitialSyncProgressMinimal(lk, &bob);
     return bob.obj();
 }
 
@@ -534,14 +548,16 @@ void InitialSyncer::waitForCloner_forTest() {
     _initialSyncState->allDatabaseClonerFuture.wait();
 }
 
-void InitialSyncer::_setUp_inlock(OperationContext* opCtx, std::uint32_t initialSyncMaxAttempts) {
+void InitialSyncer::_setUp(WithLock lk,
+                           OperationContext* opCtx,
+                           std::uint32_t initialSyncMaxAttempts) {
     // 'opCtx' is passed through from startup().
     _replicationProcess->getConsistencyMarkers()->setInitialSyncFlag(opCtx);
     _replicationProcess->getConsistencyMarkers()->clearInitialSyncId(opCtx);
 
     auto serviceCtx = opCtx->getServiceContext();
     _storage->setInitialDataTimestamp(serviceCtx, Timestamp::kAllowUnstableCheckpointsSentinel);
-    _storage->setStableTimestamp(serviceCtx, Timestamp::min());
+    invariant(serviceCtx->getStorageEngine()->getStableTimestamp().isNull());
 
     LOGV2_DEBUG(21162, 1, "Creating oplogBuffer");
     _oplogBuffer = _dataReplicatorExternalState->makeInitialSyncOplogBuffer(opCtx);
@@ -550,12 +566,14 @@ void InitialSyncer::_setUp_inlock(OperationContext* opCtx, std::uint32_t initial
     _stats.initialSyncStart = _exec->now();
     _stats.maxFailedInitialSyncAttempts = initialSyncMaxAttempts;
     _stats.failedInitialSyncAttempts = 0;
+    _stats.exec = std::weak_ptr<executor::TaskExecutor>(_exec);
 
     _allowedOutageDuration = Seconds(initialSyncTransientErrorRetryPeriodSeconds.load());
 }
 
-void InitialSyncer::_tearDown_inlock(OperationContext* opCtx,
-                                     const StatusWith<OpTimeAndWallTime>& lastApplied) {
+void InitialSyncer::_tearDown(WithLock lk,
+                              OperationContext* opCtx,
+                              const StatusWith<OpTimeAndWallTime>& lastApplied) {
     _stats.initialSyncEnd = _exec->now();
 
     // This might not be necessary if we failed initial sync.
@@ -575,7 +593,6 @@ void InitialSyncer::_tearDown_inlock(OperationContext* opCtx,
     const bool orderedCommit = true;
     _storage->oplogDiskLocRegister(opCtx, initialDataTimestamp, orderedCommit);
 
-    tenant_migration_access_blocker::recoverTenantMigrationAccessBlockers(opCtx);
     reconstructPreparedTransactions(opCtx, repl::OplogApplication::Mode::kInitialSync);
 
     _replicationProcess->getConsistencyMarkers()->setInitialSyncIdIfNotSet(opCtx);
@@ -594,8 +611,6 @@ void InitialSyncer::_tearDown_inlock(OperationContext* opCtx,
     }
 
     LOGV2(21163,
-          "initial sync done; took "
-          "{duration}.",
           "Initial sync done",
           "duration"_attr =
               duration_cast<Seconds>(_stats.initialSyncEnd - _stats.initialSyncStart));
@@ -607,8 +622,9 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
     std::uint32_t initialSyncAttempt,
     std::uint32_t initialSyncMaxAttempts) noexcept {
     auto status = [&] {
-        stdx::lock_guard<Latch> lock(_mutex);
-        return _checkForShutdownAndConvertStatus_inlock(
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        return _checkForShutdownAndConvertStatus(
+            lock,
             callbackArgs,
             str::stream() << "error while starting initial sync attempt "
                           << (initialSyncAttempt + 1) << " of " << initialSyncMaxAttempts);
@@ -620,22 +636,23 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
     }
 
     LOGV2(21164,
-          "Starting initial sync (attempt {initialSyncAttempt} of {initialSyncMaxAttempts})",
           "Starting initial sync attempt",
           "initialSyncAttempt"_attr = (initialSyncAttempt + 1),
           "initialSyncMaxAttempts"_attr = initialSyncMaxAttempts);
 
     // This completion guard invokes _finishInitialSyncAttempt on destruction.
-    auto cancelRemainingWorkInLock = [this]() { _cancelRemainingWork_inlock(); };
+    auto cancelRemainingWork = [this](WithLock lk) {
+        _cancelRemainingWork(lk);
+    };
     auto finishInitialSyncAttemptFn = [this](const StatusWith<OpTimeAndWallTime>& lastApplied) {
         _finishInitialSyncAttempt(lastApplied);
     };
     auto onCompletionGuard =
-        std::make_shared<OnCompletionGuard>(cancelRemainingWorkInLock, finishInitialSyncAttemptFn);
+        std::make_shared<OnCompletionGuard>(cancelRemainingWork, finishInitialSyncAttemptFn);
 
     // Lock guard must be declared after completion guard because completion guard destructor
     // has to run outside lock.
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
 
     _oplogApplier = {};
 
@@ -656,7 +673,9 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
         // since that would also set the all_durable point to zero. We specifically don't set
         // the stable timestamp here because that will trigger taking a first stable checkpoint even
         // though the initialDataTimestamp is still set to kAllowUnstableCheckpointsSentinel.
-        storageEngine->setOldestTimestamp(kTimestampOne);
+        // We need to use force in case we are resetting the oldest timestamp backwards after a
+        // failed initial sync attempt.
+        storageEngine->setOldestTimestamp(kTimestampOne, true /*force*/);
     }
 
     LOGV2_DEBUG(21168,
@@ -664,7 +683,12 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
                 "Resetting feature compatibility version to last-lts. If the sync source is in "
                 "latest feature compatibility version, we will find out when we clone the "
                 "server configuration collection (admin.system.version)");
-    serverGlobalParams.mutableFeatureCompatibility.reset();
+    serverGlobalParams.mutableFCV.reset();
+
+    if (MONGO_unlikely(initialSyncHangAfterResettingFCV.shouldFail())) {
+        LOGV2(8206400, "initialSyncHangAfterResettingFCV fail point enabled");
+        initialSyncHangAfterResettingFCV.pauseWhileSet();
+    }
 
     // Clear the oplog buffer.
     _oplogBuffer->clear(makeOpCtx().get());
@@ -674,16 +698,17 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
     std::uint32_t chooseSyncSourceMaxAttempts =
         static_cast<std::uint32_t>(numInitialSyncConnectAttempts.load());
 
-    // _scheduleWorkAndSaveHandle_inlock() is shutdown-aware.
-    status = _scheduleWorkAndSaveHandle_inlock(
-        [=](const executor::TaskExecutor::CallbackArgs& args) {
+    // _scheduleWorkAndSaveHandle() is shutdown-aware.
+    status = _scheduleWorkAndSaveHandle(
+        lock,
+        [=, this](const executor::TaskExecutor::CallbackArgs& args) {
             _chooseSyncSourceCallback(
                 args, chooseSyncSourceAttempt, chooseSyncSourceMaxAttempts, onCompletionGuard);
         },
         &_chooseSyncSourceHandle,
         str::stream() << "_chooseSyncSourceCallback-" << chooseSyncSourceAttempt);
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 }
@@ -698,28 +723,21 @@ void InitialSyncer::_chooseSyncSourceCallback(
         initialSyncHangBeforeChoosingSyncSource.pauseWhileSet();
     }
 
-    stdx::unique_lock<Latch> lock(_mutex);
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
     // Cancellation should be treated the same as other errors. In this case, the most likely cause
     // of a failed _chooseSyncSourceCallback() task is a cancellation triggered by
     // InitialSyncer::shutdown() or the task executor shutting down.
     auto status =
-        _checkForShutdownAndConvertStatus_inlock(callbackArgs, "error while choosing sync source");
+        _checkForShutdownAndConvertStatus(lock, callbackArgs, "error while choosing sync source");
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
-    if (MONGO_unlikely(failInitialSyncWithBadHost.shouldFail())) {
-        status = Status(ErrorCodes::InvalidSyncSource,
-                        "initial sync failed - failInitialSyncWithBadHost failpoint is set.");
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
-        return;
-    }
-
-    auto syncSource = _chooseSyncSource_inlock();
+    auto syncSource = _chooseSyncSource(lock);
     if (!syncSource.isOK()) {
         if (chooseSyncSourceAttempt + 1 >= chooseSyncSourceMaxAttempts) {
-            onCompletionGuard->setResultAndCancelRemainingWork_inlock(
+            onCompletionGuard->setResultAndCancelRemainingWork(
                 lock,
                 Status(ErrorCodes::InitialSyncOplogSourceMissing,
                        "No valid sync source found in current replica set to do an initial sync."));
@@ -729,18 +747,16 @@ void InitialSyncer::_chooseSyncSourceCallback(
         auto when = (*_attemptExec)->now() + _opts.syncSourceRetryWait;
         LOGV2_DEBUG(21169,
                     1,
-                    "Error getting sync source: '{error}', trying again in "
-                    "{syncSourceRetryWait} at {retryTime}. Attempt {chooseSyncSourceAttempt} of "
-                    "{numInitialSyncConnectAttempts}",
                     "Error getting sync source. Waiting to retry",
                     "error"_attr = syncSource.getStatus(),
                     "syncSourceRetryWait"_attr = _opts.syncSourceRetryWait,
                     "retryTime"_attr = when.toString(),
                     "chooseSyncSourceAttempt"_attr = (chooseSyncSourceAttempt + 1),
                     "numInitialSyncConnectAttempts"_attr = numInitialSyncConnectAttempts.load());
-        auto status = _scheduleWorkAtAndSaveHandle_inlock(
+        auto status = _scheduleWorkAtAndSaveHandle(
+            lock,
             when,
-            [=](const executor::TaskExecutor::CallbackArgs& args) {
+            [=, this](const executor::TaskExecutor::CallbackArgs& args) {
                 _chooseSyncSourceCallback(args,
                                           chooseSyncSourceAttempt + 1,
                                           chooseSyncSourceMaxAttempts,
@@ -749,7 +765,7 @@ void InitialSyncer::_chooseSyncSourceCallback(
             &_chooseSyncSourceHandle,
             str::stream() << "_chooseSyncSourceCallback-" << (chooseSyncSourceAttempt + 1));
         if (!status.isOK()) {
-            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+            onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
             return;
         }
         return;
@@ -773,7 +789,7 @@ void InitialSyncer::_chooseSyncSourceCallback(
     // collections and dropping user databases) attached to the current thread.
     status = _truncateOplogAndDropReplicatedDatabases();
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
@@ -781,55 +797,47 @@ void InitialSyncer::_chooseSyncSourceCallback(
 
     // Schedule rollback ID checker.
     _rollbackChecker = std::make_unique<RollbackChecker>(*_attemptExec, _syncSource);
-    auto scheduleResult = _rollbackChecker->reset([=](const RollbackChecker::Result& result) {
+    auto scheduleResult = _rollbackChecker->reset([=, this](const RollbackChecker::Result& result) {
         return _rollbackCheckerResetCallback(result, onCompletionGuard);
     });
     status = scheduleResult.getStatus();
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
     _getBaseRollbackIdHandle = scheduleResult.getValue();
 } catch (const DBException&) {
     // Report exception as an initial syncer failure.
-    stdx::unique_lock<Latch> lock(_mutex);
-    onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, exceptionToStatus());
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    onCompletionGuard->setResultAndCancelRemainingWork(lock, exceptionToStatus());
 }
 
 Status InitialSyncer::_truncateOplogAndDropReplicatedDatabases() {
     // truncate oplog; drop user databases.
     LOGV2_DEBUG(4540700,
                 1,
-                "About to truncate the oplog, if it exists, ns:{namespace}, and drop all "
-                "user databases (so that we can clone them).",
                 "About to truncate the oplog, if it exists, and drop all user databases (so that "
                 "we can clone them)",
-                "namespace"_attr = NamespaceString::kRsOplogNamespace);
+                logAttrs(NamespaceString::kRsOplogNamespace));
 
     auto opCtx = makeOpCtx();
+    // This code can make untimestamped writes (deletes) to the _mdb_catalog on top of existing
+    // timestamped updates.
+    shard_role_details::getRecoveryUnit(opCtx.get())->allowAllUntimestampedWrites();
 
     // We are not replicating nor validating these writes.
     UnreplicatedWritesBlock unreplicatedWritesBlock(opCtx.get());
 
     // 1.) Truncate the oplog.
-    LOGV2_DEBUG(4540701,
-                2,
-                "Truncating the existing oplog: {namespace}",
-                "Truncating the existing oplog",
-                "namespace"_attr = NamespaceString::kRsOplogNamespace);
+    LOGV2_DEBUG(
+        4540701, 2, "Truncating the existing oplog", logAttrs(NamespaceString::kRsOplogNamespace));
     Timer timer;
     auto status = _storage->truncateCollection(opCtx.get(), NamespaceString::kRsOplogNamespace);
-    LOGV2(21173,
-          "Initial syncer oplog truncation finished in: {durationMillis}ms",
-          "Initial syncer oplog truncation finished",
-          "durationMillis"_attr = timer.millis());
+    LOGV2(
+        21173, "Initial syncer oplog truncation finished", "durationMillis"_attr = timer.millis());
     if (!status.isOK()) {
         // 1a.) Create the oplog.
-        LOGV2_DEBUG(4540702,
-                    2,
-                    "Creating the oplog: {namespace}",
-                    "Creating the oplog",
-                    "namespace"_attr = NamespaceString::kRsOplogNamespace);
+        LOGV2_DEBUG(4540702, 2, "Creating the oplog", logAttrs(NamespaceString::kRsOplogNamespace));
         status = _storage->createOplog(opCtx.get(), NamespaceString::kRsOplogNamespace);
         if (!status.isOK()) {
             return status;
@@ -847,11 +855,11 @@ Status InitialSyncer::_truncateOplogAndDropReplicatedDatabases() {
 
 void InitialSyncer::_rollbackCheckerResetCallback(
     const RollbackChecker::Result& result, std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
-    stdx::lock_guard<Latch> lock(_mutex);
-    auto status = _checkForShutdownAndConvertStatus_inlock(result.getStatus(),
-                                                           "error while getting base rollback ID");
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    auto status = _checkForShutdownAndConvertStatus(
+        lock, result.getStatus(), "error while getting base rollback ID");
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
@@ -859,16 +867,17 @@ void InitialSyncer::_rollbackCheckerResetCallback(
     // data from the sync source, we allow the OplogEntryFetcher to use its default retry strategy
     // which retries up to 'numInitialSyncOplogFindAttempts' times'.  This will fail relatively
     // quickly in the presence of network errors, allowing us to choose a different sync source.
-    status = _scheduleLastOplogEntryFetcher_inlock(
-        [=](const StatusWith<mongo::Fetcher::QueryResponse>& response,
-            mongo::Fetcher::NextAction*,
-            mongo::BSONObjBuilder*) mutable {
+    status = _scheduleLastOplogEntryFetcher(
+        lock,
+        [=, this](const StatusWith<mongo::Fetcher::QueryResponse>& response,
+                  mongo::Fetcher::NextAction*,
+                  mongo::BSONObjBuilder*) mutable {
             _lastOplogEntryFetcherCallbackForDefaultBeginFetchingOpTime(response,
                                                                         onCompletionGuard);
         },
         kFetcherHandlesRetries);
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 }
@@ -876,19 +885,18 @@ void InitialSyncer::_rollbackCheckerResetCallback(
 void InitialSyncer::_lastOplogEntryFetcherCallbackForDefaultBeginFetchingOpTime(
     const StatusWith<Fetcher::QueryResponse>& result,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
-
-    stdx::unique_lock<Latch> lock(_mutex);
-    auto status = _checkForShutdownAndConvertStatus_inlock(
-        result.getStatus(), "error while getting last oplog entry for begin timestamp");
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    auto status = _checkForShutdownAndConvertStatus(
+        lock, result.getStatus(), "error while getting last oplog entry for begin timestamp");
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
     const auto opTimeResult = parseOpTimeAndWallTime(result);
     status = opTimeResult.getStatus();
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
@@ -905,14 +913,15 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForDefaultBeginFetchingOpTime(
                 "Initial Syncer got the defaultBeginFetchingOpTime",
                 "defaultBeginFetchingOpTime"_attr = defaultBeginFetchingOpTime);
 
-    status = _scheduleGetBeginFetchingOpTime_inlock(onCompletionGuard, defaultBeginFetchingOpTime);
+    status = _scheduleGetBeginFetchingOpTime(lock, onCompletionGuard, defaultBeginFetchingOpTime);
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 }
 
-Status InitialSyncer::_scheduleGetBeginFetchingOpTime_inlock(
+Status InitialSyncer::_scheduleGetBeginFetchingOpTime(
+    WithLock lk,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard,
     const OpTime& defaultBeginFetchingOpTime) {
 
@@ -937,11 +946,11 @@ Status InitialSyncer::_scheduleGetBeginFetchingOpTime_inlock(
     _beginFetchingOpTimeFetcher = std::make_unique<Fetcher>(
         *_attemptExec,
         _syncSource,
-        NamespaceString::kSessionTransactionsTableNamespace.db().toString(),
+        NamespaceString::kSessionTransactionsTableNamespace.dbName(),
         cmd.obj(),
-        [=](const StatusWith<mongo::Fetcher::QueryResponse>& response,
-            mongo::Fetcher::NextAction*,
-            mongo::BSONObjBuilder*) mutable {
+        [=, this](const StatusWith<mongo::Fetcher::QueryResponse>& response,
+                  mongo::Fetcher::NextAction*,
+                  mongo::BSONObjBuilder*) mutable {
             _getBeginFetchingOpTimeCallback(
                 response, onCompletionGuard, defaultBeginFetchingOpTime);
         },
@@ -961,18 +970,19 @@ void InitialSyncer::_getBeginFetchingOpTimeCallback(
     const StatusWith<Fetcher::QueryResponse>& result,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard,
     const OpTime& defaultBeginFetchingOpTime) {
-    stdx::unique_lock<Latch> lock(_mutex);
-    auto status = _checkForShutdownAndConvertStatus_inlock(
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    auto status = _checkForShutdownAndConvertStatus(
+        lock,
         result.getStatus(),
         "error while getting oldest active transaction timestamp for begin fetching timestamp");
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
     const auto docs = result.getValue().documents;
     if (docs.size() > 1) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(
+        onCompletionGuard->setResultAndCancelRemainingWork(
             lock,
             Status(ErrorCodes::TooManyMatchingDocuments,
                    str::stream() << "Expected to receive one document for the oldest active "
@@ -990,11 +1000,10 @@ void InitialSyncer::_getBeginFetchingOpTimeCallback(
     OpTime beginFetchingOpTime = defaultBeginFetchingOpTime;
     if (docs.size() != 0) {
         auto entry = SessionTxnRecord::parse(
-            IDLParserErrorContext("oldest active transaction optime for initial sync"),
-            docs.front());
+            IDLParserContext("oldest active transaction optime for initial sync"), docs.front());
         auto optime = entry.getStartOpTime();
         if (optime) {
-            beginFetchingOpTime = optime.get();
+            beginFetchingOpTime = optime.value();
         }
     }
 
@@ -1011,16 +1020,17 @@ void InitialSyncer::_getBeginFetchingOpTimeCallback(
     // data from the sync source, we allow the OplogEntryFetcher to use its default retry strategy
     // which retries up to 'numInitialSyncOplogFindAttempts' times'.  This will fail relatively
     // quickly in the presence of network errors, allowing us to choose a different sync source.
-    status = _scheduleLastOplogEntryFetcher_inlock(
-        [=](const StatusWith<mongo::Fetcher::QueryResponse>& response,
-            mongo::Fetcher::NextAction*,
-            mongo::BSONObjBuilder*) mutable {
+    status = _scheduleLastOplogEntryFetcher(
+        lock,
+        [=, this](const StatusWith<mongo::Fetcher::QueryResponse>& response,
+                  mongo::Fetcher::NextAction*,
+                  mongo::BSONObjBuilder*) mutable {
             _lastOplogEntryFetcherCallbackForBeginApplyingTimestamp(
                 response, onCompletionGuard, beginFetchingOpTime);
         },
         kFetcherHandlesRetries);
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 }
@@ -1029,18 +1039,18 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForBeginApplyingTimestamp(
     const StatusWith<Fetcher::QueryResponse>& result,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard,
     OpTime& beginFetchingOpTime) {
-    stdx::unique_lock<Latch> lock(_mutex);
-    auto status = _checkForShutdownAndConvertStatus_inlock(
-        result.getStatus(), "error while getting last oplog entry for begin timestamp");
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    auto status = _checkForShutdownAndConvertStatus(
+        lock, result.getStatus(), "error while getting last oplog entry for begin timestamp");
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
     const auto opTimeResult = parseOpTimeAndWallTime(result);
     status = opTimeResult.getStatus();
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
@@ -1066,11 +1076,11 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForBeginApplyingTimestamp(
     _fCVFetcher = std::make_unique<Fetcher>(
         *_attemptExec,
         _syncSource,
-        NamespaceString::kServerConfigurationNamespace.db().toString(),
+        NamespaceString::kServerConfigurationNamespace.dbName(),
         queryBob.obj(),
-        [=](const StatusWith<mongo::Fetcher::QueryResponse>& response,
-            mongo::Fetcher::NextAction*,
-            mongo::BSONObjBuilder*) mutable {
+        [=, this](const StatusWith<mongo::Fetcher::QueryResponse>& response,
+                  mongo::Fetcher::NextAction*,
+                  mongo::BSONObjBuilder*) mutable {
             _fcvFetcherCallback(response, onCompletionGuard, lastOpTime, beginFetchingOpTime);
         },
         ReadPreferenceSetting::secondaryPreferredMetadata(),
@@ -1081,7 +1091,7 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForBeginApplyingTimestamp(
     Status scheduleStatus = _fCVFetcher->schedule();
     if (!scheduleStatus.isOK()) {
         _fCVFetcher.reset();
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, scheduleStatus);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, scheduleStatus);
         return;
     }
 }
@@ -1090,17 +1100,17 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
                                         std::shared_ptr<OnCompletionGuard> onCompletionGuard,
                                         const OpTime& lastOpTime,
                                         OpTime& beginFetchingOpTime) {
-    stdx::unique_lock<Latch> lock(_mutex);
-    auto status = _checkForShutdownAndConvertStatus_inlock(
-        result.getStatus(), "error while getting the remote feature compatibility version");
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    auto status = _checkForShutdownAndConvertStatus(
+        lock, result.getStatus(), "error while getting the remote feature compatibility version");
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
     const auto docs = result.getValue().documents;
     if (docs.size() > 1) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(
+        onCompletionGuard->setResultAndCancelRemainingWork(
             lock,
             Status(ErrorCodes::TooManyMatchingDocuments,
                    str::stream() << "Expected to receive one feature compatibility version "
@@ -1111,7 +1121,7 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
     }
     const auto hasDoc = docs.begin() != docs.end();
     if (!hasDoc) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(
+        onCompletionGuard->setResultAndCancelRemainingWork(
             lock,
             Status(ErrorCodes::IncompatibleServerVersion,
                    "Sync source had no feature compatibility version document"));
@@ -1120,7 +1130,7 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
 
     auto fCVParseSW = FeatureCompatibilityVersionParser::parse(docs.front());
     if (!fCVParseSW.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, fCVParseSW.getStatus());
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, fCVParseSW.getStatus());
         return;
     }
 
@@ -1128,8 +1138,9 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
 
     // Changing the featureCompatibilityVersion during initial sync is unsafe.
     // (Generic FCV reference): This FCV check should exist across LTS binary versions.
-    if (serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading(version)) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(
+    if (serverGlobalParams.featureCompatibility.acquireFCVSnapshot().isUpgradingOrDowngrading(
+            version)) {
+        onCompletionGuard->setResultAndCancelRemainingWork(
             lock,
             Status(ErrorCodes::IncompatibleServerVersion,
                    str::stream() << "Sync source had unsafe feature compatibility version: "
@@ -1140,7 +1151,7 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
         // and collection/index creation can depend on FCV, we set the in-memory FCV value to match
         // the version on the sync source. We won't persist the FCV on disk nor will we update our
         // minWireVersion until we clone the actual document.
-        serverGlobalParams.mutableFeatureCompatibility.setVersion(version);
+        serverGlobalParams.mutableFCV.setVersion(version);
     }
 
     if (MONGO_unlikely(initialSyncHangBeforeSplittingControlFlow.shouldFail())) {
@@ -1164,7 +1175,7 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
                                                 getGlobalServiceContext()->getFastClockSource());
     _client = _createClientFn();
     _initialSyncState = std::make_unique<InitialSyncState>(std::make_unique<AllDatabaseCloner>(
-        _sharedData.get(), _syncSource, _client.get(), _storage, _writerPool));
+        _sharedData.get(), _syncSource, _client.get(), _storage, _workerPool));
 
     // Create oplog applier.
     auto consistencyMarkers = _replicationProcess->getConsistencyMarkers();
@@ -1175,7 +1186,7 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
                                                                    consistencyMarkers,
                                                                    _storage,
                                                                    options,
-                                                                   _writerPool);
+                                                                   _workerPool);
 
     _initialSyncState->beginApplyingTimestamp = lastOpTime.getTimestamp();
     _initialSyncState->beginFetchingTimestamp = beginFetchingOpTime.getTimestamp();
@@ -1191,17 +1202,15 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
     invariant(!result.getValue().documents.empty());
     LOGV2_DEBUG(4431600,
                 2,
-                "Setting begin applying timestamp to {beginApplyingTimestamp}, ns: "
-                "{namespace} and the begin fetching timestamp to {beginFetchingTimestamp}",
                 "Setting begin applying timestamp and begin fetching timestamp",
                 "beginApplyingTimestamp"_attr = _initialSyncState->beginApplyingTimestamp,
-                "namespace"_attr = NamespaceString::kRsOplogNamespace,
+                logAttrs(NamespaceString::kRsOplogNamespace),
                 "beginFetchingTimestamp"_attr = _initialSyncState->beginFetchingTimestamp);
 
     const auto configResult = _dataReplicatorExternalState->getCurrentConfig();
     status = configResult.getStatus();
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         _initialSyncState.reset();
         return;
     }
@@ -1211,7 +1220,6 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
         beginFetchingOpTime,
         _syncSource,
         config,
-        _rollbackChecker->getBaseRBID(),
         initialSyncOplogFetcherBatchSize,
         OplogFetcher::RequireFresherSyncSource::kDontRequireFresherSyncSource);
     oplogFetcherConfig.startingPoint = OplogFetcher::StartingPoint::kEnqueueFirstDoc;
@@ -1220,24 +1228,20 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
         std::make_unique<OplogFetcherRestartDecisionInitialSyncer>(
             _sharedData.get(), _opts.oplogFetcherMaxFetcherRestarts),
         _dataReplicatorExternalState.get(),
-        [=](OplogFetcher::Documents::const_iterator first,
-            OplogFetcher::Documents::const_iterator last,
-            const OplogFetcher::DocumentsInfo& info) {
+        [=, this](OplogFetcher::Documents::const_iterator first,
+                  OplogFetcher::Documents::const_iterator last,
+                  const OplogFetcher::DocumentsInfo& info) {
             return _enqueueDocuments(first, last, info);
         },
-        [=](const Status& s, int rbid) { _oplogFetcherCallback(s, onCompletionGuard); },
+        [=, this](const Status& s) { _oplogFetcherCallback(s, onCompletionGuard); },
         std::move(oplogFetcherConfig));
 
-    LOGV2_DEBUG(21178,
-                2,
-                "Starting OplogFetcher: {oplogFetcher}",
-                "Starting OplogFetcher",
-                "oplogFetcher"_attr = _oplogFetcher->toString());
+    LOGV2_DEBUG(21178, 2, "Starting OplogFetcher", "oplogFetcher"_attr = _oplogFetcher->toString());
 
-    // _startupComponent_inlock is shutdown-aware.
-    status = _startupComponent_inlock(_oplogFetcher);
+    // _startupComponent is shutdown-aware.
+    status = _startupComponent(lock, _oplogFetcher);
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         _initialSyncState->allDatabaseCloner.reset();
         return;
     }
@@ -1259,7 +1263,6 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
 
     LOGV2_DEBUG(21180,
                 2,
-                "Starting AllDatabaseCloner: {allDatabaseCloner}",
                 "Starting AllDatabaseCloner",
                 "allDatabaseCloner"_attr = _initialSyncState->allDatabaseCloner->toString());
 
@@ -1269,7 +1272,7 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
     if (startClonerFuture.isReady()) {
         status = startClonerFuture.getNoThrow();
         invariant(!status.isOK());
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
     _initialSyncState->allDatabaseClonerFuture =
@@ -1278,15 +1281,14 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
             // without the executor call, it would run on the wrong executor.  In both production
             // and in unit tests, if the cloner finishes very quickly, the callback could run
             // in-line and result in self-deadlock.
-            stdx::unique_lock<Latch> lock(_mutex);
+            stdx::unique_lock<stdx::mutex> lock(_mutex);
             auto exec_status = (*_attemptExec)
                                    ->scheduleWork([this, status, onCompletionGuard](
                                                       executor::TaskExecutor::CallbackArgs args) {
                                        _allDatabaseClonerCallback(status, onCompletionGuard);
                                    });
             if (!exec_status.isOK()) {
-                onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock,
-                                                                          exec_status.getStatus());
+                onCompletionGuard->setResultAndCancelRemainingWork(lock, exec_status.getStatus());
                 // In the shutdown case, it is possible the completion guard will be run
                 // from this thread (since the lambda holding another copy didn't schedule).
                 // If it does, we will self-deadlock if we're holding the lock, so release it.
@@ -1305,16 +1307,14 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
 
 void InitialSyncer::_oplogFetcherCallback(const Status& oplogFetcherFinishStatus,
                                           std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     LOGV2(21181,
-          "Finished fetching oplog during initial sync: {oplogFetcherFinishStatus}. Last fetched "
-          "optime: {lastFetched}",
           "Finished fetching oplog during initial sync",
           "oplogFetcherFinishStatus"_attr = redact(oplogFetcherFinishStatus),
           "lastFetched"_attr = _lastFetched.toString());
 
-    auto status = _checkForShutdownAndConvertStatus_inlock(
-        oplogFetcherFinishStatus, "error fetching oplog during initial sync");
+    auto status = _checkForShutdownAndConvertStatus(
+        lock, oplogFetcherFinishStatus, "error fetching oplog during initial sync");
 
     // When the OplogFetcher completes early (instead of being canceled at shutdown), we log and let
     // our reference to 'onCompletionGuard' go out of scope. Since we know the
@@ -1327,26 +1327,24 @@ void InitialSyncer::_oplogFetcherCallback(const Status& oplogFetcherFinishStatus
     // OplogFetcher to ignore the current sync source response and return early.
     if (status.isOK()) {
         LOGV2(21182,
-              "Finished fetching oplog fetching early. Last fetched optime: {lastFetched}",
               "Finished fetching oplog fetching early",
               "lastFetched"_attr = _lastFetched.toString());
         return;
     }
 
-    // During normal operation, this call to onCompletion->setResultAndCancelRemainingWork_inlock
+    // During normal operation, this call to onCompletion->setResultAndCancelRemainingWork
     // is a no-op because the other thread running the DatabasesCloner or MultiApplier will already
     // have called it with the success/failed status.
     // The OplogFetcher does not finish on its own because of the oplog tailing query it runs on the
     // sync source. The most common OplogFetcher completion status is CallbackCanceled due to either
     // a shutdown request or completion of the data cloning and oplog application phases.
-    onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+    onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
 }
 
 void InitialSyncer::_allDatabaseClonerCallback(
     const Status& databaseClonerFinishStatus,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     LOGV2(21183,
-          "Finished cloning data: {databaseClonerFinishStatus}. Beginning oplog replay.",
           "Finished cloning data. Beginning oplog replay",
           "databaseClonerFinishStatus"_attr = redact(databaseClonerFinishStatus));
     _client->shutdownAndDisallowReconnect();
@@ -1363,12 +1361,12 @@ void InitialSyncer::_allDatabaseClonerCallback(
         }
     }
 
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     _client.reset();
-    auto status = _checkForShutdownAndConvertStatus_inlock(databaseClonerFinishStatus,
-                                                           "error cloning databases");
+    auto status = _checkForShutdownAndConvertStatus(
+        lock, databaseClonerFinishStatus, "error cloning databases");
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
@@ -1377,15 +1375,16 @@ void InitialSyncer::_allDatabaseClonerCallback(
     // 'initialSyncTransientErrorRetryPeriodSeconds' (default 24 hours).  This is the same retry
     // strategy used when retrieving collection data, and avoids retrieving all the data and then
     // throwing it away due to a transient network outage.
-    status = _scheduleLastOplogEntryFetcher_inlock(
-        [=](const StatusWith<mongo::Fetcher::QueryResponse>& status,
-            mongo::Fetcher::NextAction*,
-            mongo::BSONObjBuilder*) {
+    status = _scheduleLastOplogEntryFetcher(
+        lock,
+        [=, this](const StatusWith<mongo::Fetcher::QueryResponse>& status,
+                  mongo::Fetcher::NextAction*,
+                  mongo::BSONObjBuilder*) {
             _lastOplogEntryFetcherCallbackForStopTimestamp(status, onCompletionGuard);
         },
         kInitialSyncerHandlesRetries);
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 }
@@ -1395,9 +1394,9 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     OpTimeAndWallTime resultOpTimeAndWallTime = {OpTime(), Date_t()};
     {
-        stdx::lock_guard<Latch> lock(_mutex);
-        auto status = _checkForShutdownAndConvertStatus_inlock(
-            result.getStatus(), "error fetching last oplog entry for stop timestamp");
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        auto status = _checkForShutdownAndConvertStatus(
+            lock, result.getStatus(), "error fetching last oplog entry for stop timestamp");
         if (_shouldRetryError(lock, status)) {
             auto scheduleStatus =
                 (*_attemptExec)
@@ -1405,23 +1404,25 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
                                     onCompletionGuard](executor::TaskExecutor::CallbackArgs args) {
                         // It is not valid to schedule the retry from within this callback,
                         // hence we schedule a lambda to schedule the retry.
-                        stdx::lock_guard<Latch> lock(_mutex);
-                        // Since the stopTimestamp is retrieved after we have done all the work of
-                        // retrieving collection data, we handle retries within this class by
-                        // retrying for 'initialSyncTransientErrorRetryPeriodSeconds' (default 24
-                        // hours).  This is the same retry strategy used when retrieving collection
-                        // data, and avoids retrieving all the data and then throwing it away due to
-                        // a transient network outage.
-                        auto status = _scheduleLastOplogEntryFetcher_inlock(
-                            [=](const StatusWith<mongo::Fetcher::QueryResponse>& status,
-                                mongo::Fetcher::NextAction*,
-                                mongo::BSONObjBuilder*) {
+                        stdx::lock_guard<stdx::mutex> lock(_mutex);
+                        // Since the stopTimestamp is retrieved after we have done all the
+                        // work of retrieving collection data, we handle retries within this
+                        // class by retrying for
+                        // 'initialSyncTransientErrorRetryPeriodSeconds' (default 24 hours).
+                        // This is the same retry strategy used when retrieving collection
+                        // data, and avoids retrieving all the data and then throwing it
+                        // away due to a transient network outage.
+                        auto status = _scheduleLastOplogEntryFetcher(
+                            lock,
+                            [=, this](const StatusWith<mongo::Fetcher::QueryResponse>& status,
+                                      mongo::Fetcher::NextAction*,
+                                      mongo::BSONObjBuilder*) {
                                 _lastOplogEntryFetcherCallbackForStopTimestamp(status,
                                                                                onCompletionGuard);
                             },
                             kInitialSyncerHandlesRetries);
                         if (!status.isOK()) {
-                            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+                            onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
                         }
                     });
             if (scheduleStatus.isOK())
@@ -1430,17 +1431,19 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
             // So just continue with the original failed status.
         }
         if (!status.isOK()) {
-            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+            onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
             return;
         }
 
         auto&& optimeStatus = parseOpTimeAndWallTime(result);
         if (!optimeStatus.isOK()) {
-            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock,
-                                                                      optimeStatus.getStatus());
+            onCompletionGuard->setResultAndCancelRemainingWork(lock, optimeStatus.getStatus());
             return;
         }
         resultOpTimeAndWallTime = optimeStatus.getValue();
+
+        // Pass resultOpTimeAndWallTime.opTime to oplog apply as minValid
+        _oplogApplier->setMinValid(resultOpTimeAndWallTime.opTime);
 
         _initialSyncState->stopTimestamp = resultOpTimeAndWallTime.opTime.getTimestamp();
 
@@ -1449,7 +1452,7 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
         // and/or there are operations that need to be applied.
         if (_initialSyncState->beginFetchingTimestamp != _initialSyncState->stopTimestamp) {
             invariant(_lastApplied.opTime.isNull());
-            _checkApplierProgressAndScheduleGetNextApplierBatch_inlock(lock, onCompletionGuard);
+            _checkApplierProgressAndScheduleGetNextApplierBatch(lock, onCompletionGuard);
             return;
         }
     }
@@ -1460,11 +1463,8 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
         const auto& documents = result.getValue().documents;
         invariant(!documents.empty());
         const BSONObj oplogSeedDoc = documents.front();
-        LOGV2_DEBUG(21185,
-                    2,
-                    "Inserting oplog seed document: {oplogSeedDocument}",
-                    "Inserting oplog seed document",
-                    "oplogSeedDocument"_attr = oplogSeedDoc);
+        LOGV2_DEBUG(
+            21185, 2, "Inserting oplog seed document", "oplogSeedDocument"_attr = oplogSeedDoc);
 
         auto opCtx = makeOpCtx();
         // StorageInterface::insertDocument() has to be called outside the lock because we may
@@ -1483,8 +1483,8 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
                                                TimestampedBSONObj{oplogSeedDoc},
                                                resultOpTimeAndWallTime.opTime.getTerm());
         if (!status.isOK()) {
-            stdx::lock_guard<Latch> lock(_mutex);
-            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+            stdx::lock_guard<stdx::mutex> lock(_mutex);
+            onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
             return;
         }
         const bool orderedCommit = true;
@@ -1492,41 +1492,39 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
             opCtx.get(), resultOpTimeAndWallTime.opTime.getTimestamp(), orderedCommit);
     }
 
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     _lastApplied = resultOpTimeAndWallTime;
     LOGV2(21186,
-          "No need to apply operations. (currently at {stopTimestamp})",
           "No need to apply operations",
           "stopTimestamp"_attr = _initialSyncState->stopTimestamp.toBSON());
 
     // This sets the error in 'onCompletionGuard' and shuts down the OplogFetcher on error.
-    _scheduleRollbackCheckerCheckForRollback_inlock(lock, onCompletionGuard);
+    _scheduleRollbackCheckerCheckForRollback(lock, onCompletionGuard);
 }
 
 void InitialSyncer::_getNextApplierBatchCallback(
     const executor::TaskExecutor::CallbackArgs& callbackArgs,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) noexcept try {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     auto status =
-        _checkForShutdownAndConvertStatus_inlock(callbackArgs, "error getting next applier batch");
+        _checkForShutdownAndConvertStatus(lock, callbackArgs, "error getting next applier batch");
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
-    auto batchResult = _getNextApplierBatch_inlock();
+    auto batchResult = _getNextApplierBatch(lock);
     if (!batchResult.isOK()) {
         LOGV2_WARNING(21196,
-                      "Failure creating next apply batch: {error}",
                       "Failure creating next apply batch",
                       "error"_attr = redact(batchResult.getStatus()));
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, batchResult.getStatus());
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, batchResult.getStatus());
         return;
     }
 
     std::string logMsg = str::stream()
         << "Initial Syncer is about to apply the next oplog batch of size: "
-        << batchResult.getValue().size();
+        << batchResult.getValue().count();
     pauseAtInitialSyncFuzzerSyncronizationPoints(logMsg);
 
     if (MONGO_unlikely(failInitialSyncBeforeApplyingBatch.shouldFail())) {
@@ -1536,12 +1534,12 @@ void InitialSyncer::_getNextApplierBatchCallback(
         failInitialSyncBeforeApplyingBatch.pauseWhileSet();
         status = Status(ErrorCodes::CallbackCanceled,
                         "failInitialSyncBeforeApplyingBatch fail point enabled");
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
     // Schedule MultiApplier if we have operations to apply.
-    const auto& ops = batchResult.getValue();
+    const auto& ops = batchResult.getValue().getBatch();
     if (!ops.empty()) {
         _fetchCount.store(0);
         MultiApplier::MultiApplyFn applyBatchOfOperationsFn = [this](OperationContext* opCtx,
@@ -1552,16 +1550,16 @@ void InitialSyncer::_getNextApplierBatchCallback(
         Date_t lastAppliedWall = ops.back().getWallClockTime();
 
         auto numApplied = ops.size();
-        MultiApplier::CallbackFn onCompletionFn = [=](const Status& s) {
+        MultiApplier::CallbackFn onCompletionFn = [=, this](const Status& s) {
             return _multiApplierCallback(
                 s, {lastApplied, lastAppliedWall}, numApplied, onCompletionGuard);
         };
 
         _applier = std::make_unique<MultiApplier>(
             *_attemptExec, ops, std::move(applyBatchOfOperationsFn), std::move(onCompletionFn));
-        status = _startupComponent_inlock(_applier);
+        status = _startupComponent(lock, _applier);
         if (!status.isOK()) {
-            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+            onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
             return;
         }
         return;
@@ -1584,7 +1582,7 @@ void InitialSyncer::_getNextApplierBatchCallback(
                             << msg << ". Last applied: " << _lastApplied.opTime.toString()
                             << ". Last fetched: " << _lastFetched.toString()
                             << ". Number of operations applied: " << _initialSyncState->appliedOps);
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
@@ -1592,28 +1590,31 @@ void InitialSyncer::_getNextApplierBatchCallback(
     // the sync source, we'll check the oplog buffer again in
     // '_opts.getApplierBatchCallbackRetryWait' ms.
     auto when = (*_attemptExec)->now() + _opts.getApplierBatchCallbackRetryWait;
-    status = _scheduleWorkAtAndSaveHandle_inlock(
+    status = _scheduleWorkAtAndSaveHandle(
+        lock,
         when,
-        [=](const CallbackArgs& args) { _getNextApplierBatchCallback(args, onCompletionGuard); },
+        [=, this](const CallbackArgs& args) {
+            _getNextApplierBatchCallback(args, onCompletionGuard);
+        },
         &_getNextApplierBatchHandle,
         "_getNextApplierBatchCallback");
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 } catch (const DBException&) {
     // Report exception as an initial syncer failure.
-    stdx::unique_lock<Latch> lock(_mutex);
-    onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, exceptionToStatus());
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    onCompletionGuard->setResultAndCancelRemainingWork(lock, exceptionToStatus());
 }
 
 void InitialSyncer::_multiApplierCallback(const Status& multiApplierStatus,
                                           OpTimeAndWallTime lastApplied,
                                           std::uint32_t numApplied,
                                           std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     auto status =
-        _checkForShutdownAndConvertStatus_inlock(multiApplierStatus, "error applying batch");
+        _checkForShutdownAndConvertStatus(lock, multiApplierStatus, "error applying batch");
 
     // Set to cause initial sync to fassert instead of restart if applying a batch fails, so that
     // tests can be robust to network errors but not oplog idempotency errors.
@@ -1623,11 +1624,8 @@ void InitialSyncer::_multiApplierCallback(const Status& multiApplierStatus,
     }
 
     if (!status.isOK()) {
-        LOGV2_ERROR(21199,
-                    "Failed to apply batch due to '{error}'",
-                    "Failed to apply batch",
-                    "error"_attr = redact(status));
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        LOGV2_ERROR(21199, "Failed to apply batch", "error"_attr = redact(status));
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
@@ -1646,32 +1644,29 @@ void InitialSyncer::_multiApplierCallback(const Status& multiApplierStatus,
     auto opCtx = makeOpCtx();
     const bool orderedCommit = true;
     _storage->oplogDiskLocRegister(opCtx.get(), lastAppliedOpTime.getTimestamp(), orderedCommit);
-    _checkApplierProgressAndScheduleGetNextApplierBatch_inlock(lock, onCompletionGuard);
+    _checkApplierProgressAndScheduleGetNextApplierBatch(lock, onCompletionGuard);
 }
 
 void InitialSyncer::_rollbackCheckerCheckForRollbackCallback(
     const RollbackChecker::Result& result, std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
-    stdx::lock_guard<Latch> lock(_mutex);
-    auto status = _checkForShutdownAndConvertStatus_inlock(result.getStatus(),
-                                                           "error while getting last rollback ID");
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    auto status = _checkForShutdownAndConvertStatus(
+        lock, result.getStatus(), "error while getting last rollback ID");
     if (_shouldRetryError(lock, status)) {
-        LOGV2_DEBUG(21190,
-                    1,
-                    "Retrying rollback checker because of network error {error}",
-                    "Retrying rollback checker because of network error",
-                    "error"_attr = status);
-        _scheduleRollbackCheckerCheckForRollback_inlock(lock, onCompletionGuard);
+        LOGV2_DEBUG(
+            21190, 1, "Retrying rollback checker because of network error", "error"_attr = status);
+        _scheduleRollbackCheckerCheckForRollback(lock, onCompletionGuard);
         return;
     }
 
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
     auto hasHadRollback = result.getValue();
     if (hasHadRollback) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(
+        onCompletionGuard->setResultAndCancelRemainingWork(
             lock,
             Status(ErrorCodes::UnrecoverableRollbackError,
                    str::stream() << "Rollback occurred on our sync source " << _syncSource
@@ -1685,7 +1680,7 @@ void InitialSyncer::_rollbackCheckerCheckForRollbackCallback(
     }
 
     // Success!
-    onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, _lastApplied);
+    onCompletionGuard->setResultAndCancelRemainingWork(lock, _lastApplied);
 }
 
 void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime>& lastApplied) {
@@ -1705,12 +1700,12 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
     // declare the scope guard before the lock guard.
     auto result = lastApplied;
     ScopeGuard finishCallbackGuard([this, &result] {
-        auto scheduleResult = _exec->scheduleWork(
-            [=](const mongo::executor::TaskExecutor::CallbackArgs&) { _finishCallback(result); });
+        auto scheduleResult =
+            _exec->scheduleWork([=, this](const mongo::executor::TaskExecutor::CallbackArgs&) {
+                _finishCallback(result);
+            });
         if (!scheduleResult.isOK()) {
             LOGV2_WARNING(21197,
-                          "Unable to schedule initial syncer completion task due to "
-                          "{error}. Running callback on current thread.",
                           "Unable to schedule initial syncer completion task. Running callback on "
                           "current thread",
                           "error"_attr = redact(scheduleResult.getStatus()));
@@ -1720,7 +1715,7 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
 
     LOGV2(21191, "Initial sync attempt finishing up");
 
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
 
     auto runTime = _initialSyncState ? _initialSyncState->timer.millis() : 0;
     int rollBackId = -1;
@@ -1759,7 +1754,7 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
     bool hasRetries = _stats.failedInitialSyncAttempts < _stats.maxFailedInitialSyncAttempts;
 
     initial_sync_common_stats::LogInitialSyncAttemptStats(
-        result, hasRetries, _getInitialSyncProgress_inlock());
+        result, hasRetries, _getInitialSyncProgress(lock));
 
     if (result.isOK()) {
         // Scope guard will invoke _finishCallback().
@@ -1767,9 +1762,6 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
     }
 
     LOGV2_ERROR(21200,
-                "Initial sync attempt failed -- attempts left: "
-                "{attemptsLeft} cause: "
-                "{error}",
                 "Initial sync attempt failed",
                 "attemptsLeft"_attr =
                     (_stats.maxFailedInitialSyncAttempts - _stats.failedInitialSyncAttempts),
@@ -1792,9 +1784,10 @@ void InitialSyncer::_finishInitialSyncAttempt(const StatusWith<OpTimeAndWallTime
         _clonerExec, Status(ErrorCodes::CallbackCanceled, "Initial Sync Attempt Canceled"));
     _attemptCanceled = false;
     auto when = (*_attemptExec)->now() + _opts.initialSyncRetryWait;
-    auto status = _scheduleWorkAtAndSaveHandle_inlock(
+    auto status = _scheduleWorkAtAndSaveHandle(
+        lock,
         when,
-        [=](const executor::TaskExecutor::CallbackArgs& args) {
+        [=, this](const executor::TaskExecutor::CallbackArgs& args) {
             _startInitialSyncAttemptCallback(
                 args, _stats.failedInitialSyncAttempts, _stats.maxFailedInitialSyncAttempts);
         },
@@ -1821,9 +1814,9 @@ void InitialSyncer::_finishCallback(StatusWith<OpTimeAndWallTime> lastApplied) {
     // before we transition the state to Complete.
     decltype(_onCompletion) onCompletion;
     {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         auto opCtx = makeOpCtx();
-        _tearDown_inlock(opCtx.get(), lastApplied);
+        _tearDown(lock, opCtx.get(), lastApplied);
         invariant(_onCompletion);
         std::swap(_onCompletion, onCompletion);
     }
@@ -1847,7 +1840,6 @@ void InitialSyncer::_finishCallback(StatusWith<OpTimeAndWallTime> lastApplied) {
         onCompletion(lastApplied);
     } catch (...) {
         LOGV2_WARNING(21198,
-                      "initial syncer finish callback threw exception: {error}",
                       "Initial syncer finish callback threw exception",
                       "error"_attr = redact(exceptionToStatus()));
     }
@@ -1858,7 +1850,7 @@ void InitialSyncer::_finishCallback(StatusWith<OpTimeAndWallTime> lastApplied) {
     onCompletion = {};
 
     {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         invariant(_state != State::kComplete);
         _state = State::kComplete;
         _stateCondition.notify_all();
@@ -1886,17 +1878,17 @@ void InitialSyncer::_finishCallback(StatusWith<OpTimeAndWallTime> lastApplied) {
     }
 }
 
-Status InitialSyncer::_scheduleLastOplogEntryFetcher_inlock(
-    Fetcher::CallbackFn callback, LastOplogEntryFetcherRetryStrategy retryStrategy) {
+Status InitialSyncer::_scheduleLastOplogEntryFetcher(
+    WithLock lk, Fetcher::CallbackFn callback, LastOplogEntryFetcherRetryStrategy retryStrategy) {
     BSONObj query =
         BSON("find" << NamespaceString::kRsOplogNamespace.coll() << "sort" << BSON("$natural" << -1)
                     << "limit" << 1 << ReadConcernArgs::kReadConcernFieldName
-                    << ReadConcernArgs::kLocal);
+                    << ReadConcernArgs::kLocal.toBSONInner());
 
     _lastOplogEntryFetcher = std::make_unique<Fetcher>(
         *_attemptExec,
         _syncSource,
-        NamespaceString::kRsOplogNamespace.db().toString(),
+        NamespaceString::kRsOplogNamespace.dbName(),
         query,
         callback,
         ReadPreferenceSetting::secondaryPreferredMetadata(),
@@ -1915,12 +1907,13 @@ Status InitialSyncer::_scheduleLastOplogEntryFetcher_inlock(
     return scheduleStatus;
 }
 
-void InitialSyncer::_checkApplierProgressAndScheduleGetNextApplierBatch_inlock(
-    const stdx::lock_guard<Latch>& lock, std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
+void InitialSyncer::_checkApplierProgressAndScheduleGetNextApplierBatch(
+    const stdx::lock_guard<stdx::mutex>& lock,
+    std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     // We should check our current state because shutdown() could have been called before
     // we re-acquired the lock.
-    if (_isShuttingDown_inlock()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(
+    if (_isShuttingDown(lock)) {
+        onCompletionGuard->setResultAndCancelRemainingWork(
             lock,
             Status(ErrorCodes::CallbackCanceled,
                    "failed to schedule applier to check for "
@@ -1937,7 +1930,7 @@ void InitialSyncer::_checkApplierProgressAndScheduleGetNextApplierBatch_inlock(
                     "stopTimestamp"_attr = _initialSyncState->stopTimestamp.toBSON(),
                     "beginApplyingTimestamp"_attr =
                         _initialSyncState->beginApplyingTimestamp.toBSON());
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(
+        onCompletionGuard->setResultAndCancelRemainingWork(
             lock,
             Status(ErrorCodes::OplogOutOfOrder,
                    str::stream() << msg << " " << _syncSource.toString() << ". Currently at "
@@ -1950,10 +1943,6 @@ void InitialSyncer::_checkApplierProgressAndScheduleGetNextApplierBatch_inlock(
         // Check if any ops occurred while cloning or any ops need to be fetched.
         invariant(_initialSyncState->beginFetchingTimestamp < _initialSyncState->stopTimestamp);
         LOGV2(21195,
-              "Writing to the oplog and applying operations until {stopTimestamp} "
-              "before initial sync can complete. (started fetching at "
-              "{beginFetchingTimestamp} and applying at "
-              "{beginApplyingTimestamp})",
               "Writing to the oplog and applying operations until stopTimestamp before initial "
               "sync can complete",
               "stopTimestamp"_attr = _initialSyncState->stopTimestamp.toBSON(),
@@ -1963,30 +1952,32 @@ void InitialSyncer::_checkApplierProgressAndScheduleGetNextApplierBatch_inlock(
     } else if (_lastApplied.opTime.getTimestamp() >= _initialSyncState->stopTimestamp) {
         // Check for rollback if we have applied far enough to be consistent.
         invariant(!_lastApplied.opTime.getTimestamp().isNull());
-        _scheduleRollbackCheckerCheckForRollback_inlock(lock, onCompletionGuard);
+        _scheduleRollbackCheckerCheckForRollback(lock, onCompletionGuard);
         return;
     }
 
     // Get another batch to apply.
-    // _scheduleWorkAndSaveHandle_inlock() is shutdown-aware.
-    auto status = _scheduleWorkAndSaveHandle_inlock(
-        [=](const executor::TaskExecutor::CallbackArgs& args) {
+    // _scheduleWorkAndSaveHandle() is shutdown-aware.
+    auto status = _scheduleWorkAndSaveHandle(
+        lock,
+        [=, this](const executor::TaskExecutor::CallbackArgs& args) {
             return _getNextApplierBatchCallback(args, onCompletionGuard);
         },
         &_getNextApplierBatchHandle,
         "_getNextApplierBatchCallback");
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 }
 
-void InitialSyncer::_scheduleRollbackCheckerCheckForRollback_inlock(
-    const stdx::lock_guard<Latch>& lock, std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
+void InitialSyncer::_scheduleRollbackCheckerCheckForRollback(
+    const stdx::lock_guard<stdx::mutex>& lock,
+    std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     // We should check our current state because shutdown() could have been called before
     // we re-acquired the lock.
-    if (_isShuttingDown_inlock()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(
+    if (_isShuttingDown(lock)) {
+        onCompletionGuard->setResultAndCancelRemainingWork(
             lock,
             Status(ErrorCodes::CallbackCanceled,
                    "failed to schedule rollback checker to check "
@@ -1996,13 +1987,13 @@ void InitialSyncer::_scheduleRollbackCheckerCheckForRollback_inlock(
     }
 
     auto scheduleResult =
-        _rollbackChecker->checkForRollback([=](const RollbackChecker::Result& result) {
+        _rollbackChecker->checkForRollback([=, this](const RollbackChecker::Result& result) {
             _rollbackCheckerCheckForRollbackCallback(result, onCompletionGuard);
         });
 
     auto status = scheduleResult.getStatus();
     if (!status.isOK()) {
-        onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
+        onCompletionGuard->setResultAndCancelRemainingWork(lock, status);
         return;
     }
 
@@ -2025,27 +2016,30 @@ void InitialSyncer::_clearRetriableError(WithLock lk) {
     _retryingOperation = boost::none;
 }
 
-Status InitialSyncer::_checkForShutdownAndConvertStatus_inlock(
-    const executor::TaskExecutor::CallbackArgs& callbackArgs, const std::string& message) {
-    return _checkForShutdownAndConvertStatus_inlock(callbackArgs.status, message);
+Status InitialSyncer::_checkForShutdownAndConvertStatus(
+    WithLock lk,
+    const executor::TaskExecutor::CallbackArgs& callbackArgs,
+    const std::string& message) {
+    return _checkForShutdownAndConvertStatus(lk, callbackArgs.status, message);
 }
 
-Status InitialSyncer::_checkForShutdownAndConvertStatus_inlock(const Status& status,
-                                                               const std::string& message) {
+Status InitialSyncer::_checkForShutdownAndConvertStatus(WithLock lk,
+                                                        const Status& status,
+                                                        const std::string& message) {
 
-    if (_isShuttingDown_inlock()) {
+    if (_isShuttingDown(lk)) {
         return Status(ErrorCodes::CallbackCanceled, message + ": initial syncer is shutting down");
     }
 
     return status.withContext(message);
 }
 
-Status InitialSyncer::_scheduleWorkAndSaveHandle_inlock(
-    executor::TaskExecutor::CallbackFn work,
-    executor::TaskExecutor::CallbackHandle* handle,
-    const std::string& name) {
+Status InitialSyncer::_scheduleWorkAndSaveHandle(WithLock lk,
+                                                 executor::TaskExecutor::CallbackFn work,
+                                                 executor::TaskExecutor::CallbackHandle* handle,
+                                                 const std::string& name) {
     invariant(handle);
-    if (_isShuttingDown_inlock()) {
+    if (_isShuttingDown(lk)) {
         return Status(ErrorCodes::CallbackCanceled,
                       str::stream() << "failed to schedule work " << name
                                     << ": initial syncer is shutting down");
@@ -2058,13 +2052,13 @@ Status InitialSyncer::_scheduleWorkAndSaveHandle_inlock(
     return Status::OK();
 }
 
-Status InitialSyncer::_scheduleWorkAtAndSaveHandle_inlock(
-    Date_t when,
-    executor::TaskExecutor::CallbackFn work,
-    executor::TaskExecutor::CallbackHandle* handle,
-    const std::string& name) {
+Status InitialSyncer::_scheduleWorkAtAndSaveHandle(WithLock lk,
+                                                   Date_t when,
+                                                   executor::TaskExecutor::CallbackFn work,
+                                                   executor::TaskExecutor::CallbackHandle* handle,
+                                                   const std::string& name) {
     invariant(handle);
-    if (_isShuttingDown_inlock()) {
+    if (_isShuttingDown(lk)) {
         return Status(ErrorCodes::CallbackCanceled,
                       str::stream() << "failed to schedule work " << name << " at "
                                     << when.toString() << ": initial syncer is shutting down");
@@ -2078,7 +2072,7 @@ Status InitialSyncer::_scheduleWorkAtAndSaveHandle_inlock(
     return Status::OK();
 }
 
-void InitialSyncer::_cancelHandle_inlock(executor::TaskExecutor::CallbackHandle handle) {
+void InitialSyncer::_cancelHandle(WithLock lk, executor::TaskExecutor::CallbackHandle handle) {
     if (!handle) {
         return;
     }
@@ -2086,13 +2080,13 @@ void InitialSyncer::_cancelHandle_inlock(executor::TaskExecutor::CallbackHandle 
 }
 
 template <typename Component>
-Status InitialSyncer::_startupComponent_inlock(Component& component) {
+Status InitialSyncer::_startupComponent(WithLock lk, Component& component) {
     // It is necessary to check if shutdown or attempt cancelling happens before starting a
     // component; otherwise the component may call a callback function in line which will
     // cause a deadlock when the callback attempts to obtain the initial syncer mutex.
-    if (_isShuttingDown_inlock() || _attemptCanceled) {
+    if (_isShuttingDown(lk) || _attemptCanceled) {
         component.reset();
-        if (_isShuttingDown_inlock()) {
+        if (_isShuttingDown(lk)) {
             return Status(ErrorCodes::CallbackCanceled,
                           "initial syncer shutdown while trying to call startup() on component");
         } else {
@@ -2109,19 +2103,19 @@ Status InitialSyncer::_startupComponent_inlock(Component& component) {
 }
 
 template <typename Component>
-void InitialSyncer::_shutdownComponent_inlock(Component& component) {
+void InitialSyncer::_shutdownComponent(WithLock lk, Component& component) {
     if (!component) {
         return;
     }
     component->shutdown();
 }
 
-StatusWith<std::vector<OplogEntry>> InitialSyncer::_getNextApplierBatch_inlock() {
+StatusWith<OplogApplierBatch> InitialSyncer::_getNextApplierBatch(WithLock lk) {
     // If the fail-point is active, delay the apply batch by returning an empty batch so that
     // _getNextApplierBatchCallback() will reschedule itself at a later time.
     // See InitialSyncerInterface::Options::getApplierBatchCallbackRetryWait.
     if (MONGO_unlikely(rsSyncApplyStop.shouldFail())) {
-        return std::vector<OplogEntry>();
+        return OplogApplierBatch();
     }
 
     // Obtain next batch of operations from OplogApplier.
@@ -2137,7 +2131,7 @@ StatusWith<std::vector<OplogEntry>> InitialSyncer::_getNextApplierBatch_inlock()
     return _oplogApplier->getNextApplierBatch(opCtx.get(), batchLimits);
 }
 
-StatusWith<HostAndPort> InitialSyncer::_chooseSyncSource_inlock() {
+StatusWith<HostAndPort> InitialSyncer::_chooseSyncSource(WithLock lk) {
     auto syncSource = _opts.syncSourceSelector->chooseNewSyncSource(_lastFetched);
     if (syncSource.empty()) {
         return Status{ErrorCodes::InvalidSyncSource,
@@ -2160,11 +2154,9 @@ Status InitialSyncer::_enqueueDocuments(OplogFetcher::Documents::const_iterator 
 
     invariant(_oplogBuffer);
 
-    // Wait for enough space.
-    _oplogApplier->waitForSpace(makeOpCtx().get(), info.toApplyDocumentBytes);
-
     // Buffer docs for later application.
-    _oplogApplier->enqueue(makeOpCtx().get(), begin, end);
+    OplogBuffer::Cost cost{info.toApplyDocumentBytes, info.toApplyDocumentCount};
+    _oplogApplier->enqueue(makeOpCtx().get(), begin, end, cost);
 
     _lastFetched = info.lastDocument;
 
@@ -2188,9 +2180,10 @@ void InitialSyncer::Stats::append(BSONObjBuilder* builder) const {
     builder->appendNumber("maxFailedInitialSyncAttempts",
                           static_cast<long long>(maxFailedInitialSyncAttempts));
 
+    auto e = exec.lock();
     if (initialSyncStart != Date_t()) {
         builder->appendDate("initialSyncStart", initialSyncStart);
-        auto elapsedDurationEnd = Date_t::now();
+        auto elapsedDurationEnd = e ? e->now() : Date_t::now();
         if (initialSyncEnd != Date_t()) {
             builder->appendDate("initialSyncEnd", initialSyncEnd);
             elapsedDurationEnd = initialSyncEnd;

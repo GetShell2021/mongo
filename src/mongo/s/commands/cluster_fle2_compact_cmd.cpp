@@ -27,13 +27,38 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <set>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/fle2_compact_gen.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -76,41 +101,54 @@ public:
     bool adminOnly() const final {
         return false;
     }
-} clusterCompactStructuredEncryptionDataCmd;
+
+    std::set<StringData> sensitiveFieldNames() const final {
+        return {CompactStructuredEncryptionData::kCompactionTokensFieldName};
+    }
+};
+MONGO_REGISTER_COMMAND(ClusterCompactStructuredEncryptionDataCmd).forRouter();
 
 using Cmd = ClusterCompactStructuredEncryptionDataCmd;
 Cmd::Reply Cmd::Invocation::typedRun(OperationContext* opCtx) {
+    {
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        CurOp::get(opCtx)->setShouldOmitDiagnosticInformation(lk, true);
+    }
+
     auto nss = request().getNamespace();
     const auto dbInfo =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, nss.db()));
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, nss.dbName()));
+
+    auto req = request();
+    generic_argument_util::setMajorityWriteConcern(req, &opCtx->getWriteConcern());
 
     // Rewrite command verb to _shardSvrCompactStructuredEnccryptionData.
-    auto cmd = request().toBSON({});
-    BSONObjBuilder req;
+    auto cmd = req.toBSON();
+    BSONObjBuilder reqBuilder;
     for (const auto& elem : cmd) {
         if (elem.fieldNameStringData() == Request::kCommandName) {
-            req.appendAs(elem, "_shardsvrCompactStructuredEncryptionData");
+            reqBuilder.appendAs(elem, "_shardsvrCompactStructuredEncryptionData");
         } else {
-            req.append(elem);
+            reqBuilder.append(elem);
         }
     }
 
-    auto response = uassertStatusOK(
-        executeCommandAgainstDatabasePrimary(
-            opCtx,
-            nss.db(),
-            dbInfo,
-            CommandHelpers::appendMajorityWriteConcern(req.obj(), opCtx->getWriteConcern()),
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            Shard::RetryPolicy::kIdempotent)
-            .swResponse);
+    auto response =
+        uassertStatusOK(executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
+                            opCtx,
+                            nss.dbName(),
+                            dbInfo,
+                            CommandHelpers::filterCommandRequestForPassthrough(reqBuilder.obj()),
+                            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                            Shard::RetryPolicy::kIdempotent)
+                            .swResponse);
 
     BSONObjBuilder result;
     CommandHelpers::filterCommandReplyForPassthrough(response.data, &result);
 
     auto reply = result.obj();
     uassertStatusOK(getStatusFromCommandResult(reply));
-    return Reply::parse({Request::kCommandName}, reply.removeField("ok"_sd));
+    return Reply::parse(IDLParserContext{Request::kCommandName}, reply.removeField("ok"_sd));
 }
 
 }  // namespace

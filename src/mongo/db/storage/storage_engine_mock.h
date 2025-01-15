@@ -41,45 +41,48 @@ public:
     RecoveryUnit* newRecoveryUnit() final {
         return nullptr;
     }
-    std::vector<DatabaseName> listDatabases() const final {
+    std::vector<DatabaseName> listDatabases(boost::optional<TenantId> tenantId) const final {
         return {};
     }
     bool supportsCappedCollections() const final {
         return true;
     }
-    bool isDurable() const final {
+    bool supportsCheckpoints() const final {
         return false;
     }
-    bool isEphemeral() const final {
+    bool isEphemeral() const override {
         return true;
     }
-    void loadCatalog(OperationContext* opCtx, LastShutdownState lastShutdownState) final {}
+    void loadCatalog(OperationContext* opCtx,
+                     boost::optional<Timestamp> stableTs,
+                     LastShutdownState lastShutdownState) final {}
     void closeCatalog(OperationContext* opCtx) final {}
-    Status closeDatabase(OperationContext* opCtx, const DatabaseName& dbName) final {
-        return Status::OK();
-    }
     Status dropDatabase(OperationContext* opCtx, const DatabaseName& dbName) final {
         return Status::OK();
     }
+    Status dropCollectionsWithPrefix(OperationContext* opCtx,
+                                     const DatabaseName& dbName,
+                                     const std::string& collectionNamePrefix) final {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support dropCollections");
+    }
     void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) final {}
-    Status beginBackup(OperationContext* opCtx) final {
+    Status beginBackup() final {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
-    void endBackup(OperationContext* opCtx) final {}
-    Status disableIncrementalBackup(OperationContext* opCtx) {
+    void endBackup() final {}
+    Status disableIncrementalBackup() override {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
     StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
-        OperationContext* opCtx,
-        boost::optional<Timestamp> checkpointTimestamp,
         const StorageEngine::BackupOptions& options) final {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
-    void endNonBlockingBackup(OperationContext* opCtx) final {}
-    StatusWith<std::deque<std::string>> extendBackupCursor(OperationContext* opCtx) final {
+    void endNonBlockingBackup() final {}
+    StatusWith<std::deque<std::string>> extendBackupCursor() final {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
@@ -97,10 +100,10 @@ public:
         return {};
     }
     std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
-        OperationContext* opCtx, StringData ident) final {
+        OperationContext* opCtx, StringData ident, KeyFormat keyFormat) final {
         return {};
     }
-    void cleanShutdown() final {}
+    void cleanShutdown(ServiceContext* svcCtx) final {}
     SnapshotManager* getSnapshotManager() const final {
         return nullptr;
     }
@@ -114,19 +117,10 @@ public:
     bool supportsReadConcernSnapshot() const final {
         return false;
     }
-    bool supportsReadConcernMajority() const final {
+    bool supportsOplogTruncateMarkers() const final {
         return false;
     }
-    bool supportsOplogStones() const final {
-        return false;
-    }
-    bool supportsResumableIndexBuilds() const final {
-        return false;
-    }
-    bool supportsPendingDrops() const final {
-        return false;
-    }
-    void clearDropPendingState() final {}
+    void clearDropPendingState(OperationContext* opCtx) final {}
     StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) final {
         fassertFailed(40547);
     }
@@ -145,7 +139,7 @@ public:
         return Timestamp();
     }
     void setOldestTimestampFromStable() final {}
-    void setOldestTimestamp(Timestamp timestamp) final {}
+    void setOldestTimestamp(Timestamp timestamp, bool force) final {}
     Timestamp getOldestTimestamp() const final {
         return {};
     };
@@ -153,7 +147,7 @@ public:
         OldestActiveTransactionTimestampCallback callback) final {}
 
     StatusWith<StorageEngine::ReconcileResult> reconcileCatalogAndIdents(
-        OperationContext* opCtx, LastShutdownState lastShutdownState) final {
+        OperationContext* opCtx, Timestamp stableTs, LastShutdownState lastShutdownState) final {
         return ReconcileResult{};
     }
     Timestamp getAllDurableTimestamp() const final {
@@ -162,18 +156,38 @@ public:
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
         return boost::none;
     }
+    Timestamp getPinnedOplog() const final {
+        return Timestamp();
+    }
     std::string getFilesystemPathForDb(const DatabaseName& dbName) const final {
         return "";
     }
     std::set<std::string> getDropPendingIdents() const final {
         return {};
     }
-    void addDropPendingIdent(const Timestamp& dropTimestamp,
-                             std::shared_ptr<Ident> ident,
-                             DropIdentCallback&& onDrop) final {}
+    size_t getNumDropPendingIdents() const final {
+        return 0;
+    }
+    void addDropPendingIdent(
+        const std::variant<Timestamp, StorageEngine::CheckpointIteration>& dropTime,
+        std::shared_ptr<Ident> ident,
+        DropIdentCallback&& onDrop) final {}
+    void dropIdentsOlderThan(OperationContext* opCtx, const Timestamp& ts) final {}
+    std::shared_ptr<Ident> markIdentInUse(StringData ident) final {
+        return nullptr;
+    }
     void startTimestampMonitor() final {}
 
     void checkpoint() final {}
+
+    StorageEngine::CheckpointIteration getCheckpointIteration() const final {
+        return StorageEngine::CheckpointIteration{0};
+    }
+
+    bool hasDataBeenCheckpointed(
+        StorageEngine::CheckpointIteration checkpointIteration) const override {
+        return false;
+    }
 
     int64_t sizeOnDiskForDb(OperationContext* opCtx, const DatabaseName& dbName) final {
         return 0;
@@ -197,7 +211,7 @@ public:
         return nullptr;
     }
 
-    StatusWith<Timestamp> pinOldestTimestamp(OperationContext* opCtx,
+    StatusWith<Timestamp> pinOldestTimestamp(RecoveryUnit&,
                                              const std::string& requestingServiceName,
                                              Timestamp requestedTimestamp,
                                              bool roundUpIfTooOld) final {
@@ -208,7 +222,34 @@ public:
 
     void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) final {}
 
+    Status oplogDiskLocRegister(OperationContext* opCtx,
+                                RecordStore* oplogRecordStore,
+                                const Timestamp& opTime,
+                                bool orderedCommit) final {
+        return Status::OK();
+    }
+
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                 RecordStore* oplogRecordStore) const override {}
+
+    bool waitUntilDurable(OperationContext* opCtx) override {
+        return true;
+    }
+
+    bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx,
+                                           bool stableCheckpoint) override {
+        return true;
+    }
+
+    BSONObj getSanitizedStorageOptionsForSecondaryReplication(const BSONObj& options) const final {
+        return options;
+    }
+
     void dump() const final {}
+
+    Status autoCompact(RecoveryUnit&, const AutoCompactOptions& options) final {
+        return Status::OK();
+    }
 };
 
 }  // namespace mongo

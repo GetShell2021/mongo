@@ -126,7 +126,7 @@
 # expression (as it appears in the output of dtruss on OS/X).
 
 from __future__ import print_function
-import argparse, distutils.spawn, fnmatch, os, platform, re, shutil, \
+import argparse, fnmatch, os, platform, re, shutil, \
     subprocess, sys
 
 # A class that represents a context in which predefined constants can be
@@ -147,16 +147,16 @@ class VariableContext(object):
 # Generally, system calls must be wrapped in an ASSERT_XX() "macro".
 # Exceptions are calls in this list that return 0 on success, or
 # those that are hardcoded in Runner.call_compare()
-calls_returning_zero = [ 'close', 'ftruncate', 'fdatasync', 'rename' ]
+calls_returning_zero = [ 'close', 'ftruncate', 'fdatasync' ]
 
 # Encapsulate all the defines we can use in our scripts.
 # When this program is run, we'll find out their actual values on
 # the host system.
 defines_used = [
-    'HAVE_FTRUNCATE', 'O_ACCMODE', 'O_APPEND', 'O_ASYNC',
-    'O_CLOEXEC', 'O_CREAT', 'O_EXCL', 'O_EXLOCK', 'O_NOATIME',
-    'O_NOFOLLOW', 'O_NONBLOCK', 'O_RDONLY', 'O_RDWR', 'O_SHLOCK',
-    'O_TRUNC', 'O_WRONLY', 'WT_USE_OPENAT' ]
+    'O_ACCMODE', 'O_APPEND', 'O_ASYNC', 'O_CLOEXEC', 'O_CREAT',
+    'O_EXCL', 'O_EXLOCK', 'O_NOATIME', 'O_NOFOLLOW', 'O_NONBLOCK',
+    'O_RDONLY', 'O_RDWR', 'O_SHLOCK', 'O_TRUNC', 'O_WRONLY',
+    'WT_USE_OPENAT' ]
 
 ################################################################
 
@@ -832,7 +832,7 @@ class SyscallCommand:
         else:
             msg("systype '" + args.systype + "' unsupported")
             return False
-        if not distutils.spawn.find_executable(straceexe):
+        if not shutil.which(straceexe):
             msg("strace: does not exist")
             return False
         self.args = args

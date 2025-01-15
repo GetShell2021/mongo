@@ -2,15 +2,10 @@
 
 /**
  * @tags: [
- * requires_fcv_60,
- * assumes_unsharded_collection
+ * assumes_unsharded_collection,
+ * requires_fcv_70
  * ]
  */
-load("jstests/fle2/libs/encrypted_client_util.js");
-
-(function() {
-'use strict';
-
 let dbTest = db.getSiblingDB('create_encrypted_indexes_db');
 
 dbTest.basic.drop();
@@ -74,4 +69,3 @@ assert.commandWorked(dbTest.basic.createIndex({"paymentMethods.creditCards.notNu
 
 // A wildcard index on the entire document is allowed.
 assert.commandWorked(dbTest.basic.createIndex({"$**": 1}));
-}());

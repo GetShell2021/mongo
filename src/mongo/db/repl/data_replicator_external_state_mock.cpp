@@ -27,18 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/data_replicator_external_state_mock.h"
-
 #include <memory>
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/repl/data_replicator_external_state_mock.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_buffer_blocking_queue.h"
 
 namespace mongo {
 namespace repl {
 
 namespace {
+
+constexpr std::size_t kTestOplogBufferSize = 64 * 1024 * 1024;
+constexpr std::size_t kTestOplogBufferCount = std::numeric_limits<std::size_t>::max();
 
 class OplogApplierMock : public OplogApplier {
     OplogApplierMock(const OplogApplierMock&) = delete;
@@ -83,11 +88,13 @@ std::shared_ptr<executor::TaskExecutor> DataReplicatorExternalStateMock::getShar
 }
 
 OpTimeWithTerm DataReplicatorExternalStateMock::getCurrentTermAndLastCommittedOpTime() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return {currentTerm, lastCommittedOpTime};
 }
 
 void DataReplicatorExternalStateMock::processMetadata(const rpc::ReplSetMetadata& replMetadata,
                                                       const rpc::OplogQueryMetadata& oqMetadata) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     replMetadataProcessed = rpc::ReplSetMetadata(replMetadata);
     oqMetadataProcessed = rpc::OplogQueryMetadata(oqMetadata);
     metadataWasProcessed = true;
@@ -99,6 +106,7 @@ ChangeSyncSourceAction DataReplicatorExternalStateMock::shouldStopFetching(
     const rpc::OplogQueryMetadata& oqMetadata,
     const OpTime& previousOpTimeFetched,
     const OpTime& lastOpTimeFetched) const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     lastSyncSourceChecked = source;
     syncSourceLastOpTime = oqMetadata.getLastOpApplied();
     syncSourceHasSyncSource = oqMetadata.getSyncSourceIndex() != -1;
@@ -107,13 +115,14 @@ ChangeSyncSourceAction DataReplicatorExternalStateMock::shouldStopFetching(
 
 ChangeSyncSourceAction DataReplicatorExternalStateMock::shouldStopFetchingOnError(
     const HostAndPort& source, const OpTime& lastOpTimeFetched) const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     lastSyncSourceChecked = source;
     return shouldStopFetchingResult;
 }
 
 std::unique_ptr<OplogBuffer> DataReplicatorExternalStateMock::makeInitialSyncOplogBuffer(
     OperationContext* opCtx) const {
-    return std::make_unique<OplogBufferBlockingQueue>();
+    return std::make_unique<OplogBufferBlockingQueue>(kTestOplogBufferSize, kTestOplogBufferCount);
 }
 
 std::unique_ptr<OplogApplier> DataReplicatorExternalStateMock::makeOplogApplier(
@@ -127,11 +136,13 @@ std::unique_ptr<OplogApplier> DataReplicatorExternalStateMock::makeOplogApplier(
 }
 
 StatusWith<ReplSetConfig> DataReplicatorExternalStateMock::getCurrentConfig() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return replSetConfigResult;
 }
 
 StatusWith<BSONObj> DataReplicatorExternalStateMock::loadLocalConfigDocument(
     OperationContext* opCtx) const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (replSetConfigResult.isOK()) {
         return replSetConfigResult.getValue().toBSON();
     }
@@ -145,6 +156,11 @@ Status DataReplicatorExternalStateMock::storeLocalConfigDocument(OperationContex
 
 JournalListener* DataReplicatorExternalStateMock::getReplicationJournalListener() {
     return nullptr;
+}
+
+StatusWith<LastVote> DataReplicatorExternalStateMock::loadLocalLastVoteDocument(
+    OperationContext* opCtx) const {
+    return StatusWith<LastVote>(ErrorCodes::NoMatchingDocument, "mock");
 }
 
 }  // namespace repl

@@ -26,9 +26,22 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/memory_usage_tracker.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/memory_usage_tracker.h"
+
 namespace mongo {
 
 /**
@@ -66,7 +79,7 @@ public:
 
 private:
     Value evaluateAndCoerce(Document doc) {
-        // We assume that partitioning is acheived by sorting, and missing fields and nulls are
+        // We assume that partitioning is achieved by sorting, and missing fields and nulls are
         // considered equivalent in sorting. Documents with missing fields and nulls may
         // interleave with each other, resulting in these documents processed into many separate
         // partitions (null, missing, null, missing). However, it is still guranteed that all nulls

@@ -28,29 +28,44 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
-
+#include <boost/smart_ptr.hpp>
+#include <cstddef>
 #include <tuple>
 #include <utility>
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/bson/json.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/client.h"
-#include "mongo/db/pipeline/document_source_lookup.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source_match.h"
-#include "mongo/db/pipeline/document_source_replace_root.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/document_source_unwind.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding/resharding_util.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/future_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/scopeguard.h"
-#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/timer.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
@@ -66,7 +81,7 @@ namespace {
  */
 ReshardingDonorOplogId getId(const repl::OplogEntry& oplog) {
     return ReshardingDonorOplogId::parse(
-        IDLParserErrorContext("ReshardingDonorOplogIterator::getOplogId"),
+        IDLParserContext("ReshardingDonorOplogIterator::getOplogId"),
         oplog.get_id()->getDocument().toBson());
 }
 
@@ -86,22 +101,14 @@ std::unique_ptr<Pipeline, PipelineDeleter> ReshardingDonorOplogIterator::makePip
     using Arr = std::vector<Value>;
     using V = Value;
 
-    StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
+    StringMap<ResolvedNamespace> resolvedNamespaces;
     resolvedNamespaces[_oplogBufferNss.coll()] = {_oplogBufferNss, std::vector<BSONObj>{}};
-
-    auto expCtx = make_intrusive<ExpressionContext>(opCtx,
-                                                    boost::none, /* explain */
-                                                    false,       /* fromMongos */
-                                                    false,       /* needsMerge */
-                                                    false,       /* allowDiskUse */
-                                                    false,       /* bypassDocumentValidation */
-                                                    false,       /* isMapReduceCommand */
-                                                    _oplogBufferNss,
-                                                    boost::none, /* runtimeConstants */
-                                                    nullptr,     /* collator */
-                                                    std::move(mongoProcessInterface),
-                                                    std::move(resolvedNamespaces),
-                                                    boost::none /* collUUID */);
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx)
+                      .mongoProcessInterface(std::move(mongoProcessInterface))
+                      .ns(_oplogBufferNss)
+                      .resolvedNamespace(std::move(resolvedNamespaces))
+                      .build();
 
     Pipeline::SourceContainer stages;
 
@@ -110,7 +117,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> ReshardingDonorOplogIterator::makePip
 
     stages.emplace_back(DocumentSourceSort::create(expCtx, BSON("_id" << 1)));
 
-    return Pipeline::create(std::move(stages), std::move(expCtx));
+    return Pipeline::create(std::move(stages), expCtx);
 }
 
 std::vector<repl::OplogEntry> ReshardingDonorOplogIterator::_fillBatch(Pipeline& pipeline) {
@@ -158,24 +165,14 @@ ExecutorFuture<std::vector<repl::OplogEntry>> ReshardingDonorOplogIterator::getN
         auto opCtx = factory.makeOperationContext(&cc());
         ScopeGuard guard([&] { dispose(opCtx.get()); });
 
-        // A primary which steps down may briefly continue running the ReshardingDonorOplogIterator
-        // as a secondary. AutoGetCollectionForReadBase forbids reads on a secondary from using the
-        // default RecoveryUnit::ReadSource of kNoTimestamp when the operation expects to conflict
-        // with secondary oplog application. We opt out of acquiring the PBWM lock to avoid
-        // triggering an fassert() when briefly running as a secondary. This is acceptable because
-        // the PBWM lock isn't needed as a primary and any inconsistent reads as a secondary won't
-        // have a real effect because the node won't be able to perform more writes.
-        ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
-            opCtx->lockState());
-
         Timer fetchTimer;
         if (_pipeline) {
             _pipeline->reattachToOperationContext(opCtx.get());
         } else {
             auto pipeline = makePipeline(opCtx.get(), MongoProcessInterface::create(opCtx.get()));
             _pipeline = pipeline->getContext()
-                            ->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
-                                pipeline.release());
+                            ->getMongoProcessInterface()
+                            ->attachCursorSourceToPipelineForLocalRead(pipeline.release());
             _pipeline.get_deleter().dismissDisposal();
         }
 
@@ -204,7 +201,7 @@ ExecutorFuture<std::vector<repl::OplogEntry>> ReshardingDonorOplogIterator::getN
                 return future_util::withCancellation(_insertNotifier->awaitInsert(_resumeToken),
                                                      cancelToken);
             })
-            .then([this, cancelToken, executor, factory] {
+            .then([this, cancelToken, executor, factory]() mutable {
                 return getNextBatch(std::move(executor), cancelToken, factory);
             });
     }

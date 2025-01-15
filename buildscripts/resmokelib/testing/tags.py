@@ -2,8 +2,9 @@
 
 import collections
 import copy
-from functools import cmp_to_key
 import textwrap
+from functools import cmp_to_key
+
 import yaml
 
 from buildscripts.resmokelib.utils import default_if_none
@@ -74,7 +75,8 @@ class TagsConfig(object):
             if preamble:
                 print(
                     textwrap.fill(preamble, width=100, initial_indent="# ", subsequent_indent="# "),
-                    file=fstream)
+                    file=fstream,
+                )
 
             # We use yaml.safe_dump() in order avoid having strings being written to the file as
             # "!!python/unicode ..." and instead have them written as plain 'str' instances.

@@ -3,8 +3,14 @@
 // The idea here is that a collection may be resharded / unsharded at any point, and any type of
 // operation on a mongos may be active when it happens.  All operations should handle gracefully.
 //
+// @tags: [
+//   # TODO (SERVER-97257): Re-enable this test.
+//   # Test doesn't start enough mongods to have num_mongos routers
+//   embedded_router_incompatible,
+// ]
 
-(function() {
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 var st = new ShardingTest({shards: 2, mongos: 5, verbose: 1});
 // Balancer is by default stopped, thus it will not interfere
 
@@ -29,8 +35,8 @@ var shards = [st.shard0, st.shard1];
 
 jsTest.log("Enabling sharding for the first time...");
 
-assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
-st.ensurePrimaryShard(coll.getDB().getName(), st.shard1.shardName);
+assert.commandWorked(
+    admin.runCommand({enableSharding: coll.getDB() + "", primaryShard: st.shard1.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
 
 assert.commandWorked(coll.insert({hello: "world"}));
@@ -73,8 +79,8 @@ jsTest.log("Rebuilding sharded collection with different split...");
 
 coll.drop();
 
-assert.commandWorked(admin.runCommand({enableSharding: coll.getDB() + ""}));
-st.ensurePrimaryShard(coll.getDB().getName(), st.shard1.shardName);
+assert.commandWorked(
+    admin.runCommand({enableSharding: coll.getDB() + "", primaryShard: st.shard1.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: coll + "", key: {_id: 1}}));
 
 var bulk = coll.initializeUnorderedBulkOp();
@@ -125,4 +131,3 @@ coll.drop();
 jsTest.log("Done!");
 
 st.stop();
-})();

@@ -6,11 +6,6 @@
  *   do_not_wrap_aggregations_in_facets,
  * ]
  */
-(function() {
-"use strict";
-
-// TODO SERVER-63811 Ensure the database exists so we get back non-empty results even in a sharded
-// cluster.
 assert.commandWorked(db[jsTestName()].insert({dummy: 1}));
 
 let windowResults = db.aggregate([
@@ -29,4 +24,3 @@ windowResults = db.aggregate([
 ]);
 
 assert.eq(windowResults.toArray(), [{_id: 0, obj: {k1: "v1", k2: "v2", subPath: 1}}]);
-})();

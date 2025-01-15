@@ -37,7 +37,6 @@
 static const char *home;
 
 static void add_collator(WT_CONNECTION *conn);
-static void add_extractor(WT_CONNECTION *conn);
 static void backup(WT_SESSION *session);
 static void checkpoint_ops(WT_SESSION *session);
 static void connection_ops(WT_CONNECTION *conn);
@@ -189,6 +188,14 @@ cursor_ops(WT_SESSION *session)
         WT_ITEM value; /* Get the cursor's raw value. */
         error_check(cursor->get_value(cursor, &value));
         /*! [Get the cursor's raw value] */
+    }
+
+    {
+        /*! [Get the raw key and value for the current record.] */
+        WT_ITEM key;   /* Get the raw key and value for the current record. */
+        WT_ITEM value; /* Get the raw key and value for the current record. */
+        error_check(cursor->get_raw_key_value(cursor, &key, &value));
+        /*! [Get the raw key and value for the current record.] */
     }
 
     {
@@ -483,17 +490,6 @@ checkpoint_ops(WT_SESSION *session)
     /* Checkpoint of the database, creating a named snapshot. */
     error_check(session->checkpoint(session, "name=June01"));
 
-    /*
-     * Checkpoint a list of objects. JSON parsing requires quoting the list of target URIs.
-     */
-    error_check(session->checkpoint(session, "target=(\"table:table1\",\"table:table2\")"));
-
-    /*
-     * Checkpoint a list of objects, creating a named snapshot. JSON parsing requires quoting the
-     * list of target URIs.
-     */
-    error_check(session->checkpoint(session, "target=(\"table:mytable\"),name=midnight"));
-
     /* Checkpoint the database, discarding all previous snapshots. */
     error_check(session->checkpoint(session, "drop=(from=all)"));
 
@@ -509,27 +505,15 @@ checkpoint_ops(WT_SESSION *session)
      * Checkpoint the database, discarding all snapshots before and including "midnight".
      */
     error_check(session->checkpoint(session, "drop=(to=midnight)"));
-
-    /*
-     * Create a checkpoint of a table, creating the "July01" snapshot and discarding the "May01" and
-     * "June01" snapshots. JSON parsing requires quoting the list of target URIs.
-     */
-    error_check(
-      session->checkpoint(session, "target=(\"table:mytable\"),name=July01,drop=(May01,June01)"));
     /*! [Checkpoint examples] */
-
-    /*! [JSON quoting example] */
-    /*
-     * Checkpoint a list of objects. JSON parsing requires quoting the list of target URIs.
-     */
-    error_check(session->checkpoint(session, "target=(\"table:table1\",\"table:table2\")"));
-    /*! [JSON quoting example] */
 }
 
 static void
 cursor_statistics(WT_SESSION *session)
 {
     WT_CURSOR *cursor;
+    uint64_t stat_value;
+    int ret, stat_key;
 
     /*! [Statistics cursor database] */
     error_check(session->open_cursor(session, "statistics:", NULL, NULL, &cursor));
@@ -557,6 +541,18 @@ cursor_statistics(WT_SESSION *session)
     /*! [Statistics cursor session] */
     error_check(session->open_cursor(session, "statistics:session", NULL, NULL, &cursor));
     /*! [Statistics cursor session] */
+
+    /*! [Statistics cursor ignore column] */
+    error_check(session->open_cursor(session, "statistics:", NULL, NULL, &cursor));
+    while ((ret = cursor->next(cursor)) == 0) {
+        error_check(cursor->get_key(cursor, &stat_key));
+
+        /* Ignore the first two columns, only retrieve the statistics value. */
+        error_check(cursor->get_value(cursor, NULL, NULL, &stat_value));
+    }
+    scan_end_check(ret == WT_NOTFOUND);
+    error_check(cursor->close(cursor));
+    /*! [Statistics cursor ignore column] */
 }
 
 static void
@@ -622,6 +618,13 @@ session_ops_create(WT_SESSION *session)
       session, "table:mytable", "block_compressor=zstd,key_format=S,value_format=S"));
     /*! [Create a zstd compressed table] */
     error_check(session->drop(session, "table:mytable", NULL));
+
+    /*! [Create a iaa compressed table] */
+    error_check(session->create(
+      session, "table:mytable", "block_compressor=iaa,key_format=S,value_format=S"));
+    /*! [Create a iaa compressed table] */
+    error_check(session->drop(session, "table:mytable", NULL));
+
 #endif
 
     /*! [Configure checksums to uncompressed] */
@@ -693,12 +696,6 @@ session_ops(WT_SESSION *session)
         error_check(session->compact(session, "table:mytable", NULL));
         /*! [Compact a table] */
 
-        error_check(
-          session->create(session, "table:old", "key_format=r,value_format=S,cache_resident=true"));
-        /*! [Rename a table] */
-        error_check(session->rename(session, "table:old", "table:new", NULL));
-        /*! [Rename a table] */
-
         /*! [Salvage a table] */
         error_check(session->salvage(session, "table:mytable", NULL));
         /*! [Salvage a table] */
@@ -745,10 +742,6 @@ session_ops(WT_SESSION *session)
         }
 
         error_check(session->checkpoint(session, NULL));
-
-        /*! [Upgrade a table] */
-        error_check(session->upgrade(session, "table:mytable", NULL));
-        /*! [Upgrade a table] */
 
         /*! [Verify a table] */
         error_check(session->verify(session, "table:mytable", NULL));
@@ -981,31 +974,6 @@ add_collator(WT_CONNECTION *conn)
     /*! [WT_COLLATOR register] */
 }
 
-/*! [WT_EXTRACTOR] */
-static int
-my_extract(WT_EXTRACTOR *extractor, WT_SESSION *session, const WT_ITEM *key, const WT_ITEM *value,
-  WT_CURSOR *result_cursor)
-{
-    /* Unused parameters */
-    (void)extractor;
-    (void)session;
-    (void)key;
-
-    result_cursor->set_key(result_cursor, value);
-    return (result_cursor->insert(result_cursor));
-}
-/*! [WT_EXTRACTOR] */
-
-static void
-add_extractor(WT_CONNECTION *conn)
-{
-    /*! [WT_EXTRACTOR register] */
-    static WT_EXTRACTOR my_extractor = {my_extract, NULL, NULL};
-
-    error_check(conn->add_extractor(conn, "my_extractor", &my_extractor, NULL));
-    /*! [WT_EXTRACTOR register] */
-}
-
 static void
 connection_ops(WT_CONNECTION *conn)
 {
@@ -1019,7 +987,6 @@ connection_ops(WT_CONNECTION *conn)
 #endif
 
     add_collator(conn);
-    add_extractor(conn);
 
     /*! [Reconfigure a connection] */
     error_check(conn->reconfigure(conn, "eviction_target=75"));
@@ -1113,8 +1080,6 @@ pack_ops(WT_SESSION *session)
 static void
 backup(WT_SESSION *session)
 {
-    char buf[1024];
-
     WT_CURSOR *dup_cursor;
     /*! [backup]*/
     WT_CURSOR *cursor;
@@ -1130,9 +1095,7 @@ backup(WT_SESSION *session)
     /* Copy the list of files. */
     while ((ret = cursor->next(cursor)) == 0) {
         error_check(cursor->get_key(cursor, &filename));
-        (void)snprintf(
-          buf, sizeof(buf), "cp /path/database/%s /path/database.backup/%s", filename, filename);
-        error_check(system(buf));
+        testutil_system("cp /path/database/%s /path/database.backup/%s", filename, filename);
     }
     scan_end_check(ret == WT_NOTFOUND);
 
@@ -1142,15 +1105,14 @@ backup(WT_SESSION *session)
     /*! [backup log duplicate]*/
     /* Open the backup data source. */
     error_check(session->open_cursor(session, "backup:", NULL, NULL, &cursor));
+    /*! [JSON quoting example] */
     /* Open a duplicate cursor for additional log files. */
+    /*
+     * JSON parsing requires quoting a URI that contains a colon.
+     */
     error_check(session->open_cursor(session, NULL, cursor, "target=(\"log:\")", &dup_cursor));
+    /*! [JSON quoting example] */
     /*! [backup log duplicate]*/
-
-    /*! [incremental backup]*/
-    /* Open the backup data source for log-based incremental backup. */
-    error_check(session->open_cursor(session, "backup:", NULL, "target=(\"log:\")", &cursor));
-    /*! [incremental backup]*/
-    error_check(cursor->close(cursor));
 
     /*! [incremental block backup]*/
     /* Open the backup data source for block-based incremental backup. */
@@ -1220,6 +1182,12 @@ main(int argc, char *argv[])
     /*! [Configure zstd extension with compression level] */
     error_check(conn->close(conn, NULL));
 
+    /*! [Configure iaa extension] */
+    error_check(wiredtiger_open(
+      home, NULL, "create,extensions=[/usr/local/lib/libwiredtiger_iaa.so]", &conn));
+    /*! [Configure iaa extension] */
+    error_check(conn->close(conn, NULL));
+
     /* this is outside the example snippet on purpose; don't encourage compiling in keys */
     const char *secretkey = "abcdef";
     /*! [Configure sodium extension] */
@@ -1230,16 +1198,6 @@ main(int argc, char *argv[])
       secretkey);
     error_check(wiredtiger_open(home, NULL, conf, &conn));
     /*! [Configure sodium extension] */
-    error_check(conn->close(conn, NULL));
-
-    /*
-     * This example code gets run, and direct I/O might not be available, causing the open to fail.
-     * The documentation requires code snippets, use #ifdef's to avoid running it.
-     */
-    /* Might Not Run: direct I/O may not be available. */
-    /*! [Configure direct_io for data files] */
-    error_check(wiredtiger_open(home, NULL, "create,direct_io=[data]", &conn));
-    /*! [Configure direct_io for data files] */
     error_check(conn->close(conn, NULL));
 #endif
 
@@ -1349,6 +1307,24 @@ main(int argc, char *argv[])
         func = wiredtiger_crc32c_func();
         crc32c = func(buffer, len);
         /*! [Checksum a buffer] */
+        (void)crc32c;
+    }
+
+    {
+        size_t chunk1, chunk2, chunk3;
+        /*! [Checksum a large buffer in smaller pieces] */
+        uint32_t crc32c, (*func_with_seed)(uint32_t, const void *, size_t);
+        const char *buffer = "some other larger string";
+
+        func_with_seed = wiredtiger_crc32c_with_seed_func();
+        chunk1 = strlen("some ");
+        chunk2 = strlen("other larger ");
+        chunk3 = strlen("string");
+        crc32c = 0;
+        crc32c = func_with_seed(crc32c, buffer, chunk1);
+        crc32c = func_with_seed(crc32c, buffer + chunk1, chunk2);
+        crc32c = func_with_seed(crc32c, buffer + chunk1 + chunk2, chunk3);
+        /*! [Checksum a large buffer in smaller pieces] */
         (void)crc32c;
     }
 

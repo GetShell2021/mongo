@@ -29,21 +29,51 @@
 
 #pragma once
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
-#include "mongo/db/repl/drop_pending_collection_reaper.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/oplog_interface_mock.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/log_severity.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace repl {
@@ -94,10 +124,11 @@ public:
      */
     static std::pair<BSONObj, RecordId> makeCommandOp(Timestamp ts,
                                                       const boost::optional<UUID>& uuid,
-                                                      StringData nss,
+                                                      const NamespaceString& nss,
                                                       BSONObj cmdObj,
                                                       int recordId,
-                                                      boost::optional<BSONObj> o2 = boost::none);
+                                                      boost::optional<BSONObj> o2 = boost::none,
+                                                      boost::optional<TenantId> tid = boost::none);
 
     /**
      * Creates an oplog entry with a recordId for a command operation. The oplog entry will not have
@@ -126,9 +157,6 @@ protected:
     // ReplicationProcess used to access consistency markers.
     std::unique_ptr<ReplicationProcess> _replicationProcess;
 
-    // DropPendingCollectionReaper used to clean up and roll back dropped collections.
-    DropPendingCollectionReaper* _dropPendingCollectionReaper = nullptr;
-
     ReadWriteConcernDefaultsLookupMock _lookupMock;
 
     // Increase rollback log component verbosity for unit tests.
@@ -141,7 +169,7 @@ public:
     void setStableTimestamp(ServiceContext* serviceCtx,
                             Timestamp snapshotName,
                             bool force = false) override {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         _stableTimestamp = snapshotName;
     }
 
@@ -151,7 +179,7 @@ public:
      * of '_currTimestamp'.
      */
     Timestamp recoverToStableTimestamp(OperationContext* opCtx) override {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         if (_recoverToTimestampStatus) {
             fassert(4584700, _recoverToTimestampStatus.get());
         }
@@ -174,17 +202,17 @@ public:
     }
 
     void setRecoverToTimestampStatus(Status status) {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         _recoverToTimestampStatus = status;
     }
 
     void setCurrentTimestamp(Timestamp ts) {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         _currTimestamp = ts;
     }
 
     Timestamp getCurrentTimestamp() {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         return _currTimestamp;
     }
 
@@ -193,29 +221,29 @@ public:
      */
     Status setCollectionCount(OperationContext* opCtx,
                               const NamespaceStringOrUUID& nsOrUUID,
-                              long long newCount) {
-        stdx::lock_guard<Latch> lock(_mutex);
+                              long long newCount) override {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         if (_setCollectionCountStatus && _setCollectionCountStatusUUID &&
             nsOrUUID.uuid() == _setCollectionCountStatusUUID) {
             return *_setCollectionCountStatus;
         }
-        _newCounts[*nsOrUUID.uuid()] = newCount;
+        _newCounts[nsOrUUID.uuid()] = newCount;
         return Status::OK();
     }
 
     void setSetCollectionCountStatus(UUID uuid, Status status) {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         _setCollectionCountStatus = status;
         _setCollectionCountStatusUUID = uuid;
     }
 
     long long getFinalCollectionCount(const UUID& uuid) {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         return _newCounts[uuid];
     }
 
 private:
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("StorageInterfaceRollback::_mutex");
+    mutable stdx::mutex _mutex;
 
     Timestamp _stableTimestamp;
 
@@ -274,11 +302,11 @@ public:
     BSONObj getLastOperation() const override;
     BSONObj findOne(const NamespaceString& nss, const BSONObj& filter) const override;
 
-    std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+    std::pair<BSONObj, NamespaceString> findOneByUUID(const DatabaseName& db,
                                                       UUID uuid,
                                                       const BSONObj& filter) const override;
 
-    StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+    StatusWith<BSONObj> getCollectionInfoByUUID(const DatabaseName& dbName,
                                                 const UUID& uuid) const override;
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
 

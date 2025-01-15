@@ -4,10 +4,8 @@
  *   requires_persistence,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = "initial_sync_oplog_fetcher_survives_restart";
 const rst = new ReplSetTest({name: testName, nodes: 1});
@@ -67,6 +65,5 @@ assert.commandWorked(secondary.getDB("test").adminCommand(
 
 jsTestLog("Waiting for initial sync to complete.");
 // Wait for initial sync to complete.
-rst.waitForState(secondary, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [secondary]);
 rst.stopSet();
-})();

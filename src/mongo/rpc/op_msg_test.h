@@ -27,14 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#pragma once
 
+#include <cstdint>
+#include <cstring>
+#include <third_party/wiredtiger/wiredtiger.h>
 #include <type_traits>
+#include <utility>
 
+#include "mongo/base/data_type_endian.h"
+#include "mongo/base/data_view.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/rpc/message.h"
 #include "mongo/rpc/op_msg.h"
-#include "third_party/wiredtiger/wiredtiger.h"
+#include "mongo/util/shared_buffer.h"
+
 
 namespace mongo {
 namespace rpc {
@@ -80,7 +90,7 @@ protected:
 
     template <typename... Rest>
     void append(StringData arg, Rest&&... rest) {
-        buffer.appendStr(arg, /* null terminate*/ true);
+        buffer.appendCStr(arg);
         append(rest...);
     }
 

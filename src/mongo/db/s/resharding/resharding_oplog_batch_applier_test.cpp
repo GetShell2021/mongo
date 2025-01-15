@@ -27,55 +27,117 @@
  *    it in the license file.
  */
 
-#include <boost/optional/optional_io.hpp>
+#include <cstdint>
+#include <fmt/format.h>
+#include <functional>
+#include <initializer_list>
 #include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/crypto/encryption_fields_gen.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/catalog_raii.h"
-#include "mongo/db/logical_session_cache_noop.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/client.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/operation_logger_impl.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/persistent_task_store.h"
-#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
-#include "mongo/db/s/op_observer_sharding_impl.h"
+#include "mongo/db/s/metrics/sharding_data_transform_metrics.h"
+#include "mongo/db/s/migration_chunk_cloner_source_op_observer.h"
+#include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_oplog_application.h"
+#include "mongo/db/s/resharding/resharding_oplog_applier_metrics.h"
 #include "mongo/db/s/resharding/resharding_oplog_batch_applier.h"
 #include "mongo/db/s/resharding/resharding_oplog_session_application.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
-#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
 
-class ReshardingOplogBatchApplierTest : public ServiceContextMongoDTest {
+class ReshardingOplogBatchApplierTest : service_context_test::WithSetupTransportLayer,
+                                        public ServiceContextMongoDTest {
 public:
     void setUp() override {
         ServiceContextMongoDTest::setUp();
 
         auto serviceContext = getServiceContext();
-
-        // Initialize sharding components as a shard server.
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-
         {
             auto opCtx = makeOperationContext();
             auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(serviceContext);
@@ -87,16 +149,25 @@ public:
             auto storageImpl = std::make_unique<repl::StorageInterfaceImpl>();
             repl::StorageInterface::set(serviceContext, std::move(storageImpl));
 
-            MongoDSessionCatalog::onStepUp(opCtx.get());
+            MongoDSessionCatalog::set(
+                serviceContext,
+                std::make_unique<MongoDSessionCatalog>(
+                    std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+            auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx.get());
+            mongoDSessionCatalog->onStepUp(opCtx.get());
+
             LogicalSessionCache::set(serviceContext, std::make_unique<LogicalSessionCacheNoop>());
 
-            // OpObserverShardingImpl is required for timestamping the writes from
+            // OpObserverImpl is required for timestamping the writes from
             // ReshardingOplogApplicationRules.
             auto opObserverRegistry =
                 dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
             invariant(opObserverRegistry);
 
-            opObserverRegistry->addObserver(std::make_unique<OpObserverShardingImpl>());
+            opObserverRegistry->addObserver(
+                std::make_unique<OpObserverImpl>(std::make_unique<OperationLoggerImpl>()));
+            opObserverRegistry->addObserver(
+                std::make_unique<MigrationChunkClonerSourceOpObserver>());
         }
 
         {
@@ -145,20 +216,15 @@ public:
         threadPoolOptions.threadNamePrefix = "TestReshardOplogBatchApplier-";
         threadPoolOptions.poolName = "TestReshardOplogBatchApplierThreadPool";
         threadPoolOptions.onCreateThread = [](const std::string& threadName) {
-            Client::initThread(threadName.c_str());
+            Client::initThread(threadName, getGlobalServiceContext()->getService());
             auto* client = Client::getCurrent();
-            AuthorizationSession::get(*client)->grantInternalAuthorization(client);
-
-            {
-                stdx::lock_guard<Client> lk(*client);
-                client->setSystemOperationKillableByStepdown(lk);
-            }
+            AuthorizationSession::get(*client)->grantInternalAuthorization();
         };
 
         auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
         hookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(getServiceContext()));
 
-        auto executor = std::make_shared<executor::ThreadPoolTaskExecutor>(
+        auto executor = executor::ThreadPoolTaskExecutor::create(
             std::make_unique<ThreadPool>(std::move(threadPoolOptions)),
             executor::makeNetworkInterface(
                 "TestReshardOplogBatchApplierNetwork", nullptr, std::move(hookList)));
@@ -186,10 +252,13 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       false /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kStart);
 
         txnParticipant.unstashTransactionResources(opCtx, "prepareTransaction");
 
@@ -202,8 +271,8 @@ public:
             auto opTime = repl::getNextOpTime(opCtx);
             wuow.release();
 
-            opCtx->recoveryUnit()->abortUnitOfWork();
-            opCtx->lockState()->endWriteUnitOfWork();
+            shard_role_details::getRecoveryUnit(opCtx)->abortUnitOfWork();
+            shard_role_details::getLocker(opCtx)->endWriteUnitOfWork();
 
             return opTime;
         }();
@@ -218,10 +287,13 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, false /* autocommit */, boost::none /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       false /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kContinue);
 
         txnParticipant.unstashTransactionResources(opCtx, "abortTransaction");
         txnParticipant.abortTransaction(opCtx);
@@ -320,13 +392,13 @@ private:
         auto rt = RoutingTableHistory::makeNew(_sourceNss,
                                                _sourceUUID,
                                                BSON(_currentShardKey << 1),
+                                               false, /* unsplittable */
                                                nullptr /* defaultCollator */,
                                                false /* unique */,
-                                               std::move(epoch),
+                                               epoch,
                                                Timestamp(1, 1),
                                                boost::none /* timeseriesFields */,
                                                boost::none /* reshardingFields */,
-                                               boost::none /* chunkSizeBytes */,
                                                true /* allowMigrations */,
                                                chunks);
 
@@ -345,20 +417,23 @@ private:
 
     const StringData _currentShardKey = "sk";
 
-    const NamespaceString _sourceNss{"test_crud", "collection_being_resharded"};
+    const NamespaceString _sourceNss =
+        NamespaceString::createNamespaceString_forTest("test_crud", "collection_being_resharded");
     const UUID _sourceUUID = UUID::gen();
 
     const ShardId _myDonorId{"myDonorId"};
     const ShardId _otherDonorId{"otherDonorId"};
 
     const NamespaceString _outputNss =
-        resharding::constructTemporaryReshardingNss(_sourceNss.db(), _sourceUUID);
+        resharding::constructTemporaryReshardingNss(_sourceNss, _sourceUUID);
     const NamespaceString _myStashNss =
         resharding::getLocalConflictStashNamespace(_sourceUUID, _myDonorId);
     const NamespaceString _otherStashNss =
         resharding::getLocalConflictStashNamespace(_sourceUUID, _otherDonorId);
     const NamespaceString _myOplogBufferNss =
         resharding::getLocalOplogBufferNamespace(_sourceUUID, _myDonorId);
+
+    service_context_test::ShardRoleOverride _shardRole;
 
     std::unique_ptr<ReshardingMetrics> _metrics;
     std::unique_ptr<ReshardingOplogApplierMetrics> _applierMetrics;

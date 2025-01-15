@@ -47,7 +47,8 @@ public:
      * The type of metric which can be collected and tracked during a trial run.
      */
     enum TrialRunMetric : uint8_t {
-        // Number of documents returned during a trial run.
+        // Number of documents returned by the part of the plan that participated in the
+        // multi-planning.
         kNumResults,
         // Number of physical reads performed during a trial run. Once a storage cursor advances,
         // it counts as a single physical read.
@@ -106,7 +107,7 @@ public:
         }
 
         _metrics[metric] += metricIncrement;
-        if (_metrics[metric] > _maxMetrics[metric]) {
+        if (metricReached<metric>()) {
             if (_onMetricReached) {
                 _done = _onMetricReached(metric);
             } else {
@@ -122,8 +123,26 @@ public:
         return _metrics[metric];
     }
 
+    template <TrialRunMetric metric>
+    bool metricReached() const {
+        static_assert(metric >= 0 && metric < sizeof(_metrics) / sizeof(size_t));
+        return metricTracked<metric>() && _metrics[metric] > _maxMetrics[metric];
+    }
+
+    template <TrialRunMetric metric>
+    bool metricTracked() const {
+        static_assert(metric >= 0 && metric < sizeof(_metrics) / sizeof(size_t));
+        return _maxMetrics[metric] != 0;
+    }
+
+    template <TrialRunMetric metric>
+    void updateMaxMetric(size_t newMaxMetric) {
+        static_assert(metric >= 0 && metric < sizeof(_metrics) / sizeof(size_t));
+        _maxMetrics[metric] = newMaxMetric;
+    }
+
 private:
-    const size_t _maxMetrics[TrialRunMetric::kLastElem];
+    size_t _maxMetrics[TrialRunMetric::kLastElem];
     size_t _metrics[TrialRunMetric::kLastElem]{0};
     bool _done{false};
     std::function<bool(TrialRunMetric)> _onMetricReached{};

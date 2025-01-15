@@ -30,9 +30,19 @@
 #include "mongo/util/histogram.h"
 
 #include <boost/optional.hpp>
+#include <ostream>
+#include <string_view>
+#include <tuple>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/unittest/assert_that.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/matcher.h"
+#include "mongo/unittest/matcher_core.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
@@ -49,7 +59,9 @@ public:
         boost::optional<T> lower, upper;
 
         friend bool operator==(const BucketSpec& a, const BucketSpec& b) {
-            auto lens = [](auto&& x) { return std::tie(x.count, x.lower, x.upper); };
+            auto lens = [](auto&& x) {
+                return std::tie(x.count, x.lower, x.upper);
+            };
             return lens(a) == lens(b);
         }
 

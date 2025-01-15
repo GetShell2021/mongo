@@ -3,15 +3,18 @@
 // This test is to ensure that localhost authentication works correctly against a sharded
 // cluster whether they are hosted with "localhost" or a hostname.
 
-// Checking UUID and index consistency, which occurs on ShardingTest.stop, involves using a
-// mongos to read data on the config server, but this test uses a special shutdown function
-// which stops the mongoses before calling ShardingTest.stop.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// The following checks, which occurs on ShardingTest.stop, involve using a mongos to read data on
+// the config server, but this test uses a special shutdown function which stops the mongoses before
+// calling ShardingTest.stop.
+// @tags : [requires_scripting]
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
-
-(function() {
-'use strict';
+TestData.skipCheckShardFilteringMetadata = true;
+TestData.skipCheckMetadataConsistency = true;
 
 var replSetName = "replsets_server-6591";
 var keyfile = "jstests/libs/key1";
@@ -26,7 +29,9 @@ var createUser = function(mongo) {
 };
 
 var addUsersToEachShard = function(st) {
-    for (var i = 0; i < numShards; i++) {
+    // In config shard mode skip the first shard because it is also the config server and will
+    // already have a user made on it through mongos.
+    for (var i = TestData.configShard ? 1 : 0; i < numShards; i++) {
         print("============ adding a user to shard " + i);
         var d = st["shard" + i];
         d.getDB("admin").createUser({user: username, pwd: password, roles: jsTest.adminUserRoles});
@@ -35,7 +40,7 @@ var addUsersToEachShard = function(st) {
 
 var addShard = function(st, shouldPass) {
     adhocShard++;
-    var rs =
+    const rs =
         new ReplSetTest({nodes: 1, host: 'localhost', name: 'localhostAuthShard-' + adhocShard});
     rs.startSet({shardsvr: "", keyFile: keyfile, auth: ""});
     rs.initiate();
@@ -175,8 +180,7 @@ var setupSharding = function(shardingTest) {
     var mongo = shardingTest.s;
 
     print("============ enabling sharding on test.foo.");
-    mongo.getDB("admin").runCommand({enableSharding: "test"});
-    shardingTest.ensurePrimaryShard('test', st.shard1.shardName);
+    mongo.getDB("admin").runCommand({enableSharding: "test", primaryShard: st.shard1.shardName});
     mongo.getDB("admin").runCommand({shardCollection: "test.foo", key: {_id: 1}});
 
     var test = mongo.getDB("test");
@@ -240,4 +244,3 @@ extraShards.forEach(function(rs) {
     rs.stopSet();
 });
 st.stop();
-})();

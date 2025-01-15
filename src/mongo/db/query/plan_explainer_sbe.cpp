@@ -27,26 +27,73 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/flat_hash_map.h>
+#include <cstddef>
+#include <cstdint>
+#include <set>
 
-#include "mongo/db/query/plan_explainer_sbe.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include <queue>
-
-#include "mongo/db/exec/plan_stats_walker.h"
+#include "mongo/bson/bson_depth.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
+#include "mongo/db/fts/fts_query.h"
 #include "mongo/db/fts/fts_query_impl.h"
-#include "mongo/db/keypattern.h"
-#include "mongo/db/query/optimizer/explain_interface.h"
-#include "mongo/db/query/optimizer/node.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/query/eof_node_type.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/plan_explainer_factory.h"
 #include "mongo/db/query/plan_explainer_impl.h"
+#include "mongo/db/query/plan_explainer_sbe.h"
+#include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/plan_summary_stats_visitor.h"
+#include "mongo/db/query/projection.h"
+#include "mongo/db/query/projection_ast.h"
 #include "mongo/db/query/projection_ast_util.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/tree_walker.h"
-#include "mongo/db/record_id_helpers.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/db/query/record_id_bound.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace {
+/**
+ * This function replaces field names in *replace* with those from the object
+ * *fieldNames*, preserving field ordering.  Both objects must have the same
+ * number of fields.
+ *
+ * Example:
+ *
+ *     replaceBSONKeyNames({ 'a': 1, 'b' : 1 }, { '': 'foo', '', 'bar' }) =>
+ *
+ *         { 'a' : 'foo' }, { 'b' : 'bar' }
+ */
+BSONObj replaceBSONFieldNames(const BSONObj& replace, const BSONObj& fieldNames) {
+    invariant(replace.nFields() == fieldNames.nFields());
+
+    BSONObjBuilder bob;
+    auto iter = fieldNames.begin();
+
+    for (const BSONElement& el : replace) {
+        bob.appendAs(el, (*iter++).fieldNameStringData());
+    }
+
+    return bob.obj();
+}
+
 void statsToBSON(const QuerySolutionNode* node,
                  BSONObjBuilder* bob,
                  const BSONObjBuilder* topLevelBob) {
@@ -59,7 +106,7 @@ void statsToBSON(const QuerySolutionNode* node,
         return;
     }
 
-    bob->append("stage", stageTypeToString(node->getType()));
+    bob->append("stage", nodeStageTypeToString(node));
     bob->appendNumber("planNodeId", static_cast<long long>(node->nodeId()));
 
     // Display the BSON representation of the filter, if there is one.
@@ -78,6 +125,34 @@ void statsToBSON(const QuerySolutionNode* node,
             if (csn->maxRecord) {
                 csn->maxRecord->appendToBSONAs(bob, "maxRecord");
             }
+            break;
+        }
+        case STAGE_COUNT_SCAN: {
+            auto csn = static_cast<const CountScanNode*>(node);
+
+            bob->append("keyPattern", csn->index.keyPattern);
+            bob->append("indexName", csn->index.identifier.catalogName);
+            auto collation =
+                csn->index.infoObj.getObjectField(IndexDescriptor::kCollationFieldName);
+            if (!collation.isEmpty()) {
+                bob->append("collation", collation);
+            }
+            bob->appendBool("isMultiKey", csn->index.multikey);
+            if (!csn->index.multikeyPaths.empty()) {
+                appendMultikeyPaths(csn->index.keyPattern, csn->index.multikeyPaths, bob);
+            }
+            bob->appendBool("isUnique", csn->index.unique);
+            bob->appendBool("isSparse", csn->index.sparse);
+            bob->appendBool("isPartial", csn->index.filterExpr != nullptr);
+            bob->append("indexVersion", static_cast<int>(csn->index.version));
+
+            BSONObjBuilder indexBoundsBob(bob->subobjStart("indexBounds"));
+            indexBoundsBob.append("startKey",
+                                  replaceBSONFieldNames(csn->startKey, csn->index.keyPattern));
+            indexBoundsBob.append("startKeyInclusive", csn->startKeyInclusive);
+            indexBoundsBob.append("endKey",
+                                  replaceBSONFieldNames(csn->endKey, csn->index.keyPattern));
+            indexBoundsBob.append("endKeyInclusive", csn->endKeyInclusive);
             break;
         }
         case STAGE_GEO_NEAR_2D: {
@@ -172,7 +247,9 @@ void statsToBSON(const QuerySolutionNode* node,
         case STAGE_EQ_LOOKUP: {
             auto eln = static_cast<const EqLookupNode*>(node);
 
-            bob->append("foreignCollection", eln->foreignCollection);
+            bob->append("foreignCollection",
+                        NamespaceStringUtil::serialize(eln->foreignCollection,
+                                                       SerializationContext::stateDefault()));
             bob->append("localField", eln->joinFieldLocal.fullPath());
             bob->append("foreignField", eln->joinFieldForeign.fullPath());
             bob->append("asField", eln->joinField.fullPath());
@@ -181,6 +258,67 @@ void statsToBSON(const QuerySolutionNode* node,
                 bob->append("indexName", eln->idxEntry->identifier.catalogName);
                 bob->append("indexKeyPattern", eln->idxEntry->keyPattern);
             }
+            bob->append("scanDirection", toString(eln->scanDirection));
+            break;
+        }
+        case STAGE_EQ_LOOKUP_UNWIND: {
+            auto eln = static_cast<const EqLookupUnwindNode*>(node);
+
+            bob->append("foreignCollection",
+                        NamespaceStringUtil::serialize(eln->foreignCollection,
+                                                       SerializationContext::stateDefault()));
+            bob->append("localField", eln->joinFieldLocal.fullPath());
+            bob->append("foreignField", eln->joinFieldForeign.fullPath());
+            bob->append("asField", eln->joinField.fullPath());
+            bob->append("strategy", EqLookupNode::serializeLookupStrategy(eln->lookupStrategy));
+            if (eln->idxEntry) {
+                bob->append("indexName", eln->idxEntry->identifier.catalogName);
+                bob->append("indexKeyPattern", eln->idxEntry->keyPattern);
+            }
+            bob->append("scanDirection", toString(eln->scanDirection));
+            break;
+        }
+        case STAGE_UNPACK_TS_BUCKET: {
+            auto utsbn = static_cast<const UnpackTsBucketNode*>(node);
+            {
+                const auto behaviorField =
+                    utsbn->bucketSpec.behavior() == timeseries::BucketSpec::Behavior::kInclude
+                    ? "include"
+                    : "exclude";
+                BSONArrayBuilder fieldsBab{bob->subarrayStart(behaviorField)};
+                for (const auto& field : utsbn->bucketSpec.fieldSet()) {
+                    fieldsBab.append(field);
+                }
+                if (utsbn->bucketSpec.behavior() == timeseries::BucketSpec::Behavior::kInclude &&
+                    utsbn->includeMeta) {
+                    fieldsBab.append(*utsbn->bucketSpec.metaField());
+                }
+            }
+            {
+                BSONArrayBuilder fieldsBab{bob->subarrayStart("computedMetaProjFields")};
+                for (const auto& computedMeta : utsbn->bucketSpec.computedMetaProjFields()) {
+                    fieldsBab.append(computedMeta);
+                }
+            }
+            bob->append("includeMeta", utsbn->includeMeta);
+            bob->append("eventFilter",
+                        utsbn->eventFilter ? utsbn->eventFilter->serialize() : BSONObj());
+            bob->append("wholeBucketFilter",
+                        utsbn->wholeBucketFilter ? utsbn->wholeBucketFilter->serialize()
+                                                 : BSONObj());
+
+            break;
+        }
+        case STAGE_SEARCH: {
+            auto sn = static_cast<const SearchNode*>(node);
+            bob->append("isSearchMeta", sn->isSearchMeta);
+            bob->appendNumber("remoteCursorId", static_cast<long long>(sn->remoteCursorId));
+            bob->append("searchQuery", sn->searchQuery);
+            break;
+        }
+        case STAGE_EOF: {
+            auto eofn = static_cast<const EofNode*>(node);
+            bob->append("type", eof_node::typeStr(eofn->type));
             break;
         }
         default:
@@ -238,9 +376,21 @@ void statsToBSONHelper(const sbe::PlanStageStats* stats,
 
     // Some top-level exec stats get pulled out of the root stage.
     bob->appendNumber("nReturned", static_cast<long long>(stats->common.advances));
-    // Include executionTimeMillis if it was recorded.
-    if (stats->common.executionTimeMillis) {
-        bob->appendNumber("executionTimeMillisEstimate", *stats->common.executionTimeMillis);
+    // Include the execution time if it was recorded.
+    if (stats->common.executionTime.precision == QueryExecTimerPrecision::kMillis) {
+        bob->appendNumber(
+            "executionTimeMillisEstimate",
+            durationCount<Milliseconds>(stats->common.executionTime.executionTimeEstimate));
+    } else if (stats->common.executionTime.precision == QueryExecTimerPrecision::kNanos) {
+        bob->appendNumber(
+            "executionTimeMillisEstimate",
+            durationCount<Milliseconds>(stats->common.executionTime.executionTimeEstimate));
+        bob->appendNumber(
+            "executionTimeMicros",
+            durationCount<Microseconds>(stats->common.executionTime.executionTimeEstimate));
+        bob->appendNumber(
+            "executionTimeNanos",
+            durationCount<Nanoseconds>(stats->common.executionTime.executionTimeEstimate));
     }
     bob->appendNumber("opens", static_cast<long long>(stats->common.opens));
     bob->appendNumber("closes", static_cast<long long>(stats->common.closes));
@@ -305,8 +455,11 @@ PlanExplainer::PlanStatsDetails buildPlanStatsDetails(
     const QuerySolution* solution,
     const sbe::PlanStageStats& stats,
     const boost::optional<BSONObj>& execPlanDebugInfo,
-    const boost::optional<BSONObj>& optimizerExplain,
-    ExplainOptions::Verbosity verbosity) {
+    const boost::optional<std::string>& planSummary,
+    const boost::optional<BSONObj>& queryParams,
+    const boost::optional<BSONArray>& remotePlanInfo,
+    ExplainOptions::Verbosity verbosity,
+    bool isCached) {
     BSONObjBuilder bob;
 
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
@@ -329,26 +482,56 @@ PlanExplainer::PlanStatsDetails buildPlanStatsDetails(
     }
 
     invariant(execPlanDebugInfo);
-    if (optimizerExplain) {
-        return {BSON("optimizerPlan" << *optimizerExplain << "slotBasedPlan" << *execPlanDebugInfo),
-                boost::none};
-    } else {
-        return {BSON("queryPlan" << bob.obj() << "slotBasedPlan" << *execPlanDebugInfo),
-                boost::none};
+    BSONObjBuilder plan;
+    if (planSummary) {
+        plan.append("planSummary", *planSummary);
     }
+
+    plan.append("isCached", isCached);
+    plan.append("queryPlan", bob.obj());
+
+    plan.append("slotBasedPlan", *execPlanDebugInfo);
+    if (remotePlanInfo && !remotePlanInfo->isEmpty()) {
+        plan.append("remotePlans", *remotePlanInfo);
+    }
+    return {plan.obj(), boost::none};
 }
 }  // namespace
 
-const PlanExplainer::ExplainVersion& PlanExplainerSBE::getVersion() const {
-    static const ExplainVersion kExplainVersion = "2";
-    return kExplainVersion;
+PlanExplainerSBEBase::PlanExplainerSBEBase(
+    const sbe::PlanStage* root,
+    const stage_builder::PlanStageData* data,
+    const QuerySolution* solution,
+    bool isMultiPlan,
+    bool isCachedPlan,
+    boost::optional<size_t> cachedPlanHash,
+    std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> debugInfo,
+    RemoteExplainVector* remoteExplains)
+    : PlanExplainer{solution},
+      _root{root},
+      _rootData{data},
+      _isMultiPlan{isMultiPlan},
+      _isFromPlanCache{isCachedPlan},
+      _cachedPlanHash{cachedPlanHash},
+      _debugInfo{debugInfo},
+      _remoteExplains{remoteExplains} {
+    tassert(5968203, "_debugInfo should not be null", _debugInfo);
+};
+
+const PlanExplainer::ExplainVersion& PlanExplainerSBEBase::getVersion() const {
+    static const ExplainVersion kExplainVersionForStageBuilders = "2";
+    return kExplainVersionForStageBuilders;
 }
 
-std::string PlanExplainerSBE::getPlanSummary() const {
+bool PlanExplainerSBEBase::matchesCachedPlan() const {
+    return _cachedPlanHash && (*_cachedPlanHash == _solution->hash());
+};
+
+std::string PlanExplainerSBEBase::getPlanSummary() const {
     return _debugInfo->planSummary;
 }
 
-void PlanExplainerSBE::getSummaryStats(PlanSummaryStats* statsOut) const {
+void PlanExplainerSBEBase::getSummaryStats(PlanSummaryStats* statsOut) const {
     tassert(6466201, "statsOut should be a valid pointer", statsOut);
 
     if (!_root) {
@@ -361,6 +544,7 @@ void PlanExplainerSBE::getSummaryStats(PlanSummaryStats* statsOut) const {
     auto common = _root->getCommonStats();
     statsOut->nReturned = common->advances;
     statsOut->fromMultiPlanner = isMultiPlan();
+    statsOut->fromPlanCache = isFromCache();
     statsOut->totalKeysExamined = 0;
     statsOut->totalDocsExamined = 0;
     statsOut->replanReason = _rootData->replanReason;
@@ -371,13 +555,14 @@ void PlanExplainerSBE::getSummaryStats(PlanSummaryStats* statsOut) const {
 
     // Use the pre-computed summary stats instead of traversing the QuerySolution tree.
     const auto& indexesUsed = _debugInfo->mainStats.indexesUsed;
+    statsOut->indexesUsed.clear();
     statsOut->indexesUsed.insert(indexesUsed.begin(), indexesUsed.end());
-    statsOut->collectionScans += _debugInfo->mainStats.collectionScans;
-    statsOut->collectionScansNonTailable += _debugInfo->mainStats.collectionScansNonTailable;
+    statsOut->collectionScans = _debugInfo->mainStats.collectionScans;
+    statsOut->collectionScansNonTailable = _debugInfo->mainStats.collectionScansNonTailable;
 }
 
-void PlanExplainerSBE::getSecondarySummaryStats(std::string secondaryColl,
-                                                PlanSummaryStats* statsOut) const {
+void PlanExplainerSBEBase::getSecondarySummaryStats(const NamespaceString& secondaryColl,
+                                                    PlanSummaryStats* statsOut) const {
     tassert(6466202, "statsOut should be a valid pointer", statsOut);
 
     // Use the pre-computed summary stats instead of traversing the QuerySolution tree.
@@ -393,82 +578,74 @@ void PlanExplainerSBE::getSecondarySummaryStats(std::string secondaryColl,
     }
 }
 
-PlanExplainer::PlanStatsDetails PlanExplainerSBE::getWinningPlanStats(
+PlanExplainer::PlanStatsDetails PlanExplainerSBEBase::getWinningPlanStats(
     ExplainOptions::Verbosity verbosity) const {
     invariant(_root);
     auto stats = _root->getStats(true /* includeDebugInfo  */);
     invariant(stats);
+
     return buildPlanStatsDetails(_solution,
                                  *stats,
                                  buildExecPlanDebugInfo(_root, _rootData),
-                                 buildCascadesPlan(),
-                                 verbosity);
+                                 boost::none /* planSummary */,
+                                 boost::none /* queryParams */,
+                                 buildRemotePlanInfo(),
+                                 verbosity,
+                                 matchesCachedPlan());
 }
 
-PlanExplainer::PlanStatsDetails PlanExplainerSBE::getWinningPlanTrialStats() const {
-    invariant(_rootData);
-    if (_rootData->savedStatsOnEarlyExit) {
-        invariant(_solution);
-        return buildPlanStatsDetails(
-            _solution,
-            *_rootData->savedStatsOnEarlyExit,
-            // This parameter is not used in `buildPlanStatsDetails` if the last parameter is
-            // `ExplainOptions::Verbosity::kExecAllPlans`, as is the case here.
-            boost::none,
-            boost::none,
-            ExplainOptions::Verbosity::kExecAllPlans);
+boost::optional<BSONArray> PlanExplainerSBEBase::buildRemotePlanInfo() const {
+    if (!_remoteExplains) {
+        return boost::none;
     }
-    return getWinningPlanStats(ExplainOptions::Verbosity::kExecAllPlans);
+    BSONArrayBuilder arrBuilder;
+    for (const auto& explain : *_remoteExplains) {
+        arrBuilder << explain;
+    }
+    return arrBuilder.arr();
 }
 
-std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerSBE::getRejectedPlansStats(
+PlanExplainerClassicRuntimePlannerForSBE::PlanExplainerClassicRuntimePlannerForSBE(
+    const sbe::PlanStage* root,
+    const stage_builder::PlanStageData* data,
+    const QuerySolution* solution,
+    bool isMultiPlan,
+    bool isCachedPlan,
+    boost::optional<size_t> cachedPlanHash,
+    std::shared_ptr<const plan_cache_debug_info::DebugInfoSBE> debugInfo,
+    std::unique_ptr<PlanStage> classicRuntimePlannerStage,
+    RemoteExplainVector* remoteExplains)
+    : PlanExplainerSBEBase{root,
+                           data,
+                           solution,
+                           isMultiPlan,
+                           isCachedPlan,
+                           cachedPlanHash,
+                           std::move(debugInfo),
+                           remoteExplains},
+      _classicRuntimePlannerStage{std::move(classicRuntimePlannerStage)},
+      _classicRuntimePlannerExplainer{
+          _classicRuntimePlannerStage  // If there were no multi-planning, this will be nullptr.
+              ? plan_explainer_factory::make(_classicRuntimePlannerStage.get(), cachedPlanHash)
+              : nullptr} {
+    if (_classicRuntimePlannerExplainer) {
+        _classicRuntimePlannerExplainer->updateEnumeratorExplainInfo(
+            _solution->_enumeratorExplainInfo);
+    }
+}
+
+PlanExplainer::PlanStatsDetails PlanExplainerClassicRuntimePlannerForSBE::getWinningPlanTrialStats()
+    const {
+    return _classicRuntimePlannerExplainer
+        ? _classicRuntimePlannerExplainer->getWinningPlanTrialStats()
+        : PlanExplainer::PlanStatsDetails{};
+}
+
+std::vector<PlanExplainer::PlanStatsDetails>
+PlanExplainerClassicRuntimePlannerForSBE::getRejectedPlansStats(
     ExplainOptions::Verbosity verbosity) const {
-    if (_rejectedCandidates.empty()) {
-        return {};
-    }
-
-    std::vector<PlanStatsDetails> res;
-    res.reserve(_rejectedCandidates.size());
-    for (auto&& candidate : _rejectedCandidates) {
-        invariant(candidate.root);
-        invariant(candidate.solution);
-
-        auto stats = candidate.root->getStats(true /* includeDebugInfo  */);
-        invariant(stats);
-        auto execPlanDebugInfo = buildExecPlanDebugInfo(candidate.root.get(), &candidate.data);
-        res.push_back(buildPlanStatsDetails(
-            candidate.solution.get(), *stats, execPlanDebugInfo, boost::none, verbosity));
-    }
-    return res;
+    return _classicRuntimePlannerExplainer
+        ? _classicRuntimePlannerExplainer->getRejectedPlansStats(verbosity)
+        : std::vector<PlanExplainer::PlanStatsDetails>{};
 }
-
-std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerSBE::getCachedPlanStats(
-    const plan_cache_debug_info::DebugInfo& debugInfo, ExplainOptions::Verbosity verbosity) const {
-    const auto& decision = *debugInfo.decision;
-    std::vector<PlanStatsDetails> res;
-
-    auto&& stats = decision.getStats<mongo::sbe::PlanStageStats>();
-    if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-        for (auto&& planStats : stats.candidatePlanStats) {
-            invariant(planStats);
-            res.push_back(
-                buildPlanStatsDetails(nullptr, *planStats, boost::none, boost::none, verbosity));
-        }
-    } else {
-        // At the "queryPlanner" verbosity we only need to provide details about the winning plan
-        // when explaining from the plan cache.
-        invariant(verbosity == ExplainOptions::Verbosity::kQueryPlanner);
-        res.push_back({stats.serializedWinningPlan, boost::none});
-    }
-
-    return res;
-}
-
-boost::optional<BSONObj> PlanExplainerSBE::buildCascadesPlan() const {
-    if (_optimizerData) {
-        return _optimizerData->explainBSON();
-    }
-    return {};
-}
-
 }  // namespace mongo

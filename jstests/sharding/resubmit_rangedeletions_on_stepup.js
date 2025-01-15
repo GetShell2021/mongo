@@ -2,10 +2,8 @@
  * Ensure that orphaned documents are submitted for deletion on step up.
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/uuid_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {getUUIDFromConfigCollections} from "jstests/libs/uuid_util.js";
 
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 // Test deliberately keeps range deletion in pending state.
@@ -18,11 +16,18 @@ const rangeDeletionNs = "config.rangeDeletions";
 
 function setup() {
     // Create 2 shards with 3 replicas each.
-    let st = new ShardingTest({shards: {rs0: {nodes: 3}, rs1: {nodes: 3}}});
+    let st = new ShardingTest({
+        shards: {rs0: {nodes: 3}, rs1: {nodes: 3}},
+        // By default, our test infrastructure sets the election timeout to a very high value (24
+        // hours). For this test, we need a shorter election timeout because it relies on nodes
+        // running an election when they do not detect an active primary. Therefore, we are setting
+        // the electionTimeoutMillis to its default value.
+        initiateWithDefaultElectionTimeout: true
+    });
 
     // Create a sharded collection with two chunks: [-inf, 50), [50, inf)
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 50}}));
 
@@ -152,5 +157,4 @@ function writeRangeDeletionTask(collectionUuid, shardConn, pending, numOrphans) 
     assert.eq(shard0PrimaryColl.find().itcount(), expectedNumDocsShard0 + orphanCount);
 
     st.stop();
-})();
 })();

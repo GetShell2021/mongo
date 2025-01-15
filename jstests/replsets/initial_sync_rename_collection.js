@@ -2,13 +2,9 @@
  * Test that CollectionCloner completes without error when a collection is renamed during cloning.
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/uuid_util.js");
-load('jstests/replsets/libs/two_phase_drops.js');
-load("jstests/libs/logv2_helpers.js");
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {extractUUIDFromObject, getUUIDFromListCollections} from "jstests/libs/uuid_util.js";
 
 // Set up replica set. Disallow chaining so nodes always sync from primary.
 const testName = "initial_sync_rename_collection";
@@ -87,16 +83,6 @@ function finishTest({failPoint, expectedLog, createNew, renameAcrossDBs}) {
         dropTarget: false
     }));
 
-    // Only set for test cases that use 'system.drop' namespaces when dropping collections.
-    // In those tests the variable 'dropPendingNss' represents such a namespace. Used for
-    // expectedLog. See test cases 6 and 8 below.
-    let dropPendingNss;
-    const dropPendingColl =
-        TwoPhaseDropCollectionTest.collectionIsPendingDropInDatabase(primaryDB, collName);
-    if (dropPendingColl) {
-        dropPendingNss = dbName + "." + dropPendingColl["name"];
-    }
-
     if (createNew) {
         jsTestLog("Creating a new collection with the same name: " + primaryColl.getFullName());
         assert.commandWorked(primaryColl.insert({_id: "not the same collection"}));
@@ -112,7 +98,7 @@ function finishTest({failPoint, expectedLog, createNew, renameAcrossDBs}) {
     }
 
     jsTestLog("Waiting for initial sync to complete.");
-    replTest.waitForState(secondary, ReplSetTest.State.SECONDARY);
+    replTest.awaitSecondaryNodes(null, [secondary]);
 
     let res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
     assert.eq(0, res.initialSyncStatus.failedInitialSyncAttempts);
@@ -164,9 +150,8 @@ runRenameTest({
     renameAcrossDBs: true
 });
 
-const expectedLogFor5and7 = isJsonLogNoConn()
-    ? '`Sync process retrying cloner stage due to error","attr":{"cloner":"CollectionCloner","stage":"query","error":{"code":175,"codeName":"QueryPlanKilled","errmsg":"collection renamed from \'${nss}\' to \'${rnss}\'. UUID ${uuid}"}}}`'
-    : "`Sync process retrying CollectionCloner stage query due to QueryPlanKilled: collection renamed from '${nss}' to '${rnss}'. UUID ${uuid}`";
+const expectedLogFor5and7 =
+    '`Sync process retrying cloner stage due to error","attr":{"cloner":"CollectionCloner","stage":"query","error":{"code":175,"codeName":"QueryPlanKilled","errmsg":"collection renamed from \'${nss}\' to \'${rnss}\'. UUID ${uuid}"}}}`';
 
 jsTestLog("[5] Testing rename between getMores.");
 runRenameTest({
@@ -176,28 +161,9 @@ runRenameTest({
 });
 
 // A cross-DB rename will appear as a drop in the context of the source DB.
+// Double escape the backslash as eval will do unescaping
 let expectedLogFor6and8 =
-    "`CollectionCloner ns: '${nss}' uuid: UUID(\"${uuid}\") stopped because collection was dropped on source.`";
-
-if (isJsonLogNoConn()) {
-    // Double escape the backslash as eval will do unescaping
-    expectedLogFor6and8 =
-        '`CollectionCloner stopped because collection was dropped on source","attr":{"namespace":"${nss}","uuid":{"uuid":{"$uuid":"${uuid}"}}}}`';
-}
-
-// We don't support 4.2 style two-phase drops with EMRC=false - in that configuration, the
-// collection will instead be renamed to a <db>.system.drop.* namespace before being dropped. Since
-// the cloner queries collection by UUID, it will observe the first drop phase as a rename.
-// We still want to check that initial sync succeeds in such a case.
-if (TwoPhaseDropCollectionTest.supportsDropPendingNamespaces(replTest)) {
-    if (isJsonLogNoConn()) {
-        expectedLogFor6and8 =
-            '`Sync process retrying cloner stage due to error","attr":{"cloner":"CollectionCloner","stage":"query","error":{"code":175,"codeName":"QueryPlanKilled","errmsg":"collection renamed from \'${nss}\' to \'${dropPendingNss}\'. UUID ${uuid}`';
-    } else {
-        expectedLogFor6and8 =
-            "`Sync process retrying CollectionCloner stage query due to QueryPlanKilled: collection renamed from '${nss}' to '${dropPendingNss}'. UUID ${uuid}`";
-    }
-}
+    '`CollectionCloner stopped because collection was dropped on source","attr":{"namespace":"${nss}","uuid":{"uuid":{"$uuid":"${uuid}"}}}}`';
 
 jsTestLog("[6] Testing cross-DB rename between getMores.");
 runRenameTest({
@@ -223,4 +189,3 @@ runRenameTest({
 });
 
 replTest.stopSet();
-})();

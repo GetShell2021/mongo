@@ -4,8 +4,7 @@
  *
  * @tags: [requires_fcv_60, uses_transactions]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const logicalSessionRefreshMillis = 1000;
 const rst = new ReplSetTest({
@@ -17,7 +16,9 @@ const rst = new ReplSetTest({
             ttlMonitorEnabled: false,
             disableLogicalSessionCacheRefresh: false,
             TransactionRecordMinimumLifetimeMinutes: 0,
-            logicalSessionRefreshMillis
+            logicalSessionRefreshMillis,
+            // Make the eager reaping occur more frequently.
+            internalSessionsReapThreshold: 5,
         }
     }
 });
@@ -82,4 +83,3 @@ for (let isRetryableWriteSession of [true, false]) {
 }
 
 rst.stopSet();
-})();

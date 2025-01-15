@@ -11,10 +11,7 @@
 //   do_not_wrap_aggregations_in_facets,
 //   requires_pipeline_optimization,
 // ]
-(function() {
-"use strict";
-
-load("jstests/libs/analyze_plan.js");  // For 'getPlanStage'.
+import {getAggPlanStage} from "jstests/libs/query/analyze_plan.js";
 
 const t = db.jstests_aggregation_server6192;
 t.drop();
@@ -37,7 +34,7 @@ function optimize(expression) {
 
 function assertOptimized(expression, value) {
     const optimized = optimize(expression);
-    assert.docEq(optimized, {$const: value}, "ensure short-circuiting worked", optimized);
+    assert.docEq({$const: value}, optimized, "ensure short-circuiting worked");
 }
 
 function assertNotOptimized(expression) {
@@ -72,4 +69,3 @@ assertNotOptimized({$and: ['$x', '$x']});
 assertNotOptimized({$or: ['$x', '$x']});
 assertNotOptimized({$and: ['$x']});
 assertNotOptimized({$or: ['$x']});
-}());

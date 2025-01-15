@@ -41,6 +41,8 @@ const std::string
 type_string(thread_type type)
 {
     switch (type) {
+    case thread_type::BACKGROUND_COMPACT:
+        return ("background_compact");
     case thread_type::CHECKPOINT:
         return ("checkpoint");
     case thread_type::CUSTOM:
@@ -53,23 +55,31 @@ type_string(thread_type type)
         return ("remove");
     case thread_type::UPDATE:
         return ("update");
-    default:
-        testutil_die(EINVAL, "unexpected thread_type: %d", static_cast<int>(type));
     }
+    testutil_die(EINVAL, "unexpected thread_type: %d", static_cast<int>(type));
 }
 
 thread_worker::thread_worker(uint64_t id, thread_type type, configuration *config,
   scoped_session &&created_session, timestamp_manager *timestamp_manager,
   operation_tracker *op_tracker, database &dbase)
+    : thread_worker(
+        id, type, config, std::move(created_session), timestamp_manager, op_tracker, dbase, nullptr)
+{
+}
+
+thread_worker::thread_worker(uint64_t id, thread_type type, configuration *config,
+  scoped_session &&created_session, timestamp_manager *timestamp_manager,
+  operation_tracker *op_tracker, database &dbase, std::shared_ptr<barrier> barrier_ptr)
     : /* These won't exist for certain threads which is why we use optional here. */
       collection_count(config->get_optional_int(COLLECTION_COUNT, 1)),
+      free_space_target_mb(config->get_optional_int(FREE_SPACE_TARGET_MB, 1)),
       key_count(config->get_optional_int(KEY_COUNT_PER_COLLECTION, 1)),
       key_size(config->get_optional_int(KEY_SIZE, 1)),
       value_size(config->get_optional_int(VALUE_SIZE, 1)),
       thread_count(config->get_int(THREAD_COUNT)), type(type), id(id), db(dbase),
       session(std::move(created_session)), tsm(timestamp_manager),
       txn(transaction(config, timestamp_manager, session.get())), op_tracker(op_tracker),
-      _sleep_time_ms(config->get_throttle_ms())
+      _sleep_time_ms(std::chrono::milliseconds(config->get_throttle_ms())), _barrier(barrier_ptr)
 {
     if (op_tracker->enabled())
         op_track_cursor = session.open_scoped_cursor(op_tracker->get_operation_table_name());
@@ -95,7 +105,7 @@ bool
 thread_worker::update(
   scoped_cursor &cursor, uint64_t collection_id, const std::string &key, const std::string &value)
 {
-    WT_DECL_RET;
+    int ret = 0;
 
     testutil_assert(op_tracker != nullptr);
     testutil_assert(cursor.get() != nullptr);
@@ -136,7 +146,7 @@ bool
 thread_worker::insert(
   scoped_cursor &cursor, uint64_t collection_id, const std::string &key, const std::string &value)
 {
-    WT_DECL_RET;
+    int ret = 0;
 
     testutil_assert(op_tracker != nullptr);
     testutil_assert(cursor.get() != nullptr);
@@ -176,7 +186,7 @@ thread_worker::insert(
 bool
 thread_worker::remove(scoped_cursor &cursor, uint64_t collection_id, const std::string &key)
 {
-    WT_DECL_RET;
+    int ret = 0;
     testutil_assert(op_tracker != nullptr);
     testutil_assert(cursor.get() != nullptr);
 
@@ -210,15 +220,100 @@ thread_worker::remove(scoped_cursor &cursor, uint64_t collection_id, const std::
     return (ret == 0);
 }
 
+/*
+ * Truncate takes in the collection_id to perform truncate on, two optional keys corresponding to
+ * the desired start and stop range, and a configuration string. If a start/stop key exists, we open
+ * a cursor and position on that key, otherwise we pass in a null cursor to the truncate API to
+ * indicate we should truncate all the way to the first and/or last key.
+ */
+bool
+thread_worker::truncate(uint64_t collection_id, std::optional<std::string> start_key,
+  std::optional<std::string> stop_key, const std::string &config)
+{
+    int ret = 0;
+
+    wt_timestamp_t ts = tsm->get_next_ts();
+    ret = txn.set_commit_timestamp(ts);
+    testutil_assert(ret == 0 || ret == EINVAL);
+    if (ret != 0) {
+        txn.set_needs_rollback(true);
+        return (false);
+    }
+
+    const std::string coll_name = db.get_collection(collection_id).name;
+
+    scoped_cursor start_cursor = session.open_scoped_cursor(coll_name);
+    scoped_cursor stop_cursor = session.open_scoped_cursor(coll_name);
+    if (start_key)
+        start_cursor->set_key(start_cursor.get(), start_key.value().c_str());
+
+    if (stop_key)
+        stop_cursor->set_key(stop_cursor.get(), stop_key.value().c_str());
+
+    ret = session->truncate(session.get(), (start_key || stop_key) ? nullptr : coll_name.c_str(),
+      start_key ? start_cursor.get() : nullptr, stop_key ? stop_cursor.get() : nullptr,
+      config.empty() ? nullptr : config.c_str());
+
+    if (ret != 0) {
+        if (ret == WT_ROLLBACK) {
+            txn.set_needs_rollback(true);
+            return (false);
+        } else
+            testutil_die(ret, "unhandled error while trying to truncate a key range");
+    }
+
+    return (ret == 0);
+}
+
 void
 thread_worker::sleep()
 {
-    std::this_thread::sleep_for(std::chrono::milliseconds(_sleep_time_ms));
+    std::this_thread::sleep_for(_sleep_time_ms);
+}
+
+void
+thread_worker::sync()
+{
+    _barrier->wait();
 }
 
 bool
 thread_worker::running() const
 {
     return (_running);
+}
+
+/*
+ * E.g. If we have 4 threads with ids from 0 to 3, and 14 collections with ids from 0 to 13,
+ * the distribution of collections to each thread will be as below:
+ *
+ * Collection count: 14         | Thread count: 4               |
+ * -----------------------------|-------------------------------|
+ * Thread_id                    |   0   |   1   |   2   |   3   |
+ * -----------------------------|-------|-------|-------|-------|
+ * Assigned collection count    |   4   |   4   |   3   |   3   |
+ * -----------------------------|-------|-------|-------|-------|
+ * Assigned first collection_id |   0   |   4   |   8   |   11  |
+ * -----------------------------|-------|-------|-------|-------|
+ * Assigned collection_id range | [0,3] | [4,7] |[8,10] |[11,13]|
+ *
+ */
+uint64_t
+thread_worker::get_assigned_first_collection_id() const
+{
+    uint64_t collection_count = db.get_collection_count();
+    return collection_count / thread_count * id + std::min(id, collection_count % thread_count);
+}
+
+/*
+ * Assign collections evenly among threads, for any remainders, distribute one collection to each
+ * thread starting from thread 0. See a detailed example in the header of
+ * get_assigned_first_collection_id().
+ */
+uint64_t
+thread_worker::get_assigned_collection_count() const
+{
+    uint64_t collection_count = db.get_collection_count();
+    return collection_count / thread_count + (collection_count % thread_count > id);
 }
 } // namespace test_harness

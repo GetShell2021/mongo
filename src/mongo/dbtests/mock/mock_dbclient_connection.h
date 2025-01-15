@@ -29,12 +29,38 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/client/dbclient_connection.h"
-#include "mongo/db/query/cursor_response.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/client_cursor/cursor_response.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/dbtests/mock/mock_remote_db_server.h"
+#include "mongo/rpc/message.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/unique_message.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/net/ssl_options.h"
 
 namespace mongo {
 /**
@@ -98,7 +124,7 @@ public:
      *     this connection to fall into a failed state.
      */
     MockDBClientConnection(MockRemoteDBServer* remoteServer, bool autoReconnect = false);
-    virtual ~MockDBClientConnection();
+    ~MockDBClientConnection() override;
 
     //
     // DBClientBase methods
@@ -107,14 +133,13 @@ public:
 
     bool connect(const char* hostName, StringData applicationName, std::string& errmsg);
 
-    Status connect(const HostAndPort& host,
-                   StringData applicationName,
-                   boost::optional<TransientSSLParams> transientSSLParams) override {
+    void connect(const HostAndPort& host,
+                 StringData applicationName,
+                 const boost::optional<TransientSSLParams>& transientSSLParams) override {
         std::string errmsg;
         if (!connect(host.toString().c_str(), applicationName, errmsg)) {
-            return {ErrorCodes::HostUnreachable, errmsg};
+            uasserted(ErrorCodes::HostUnreachable, errmsg);
         }
-        return Status::OK();
     }
 
     using DBClientBase::runCommandWithTarget;
@@ -126,26 +151,22 @@ public:
 
     uint64_t getSockCreationMicroSec() const override;
 
-    void insert(const std::string& ns,
+    void insert(const NamespaceString& nss,
                 BSONObj obj,
                 bool ordered = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    void insert(const std::string& ns,
+    void insert(const NamespaceString& nss,
                 const std::vector<BSONObj>& objList,
                 bool ordered = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    void remove(const std::string& ns,
+    void remove(const NamespaceString& nss,
                 const BSONObj& filter,
                 bool removeMany = true,
                 boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    bool call(mongo::Message& toSend,
-              mongo::Message& response,
-              bool assertOk,
-              std::string* actualServer) override;
-    Status recv(mongo::Message& m, int lastRequestId) override;
+    mongo::Message recv(int lastRequestId) override;
 
     void shutdown() override;
     void shutdownAndDisallowReconnect() override;
@@ -181,7 +202,8 @@ public:
              std::string* actualServer = nullptr) override;
 
 private:
-    void checkConnection() override;
+    mongo::Message _call(mongo::Message& toSend, std::string* actualServer) override;
+    void ensureConnection() override;
 
     std::unique_ptr<DBClientCursor> bsonArrayToCursor(BSONArray results,
                                                       int nToSkip,
@@ -193,7 +215,7 @@ private:
     uint64_t _sockCreationTime;
     boost::optional<OpMsgRequest> _lastCursorMessage;
 
-    Mutex _netMutex = MONGO_MAKE_LATCH("MockDBClientConnection");
+    stdx::mutex _netMutex;
 
     stdx::condition_variable _mockCallResponsesCV;
     Responses _mockCallResponses;

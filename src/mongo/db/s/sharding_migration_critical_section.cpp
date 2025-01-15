@@ -27,9 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/s/sharding_migration_critical_section.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 

@@ -29,11 +29,24 @@
 
 #pragma once
 
+#include <cstddef>
+#include <functional>
+#include <memory>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/requires_collection_stage.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/write_stage_common.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/storage/remove_saver.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/profile_filter.h"
+#include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_role.h"
 
 namespace mongo {
 
@@ -79,15 +92,6 @@ struct DeleteStageParams {
     // Optional. When not null, delete metrics are recorded here.
     OpDebug* opDebug;
 
-    // Optional. When not null, send document about to be deleted to removeSaver.
-    // RemoveSaver is called before actual deletes are executed.
-    // Note: the differentiating factor between this and returnDeleted is that the caller will get
-    // the deleted document after it was already deleted. That means that if the caller would have
-    // to use the removeSaver at that point, they miss the document if the process dies before it
-    // reaches the removeSaver. However, this is still best effort since the RemoveSaver
-    // operates on a different persistence system from the the database storage engine.
-    std::unique_ptr<RemoveSaver> removeSaver;
-
     // Determines how the delete stats should be incremented. Will be incremented by 1 if the
     // function is empty.
     DocumentCounter numStatsForDoc;
@@ -101,7 +105,7 @@ struct DeleteStageParams {
  * Callers of work() must be holding a write lock (and, for replicated deletes, callers must have
  * had the replication coordinator approve the write).
  */
-class DeleteStage : public RequiresMutableCollectionStage {
+class DeleteStage : public RequiresWritableCollectionStage {
     DeleteStage(const DeleteStage&) = delete;
     DeleteStage& operator=(const DeleteStage&) = delete;
 
@@ -111,26 +115,26 @@ public:
     DeleteStage(ExpressionContext* expCtx,
                 std::unique_ptr<DeleteStageParams> params,
                 WorkingSet* ws,
-                const CollectionPtr& collection,
+                CollectionAcquisition collection,
                 PlanStage* child);
 
     DeleteStage(const char* stageType,
                 ExpressionContext* expCtx,
                 std::unique_ptr<DeleteStageParams> params,
                 WorkingSet* ws,
-                const CollectionPtr& collection,
+                CollectionAcquisition collection,
                 PlanStage* child);
 
-    bool isEOF();
-    StageState doWork(WorkingSetID* out);
+    bool isEOF() const override;
+    StageState doWork(WorkingSetID* out) override;
 
-    StageType stageType() const {
+    StageType stageType() const override {
         return STAGE_DELETE;
     }
 
-    std::unique_ptr<PlanStageStats> getStats();
+    std::unique_ptr<mongo::PlanStageStats> getStats() override;
 
-    const SpecificStats* getSpecificStats() const;
+    const SpecificStats* getSpecificStats() const override;
 
 protected:
     void doSaveStateRequiresCollection() final {
@@ -160,9 +164,9 @@ protected:
 private:
     /**
      * Stores 'idToRetry' in '_idRetrying' so the delete can be retried during the next call to
-     * work(). Always returns NEED_YIELD and sets 'out' to WorkingSet::INVALID_ID.
+     * work(). Sets 'out' to WorkingSet::INVALID_ID.
      */
-    StageState prepareToRetryWSM(WorkingSetID idToRetry, WorkingSetID* out);
+    void prepareToRetryWSM(WorkingSetID idToRetry, WorkingSetID* out);
 
     // If not WorkingSet::INVALID_ID, we use this rather than asking our child what to do next.
     WorkingSetID _idRetrying;

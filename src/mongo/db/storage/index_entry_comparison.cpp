@@ -26,17 +26,22 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/index_entry_comparison.h"
-
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <limits>
 #include <ostream>
 
-#include "mongo/db/jsobj.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/text.h"
+#include "mongo/util/str.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
 
 namespace mongo {
 
@@ -112,13 +117,11 @@ int IndexEntryComparison::compare(const IndexKeyEntry& lhs, const IndexKeyEntry&
     return lhs.loc.compare(rhs.loc);  // is supposed to ignore ordering
 }
 
-KeyString::Value IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
-    const IndexSeekPoint& seekPoint, KeyString::Version version, Ordering ord, bool isForward) {
+std::span<const char> IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
+    const IndexSeekPoint& seekPoint, bool isForward, key_string::Builder& builder) {
     const bool inclusive = seekPoint.firstExclusive < 0;
-    const auto discriminator = isForward == inclusive ? KeyString::Discriminator::kExclusiveBefore
-                                                      : KeyString::Discriminator::kExclusiveAfter;
-
-    KeyString::Builder builder(version, ord, discriminator);
+    const auto discriminator = isForward == inclusive ? key_string::Discriminator::kExclusiveBefore
+                                                      : key_string::Discriminator::kExclusiveAfter;
 
     // Appends keyPrefix elements to the builder.
     if (seekPoint.prefixLen > 0) {
@@ -135,32 +138,33 @@ KeyString::Value IndexEntryComparison::makeKeyStringFromSeekPointForSeek(
     size_t end = seekPoint.firstExclusive >= 0 ? static_cast<size_t>(seekPoint.firstExclusive + 1)
                                                : seekPoint.keySuffix.size();
     for (size_t i = seekPoint.prefixLen; i < end; i++) {
-        invariant(seekPoint.keySuffix[i]);
-        builder.appendBSONElement(*seekPoint.keySuffix[i]);
+        builder.appendBSONElement(seekPoint.keySuffix[i]);
     }
-    return builder.getValueCopy();
+
+    return builder.finishAndGetBuffer(discriminator);
 }
 
-KeyString::Value IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(const BSONObj& bsonKey,
-                                                                       KeyString::Version version,
-                                                                       Ordering ord,
-                                                                       bool isForward,
-                                                                       bool inclusive) {
+std::span<const char> IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+    const BSONObj& bsonKey,
+    Ordering ord,
+    bool isForward,
+    bool inclusive,
+    key_string::Builder& builder) {
     return makeKeyStringFromBSONKey(bsonKey,
-                                    version,
                                     ord,
                                     isForward == inclusive
-                                        ? KeyString::Discriminator::kExclusiveBefore
-                                        : KeyString::Discriminator::kExclusiveAfter);
+                                        ? key_string::Discriminator::kExclusiveBefore
+                                        : key_string::Discriminator::kExclusiveAfter,
+                                    builder);
 }
 
-KeyString::Value IndexEntryComparison::makeKeyStringFromBSONKey(const BSONObj& bsonKey,
-                                                                KeyString::Version version,
-                                                                Ordering ord,
-                                                                KeyString::Discriminator discrim) {
-    BSONObj finalKey = BSONObj::stripFieldNames(bsonKey);
-    KeyString::Builder builder(version, finalKey, ord, discrim);
-    return builder.getValueCopy();
+std::span<const char> IndexEntryComparison::makeKeyStringFromBSONKey(
+    const BSONObj& bsonKey,
+    Ordering ord,
+    key_string::Discriminator discrim,
+    key_string::Builder& builder) {
+    builder.resetToKey(bsonKey, ord, discrim);
+    return builder.finishAndGetBuffer();
 }
 
 Status buildDupKeyErrorStatus(const BSONObj& key,
@@ -168,12 +172,13 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
                               const std::string& indexName,
                               const BSONObj& keyPattern,
                               const BSONObj& indexCollation,
-                              DuplicateKeyErrorInfo::FoundValue&& foundValue) {
+                              DuplicateKeyErrorInfo::FoundValue&& foundValue,
+                              const boost::optional<RecordId> duplicateRid) {
     const bool hasCollation = !indexCollation.isEmpty();
 
     StringBuilder sb;
     sb << "E11000 duplicate key error";
-    sb << " collection: " << collectionNamespace;
+    sb << " collection: " << collectionNamespace.toStringForErrorMsg();
     if (indexName.size()) {
         // This helper may be used for clustered collections when there is no index for the cluster
         // key.
@@ -220,9 +225,11 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
             (hasCollation || !isValidUTF8(keyValueElem.valueStringData()));
 
         if (shouldHexEncode) {
-            auto stringToEncode = keyValueElem.valueStringData();
-            builderForErrmsg.append(keyNameElem.fieldName(),
-                                    "0x" + hexblob::encodeLower(stringToEncode));
+            std::string hexEncoded = "0x" + hexblob::encodeLower(keyValueElem.valueStringData());
+            if (hasCollation) {
+                hexEncoded = str::stream() << "CollationKey(" << hexEncoded << ")";
+            }
+            builderForErrmsg.append(keyNameElem.fieldName(), hexEncoded);
         } else {
             builderForErrmsg.appendAs(keyValueElem, keyNameElem.fieldName());
         }
@@ -230,42 +237,41 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
 
     sb << builderForErrmsg.obj();
 
-    stdx::visit(
-        visit_helper::Overloaded{
-            [](stdx::monostate) {},
-            [&sb](const RecordId& rid) { sb << " found value: " << rid; },
-            [&sb](const BSONObj& obj) {
-                if (obj.objsize() < BSONObjMaxUserSize / 2) {
-                    sb << " found value: " << obj;
-                }
-            },
-        },
-        foundValue);
+    visit(OverloadedVisitor{
+              [](std::monostate) {},
+              [&sb](const RecordId& rid) { sb << " found value: " << rid; },
+              [&sb](const BSONObj& obj) {
+                  if (obj.objsize() < BSONObjMaxUserSize / 2) {
+                      sb << " found value: " << obj;
+                  }
+              },
+          },
+          foundValue);
 
-    return Status(
-        DuplicateKeyErrorInfo(
-            keyPattern, builderForErrorExtraInfo.obj(), indexCollation, std::move(foundValue)),
-        sb.str());
+    return Status(DuplicateKeyErrorInfo(keyPattern,
+                                        builderForErrorExtraInfo.obj(),
+                                        indexCollation,
+                                        std::move(foundValue),
+                                        duplicateRid),
+                  sb.str());
 }
 
-Status buildDupKeyErrorStatus(const KeyString::Value& keyString,
+Status buildDupKeyErrorStatus(const key_string::Value& keyString,
                               const NamespaceString& collectionNamespace,
                               const std::string& indexName,
                               const BSONObj& keyPattern,
                               const BSONObj& indexCollation,
                               const Ordering& ordering) {
-    const BSONObj key = KeyString::toBson(
-        keyString.getBuffer(), keyString.getSize(), ordering, keyString.getTypeBits());
+    const BSONObj key = key_string::toBson(keyString.getView(), ordering, keyString.getTypeBits());
 
     return buildDupKeyErrorStatus(key, collectionNamespace, indexName, keyPattern, indexCollation);
 }
 
 Status buildDupKeyErrorStatus(OperationContext* opCtx,
-                              const KeyString::Value& keyString,
+                              const key_string::Value& keyString,
                               const Ordering& ordering,
                               const IndexDescriptor* desc) {
-    const BSONObj key = KeyString::toBson(
-        keyString.getBuffer(), keyString.getSize(), ordering, keyString.getTypeBits());
+    const BSONObj key = key_string::toBson(keyString.getView(), ordering, keyString.getTypeBits());
     return buildDupKeyErrorStatus(opCtx, key, desc);
 }
 
@@ -273,8 +279,9 @@ Status buildDupKeyErrorStatus(OperationContext* opCtx,
                               const BSONObj& key,
                               const IndexDescriptor* desc) {
     NamespaceString nss;
-    // In testing these may be nullptr, and being a bit more lenient during error handling is OK.
-    if (desc && desc->getEntry())
+    invariant(desc);
+    // In testing this may be nullptr, and being a bit more lenient during error handling is OK.
+    if (desc->getEntry())
         nss = desc->getEntry()->getNSSFromCatalog(opCtx);
     return buildDupKeyErrorStatus(
         key, nss, desc->indexName(), desc->keyPattern(), desc->collation());

@@ -6,18 +6,27 @@
 // This test induces failovers on shards.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-(function() {
-'use strict';
-
-load('jstests/sharding/migration_coordinator_failover_include.js');
-load('jstests/replsets/rslib.js');
+import {
+    runMoveChunkMakeDonorStepDownAfterFailpoint
+} from "jstests/sharding/migration_coordinator_failover_include.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "test";
 
-var st = new ShardingTest({shards: 2, rs: {nodes: 2}});
+// Try and prevent split vote failed elections after freezing / unfreezing by preventing the
+// secondary from being electable.
+var st = new ShardingTest({
+    shards: 2,
+    rs: {nodes: [{rsConfig: {}}, {rsConfig: {priority: 0}}]},
+    // By default, our test infrastructure sets the election timeout to a very high value (24
+    // hours). For this test, we need a shorter election timeout because it relies on nodes running
+    // an election when they do not detect an active primary. Therefore, we are setting the
+    // electionTimeoutMillis to its default value.
+    initiateWithDefaultElectionTimeout: true
+});
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 runMoveChunkMakeDonorStepDownAfterFailpoint(st,
                                             dbName,
@@ -52,4 +61,3 @@ runMoveChunkMakeDonorStepDownAfterFailpoint(st,
                                             false /* shouldMakeMigrationFailToCommitOnConfig */);
 
 st.stop();
-})();

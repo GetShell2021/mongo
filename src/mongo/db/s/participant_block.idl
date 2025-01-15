@@ -29,10 +29,18 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+
+enums:
+    CriticalSectionBlockType:
+        description: "Type of block to be used in the critical section."
+        type: string
+        values:
+            kWrites: "Writes"
+            kReadsAndWrites: "ReadsAndWrites"
+            kUnblock: "Unblock"
 
 commands:
-    # TODO(SERVER-64346): Generalize this command to be reusable in other DDL context
     _shardsvrParticipantBlock:
         command_name: _shardsvrParticipantBlock
         cpp_name: ShardsvrParticipantBlock
@@ -40,3 +48,29 @@ commands:
         strict: false
         api_version: ""
         namespace: concatenate_with_db
+        fields:
+            blockType:
+                type: CriticalSectionBlockType
+                optional: true
+            reason:
+                type: object
+                optional: true
+            throwIfReasonDiffers:
+                type: bool
+                description: >-
+                    If true, throw an invariant in case the collection critical section is already
+                    taken by another operation with a different reason.
+                optional: true
+            # TODO SERVER-79600: Remove once the release of the critical section clears the
+            # filtering metaddata. WARNING: new parameter, do not use in DDLCoordinators unless
+            # it's drained.
+            clearFilteringMetadata:
+                type: bool
+                description: >-
+                    (NOTE: this field has been deprecated in 8.0:
+                     - starting from such a release, filtering metadata are always cleared when blockType == kUnblock;
+                     - requestors should still specify a value to maintain operability with remote nodes running a legacy binary)
+                    If true the filtering metadata will be cleared, forcing a refresh the next time
+                    the collection metadata is needed.
+                optional: true
+        reply_type: OkReply

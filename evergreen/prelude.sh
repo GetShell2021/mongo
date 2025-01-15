@@ -7,10 +7,38 @@ set -o errexit
 # path the directory that contains this script.
 evergreen_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null 2>&1 && pwd)"
 
+function timeout_and_retry {
+  TIMEOUT=$1
+  shift
+  RETRIES=3
+
+  RET=0
+  for i in $(seq $RETRIES); do
+    echo "Running command with ${TIMEOUT}s timeout: $@"
+    eval timeout $TIMEOUT $@ || RET=$?
+
+    if [ $RET -eq 0 ]; then
+      break
+    elif [ $RET -eq 124 ]; then
+      echo "Command timed out after ${TIMEOUT}s on attempt $i: $@"
+    else
+      echo "Command failed with exitcode $RET after $i attempts: $@"
+    fi
+    sleep 1
+  done
+
+  return $RET
+}
+
+# let child shell processes use timeout_and_retry
+export -f timeout_and_retry
+
 . "$evergreen_dir/prelude_workdir.sh"
 . "$evergreen_dir/prelude_python.sh"
 . "$evergreen_dir/prelude_venv.sh"
 . "$evergreen_dir/prelude_db_contrib_tool.sh"
+. "$evergreen_dir/prelude_mongo_task_generator.sh"
+. "$evergreen_dir/prelude_system_env_variables.sh"
 
 expansions_yaml="$evergreen_dir/../../expansions.yml"
 expansions_default_yaml="$evergreen_dir/../etc/expansions.default.yml"
@@ -30,21 +58,6 @@ unset expansions_yaml
 unset expansions_default_yaml
 unset script
 unset evergreen_dir
-
-function add_nodejs_to_path {
-  # Add node and npm binaries to PATH
-  if [ "Windows_NT" = "$OS" ]; then
-    # An "npm" directory might not have been created in %APPDATA% by the Windows installer.
-    # Work around the issue by specifying a different %APPDATA% path.
-    # See: https://github.com/nodejs/node-v0.x-archive/issues/8141
-    export APPDATA=${workdir}/npm-app-data
-    export PATH="$PATH:/cygdrive/c/Program Files (x86)/nodejs" # Windows location
-    # TODO: this is to work around BUILD-8652
-    cd "$(pwd -P | sed 's,cygdrive/c/,cygdrive/z/,')"
-  else
-    export PATH="$PATH:/opt/node/bin"
-  fi
-}
 
 function posix_workdir {
   if [ "Windows_NT" = "$OS" ]; then

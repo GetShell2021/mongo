@@ -95,7 +95,7 @@ class test_timestamp22(wttest.WiredTigerTestCase):
             message += ': ERROR expected ' + expected
             self.checkStderr()
         self.pr(message)
-        self.assertEquals(expected, got)
+        self.assertEqual(expected, got)
 
     # Create a predictable value based on the iteration number and timestamp.
     def gen_value(self, iternum, ts):
@@ -342,13 +342,6 @@ class test_timestamp22(wttest.WiredTigerTestCase):
 
         expected = self.SUCCESS
 
-        # It is a no-op to provide oldest or stable behind the global values. If provided ahead, we
-        # will treat the values as if not provided at all.
-        if oldest <= self.oldest_ts:
-            oldest = -1
-        if stable <= self.stable_ts:
-            stable = -1
-
         if oldest >= 0 and stable < 0:
             expected = expected_newer(expected, self.stable_ts, oldest, self.oldest_ts)
         expected = expected_newer(expected, stable, oldest, self.oldest_ts)
@@ -364,8 +357,7 @@ class test_timestamp22(wttest.WiredTigerTestCase):
 
         # Predict what we expect to happen to the timestamps.
         if expected == self.SUCCESS:
-            # If that passes, then independently, oldest and stable can advance, but if they
-            # are less than the current value, that is silently ignored.
+            # If that passes, then independently, oldest and stable can advance.
             if oldest >= self.oldest_ts:
                 self.oldest_ts = oldest
                 self.pr('updating oldest: ' + str(oldest))
@@ -379,8 +371,8 @@ class test_timestamp22(wttest.WiredTigerTestCase):
         query_oldest = self.conn.query_timestamp('get=oldest_timestamp')
         query_stable = self.conn.query_timestamp('get=stable_timestamp')
 
-        self.assertEquals(expect_query_oldest, query_oldest)
-        self.assertEquals(expect_query_stable, query_stable)
+        self.assertEqual(expect_query_oldest, query_oldest)
+        self.assertEqual(expect_query_stable, query_stable)
         self.pr('oldest now: ' + query_oldest)
         self.pr('stable now: ' + query_stable)
 
@@ -455,15 +447,15 @@ class test_timestamp22(wttest.WiredTigerTestCase):
                 stable = maybe_ts((r & 0x2) != 0, iternum)
                 commit = maybe_ts((r & 0x4) != 0, iternum)
                 durable = maybe_ts((r & 0x8) != 0, iternum)
-                self.set_global_timestamps(oldest, stable, durable)
+                self.set_global_timestamps(max(oldest, self.oldest_ts), max(stable, self.stable_ts), durable)
 
         # Make sure the resulting rows are what we expect.
         cursor = self.session.open_cursor(self.uri)
         expect_key = 1
         expect_value = self.commit_value
         for k,v in cursor:
-            self.assertEquals(k, expect_key)
-            self.assertEquals(v, expect_value)
+            self.assertEqual(k, expect_key)
+            self.assertEqual(v, expect_value)
             expect_key += 1
 
         # Although it's theoretically possible to never successfully update a single row,
@@ -471,6 +463,3 @@ class test_timestamp22(wttest.WiredTigerTestCase):
         # a test code error where we mistakenly don't update any rows.
         self.assertGreater(expect_key, 1)
         cursor.close()
-
-if __name__ == '__main__':
-    wttest.run()

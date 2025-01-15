@@ -30,15 +30,12 @@
 #include "mongo/db/exec/limit.h"
 
 #include <memory>
-
-#include "mongo/db/exec/scoped_timer.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/util/str.h"
+#include <utility>
+#include <vector>
 
 namespace mongo {
 
 using std::unique_ptr;
-using std::vector;
 
 // static
 const char* LimitStage::kStageType = "LIMIT";
@@ -54,7 +51,7 @@ LimitStage::LimitStage(ExpressionContext* expCtx,
 
 LimitStage::~LimitStage() {}
 
-bool LimitStage::isEOF() {
+bool LimitStage::isEOF() const {
     return (0 == _numToReturn) || child()->isEOF();
 }
 

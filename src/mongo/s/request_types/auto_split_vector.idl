@@ -34,7 +34,7 @@ global:
     - "mongo/db/s/auto_split_vector.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 types:
     bson_vector:
@@ -42,11 +42,14 @@ types:
         description: "An array of objects representing the split keys."
         cpp_type: "std::vector<mongo::BSONObj>"
         deserializer: ::mongo::parseSplitKeys
+        # Deserializer uses getOwned.
+        is_view: false
 
 structs:
     AutoSplitVectorResponse:
         description: "The reply of an autoSplitVector command."
         strict: false
+        is_command_reply: true
         fields:
             splitKeys: bson_vector
             continuation:
@@ -57,7 +60,7 @@ commands:
   autoSplitVector:
     command_name: autoSplitVector
     cpp_name: AutoSplitVectorRequest
-    description: "Internal autoSplitVector command"
+    description: "Returns the split points for a chunk, given a range and the maximum chunk size."
     strict: false
     namespace: concatenate_with_db
     api_version: ""
@@ -74,3 +77,7 @@ commands:
         maxChunkSizeBytes:
             type: safeInt64
             description: "Max chunk size of the collection expressed in bytes"
+        limit:
+            type: int
+            description: "Max number of split points to look for"
+            optional: true

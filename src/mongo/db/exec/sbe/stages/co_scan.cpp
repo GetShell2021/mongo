@@ -27,11 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/exec/sbe/stages/co_scan.h"
-
-#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 
 namespace mongo::sbe {
 CoScanStage::CoScanStage(PlanNodeId planNodeId,
@@ -41,7 +39,7 @@ CoScanStage::CoScanStage(PlanNodeId planNodeId,
 
 std::unique_ptr<PlanStage> CoScanStage::clone() const {
     return std::make_unique<CoScanStage>(
-        _commonStats.nodeId, _yieldPolicy, _participateInTrialRunTracking);
+        _commonStats.nodeId, _yieldPolicy, participateInTrialRunTracking());
 }
 void CoScanStage::prepare(CompileCtx& ctx) {}
 value::SlotAccessor* CoScanStage::getAccessor(CompileCtx& ctx, value::SlotId slot) {
@@ -57,7 +55,7 @@ void CoScanStage::open(bool reOpen) {
 PlanState CoScanStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
 
-    checkForInterrupt(_opCtx);
+    checkForInterruptAndYield(_opCtx);
 
     // Run forever.
     return trackPlanState(PlanState::ADVANCED);

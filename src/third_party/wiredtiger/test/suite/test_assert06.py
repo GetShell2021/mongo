@@ -63,9 +63,6 @@ class test_assert06(wttest.WiredTigerTestCase, suite_subprocess):
         ds = SimpleDataSet(
             self, 'file:notused', 10, key_format=self.key_format, value_format=self.value_format)
 
-        cfg_on = 'write_timestamp_usage=ordered'
-        cfg_off = 'write_timestamp_usage=none'
-
         # Create a few items with and without timestamps.
         # Then alter the setting and verify the inconsistent usage is detected.
         uri = 'file:assert06'
@@ -105,7 +102,7 @@ class test_assert06(wttest.WiredTigerTestCase, suite_subprocess):
         # file will fail with EBUSY.
         self.conn.set_timestamp('oldest_timestamp=' + self.timestamp_str(2))
         c.close()
-        self.session.alter(uri, cfg_on)
+        self.session.alter(uri, 'write_timestamp_usage=ordered')
         c = self.session.open_cursor(uri)
 
         # Update at timestamp 5, then detect not using a timestamp.
@@ -118,6 +115,8 @@ class test_assert06(wttest.WiredTigerTestCase, suite_subprocess):
         c[key] = ds.value(6)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.commit_transaction(), self.msg_usage)
+
+        self.ignoreStdoutPatternIfExists(self.msg_usage)
 
     def test_timestamp_usage(self):
         if wiredtiger.diagnostic_build():
@@ -165,8 +164,8 @@ class test_assert06(wttest.WiredTigerTestCase, suite_subprocess):
         self.apply_timestamps(13, False)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.commit_transaction(), '/unexpected timestamp usage/')
-        self.assertEquals(c[ds.key(3)], ds.value(3))
-        self.assertEquals(c[ds.key(4)], ds.value(4))
+        self.assertEqual(c[ds.key(3)], ds.value(3))
+        self.assertEqual(c[ds.key(4)], ds.value(4))
 
         # Modify a key previously used with timestamps without one. We should get the inconsistent
         # usage message.
@@ -186,7 +185,7 @@ class test_assert06(wttest.WiredTigerTestCase, suite_subprocess):
         self.session.timestamp_transaction('commit_timestamp=' + self.timestamp_str(16))
         c[key] = ds.value(9)
         self.session.commit_transaction()
-        self.assertEquals(c[key], ds.value(9))
+        self.assertEqual(c[key], ds.value(9))
 
         key = ds.key(7)
         self.session.begin_transaction()
@@ -196,14 +195,14 @@ class test_assert06(wttest.WiredTigerTestCase, suite_subprocess):
         c[key] = ds.value(12)
         c[key] = ds.value(13)
         self.session.commit_transaction()
-        self.assertEquals(c[key], ds.value(13))
+        self.assertEqual(c[key], ds.value(13))
 
         key = ds.key(8)
         self.session.begin_transaction()
         c[key] = ds.value(14)
         self.apply_timestamps(18, True)
         self.session.commit_transaction()
-        self.assertEquals(c[key], ds.value(14))
+        self.assertEqual(c[key], ds.value(14))
 
         # Confirm it is okay to set the durable timestamp on the commit call.
         key = ds.key(9)
@@ -222,5 +221,4 @@ class test_assert06(wttest.WiredTigerTestCase, suite_subprocess):
         self.session.prepare_transaction('prepare_timestamp=' + self.timestamp_str(30))
         self.session.rollback_transaction()
 
-if __name__ == '__main__':
-    wttest.run()
+        self.ignoreStdoutPatternIfExists('/unexpected timestamp usage/')

@@ -26,8 +26,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef SCOPED_CURSOR_H
-#define SCOPED_CURSOR_H
+#pragma once
 
 /* Following definitions are required in order to use printing format specifiers in C++. */
 #ifndef __STDC_LIMIT_MACROS
@@ -45,7 +44,7 @@ extern "C" {
 
 namespace test_harness {
 class scoped_cursor {
-    public:
+public:
     scoped_cursor() = default;
     scoped_cursor(WT_SESSION *session, const std::string &uri, const std::string &cfg);
 
@@ -65,8 +64,7 @@ class scoped_cursor {
 
     WT_CURSOR *get();
 
-    private:
+private:
     WT_CURSOR *_cursor = nullptr;
 };
 } // namespace test_harness
-#endif

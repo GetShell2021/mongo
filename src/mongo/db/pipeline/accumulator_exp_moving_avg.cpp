@@ -27,21 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include <cmath>
-#include <limits>
-
-#include "mongo/db/pipeline/accumulator.h"
-
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/pipeline/accumulation_statement.h"
-#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/window_function/window_function_expression.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
-
-using boost::intrusive_ptr;
 
 REGISTER_STABLE_WINDOW_FUNCTION(expMovingAvg,
                                 mongo::window_function::ExpressionExpMovingAvg::parse);
@@ -64,11 +62,6 @@ void AccumulatorExpMovingAvg::processInternal(const Value& input, bool merging) 
     }
 }
 
-intrusive_ptr<AccumulatorState> AccumulatorExpMovingAvg::create(ExpressionContext* const expCtx,
-                                                                Decimal128 alpha) {
-    return new AccumulatorExpMovingAvg(expCtx, alpha);
-}
-
 Value AccumulatorExpMovingAvg::getValue(bool toBeMerged) {
     tassert(5433601, "$expMovingAvg can't be merged", !toBeMerged);
     if (!_init) {
@@ -82,11 +75,11 @@ Value AccumulatorExpMovingAvg::getValue(bool toBeMerged) {
 
 AccumulatorExpMovingAvg::AccumulatorExpMovingAvg(ExpressionContext* const expCtx, Decimal128 alpha)
     : AccumulatorState(expCtx), _alpha(alpha) {
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorExpMovingAvg::reset() {
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
     _init = false;
 }
 }  // namespace mongo

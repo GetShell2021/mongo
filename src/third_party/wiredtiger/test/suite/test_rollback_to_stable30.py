@@ -26,6 +26,7 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
+from rollback_to_stable_util import verify_rts_logs
 import wiredtiger, wttest
 from wtdataset import SimpleDataSet, ComplexDataSet
 from wtscenario import make_scenarios
@@ -33,13 +34,32 @@ from wtscenario import make_scenarios
 # test_rollback_to_stable30.py
 # Test RTS fails with active transactions and the subsequent transaction resolution succeeds.
 class test_rollback_to_stable30(wttest.WiredTigerTestCase):
-    scenarios = make_scenarios([
+
+    format_values = [
         ('table-f', dict(keyfmt='r', valfmt='8t', dataset=SimpleDataSet)),
         ('table-r', dict(keyfmt='r', valfmt='S', dataset=SimpleDataSet)),
         ('table-S', dict(keyfmt='S', valfmt='S', dataset=SimpleDataSet)),
         ('table-r-complex', dict(keyfmt='r', valfmt=None, dataset=ComplexDataSet)),
         ('table-S-complex', dict(keyfmt='S', valfmt=None, dataset=ComplexDataSet)),
-    ])
+    ]
+
+    worker_thread_values = [
+        ('0', dict(threads=0)),
+        ('4', dict(threads=4)),
+        ('8', dict(threads=8))
+    ]
+
+    scenarios = make_scenarios(format_values, worker_thread_values)
+
+    # Don't raise errors for these, the expectation is that the RTS verifier will
+    # run on the test output.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ignoreStdoutPattern('WT_VERB_RTS')
+        self.addTearDownAction(verify_rts_logs)
+
+    def conn_config(self):
+        return 'verbose=(rts:5)'
 
     def prepare_resolve(self, resolve):
         ds = self.dataset(self, "table:rts30", 10, key_format=self.keyfmt, value_format=self.valfmt)
@@ -64,7 +84,7 @@ class test_rollback_to_stable30(wttest.WiredTigerTestCase):
         msg = '/rollback_to_stable.*active/'
         with self.expectedStdoutPattern('transaction state dump'):
             self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-                lambda:self.conn.rollback_to_stable(), msg)
+                lambda:self.conn.rollback_to_stable('threads=' + str(self.threads)), msg)
 
         # Set commit, durable timestamps to 20.
         self.session.timestamp_transaction(
@@ -79,6 +99,3 @@ class test_rollback_to_stable30(wttest.WiredTigerTestCase):
 
     def test_rts_prepare_rollback(self):
         self.prepare_resolve(self.session.rollback_transaction)
-
-if __name__ == '__main__':
-    wttest.run()

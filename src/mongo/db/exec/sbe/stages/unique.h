@@ -29,9 +29,19 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <queue>
+#include <vector>
 
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/row.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo::sbe {
 /**
@@ -71,13 +81,18 @@ public:
     std::vector<DebugPrinter::Block> debugPrint() const final;
     size_t estimateCompileTimeSize() const final;
 
+protected:
+    bool shouldOptimizeSaveState(size_t) const final {
+        return true;
+    }
+
 private:
     const value::SlotVector _keySlots;
 
     std::vector<value::SlotAccessor*> _inKeyAccessors;
 
     // Table of keys that have been seen.
-    stdx::unordered_set<value::MaterializedRow,
+    absl::flat_hash_set<value::MaterializedRow,
                         value::MaterializedRowHasher,
                         value::MaterializedRowEq>
         _seen;

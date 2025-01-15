@@ -28,11 +28,14 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
 #include "mongo/db/repl/data_replicator_external_state_impl.h"
-
-#include "mongo/base/init.h"
 #include "mongo/db/repl/oplog_applier_impl.h"
 #include "mongo/db/repl/oplog_buffer_blocking_queue.h"
 #include "mongo/db/repl/oplog_buffer_collection.h"
@@ -40,9 +43,11 @@
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_external_state.h"
-#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
@@ -50,6 +55,12 @@
 namespace mongo {
 namespace repl {
 namespace {
+
+// The maximum size of the oplog buffer is set to 256MB.
+constexpr std::size_t kOplogBufferSize = 256 * 1024 * 1024;
+
+// The maximum count of the oplog buffer is set to unlimited.
+constexpr std::size_t kOplogBufferCount = std::numeric_limits<std::size_t>::max();
 
 const char kCollectionOplogBufferName[] = "collection";
 const char kBlockingQueueOplogBufferName[] = "inMemoryBlockingQueue";
@@ -109,9 +120,6 @@ ChangeSyncSourceAction DataReplicatorExternalStateImpl::shouldStopFetching(
     if (changeSyncSourceAction != ChangeSyncSourceAction::kContinueSyncing) {
         LOGV2(21150,
               "Canceling oplog query due to OplogQueryMetadata. We have to choose a new "
-              "sync source. Current source: {syncSource}, OpTime {lastAppliedOpTime}, "
-              "its sync source index:{syncSourceIndex}",
-              "Canceling oplog query due to OplogQueryMetadata. We have to choose a new "
               "sync source",
               "syncSource"_attr = source,
               "lastAppliedOpTime"_attr = oqMetadata.getLastOpApplied(),
@@ -141,7 +149,7 @@ std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeInitialSyncOpl
         return std::make_unique<OplogBufferProxy>(
             std::make_unique<OplogBufferCollection>(StorageInterface::get(opCtx), options));
     } else {
-        return std::make_unique<OplogBufferBlockingQueue>();
+        return std::make_unique<OplogBufferBlockingQueue>(kOplogBufferSize, kOplogBufferCount);
     }
 }
 
@@ -151,7 +159,7 @@ std::unique_ptr<OplogApplier> DataReplicatorExternalStateImpl::makeOplogApplier(
     ReplicationConsistencyMarkers* consistencyMarkers,
     StorageInterface* storageInterface,
     const OplogApplier::Options& options,
-    ThreadPool* writerPool) {
+    ThreadPool* workerPool) {
     return std::make_unique<OplogApplierImpl>(getTaskExecutor(),
                                               oplogBuffer,
                                               observer,
@@ -159,7 +167,7 @@ std::unique_ptr<OplogApplier> DataReplicatorExternalStateImpl::makeOplogApplier(
                                               consistencyMarkers,
                                               storageInterface,
                                               options,
-                                              writerPool);
+                                              workerPool);
 }
 
 StatusWith<ReplSetConfig> DataReplicatorExternalStateImpl::getCurrentConfig() const {
@@ -175,6 +183,11 @@ Status DataReplicatorExternalStateImpl::storeLocalConfigDocument(OperationContex
                                                                  const BSONObj& config) {
     return _replicationCoordinatorExternalState->storeLocalConfigDocument(
         opCtx, config, false /* write oplog entry */);
+}
+
+StatusWith<LastVote> DataReplicatorExternalStateImpl::loadLocalLastVoteDocument(
+    OperationContext* opCtx) const {
+    return _replicationCoordinatorExternalState->loadLocalLastVoteDocument(opCtx);
 }
 
 JournalListener* DataReplicatorExternalStateImpl::getReplicationJournalListener() {

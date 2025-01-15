@@ -4,21 +4,29 @@
  *
  * Checking UUID and index consistency involves talking to config servers through mongos, but mongos
  * is blackholed from the config servers in this test.
+ * @tags: [
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
 TestData.skipCheckRoutingTableConsistency = true;
-
-(function() {
-'use strict';
+TestData.skipCheckShardFilteringMetadata = true;
+TestData.skipCheckMetadataConsistency = true;
 
 var st = new ShardingTest({
     shards: 2,
     mongos: 1,
     useBridge: true,
     bridgeOptions: {verbose: 'vvv'},
+    // ShardingTest use a high config command timeout to avoid spurious failures but this test
+    // intentionally triggers a timeout, so we restore the default value.
+    other: {mongosOptions: {setParameter: {defaultConfigCommandTimeoutMS: 30000}}}
 });
 
 var testDB = st.s.getDB('BlackHoleDB');
@@ -49,4 +57,3 @@ assert.writeError(
         .TestColl.insert({_id: 0, value: 'This value will never be inserted'}, {maxTimeMS: 15000}));
 
 st.stop();
-}());

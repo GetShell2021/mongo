@@ -58,18 +58,9 @@ class test_tiered12(wttest.WiredTigerTestCase, TieredConfigMixin):
         get_check(self, tc, base, n)
 
     def test_tiered(self):
-        # Default cache location is cache-<bucket-name>
-        cache = "cache-" + self.bucket
-        # The bucket format for the S3 store is the name and the region separataed by a semi-colon.
-        # Strip off the region to get the cache folder.
-        if self.ss_name == 's3_store':
-            cache = cache[:cache.find(';')]  
-
         # Create a table. Add some data. Checkpoint and flush tier.
         # We have configured the timing stress for tiered caching which delays
         # the internal thread calling flush_finish for 1 second.
-        # So after flush tier completes, check that the cached object does not
-        # exist. Then sleep and check that it does exist.
         #
         # The idea is to make sure flush_tier is not waiting for unnecessary work
         # to be done, but returns as soon as the copying to shared storage completes.
@@ -80,9 +71,9 @@ class test_tiered12(wttest.WiredTigerTestCase, TieredConfigMixin):
         c["0"] = "0"
         self.check(c, 0, 1)
         c.close()
-        self.session.checkpoint()
-
-        self.session.flush_tier(None)
+        # Use force to make sure the new object is created. Otherwise there is no
+        # existing checkpoint yet and the flush will think there is no work to do.
+        self.session.checkpoint('flush_tier=(enabled,force=true)')
 
         # On directory store, the bucket object should exist.
         if self.ss_name == 'dir_store':
@@ -91,9 +82,3 @@ class test_tiered12(wttest.WiredTigerTestCase, TieredConfigMixin):
 
         # Sleep more than the one second stress timing amount and give the thread time to run.
         time.sleep(2)
-        # After sleeping, the internal thread should have created the cached object.
-        cache_obj = os.path.join(cache, self.bucket_prefix + self.obj1file)
-        self.assertTrue(os.path.exists(cache_obj))
-
-if __name__ == '__main__':
-    wttest.run()

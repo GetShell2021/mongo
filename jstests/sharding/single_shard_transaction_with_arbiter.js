@@ -1,13 +1,15 @@
 /**
  * Tests that single shard transactions succeed against replica sets that contain arbiters.
  *
+ * A config server can't have arbiter nodes.
  * @tags: [
  *   uses_transactions,
+ *   config_shard_incompatible,
  * ]
  */
 
-(function() {
-"use strict";
+import {withTxnAndAutoRetryOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const name = "single_shard_transaction_with_arbiter";
 const dbName = "test";
@@ -41,11 +43,10 @@ const sessionDB = session.getDatabase(dbName);
 const sessionColl = sessionDB.getCollection(collName);
 
 // Start a transaction and verify that it succeeds.
-session.startTransaction();
-assert.commandWorked(sessionColl.insert({_id: 0}));
-assert.commandWorked(session.commitTransaction_forTesting());
+withTxnAndAutoRetryOnMongos(session, () => {
+    assert.commandWorked(sessionColl.insert({_id: 0}));
+});
 
 assert.eq({_id: 0}, sessionColl.findOne({_id: 0}));
 
 shardingTest.stop();
-})();

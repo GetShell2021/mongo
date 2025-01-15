@@ -5,18 +5,27 @@
  * - manual key rotation is possible by deleting existing keys and restarting the cluster.
  *
  * Manual key rotation requires restarting a shard, so a persistent storage engine is necessary.
- * @tags: [requires_persistence]
+ * @tags: [
+ *   requires_persistence,
+ * ]
  */
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test restarts a shard replica set, potentially changing the primary node, while
 // ShardingTest._connections remains stale with the old primary/secondaries information. The UUIDs
 // check does a primary only command against the shards using _connections and can fail.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-(function() {
-"use strict";
-
-let st = new ShardingTest({shards: {rs0: {nodes: 2}}});
+let st = new ShardingTest({
+    shards: {rs0: {nodes: 2}},
+    // By default, our test infrastructure sets the election timeout to a very high value (24
+    // hours). This test restarts the router, and if the router is embedded, it will also restart
+    // the config shard. In this case, we need a shorter election timeout because the test relies on
+    // nodes running an election when they don't detect an active primary. Therefore, we are setting
+    // the electionTimeoutMillis to its default value.
+    initiateWithDefaultElectionTimeout: jsTestOptions().embeddedRouter
+});
 
 // Verify after startup there is a new key in admin.system.keys.
 jsTestLog("Verify the admin.system.keys collection after startup.");
@@ -75,11 +84,10 @@ assert.eq(res.$clusterTime.signature.keyId, NumberLong(0));
 
 // Resume key generation.
 for (let i = 0; i < st.configRS.nodes.length; i++) {
-    st.configRS.getPrimary().adminCommand(
-        {configureFailPoint: "disableKeyGeneration", mode: "off"});
+    st.configRS.nodes[i].adminCommand({configureFailPoint: "disableKeyGeneration", mode: "off"});
 }
 
-st.restartMongos(0);
+st.restartRouterNode(0);
 
 // Wait for config server primary to create new keys.
 assert.soonNoExcept(function() {
@@ -89,4 +97,3 @@ assert.soonNoExcept(function() {
 }, "expected the config server primary to create new keys");
 
 st.stop();
-})();

@@ -5,14 +5,14 @@ Utility to interact with golden data test outputs, produced by golden data test 
 For details on the golden data test framework see: docs/golden_data_test_framework.md.
 """
 
-import json
 import os
 import pathlib
+import platform
 import re
-import sys
 import shutil
+import sys
+from subprocess import call, check_output
 
-from subprocess import call, CalledProcessError, check_output, STDOUT, DEVNULL
 import click
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
@@ -21,9 +21,10 @@ if __name__ == "__main__" and __package__ is None:
 
 # pylint: disable=wrong-import-position
 from buildscripts.util.fileops import read_yaml_file
+
 # pylint: enable=wrong-import-position
 
-assert sys.version_info >= (3, 8)
+assert sys.version_info >= (3, 7)
 
 
 class AppError(Exception):
@@ -70,14 +71,36 @@ def replace_variables(pattern: str, variables: dict) -> str:
 
 def get_path_name_regex(pattern: str) -> str:
     """Return the regex pattern for output names."""
-    return '[0-9a-f]'.join([re.escape(part) for part in pattern.split('%')])
+    return "[0-9a-f]".join([re.escape(part) for part in pattern.split("%")])
+
+
+# For compatibility with version<3.8 that does not support shutil.copytree with dirs_exist_ok=True
+def copytree_dirs_exist_ok_compatibility(src, dest):
+    if os.path.isdir(src):
+        if not os.path.isdir(dest):
+            os.makedirs(dest)
+        files = os.listdir(src)
+        for file in files:
+            copytree_dirs_exist_ok_compatibility(os.path.join(src, file), os.path.join(dest, file))
+    else:
+        shutil.copyfile(src, dest)
+
+
+def copytree_dirs_exist_ok(src, dest):
+    if sys.version_info >= (3, 8):
+        shutil.copytree(src, dest, dirs_exist_ok=True)
+    else:
+        copytree_dirs_exist_ok_compatibility(src, dest)
 
 
 @click.group()
-@click.option('-n', '--dry-run', is_flag=True)
-@click.option('-v', '--verbose', is_flag=True)
-@click.option('--config', envvar='GOLDEN_TEST_CONFIG_PATH',
-              help='Config file path. Also GOLDEN_TEST_CONFIG_PATH environment variable.')
+@click.option("-n", "--dry-run", is_flag=True)
+@click.option("-v", "--verbose", is_flag=True)
+@click.option(
+    "--config",
+    envvar="GOLDEN_TEST_CONFIG_PATH",
+    help="Config file path. Also GOLDEN_TEST_CONFIG_PATH environment variable.",
+)
 @click.pass_context
 def cli(ctx, dry_run, verbose, config):
     """Manage test results from golden data test framework.
@@ -96,6 +119,7 @@ class GoldenTestApp(object):
 
     verbose: False
     dry_run: False
+    config_path: None
     config: None
     output_parent_path = None
     output_name_pattern = None
@@ -105,8 +129,10 @@ class GoldenTestApp(object):
         """Initialize the app."""
         self.verbose = verbose
         self.dry_run = dry_run
+        self.config_path = config_path
 
-        self.config = self.load_config(config_path)
+    def init_config(self):
+        self.config = self.load_config(self.config_path)
 
         self.output_parent_path = pathlib.Path(self.config.outputRootPattern).parent
         self.output_name_pattern = str(pathlib.Path(self.config.outputRootPattern).name)
@@ -134,21 +160,29 @@ class GoldenTestApp(object):
     def load_config(self, config_path):
         """Load configuration file."""
         if config_path is None:
-            raise "Can't load config. GOLDEN_TEST_CONFIG_PATH envrionment variable is not set"
+            raise AppError(
+                (
+                    "Can't load config. GOLDEN_TEST_CONFIG_PATH envrionment variable is not set. Golden test CLI must be configured before use.\n"
+                    "To configure it, follow the instructions in https://github.com/mongodb/mongo/blob/master/docs/golden_data_test_framework.md#how-to-diff-and-accept-new-test-outputs-on-a-workstation\n"
+                    "Note: After setup you may need to rerun the tests for this utility to find them."
+                )
+            )
 
         self.vprint(f"Loading config from path: '{config_path}'")
         config = GoldenTestConfig.from_yaml_file(config_path)
 
         if config.outputRootPattern is None:
-            raise "Invalid config. outputRootPattern config parameter is not set"
+            raise AppError("Invalid config. outputRootPattern config parameter is not set")
 
         return config
 
     def get_output_path(self, output_name):
         """Return the path for given output name."""
         if not re.match(self.output_name_regex, output_name):
-            raise AppError(f"Invalid name: '{output_name}'. " +
-                           f"Does not match configured pattern: {self.output_name_pattern}")
+            raise AppError(
+                f"Invalid name: '{output_name}'. "
+                + f"Does not match configured pattern: {self.output_name_pattern}"
+            )
         output_path = os.path.join(self.output_parent_path, output_name)
         if not os.path.isdir(output_path):
             raise AppError(f"No such directory: '{output_path}'")
@@ -156,13 +190,17 @@ class GoldenTestApp(object):
 
     def list_outputs(self):
         """Return names of all available outputs."""
-        self.vprint(f"Listing outputs in path: '{self.output_parent_path}' " +
-                    f"matching '{self.output_name_pattern}'")
+        self.vprint(
+            f"Listing outputs in path: '{self.output_parent_path}' "
+            + f"matching '{self.output_name_pattern}'"
+        )
 
         if not os.path.isdir(self.output_parent_path):
             return []
         return [
-            o for o in os.listdir(self.output_parent_path) if re.match(self.output_name_regex, o)
+            o
+            for o in os.listdir(self.output_parent_path)
+            if re.match(self.output_name_regex, o)
             and os.path.isdir(os.path.join(self.output_parent_path, o))
         ]
 
@@ -180,8 +218,9 @@ class GoldenTestApp(object):
         if latest_name is None:
             raise AppError("No outputs found")
 
-        self.vprint(f"Found output with latest creation time: {latest_name} " +
-                    f"created at {latest_ctime}")
+        self.vprint(
+            f"Found output with latest creation time: {latest_name} " + f"created at {latest_ctime}"
+        )
 
         return latest_name
 
@@ -189,42 +228,116 @@ class GoldenTestApp(object):
         """Return actual and expected paths for given output name."""
         output_path = self.get_output_path(output_name)
         return OutputPaths(
-            actual=os.path.join(output_path, "actual"), expected=os.path.join(
-                output_path, "expected"))
+            actual=os.path.join(output_path, "actual"),
+            expected=os.path.join(output_path, "expected"),
+        )
 
-    @cli.command('diff', help='Diff the expected and actual folders of the test output')
-    @click.argument('output_name', required=False)
+    def setup_linux(self):
+        # Create config file
+        config_path = os.path.join(os.path.expanduser("~"), ".golden_test_config.yml")
+        if not os.path.isfile(config_path):
+            print(f"Creating {config_path}")
+            config_contents = (
+                r"""outputRootPattern: '/var/tmp/test_output/out-%%%%-%%%%-%%%%-%%%%'"""
+                "\n"
+                r"""diffCmd: 'git diff --no-index "{{expected}}" "{{actual}}"'"""
+                "\n"
+            )
+            with open(config_path, "w") as file:
+                file.write(config_contents)
+        else:
+            print(f"Skipping creating {config_path}, file exists.")
+
+        # Add global GOLDEN_TEST_CONFIG_PATH environment variable
+        etc_environment_path = "/etc/environment"
+        env_var_defined = False
+        if os.path.isfile(etc_environment_path):
+            with open(etc_environment_path, "r") as file:
+                for line in file.readlines():
+                    if line.startswith("GOLDEN_TEST_CONFIG_PATH="):
+                        env_var_defined = True
+        if not env_var_defined:
+            print(f"Adding GOLDEN_TEST_CONFIG_PATH to {etc_environment_path}")
+            env_var_contents = f'GOLDEN_TEST_CONFIG_PATH="{config_path}"'
+            call(["sudo", "/bin/sh", "-c", f"echo '{env_var_contents}' >> {etc_environment_path}"])
+        else:
+            print(
+                f"Skipping adding GOLDEN_TEST_CONFIG_PATH to {etc_environment_path}, variable already defined."
+            )
+
+    def setup_windows(self):
+        # Create config file
+        config_path = os.path.join(os.path.expandvars("%LocalAppData%"), ".golden_test_config.yml")
+        if not os.path.isfile(config_path):
+            print(f"Creating {config_path}")
+            config_contents = (
+                r"outputRootPattern: 'C:\Users\Administrator\AppData\Local\Temp\test_output\out-%%%%-%%%%-%%%%-%%%%'"
+                "\n"
+                r"""diffCmd: 'git diff --no-index "{{expected}}" "{{actual}}"'"""
+                "\n"
+            )
+            with open(config_path, "w") as file:
+                file.write(config_contents)
+        else:
+            print(f"Skipping creating {config_path}, file exists.")
+
+        # Add global GOLDEN_TEST_CONFIG_PATH environment variable
+        if os.environ.get("GOLDEN_TEST_CONFIG_PATH") is None:
+            print("Setting GOLDEN_TEST_CONFIG_PATH global variable")
+            call(
+                [
+                    "runas",
+                    "/profile",
+                    "/user:administrator",
+                    f'setx GOLDEN_TEST_CONFIG_PATH "{config_path}"',
+                ]
+            )
+        else:
+            print(
+                "Skipping setting GOLDEN_TEST_CONFIG_PATH global variable, variable already defined."
+            )
+
+    @cli.command("diff", help="Diff the expected and actual folders of the test output")
+    @click.argument("output_name", required=False)
     @click.pass_obj
     def command_diff(self, output_name):
         """Diff the expected and actual folders of the test output."""
+        self.init_config()
+
         if output_name is None:
             output_name = self.get_latest_output()
 
         self.vprint(f"Diffing results from output '{output_name}'")
 
         paths = self.get_paths(output_name)
-        diff_cmd = replace_variables(self.config.diffCmd,
-                                     {'actual': paths.actual, 'expected': paths.expected})
+        diff_cmd = replace_variables(
+            self.config.diffCmd, {"actual": paths.actual, "expected": paths.expected}
+        )
         self.vprint(f"Running command: '{diff_cmd}'")
         self.call_shell(diff_cmd)
 
-    @cli.command('get-path', help='Get the root folder path of the test output.')
-    @click.argument('output_name', required=False)
+    @cli.command("get-path", help="Get the root folder path of the test output.")
+    @click.argument("output_name", required=False)
     @click.pass_obj
     def command_get_path(self, output_name):
         """Get the root folder path of the test output."""
+        self.init_config()
+
         if output_name is None:
             output_name = self.get_latest_output()
 
         print(self.get_output_path(output_name))
 
     @cli.command(
-        'accept',
-        help='Accept the actual test output and copy it as new golden data to the source repo.')
-    @click.argument('output_name', required=False)
+        "accept",
+        help="Accept the actual test output and copy it as new golden data to the source repo.",
+    )
+    @click.argument("output_name", required=False)
     @click.pass_obj
     def command_accept(self, output_name):
         """Accept the actual test output and copy it as new golden data to the source repo."""
+        self.init_config()
+
         if output_name is None:
             output_name = self.get_latest_output()
 
@@ -235,12 +348,14 @@ class GoldenTestApp(object):
 
         self.vprint(f"Copying files recursively from '{paths.actual}' to '{repo_root}'")
         if not self.dry_run:
-            shutil.copytree(paths.actual, repo_root, dirs_exist_ok=True)
+            copytree_dirs_exist_ok(paths.actual, repo_root)
 
-    @cli.command('clean', help='Remove all test outputs')
+    @cli.command("clean", help="Remove all test outputs")
     @click.pass_obj
     def command_clean(self):
         """Remove all test outputs."""
+        self.init_config()
+
         outputs = self.list_outputs()
         self.vprint(f"Deleting {len(outputs)} outputs")
         for output_name in outputs:
@@ -249,19 +364,34 @@ class GoldenTestApp(object):
             if not self.dry_run:
                 shutil.rmtree(output_path)
 
-    @cli.command('latest', help='Get the name of the most recent test output')
+    @cli.command("latest", help="Get the name of the most recent test output")
     @click.pass_obj
     def command_latest(self):
         """Get the name of the most recent test output."""
+        self.init_config()
+
         output_name = self.get_latest_output()
         print(output_name)
 
-    @cli.command('list', help='List all names of the available test outputs')
+    @cli.command("list", help="List all names of the available test outputs")
     @click.pass_obj
     def command_list(self):
         """List all names of the available test outputs."""
+        self.init_config()
+
         for output_name in self.list_outputs():
             print(output_name)
+
+    @cli.command("setup", help="Performs default setup based on current platform")
+    @click.pass_obj
+    def command_setup(self):
+        """Performs default setup based on current platform."""
+        if platform.platform().startswith("Linux"):
+            self.setup_linux()
+        elif platform.platform().startswith("Windows"):
+            self.setup_windows()
+        else:
+            raise AppError(f"Platform not supported by this setup utility: {platform.platform()}")
 
 
 def main():

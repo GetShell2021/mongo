@@ -6,13 +6,14 @@
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    flushRoutersAndRefreshShardMetadata
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const st = new ShardingTest({shards: 2, mongos: 1});
-const kDBName = "unsharded_lookup_in_txn";
 
 let session = st.s.startSession();
 let sessionDB = session.getDatabase("unsharded_lookup_in_txn");
@@ -20,8 +21,8 @@ let sessionDB = session.getDatabase("unsharded_lookup_in_txn");
 const shardedColl = sessionDB.sharded;
 const unshardedColl = sessionDB.unsharded;
 
-assert.commandWorked(st.s.adminCommand({enableSharding: sessionDB.getName()}));
-st.ensurePrimaryShard(sessionDB.getName(), st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: sessionDB.getName(), primaryShard: st.shard0.shardName}));
 
 assert.commandWorked(
     st.s.adminCommand({shardCollection: shardedColl.getFullName(), key: {_id: 1}}));
@@ -47,6 +48,13 @@ const pipeline = [{
 const kBatchSize = 2;
 
 const testLookupDoesNotSeeDocumentsOutsideSnapshot = function() {
+    // TODO SERVER-88936 Remove this check once allow additional participants is enabled on last-lts
+    const additionalTxnParticipantsAllowed =
+        FeatureFlagUtil.isPresentAndEnabled(st.s.getDB('admin'), "AllowAdditionalParticipants");
+    if (!additionalTxnParticipantsAllowed) {
+        return;
+    }
+
     unshardedColl.drop();
     // Insert some stuff into the unsharded collection.
     const kUnshardedCollOriginalSize = 10;
@@ -54,32 +62,38 @@ const testLookupDoesNotSeeDocumentsOutsideSnapshot = function() {
         assert.commandWorked(unshardedColl.insert({_id: i, foreign_always_one: 1}));
     }
 
-    session.startTransaction();
+    withRetryOnTransientTxnError(
+        () => {
+            session.startTransaction();
 
-    const curs = shardedColl.aggregate(
-        pipeline, {readConcern: {level: "snapshot"}, cursor: {batchSize: kBatchSize}});
+            const curs = shardedColl.aggregate(
+                pipeline, {readConcern: {level: "snapshot"}, cursor: {batchSize: kBatchSize}});
 
-    for (let i = 0; i < kBatchSize; i++) {
-        const doc = curs.next();
-        assert.eq(doc.matches.length, kUnshardedCollOriginalSize);
-    }
+            for (let i = 0; i < kBatchSize; i++) {
+                const doc = curs.next();
+                assert.eq(doc.matches.length, kUnshardedCollOriginalSize);
+            }
 
-    // Do writes on the unsharded collection from outside the session.
-    (function() {
-        const unshardedCollOutsideSession =
-            st.s.getDB(sessionDB.getName())[unshardedColl.getName()];
-        assert.commandWorked(unshardedCollOutsideSession.insert({b: 1, xyz: 1}));
-        assert.commandWorked(unshardedCollOutsideSession.insert({b: 1, xyz: 2}));
-    })();
+            // Do writes on the unsharded collection from outside the session.
+            (function() {
+                const unshardedCollOutsideSession =
+                    st.s.getDB(sessionDB.getName())[unshardedColl.getName()];
+                assert.commandWorked(unshardedCollOutsideSession.insert({b: 1, xyz: 1}));
+                assert.commandWorked(unshardedCollOutsideSession.insert({b: 1, xyz: 2}));
+            })();
 
-    // We shouldn't see those writes from the aggregation within the session.
-    assert.eq(curs.hasNext(), true);
-    while (curs.hasNext()) {
-        const doc = curs.next();
-        assert.eq(doc.matches.length, kUnshardedCollOriginalSize);
-    }
+            // We shouldn't see those writes from the aggregation within the session.
+            assert.eq(curs.hasNext(), true);
+            while (curs.hasNext()) {
+                const doc = curs.next();
+                assert.eq(doc.matches.length, kUnshardedCollOriginalSize);
+            }
 
-    assert.commandWorked(session.abortTransaction_forTesting());
+            assert.commandWorked(session.abortTransaction_forTesting());
+        },
+        () => {
+            session.abortTransaction_forTesting();
+        });
 };
 
 // Run the test once, with all of the data on shard 1. This means that the merging shard (shard
@@ -97,4 +111,3 @@ flushRoutersAndRefreshShardMetadata(st, {ns: shardedColl.getFullName()});
 testLookupDoesNotSeeDocumentsOutsideSnapshot();
 
 st.stop();
-})();

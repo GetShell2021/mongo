@@ -1,10 +1,14 @@
 // Test validation of connection strings passed to the JavaScript "connect()" function.
 // @tags: [
 //   uses_multiple_connections,
+//   docker_incompatible,
+//   # network_error_and_txn_override.js will timeout with assert.soon and
+//   # give a different error from what test expects.
+//   does_not_support_stepdowns,
 // ]
 // Related to SERVER-8030.
 
-port = "27017";
+let port = "27017";
 
 if (db.getMongo().host.indexOf(":") >= 0) {
     var idx = db.getMongo().host.indexOf(":");

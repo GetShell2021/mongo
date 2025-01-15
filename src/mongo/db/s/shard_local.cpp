@@ -28,38 +28,31 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/s/shard_local.h"
+#include <boost/optional/optional.hpp>
 
 #include "mongo/client/remote_command_targeter.h"
-#include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog_raii.h"
-#include "mongo/db/concurrency/exception_util.h"
-#include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/shard_local.h"
 #include "mongo/db/server_options.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/scopeguard.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 
 namespace mongo {
 
+const ConnectionString ShardLocal::kLocalConnectionString = ConnectionString::forLocal();
+
 ShardLocal::ShardLocal(const ShardId& id) : Shard(id) {
     // Currently ShardLocal only works for config servers. If we ever start using ShardLocal on
     // shards we'll need to consider how to handle shards.
-    invariant(serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 }
 
-ConnectionString ShardLocal::getConnString() const {
-    return repl::ReplicationCoordinator::get(getGlobalServiceContext())
-        ->getConfigConnectionString();
+const ConnectionString& ShardLocal::getConnString() const {
+    return kLocalConnectionString;
 }
 
 std::shared_ptr<RemoteCommandTargeter> ShardLocal::getTargeter() const {
@@ -71,44 +64,17 @@ void ShardLocal::updateReplSetMonitor(const HostAndPort& remoteHost,
     MONGO_UNREACHABLE;
 }
 
-void ShardLocal::updateLastCommittedOpTime(LogicalTime lastCommittedOpTime) {
-    MONGO_UNREACHABLE;
-}
-
-LogicalTime ShardLocal::getLastCommittedOpTime() const {
-    MONGO_UNREACHABLE;
-}
-
 std::string ShardLocal::toString() const {
     return getId().toString() + ":<local>";
 }
 
 bool ShardLocal::isRetriableError(ErrorCodes::Error code, RetryPolicy options) {
-    switch (options) {
-        case Shard::RetryPolicy::kNoRetry: {
-            return false;
-        } break;
-
-        case Shard::RetryPolicy::kIdempotent: {
-            return code == ErrorCodes::WriteConcernFailed;
-        } break;
-
-        case Shard::RetryPolicy::kIdempotentOrCursorInvalidated: {
-            return isRetriableError(code, Shard::RetryPolicy::kIdempotent) ||
-                ErrorCodes::isCursorInvalidatedError(code);
-        } break;
-
-        case Shard::RetryPolicy::kNotIdempotent: {
-            return false;
-        } break;
-    }
-
-    MONGO_UNREACHABLE;
+    return localIsRetriableError(code, options);
 }
 
 StatusWith<Shard::CommandResponse> ShardLocal::_runCommand(OperationContext* opCtx,
                                                            const ReadPreferenceSetting& unused,
-                                                           StringData dbName,
+                                                           const DatabaseName& dbName,
                                                            Milliseconds maxTimeMSOverrideUnused,
                                                            const BSONObj& cmdObj) {
     return _rsLocalClient.runCommandOnce(opCtx, dbName, cmdObj);
@@ -117,7 +83,7 @@ StatusWith<Shard::CommandResponse> ShardLocal::_runCommand(OperationContext* opC
 StatusWith<Shard::QueryResponse> ShardLocal::_runExhaustiveCursorCommand(
     OperationContext* opCtx,
     const ReadPreferenceSetting& readPref,
-    StringData dbName,
+    const DatabaseName& dbName,
     Milliseconds maxTimeMSOverride,
     const BSONObj& cmdObj) {
     MONGO_UNREACHABLE;
@@ -138,7 +104,7 @@ StatusWith<Shard::QueryResponse> ShardLocal::_exhaustiveFindOnConfig(
 
 void ShardLocal::runFireAndForgetCommand(OperationContext* opCtx,
                                          const ReadPreferenceSetting& readPref,
-                                         const std::string& dbName,
+                                         const DatabaseName& dbName,
                                          const BSONObj& cmdObj) {
     MONGO_UNREACHABLE;
 }
@@ -151,4 +117,24 @@ Status ShardLocal::runAggregation(
     return _rsLocalClient.runAggregation(opCtx, aggRequest, callback);
 }
 
+BatchedCommandResponse ShardLocal::runBatchWriteCommand(OperationContext* opCtx,
+                                                        const Milliseconds maxTimeMS,
+                                                        const BatchedCommandRequest& batchRequest,
+                                                        const WriteConcernOptions& writeConcern,
+                                                        RetryPolicy retryPolicy) {
+    // A request dispatched through a local client is served within the same thread that submits it
+    // (so that the opCtx needs to be used as the vehicle to pass the WC to the ServiceEntryPoint).
+    const auto originalWC = opCtx->getWriteConcern();
+    ScopeGuard resetWCGuard([&] { opCtx->setWriteConcern(originalWC); });
+    opCtx->setWriteConcern(writeConcern);
+
+    const DatabaseName dbName = batchRequest.getNS().dbName();
+    const BSONObj cmdObj = [&] {
+        BSONObjBuilder cmdObjBuilder;
+        batchRequest.serialize(&cmdObjBuilder);
+        return cmdObjBuilder.obj();
+    }();
+
+    return _submitBatchWriteCommand(opCtx, cmdObj, dbName, maxTimeMS, retryPolicy);
+}
 }  // namespace mongo

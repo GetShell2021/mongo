@@ -27,20 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/bson/bsonobj.h"
+#include <string>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/client/read_preference.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace {
 
-using unittest::assertGet;
 
 const KeyPattern kKeyPattern(BSON("x" << 1));
 
@@ -72,8 +82,7 @@ protected:
         chunk.setCollectionUUID(collUuid);
         chunk.setVersion(ChunkVersion({epoch, timestamp}, {12, 7}));
         chunk.setShard(_shardName);
-        chunk.setMin(jumboChunk().getMin());
-        chunk.setMax(jumboChunk().getMax());
+        chunk.setRange(jumboChunk());
         chunk.setJumbo(true);
 
         ChunkType otherChunk;
@@ -81,15 +90,16 @@ protected:
         otherChunk.setCollectionUUID(collUuid);
         otherChunk.setVersion(ChunkVersion({epoch, timestamp}, {14, 7}));
         otherChunk.setShard(_shardName);
-        otherChunk.setMin(nonJumboChunk().getMin());
-        otherChunk.setMax(nonJumboChunk().getMax());
+        otherChunk.setRange(nonJumboChunk());
 
         setupCollection(nss, kKeyPattern, {chunk, otherChunk});
     }
 
     const std::string _shardName = "shard";
-    const NamespaceString _nss1{"TestDB.TestColl1"};
-    const NamespaceString _nss2{"TestDB.TestColl2"};
+    const NamespaceString _nss1 =
+        NamespaceString::createNamespaceString_forTest("TestDB.TestColl1");
+    const NamespaceString _nss2 =
+        NamespaceString::createNamespaceString_forTest("TestDB.TestColl2");
 };
 
 TEST_F(ClearJumboFlagTest, ClearJumboShouldBumpVersion) {

@@ -27,13 +27,27 @@
  *    it in the license file.
  */
 
+#include <memory>
+#include <string>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/active_migrations_registry.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/request_types/shardsvr_join_migrations_request_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
 
 
 namespace mongo {
@@ -65,7 +79,7 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
             {
                 Lock::GlobalLock lk(opCtx, MODE_IX);
@@ -83,7 +97,7 @@ public:
         static constexpr char kRegistryLockReason[] = "Running _shardsvrJoinMigrations";
 
         NamespaceString ns() const override {
-            return {request().getDbName(), ""};
+            return NamespaceString(request().getDbName());
         }
 
         bool supportsWriteConcern() const override {
@@ -94,11 +108,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-} _shardsvrJoinMigrationsCmd;
+};
+MONGO_REGISTER_COMMAND(ShardsvrJoinMigrationsCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

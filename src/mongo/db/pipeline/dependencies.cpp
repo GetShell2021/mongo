@@ -27,21 +27,47 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <bitset>
 
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/document_value/document_metadata_fields.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
+#include <compare>
 
 namespace mongo {
 
-std::list<std::string> DepsTracker::sortedFields() const {
-    // Use a special comparator to put parent fieldpaths before their children.
-    std::list<std::string> sortedFields(fields.begin(), fields.end());
-    sortedFields.sort(PathPrefixComparator());
-    return sortedFields;
+OrderedPathSet DepsTracker::simplifyDependencies(OrderedPathSet dependencies,
+                                                 TruncateToRootLevel truncateToRootLevel) {
+    // The key operation here is folding dependencies into ancestor dependencies, wherever possible.
+    // This is assisted by a special sort in OrderedPathSet that treats '.'
+    // as the first char and thus places parent paths directly before their children.
+    OrderedPathSet returnSet;
+    std::string last;
+    for (const auto& path : dependencies) {
+        if (!last.empty() && str::startsWith(path, last)) {
+            // We are including a parent of this field, so we can skip this field.
+            continue;
+        }
+
+        // Check that the field requested is a valid field name in the agg language. This
+        // constructor will throw if it isn't.
+        FieldPath fp(path);
+
+        if (truncateToRootLevel == TruncateToRootLevel::yes) {
+            last = fp.front().toString() + '.';
+            returnSet.insert(fp.front().toString());
+        } else {
+            last = path + '.';
+            returnSet.insert(path);
+        }
+    }
+    return returnSet;
 }
 
 BSONObj DepsTracker::toProjectionWithoutMetadata(
@@ -59,35 +85,16 @@ BSONObj DepsTracker::toProjectionWithoutMetadata(
         return bb.obj();
     }
 
-    // Go through dependency fieldpaths to find the minimal set of projections that cover the
-    // dependencies. For example, the dependencies ["a.b", "a.b.c.g", "c", "c.d", "f"] would be
-    // minimally covered by the projection {"a.b": 1, "c": 1, "f": 1}. The key operation here is
-    // folding dependencies into ancestor dependencies, wherever possible. This is assisted by a
-    // special sort in DepsTracker::sortedFields that treats '.' as the first char and thus places
-    // parent paths directly before their children.
+    // Create a projection from the simplified dependencies (absorbing descendants into parents).
+    // For example, the dependencies ["a.b", "a.b.c.g", "c", "c.d", "f"] would be
+    // minimally covered by the projection {"a.b": 1, "c": 1, "f": 1}.
     bool idSpecified = false;
-    std::string last;
-    for (const auto& field : sortedFields()) {
-        if (str::startsWith(field, "_id") && (field.size() == 3 || field[3] == '.')) {
+    for (auto& path : simplifyDependencies(fields, truncationBehavior)) {
+        // Remember if _id was specified.  If not, we'll later explicitly add {_id: 0}
+        if (str::startsWith(path, "_id") && (path.size() == 3 || path[3] == '.')) {
             idSpecified = true;
         }
-
-        if (!last.empty() && str::startsWith(field, last)) {
-            // We are including a parent of this field, so we can skip this field.
-            continue;
-        }
-
-        // Check that the field requested is a valid field name in the agg language. This
-        // constructor will throw if it isn't.
-        FieldPath fp(field);
-
-        if (truncationBehavior == TruncateToRootLevel::yes) {
-            last = fp.front().toString() + '.';
-            bb.append(fp.front(), 1);
-        } else {
-            last = field + '.';
-            bb.append(field, 1);
-        }
+        bb.append(path, 1);
     }
 
     if (!idSpecified) {
@@ -102,21 +109,43 @@ void DepsTracker::setNeedsMetadata(DocumentMetadataFields::MetaType type, bool r
             str::stream() << "query requires " << type << " metadata, but it is not available",
             !required || !_unavailableMetadata[type]);
 
-    // If the metadata type is not required, then it should not be recorded as a metadata
-    // dependency.
-    invariant(required || !_metadataDeps[type]);
-    _metadataDeps[type] = required;
+    switch (type) {
+        case DocumentMetadataFields::MetaType::kSearchScore:
+        case DocumentMetadataFields::MetaType::kSearchHighlights:
+        case DocumentMetadataFields::MetaType::kSearchScoreDetails:
+        case DocumentMetadataFields::MetaType::kVectorSearchScore:
+        case DocumentMetadataFields::MetaType::kSearchSequenceToken:
+        case DocumentMetadataFields::MetaType::kScore:
+            // We track the dependencies for searchScore, searchHighlights,
+            // searchScoreDetails, vectorSearchScore, or score separately because those values are
+            // not stored in the collection (or in mongod at all).
+            invariant(required || !_searchMetadataDeps[type]);
+            _searchMetadataDeps[type] = required;
+            break;
+        default:
+            // If the metadata type is not required, then it should not be recorded as a metadata
+            // dependency.
+            invariant(required || !_metadataDeps[type]);
+            _metadataDeps[type] = required;
+    }
 }
 
 // Returns true if the lhs value should sort before the rhs, false otherwise.
-bool PathPrefixComparator::operator()(const std::string& lhs, const std::string& rhs) const {
+bool PathComparator::operator()(StringData lhs, StringData rhs) const {
+    // Use the three-way (<=>) comparator to avoid code duplication.
+    return std::is_lt(ThreeWayPathComparator{}(lhs, rhs));
+}
+
+std::strong_ordering ThreeWayPathComparator::operator()(StringData lhs, StringData rhs) const {
     constexpr char dot = '.';
 
     for (size_t pos = 0, len = std::min(lhs.size(), rhs.size()); pos < len; ++pos) {
         // Below, we explicitly choose unsigned char because the usual const char& returned by
         // operator[] is actually signed on x86 and will incorrectly order unicode characters.
         unsigned char lchar = lhs[pos], rchar = rhs[pos];
-        if (lchar == rchar) {
+
+        const auto res = lchar <=> rchar;
+        if (std::is_eq(res)) {
             continue;
         }
 
@@ -124,19 +153,19 @@ bool PathPrefixComparator::operator()(const std::string& lhs, const std::string&
         // paths sort directly before any paths they prefix and directly after any paths
         // which prefix them.
         if (lchar == dot) {
-            return true;
+            return std::strong_ordering::less;
         } else if (rchar == dot) {
-            return false;
+            return std::strong_ordering::greater;
         }
 
         // Otherwise, default to normal character comparison.
-        return lchar < rchar;
+        return res;
     }
 
     // If we get here, then we have reached the end of lhs and/or rhs and all of their path
     // segments up to this point match. If lhs is shorter than rhs, then lhs prefixes rhs
     // and should sort before it.
-    return lhs.size() < rhs.size();
+    return lhs.size() <=> rhs.size();
 }
 
 }  // namespace mongo

@@ -3,15 +3,14 @@
  * "for restore" mode, but not read from older points-in-time on the recovered node.
  *
  * This test only makes sense for storage engines that support recover to stable timestamp.
- * @tags: [requires_persistence, requires_journaling, requires_replication,
+ * @tags: [requires_persistence, requires_replication,
  * requires_majority_read_concern, uses_transactions, uses_prepare_transaction,
  * # We don't expect to do this while upgrading.
  * multiversion_incompatible]
  */
 
-(function() {
-"use strict";
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const dbName = TestData.testName;
 
@@ -28,7 +27,7 @@ const startParams = {
 };
 const nodes = rst.startSet({setParameter: startParams});
 let restoreNode = nodes[1];
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 const primary = rst.getPrimary();
 const db = primary.getDB(dbName);
 const collName = "testcoll";
@@ -134,6 +133,7 @@ assert.commandWorked(db.runCommand({insert: sentinelCollName, documents: [{_id: 
 // Make sure we can read the new write on the restore node.  Must be durable because we're about
 // to crash this node with no checkpoints.
 rst.awaitReplication(undefined, ReplSetTest.OpTimeType.LAST_DURABLE, [restoreNode]);
+rst.awaitReplication(undefined, ReplSetTest.OpTimeType.LAST_APPLIED, [restoreNode]);
 assert.eq(3, restoreNode.getDB(dbName)[sentinelCollName].find({}).itcount());
 
 jsTestLog("Crashing restore node before it takes the first stable checkpoint");
@@ -201,4 +201,3 @@ restoreNodeSession.abortTransaction();
 stopReplProducer2.off();
 stopReplProducer3.off();
 rst.stopSet();
-})();

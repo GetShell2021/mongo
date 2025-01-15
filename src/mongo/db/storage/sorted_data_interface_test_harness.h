@@ -29,13 +29,22 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_noop.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/test_harness_helper.h"
 
@@ -88,22 +97,29 @@ class RecoveryUnit;
 
 class SortedDataInterfaceHarnessHelper : public virtual HarnessHelper {
 public:
-    virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique,
+    virtual std::unique_ptr<SortedDataInterface> newSortedDataInterface(OperationContext* opCtx,
+                                                                        bool unique,
                                                                         bool partial,
                                                                         KeyFormat keyFormat) = 0;
 
-    std::unique_ptr<SortedDataInterface> newSortedDataInterface(bool unique, bool partial) {
-        return newSortedDataInterface(unique, partial, KeyFormat::Long);
+    std::unique_ptr<SortedDataInterface> newSortedDataInterface(OperationContext* opCtx,
+                                                                bool unique,
+                                                                bool partial) {
+        return newSortedDataInterface(opCtx, unique, partial, KeyFormat::Long);
     }
 
-    virtual std::unique_ptr<SortedDataInterface> newIdIndexSortedDataInterface() = 0;
+    virtual std::unique_ptr<SortedDataInterface> newIdIndexSortedDataInterface(
+        OperationContext* opCtx) = 0;
     /**
      * Creates a new SDI with some initial data.
      *
      * For clarity to readers, toInsert must be sorted.
      */
     std::unique_ptr<SortedDataInterface> newSortedDataInterface(
-        bool unique, bool partial, std::initializer_list<IndexKeyEntry> toInsert);
+        OperationContext* opCtx,
+        bool unique,
+        bool partial,
+        std::initializer_list<IndexKeyEntry> toInsert);
 };
 
 void registerSortedDataInterfaceHarnessHelperFactory(
@@ -111,32 +127,27 @@ void registerSortedDataInterfaceHarnessHelperFactory(
 
 std::unique_ptr<SortedDataInterfaceHarnessHelper> newSortedDataInterfaceHarnessHelper();
 
-KeyString::Value makeKeyString(SortedDataInterface* sorted,
-                               BSONObj bsonKey,
-                               boost::optional<RecordId> rid = boost::none);
+key_string::Value makeKeyString(SortedDataInterface* sorted,
+                                BSONObj bsonKey,
+                                const boost::optional<RecordId>& rid = boost::none);
 
-KeyString::Value makeKeyStringForSeek(SortedDataInterface* sorted,
-                                      BSONObj bsonKey,
-                                      bool isForward,
-                                      bool inclusive);
+key_string::Builder makeKeyStringForSeek(SortedDataInterface* sorted, BSONObj bsonKey);
+
+key_string::Builder makeKeyStringForSeek(SortedDataInterface* sorted,
+                                         BSONObj bsonKey,
+                                         bool isForward,
+                                         bool inclusive);
 
 /**
  * Inserts all entries in toInsert into index.
  * ASSERT_OKs the inserts.
- * Always uses dupsAllowed=true.
  *
  * Should be used for declaring and changing conditions, not for testing inserts.
  */
 void insertToIndex(OperationContext* opCtx,
                    SortedDataInterface* index,
-                   std::initializer_list<IndexKeyEntry> toInsert);
-
-inline void insertToIndex(HarnessHelper* harness,
-                          SortedDataInterface* index,
-                          std::initializer_list<IndexKeyEntry> toInsert) {
-    auto client = harness->serviceContext()->makeClient("insertToIndex");
-    insertToIndex(harness->newOperationContext(client.get()).get(), index, toInsert);
-}
+                   std::initializer_list<IndexKeyEntry> toInsert,
+                   bool dupsAllowed = true);
 
 /**
  * Removes all entries in toRemove from index.
@@ -148,11 +159,33 @@ void removeFromIndex(OperationContext* opCtx,
                      SortedDataInterface* index,
                      std::initializer_list<IndexKeyEntry> toRemove);
 
-inline void removeFromIndex(HarnessHelper* harness,
-                            SortedDataInterface* index,
-                            std::initializer_list<IndexKeyEntry> toRemove) {
-    auto client = harness->serviceContext()->makeClient("removeFromIndex");
-    removeFromIndex(harness->newOperationContext(client.get()).get(), index, toRemove);
-}
+class SortedDataInterfaceTest : public unittest::Test {
+public:
+    void setUp() override {
+        _harnessHelper = newSortedDataInterfaceHarnessHelper();
+        _opCtx = _harnessHelper->newOperationContext();
+    }
+
+    void tearDown() override {
+        _opCtx.reset();
+        _harnessHelper.reset();
+    }
+
+    SortedDataInterfaceHarnessHelper* harnessHelper() {
+        return _harnessHelper.get();
+    }
+
+    OperationContext* opCtx() {
+        return _opCtx.get();
+    }
+
+    RecoveryUnit& recoveryUnit() {
+        return *shard_role_details::getRecoveryUnit(opCtx());
+    }
+
+private:
+    ServiceContext::UniqueOperationContext _opCtx;
+    std::unique_ptr<SortedDataInterfaceHarnessHelper> _harnessHelper;
+};
 
 }  // namespace mongo

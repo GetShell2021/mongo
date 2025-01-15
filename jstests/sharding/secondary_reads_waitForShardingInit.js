@@ -8,12 +8,11 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
-load("jstests/replsets/libs/sync_source.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {forceSyncSource} from "jstests/replsets/libs/sync_source.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
 
 let st = new ShardingTest({shards: 1});
 
@@ -66,8 +65,7 @@ const sessionDb = st.s.startSession().getDatabase(dbName);
 
 jsTest.log("Going to write a document to testDB.foo.");
 // Make sure that the test db data is stored into the new shard.
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, shardName);
+assert.commandWorked(st.s.adminCommand({enableSharding: dbName, primaryShard: shardName}));
 assert.commandWorked(sessionDb.foo.insert({x: 1}));
 
 /**
@@ -114,7 +112,13 @@ assert.commandWorked(sessionDb.runCommand({
 
 fpForceSyncSource.off();
 sessionDb.getSession().endSession();
-replTest.stopSet();
 
+// Remove the shard as part of the test teardown; this will prevent spurious failures of the
+// checkShardFilteringMetadata teardown hook.
+// TODO SERVER-88362 delete the block below.
+assert.commandWorked(st.getDB(dbName).dropDatabase());
+assert.commandWorked(st.getDB('forceSyncSourceDB').dropDatabase());
+removeShard(st, shardName);
+
+replTest.stopSet();
 st.stop();
-})();

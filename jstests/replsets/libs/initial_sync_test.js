@@ -12,9 +12,7 @@
  *
  */
 
-"use strict";
-
-load('jstests/replsets/rslib.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 /**
  * This fixture allows the user to optionally pass in a custom ReplSetTest to be used for the test.
@@ -27,7 +25,7 @@ load('jstests/replsets/rslib.js');
  * @param {Object} [replSet] the ReplSetTest instance to adopt
  * @param {int} [timeout] how long to wait for initial sync to start
  */
-function InitialSyncTest(
+export function InitialSyncTest(
     name = "InitialSyncTest", replSet, timeout, replBatchLimitBytes = 100 * 1024 * 1024) {
     this.replBatchLimitBytes = replBatchLimitBytes;
     const State = {
@@ -51,12 +49,12 @@ function InitialSyncTest(
 
     assert.eq(2, replSet.nodes.length, "Replica set must contain exactly two nodes.");
 
-    let initialSyncTimeout = timeout || replSet.kDefaultTimeoutMS;
+    let initialSyncTimeout = timeout || replSet.timeoutMS;
 
     const primary = replSet.getPrimary();
     let secondary = replSet.getSecondary();
 
-    replSet.waitForState(secondary, ReplSetTest.State.SECONDARY);
+    replSet.awaitSecondaryNodes(null, [secondary]);
 
     /**
      * Return an instance of ReplSetTest initialized with a standard two-node replica set running

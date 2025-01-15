@@ -7,8 +7,7 @@
  *   requires_persistence,
  * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const dbToDropName = jsTestName() + "_drop";
 const dbToKeepName = jsTestName() + "_keep";
@@ -44,7 +43,7 @@ const runTest = function(dropDatabase) {
     assert.commandWorked(primary.adminCommand({fsync: 1}));
 
     // Ensure that the empty database directory was removed.
-    checkLog.containsJson(primary, 4888200, {db: dbToDropName});
+    checkLog.containsJson(primary, 4888200);
     const files = listFiles(rst.getDbPath(primary));
     assert(!files.some(file => file.baseName === dbToDropName),
            "Database directory " + dbToDropName +
@@ -55,4 +54,3 @@ runTest(false);
 runTest(true);
 
 rst.stopSet();
-})();

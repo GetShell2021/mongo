@@ -3,8 +3,8 @@
  * @tags: [
  * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function runTest(conn) {
     let expectedDefaultWC = {w: "majority", wtimeout: 0};
@@ -54,4 +54,3 @@ const st = new ShardingTest({name: name});
 const mongos = st.s;
 runTest(mongos);
 st.stop();
-})();

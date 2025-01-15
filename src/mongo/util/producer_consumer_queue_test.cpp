@@ -27,22 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <array>
+#include <boost/move/utility_core.hpp>
+#include <fmt/format.h>
+#include <ostream>
+#include <thread>
+#include <tuple>
+#include <type_traits>
 
-#include "mongo/unittest/unittest.h"
+#include <boost/optional/optional.hpp>
 
-#include "mongo/util/producer_consumer_queue.h"
-
-#include "mongo/db/concurrency/locker_noop_client_observer.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/mutex.h"
-#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/producer_consumer_queue.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
-
 namespace {
 
 using namespace producer_consumer_queue_detail;
@@ -58,7 +67,7 @@ public:
     template <typename Callback>
     stdx::thread runThread(StringData name, Callback&& cb) {
         return stdx::thread([this, name, cb] {
-            auto client = _serviceCtx->makeClient(name.toString());
+            auto client = _serviceCtx->getService()->makeClient(name.toString());
             auto opCtx = client->makeOperationContext();
 
             cb(opCtx.get());
@@ -85,7 +94,7 @@ public:
     template <typename Callback>
     stdx::thread runThread(StringData name, Callback&& cb) {
         return stdx::thread([this, name, cb] {
-            auto client = _serviceCtx->makeClient(name.toString());
+            auto client = _serviceCtx->getService()->makeClient(name.toString());
             auto opCtx = client->makeOperationContext();
 
             opCtx->runWithDeadline(
@@ -136,9 +145,7 @@ std::enable_if_t<requiresMultiProducer && requiresMultiConsumer> runCallbackWith
 
 class ProducerConsumerQueueTest : public unittest::Test {
 public:
-    ProducerConsumerQueueTest() {
-        _serviceCtx->registerClientObserver(std::make_unique<LockerNoopClientObserver>());
-    }
+    ProducerConsumerQueueTest() = default;
 
     template <bool requiresMultiProducer, bool requiresMultiConsumer, typename Callback>
     void runPermutations(Callback&& callback) {
@@ -673,7 +680,7 @@ PRODUCER_CONSUMER_QUEUE_TEST(popManyUpToPopWithBlockingWithSpecialCost,
 PRODUCER_CONSUMER_QUEUE_TEST(singleProducerMultiConsumer, runPermutations<false, true>) {
     typename Helper::template ProducerConsumerQueue<MoveOnly> pcq{};
 
-    auto mutex = MONGO_MAKE_LATCH();
+    stdx::mutex mutex;
     size_t successes = 0;
     size_t failures = 0;
 
@@ -683,10 +690,10 @@ PRODUCER_CONSUMER_QUEUE_TEST(singleProducerMultiConsumer, runPermutations<false,
             {
                 try {
                     pcq.pop(opCtx);
-                    stdx::lock_guard<Latch> lk(mutex);
+                    stdx::lock_guard<stdx::mutex> lk(mutex);
                     successes++;
                 } catch (const ExceptionFor<ErrorCodes::ProducerConsumerQueueConsumed>&) {
-                    stdx::lock_guard<Latch> lk(mutex);
+                    stdx::lock_guard<stdx::mutex> lk(mutex);
                     failures++;
                 }
             }
@@ -716,7 +723,7 @@ PRODUCER_CONSUMER_QUEUE_TEST(multiProducerSingleConsumer, runPermutations<true, 
 
     pcq.push(MoveOnly(1));
 
-    auto mutex = MONGO_MAKE_LATCH();
+    stdx::mutex mutex;
     size_t success = 0;
     size_t failure = 0;
 
@@ -726,10 +733,10 @@ PRODUCER_CONSUMER_QUEUE_TEST(multiProducerSingleConsumer, runPermutations<true, 
             {
                 try {
                     pcq.push(MoveOnly(1), opCtx);
-                    stdx::lock_guard<Latch> lk(mutex);
+                    stdx::lock_guard<stdx::mutex> lk(mutex);
                     success++;
                 } catch (const ExceptionFor<ErrorCodes::ProducerConsumerQueueEndClosed>&) {
-                    stdx::lock_guard<Latch> lk(mutex);
+                    stdx::lock_guard<stdx::mutex> lk(mutex);
                     failure++;
                 }
             }
@@ -739,7 +746,7 @@ PRODUCER_CONSUMER_QUEUE_TEST(multiProducerSingleConsumer, runPermutations<true, 
     pcq.pop();
 
     while (true) {
-        stdx::lock_guard<Latch> lk(mutex);
+        stdx::lock_guard<stdx::mutex> lk(mutex);
         if (success == 1)
             break;
         stdx::this_thread::yield();
@@ -795,7 +802,7 @@ PRODUCER_CONSUMER_QUEUE_TEST(multiProducerMiddleWaiterBreaks, runPermutations<tr
 
     pcq.push(MoveOnly(1));
 
-    auto mutex = MONGO_MAKE_LATCH();
+    stdx::mutex mutex;
     bool failed = false;
     OperationContext* threadBopCtx = nullptr;
 
@@ -808,7 +815,7 @@ PRODUCER_CONSUMER_QUEUE_TEST(multiProducerMiddleWaiterBreaks, runPermutations<tr
 
     auto threadB = helper.runThread("ProducerB", [&](OperationContext* opCtx) {
         {
-            stdx::lock_guard<Latch> lk(mutex);
+            stdx::lock_guard<stdx::mutex> lk(mutex);
             threadBopCtx = opCtx;
         }
 
@@ -824,7 +831,7 @@ PRODUCER_CONSUMER_QUEUE_TEST(multiProducerMiddleWaiterBreaks, runPermutations<tr
     };
 
     {
-        stdx::lock_guard<Latch> lk(mutex);
+        stdx::lock_guard<stdx::mutex> lk(mutex);
         ASSERT(threadBopCtx != nullptr);
     }
 
@@ -862,9 +869,15 @@ PRODUCER_CONSUMER_QUEUE_TEST(pipeCompiles, runPermutations<false, false>) {
     //
     // At some point this was working with a single move, and this pattern helped me catch some
     // lifetime screw ups
-    auto producer = [](auto p) { return std::move(p); }(std::move(pipe.producer));
-    auto controller = [](auto c) { return std::move(c); }(std::move(pipe.controller));
-    auto consumer = [](auto c) { return std::move(c); }(std::move(pipe.consumer));
+    auto producer = [](auto p) {
+        return std::move(p);
+    }(std::move(pipe.producer));
+    auto controller = [](auto c) {
+        return std::move(c);
+    }(std::move(pipe.controller));
+    auto consumer = [](auto c) {
+        return std::move(c);
+    }(std::move(pipe.consumer));
 
     producer.push(MoveOnly(1));
     std::array<MoveOnly, 1> container({MoveOnly(1)});

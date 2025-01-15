@@ -1,7 +1,6 @@
 // Tests that a client will auto-discover a user's supported SASL mechanisms during auth().
 // @tags: [requires_sharding]
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function runTest(conn) {
     const admin = conn.getDB("admin");
@@ -48,4 +47,3 @@ const st =
     new ShardingTest({shards: 1, mongos: 1, config: 1, other: {keyFile: 'jstests/libs/key1'}});
 runTest(st.s0);
 st.stop();
-})();

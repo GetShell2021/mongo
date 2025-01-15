@@ -3,15 +3,23 @@
  *
  * @tags: [requires_fcv_60, uses_transactions]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 TestData.disableImplicitSessions = true;
 
+let mongosOptions = {
+    setParameter: {'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"}
+};
+
+// Don't add a maxSessions parameter in case of embeddedRouter, otherwise it will be passed to the
+// config server and the cluster won't boot.
+if (!TestData.embeddedRouter) {
+    mongosOptions.setParameter.maxSessions = 1;
+}
+
 const st = new ShardingTest({
     shards: 1,
-    mongosOptions: {setParameter: {maxSessions: 1}},
-    shardOptions: {setParameter: {maxSessions: 1}}
+    mongosOptions: mongosOptions,
 });
 const shard0Primary = st.rs0.getPrimary();
 
@@ -171,4 +179,3 @@ assert.commandWorked(shard0Primary.adminCommand({refreshLogicalSessionCacheNow: 
 })();
 
 st.stop();
-})();

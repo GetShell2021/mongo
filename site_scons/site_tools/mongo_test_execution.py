@@ -22,9 +22,9 @@
 
 import os
 
-import SCons
-
 import auto_install_binaries
+import SCons
+from SCons.Node.Alias import default_ans
 
 _proof_scanner_cache_key = "proof_scanner_cache"
 _associated_proof = "associated_proof_key"
@@ -49,7 +49,8 @@ proof_generator_command_scanner = SCons.Scanner.Scanner(
 def auto_prove_task(env, component, role):
     entry = auto_install_binaries.get_alias_map_entry(env, component, role)
     return [
-        getattr(f.attributes, _associated_proof) for f in entry.files
+        getattr(f.attributes, _associated_proof)
+        for f in entry.files
         if hasattr(f.attributes, _associated_proof)
     ]
 
@@ -62,7 +63,7 @@ def generate_test_execution_aliases(env, test):
     target_name = os.path.basename(installed[0].path)
 
     test_env = env.Clone()
-    test_env['ENV']['TMPDIR'] = test_env.Dir('$LOCAL_TMPDIR').abspath
+    test_env["ENV"]["TMPDIR"] = test_env.Dir("$LOCAL_TMPDIR").abspath
     target_command = test_env.Command(
         target=f"#+{target_name}",
         source=installed[0],
@@ -72,8 +73,26 @@ def generate_test_execution_aliases(env, test):
     env.Pseudo(target_command)
     env.Alias("test-execution-aliases", target_command)
 
-    for source in test.sources:
+    try:
+        scons_node = env.File(os.path.join(os.getcwd(), str(test)))
+        root_path = scons_node.abspath.replace("\\", "/").replace(
+            env.Dir("#").abspath.replace("\\", "/") + "/", ""
+        )
+        if root_path.startswith("src"):
+            root_path = env.Dir("$BUILD_DIR").path + root_path[3:]
+        root_path = root_path.replace("\\", "/")
+        sources_list = env["SCONS2BAZEL_TARGETS"].bazel_sources_file(root_path)
+        sources = []
+        with open(os.path.join(env.Dir("#").abspath, sources_list)) as f:
+            for s in f.readlines():
+                if s.strip().endswith(".cpp"):
+                    sources.append(env.File(s.strip().replace("//", "#").replace(":", "/")))
+    except KeyError:
+        sources = test.sources
+
+    for source in sources:
         source_base_name = os.path.basename(source.get_path())
+
         # Strip suffix
         dot_idx = source_base_name.rfind(".")
         suffix = source_base_name[dot_idx:]
@@ -93,28 +112,27 @@ def generate_test_execution_aliases(env, test):
         verbose_source_command = test_env.Command(
             target=f"#+{target_name}-{source_name}",
             source=installed[0],
-            action=
-            "$( $ICERUN $) ${SOURCES[0]} -fileNameFilter $TEST_SOURCE_FILE_NAME $UNITTEST_FLAGS",
+            action="$( $ICERUN $) ${SOURCES[0]} -fileNameFilter $TEST_SOURCE_FILE_NAME $UNITTEST_FLAGS",
             TEST_SOURCE_FILE_NAME=source_name,
             NINJA_POOL="console",
         )
         env.Pseudo(verbose_source_command)
-        env.Alias('test-execution-aliases', verbose_source_command)
+        env.Alias("test-execution-aliases", verbose_source_command)
 
         if target_name == source_name:
             continue
 
-        alias = env.Alias(f'+{source_name}', verbose_source_command)
-        if len(alias[0].children()) > 1:
+        if default_ans.lookup(f"+{source_name}") is not None:
             raise SCons.Errors.BuildError(
-                alias[0].children()[0],
-                f"Multiple unit test programs contain a source file named '{source_name}' which would result in an ambiguous test execution alias. Unit test source filenames are required to be globally unique."
+                str(verbose_source_command[0]),
+                f"There exists multiple unittests with a source file named {source_name}: {source.abspath} and {env.Alias(f'+{source_name}')[0].children()[1].abspath}",
             )
+        env.Alias(f"+{source_name}", [verbose_source_command, source])
 
     proof_generator_command = test_env.Command(
         target=[
-            '${SOURCE}.log',
-            '${SOURCE}.status',
+            "${SOURCE}.log",
+            "${SOURCE}.status",
         ],
         source=installed[0],
         action=SCons.Action.Action("$PROOF_GENERATOR_COMMAND", "$PROOF_GENERATOR_COMSTR"),
@@ -125,12 +143,12 @@ def generate_test_execution_aliases(env, test):
     # be. Such tests can be tagged with UNDECIDABLE_TEST=True. If a
     # test isn't provable, we disable caching its results and require
     # it to be always rebuilt.
-    if installed[0].env.get('UNDECIDABLE_TEST', False):
+    if installed[0].env.get("UNDECIDABLE_TEST", False):
         env.NoCache(proof_generator_command)
         env.AlwaysBuild(proof_generator_command)
 
     proof_analyzer_command = test_env.Command(
-        target='${SOURCES[1].base}.proof',
+        target="${SOURCES[1].base}.proof",
         source=proof_generator_command,
         action=SCons.Action.Action("$PROOF_ANALYZER_COMMAND", "$PROOF_ANALYZER_COMSTR"),
     )
@@ -159,15 +177,19 @@ def generate(env):
         [".in"],
     )
 
-    env.AppendUnique(AIB_TASKS={
-        "prove": (auto_prove_task, False),
-    })
+    env.AppendUnique(
+        AIB_TASKS={
+            "prove": (auto_prove_task, False),
+        }
+    )
 
     # TODO: Should we have some sort of prefix_xdir for the output location for these? Something like
     # $PREFIX_VARCACHE and which in our build is pre-populated to $PREFIX/var/cache/mongo or similar?
 
-    if env['PLATFORM'] == 'win32':
-        env["PROOF_GENERATOR_COMMAND"] = "$( $ICERUN $) ${SOURCES[0]} $UNITTEST_FLAGS > ${TARGETS[0]} 2>&1 & call echo %^errorlevel% > ${TARGETS[1]}"
+    if env["PLATFORM"] == "win32":
+        env["PROOF_GENERATOR_COMMAND"] = (
+            "$( $ICERUN $) ${SOURCES[0]} $UNITTEST_FLAGS > ${TARGETS[0]} 2>&1 & call echo %^errorlevel% > ${TARGETS[1]}"
+        )
 
         # Keeping this here for later, but it only works if cmd.exe is
         # launched with /V, and SCons doesn't do that.
@@ -175,11 +197,17 @@ def generate(env):
         # env["PROOF_ANALYZER_COMMAND"] = "set /p nextErrorLevel=<${SOURCES[1]} & if \"!nextErrorLevel!\"==\"0 \" (type nul > $TARGET) else (exit 1)"
         #
         # Instead, use grep! I mean findstr.
-        env["PROOF_ANALYZER_COMMAND"] = "findstr /B /L 0 ${SOURCES[1]} && (type nul > $TARGET) || (exit 1)"
+        env["PROOF_ANALYZER_COMMAND"] = (
+            "findstr /B /L 0 ${SOURCES[1]} && (type nul > $TARGET) || (exit 1)"
+        )
     else:
-        env["PROOF_GENERATOR_COMMAND"] = "$( $ICERUN $) ${SOURCES[0]} $UNITTEST_FLAGS > ${TARGETS[0]} 2>&1 ; echo $? > ${TARGETS[1]}"
-        env["PROOF_ANALYZER_COMMAND"] = "if $$(exit $$(cat ${SOURCES[1]})) ; then touch $TARGET ; else exit 1 ; fi"
+        env["PROOF_GENERATOR_COMMAND"] = (
+            "$( $ICERUN $) ${SOURCES[0]} $UNITTEST_FLAGS > ${TARGETS[0]} 2>&1 ; echo $? > ${TARGETS[1]}"
+        )
+        env["PROOF_ANALYZER_COMMAND"] = (
+            "if $$(exit $$(cat ${SOURCES[1]})) ; then touch $TARGET ; else cat ${SOURCES[0]}; exit 1 ; fi"
+        )
 
     # TODO: Condition this on verbosity
-    env['PROOF_GENERATOR_COMSTR'] = "Running test ${SOURCES[0]}"
-    env['PROOF_ANALYZER_COMSTR'] = "Analyzing test results in ${SOURCES[1]}"
+    env["PROOF_GENERATOR_COMSTR"] = "Running test ${SOURCES[0]}"
+    env["PROOF_ANALYZER_COMSTR"] = "Analyzing test results in ${SOURCES[1]}"

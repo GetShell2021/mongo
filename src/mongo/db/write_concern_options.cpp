@@ -27,24 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <utility>
 
-#include <type_traits>
+#include <boost/move/utility_core.hpp>
+#include <fmt/format.h>
 
-#include "mongo/db/write_concern_options.h"
-#include "mongo/db/write_concern_options_gen.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/field_parser.h"
 #include "mongo/db/repl/repl_set_config.h"
-#include "mongo/util/str.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/db/write_concern_options_gen.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
-
-using std::string;
-
 namespace {
 
 /**
@@ -65,8 +69,13 @@ constexpr StringData kWElectionIdFieldName = "wElectionId"_sd;
 
 }  // namespace
 
-constexpr Milliseconds WriteConcernOptions::kNoTimeout;
-constexpr Milliseconds WriteConcernOptions::kNoWaiting;
+constexpr Milliseconds WriteConcernOptions::Timeout::kNoTimeoutVal;
+constexpr Milliseconds WriteConcernOptions::Timeout::kNoWaitingVal;
+
+constexpr WriteConcernOptions::Timeout WriteConcernOptions::kNoTimeout(
+    WriteConcernOptions::Timeout::kNoTimeoutVal);
+constexpr WriteConcernOptions::Timeout WriteConcernOptions::kNoWaiting(
+    WriteConcernOptions::Timeout::kNoWaitingVal);
 
 constexpr StringData WriteConcernOptions::kWriteConcernField;
 const char WriteConcernOptions::kMajority[] = "majority";
@@ -76,9 +85,11 @@ const BSONObj WriteConcernOptions::Acknowledged(BSON("w" << W_NORMAL));
 const BSONObj WriteConcernOptions::Unacknowledged(BSON("w" << W_NONE));
 const BSONObj WriteConcernOptions::Majority(BSON("w" << WriteConcernOptions::kMajority));
 
-// The "kInternalWriteDefault" write concern, used by internal operations, is deliberately empty (no
-// 'w' or 'wtimeout' specified). This allows internal operations to specify a write concern, while
-// still allowing it to be either w:1 or automatically upconverted to w:majority on configsvrs.
+// The "kInternalWriteDefault" write concern used by internal operations, is deliberately empty (no
+// 'w' or 'wtimeout' specified). We require that all internal operations explicitly specify a write
+// concern, so "kInternalWriteDefault" allows internal operations to explicitly specify a write
+// concern, without counting as a "client-supplied write concern" and instead still using the
+// "default constructed WC" ({w:1})
 const BSONObj WriteConcernOptions::kInternalWriteDefault;
 
 constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutSystem;
@@ -89,7 +100,7 @@ constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutUserCommand;
 WriteConcernOptions::WriteConcernOptions(int numNodes, SyncMode sync, Milliseconds timeout)
     : w{numNodes},
       syncMode{sync},
-      wTimeout(durationCount<Milliseconds>(timeout)),
+      wTimeout(timeout),
       usedDefaultConstructedWC{false},
       notExplicitWValue{false} {}
 
@@ -98,7 +109,21 @@ WriteConcernOptions::WriteConcernOptions(const std::string& mode,
                                          Milliseconds timeout)
     : w{mode},
       syncMode{sync},
-      wTimeout(durationCount<Milliseconds>(timeout)),
+      wTimeout(timeout),
+      usedDefaultConstructedWC{false},
+      notExplicitWValue{false} {}
+
+WriteConcernOptions::WriteConcernOptions(int numNodes, SyncMode sync, Timeout timeout)
+    : w{numNodes},
+      syncMode{sync},
+      wTimeout(timeout),
+      usedDefaultConstructedWC{false},
+      notExplicitWValue{false} {}
+
+WriteConcernOptions::WriteConcernOptions(const std::string& mode, SyncMode sync, Timeout timeout)
+    : w{mode},
+      syncMode{sync},
+      wTimeout(timeout),
       usedDefaultConstructedWC{false},
       notExplicitWValue{false} {}
 
@@ -107,7 +132,7 @@ StatusWith<WriteConcernOptions> WriteConcernOptions::parse(const BSONObj& obj) t
         return Status(ErrorCodes::FailedToParse, "write concern object cannot be empty");
     }
 
-    auto writeConcernIdl = WriteConcernIdl::parse({"WriteConcernOptions"}, obj);
+    auto writeConcernIdl = WriteConcernIdl::parse(IDLParserContext{"WriteConcernOptions"}, obj);
     auto parsedW = writeConcernIdl.getWriteConcernW();
 
     WriteConcernOptions writeConcern;
@@ -153,9 +178,11 @@ WriteConcernOptions WriteConcernOptions::deserializerForIDL(const BSONObj& obj) 
 }
 
 StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(const BSONObj& cmdObj) {
-    // Return the default write concern if no write concern is provided. We check for the existence
-    // of the write concern field up front in order to avoid the expense of constructing an error
-    // status in bsonExtractTypedField() below.
+    // If no write concern is provided from the command, return the default write concern
+    // ({w: 1, wtimeout: 0}). If the default write concern is returned, it will be overriden in
+    // extractWriteConcern by the cluster-wide write concern or the implicit default write concern.
+    // We check for the existence of the write concern field up front in order to avoid the expense
+    // of constructing an error status in bsonExtractTypedField() below.
     if (!cmdObj.hasField(kWriteConcernField)) {
         return WriteConcernOptions();
     }
@@ -176,99 +203,37 @@ StatusWith<WriteConcernOptions> WriteConcernOptions::extractWCFromCommand(const 
     return parse(writeConcernObj);
 }
 
-WriteConcernW deserializeWriteConcernW(BSONElement wEl) {
-    // Preserve pre-5.3 behavior to avoid issues with mixed-version clusters. This will eventually
-    // be removed when we release 7.0.
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.isLessThan(
-            multiversion::FeatureCompatibilityVersion::kVersion_5_3)) {
-        uassert(ErrorCodes::FailedToParse,
-                "w has to be a number or string; found: {}"_format(typeName(wEl.type())),
-                wEl.type() != BSONType::Object);
+WriteConcernIdl WriteConcernOptions::toWriteConcernIdl() const {
+    WriteConcernIdl idl;
+
+    idl.setWriteConcernW(w);
+
+    if (syncMode == SyncMode::FSYNC) {
+        idl.setFsync(true);
+    } else if (syncMode == SyncMode::JOURNAL) {
+        idl.setJ(true);
+    } else if (syncMode == SyncMode::NONE) {
+        idl.setJ(false);
     }
 
-    if (wEl.isNumber()) {
-        auto wNum = wEl.safeNumberLong();
-        if (wNum < 0 || wNum > static_cast<long long>(repl::ReplSetConfig::kMaxMembers)) {
-            uasserted(ErrorCodes::FailedToParse,
-                      "w has to be a non-negative number and not greater than {}; found: {}"_format(
-                          repl::ReplSetConfig::kMaxMembers, wNum));
-        }
+    wTimeout.addToIDL(&idl);
+    idl.setSource(_provenance.getSource());
 
-        return WriteConcernW{wNum};
-    } else if (wEl.type() == BSONType::String) {
-        return WriteConcernW{wEl.str()};
-    } else if (wEl.type() == BSONType::Object) {
-        auto wTags = wEl.Obj();
-        uassert(ErrorCodes::FailedToParse, "tagged write concern requires tags", !wTags.isEmpty());
-
-        WTags tags;
-        for (auto e : wTags) {
-            uassert(
-                ErrorCodes::FailedToParse,
-                "tags must be a single level document with only number values; found: {}"_format(
-                    e.toString()),
-                e.isNumber());
-
-            tags.try_emplace(e.fieldName(), e.safeNumberInt());
-        }
-
-        return WriteConcernW{std::move(tags)};
-    } else if (wEl.eoo() || wEl.type() == BSONType::jstNULL || wEl.type() == BSONType::Undefined) {
-        return WriteConcernW{};
-    }
-    uasserted(ErrorCodes::FailedToParse,
-              "w has to be a number, string, or object; found: {}"_format(typeName(wEl.type())));
-}
-
-void serializeWriteConcernW(const WriteConcernW& w, StringData fieldName, BSONObjBuilder* builder) {
-    stdx::visit(
-        visit_helper::Overloaded{[&](int64_t wNumNodes) {
-                                     builder->appendNumber(fieldName,
-                                                           static_cast<long long>(wNumNodes));
-                                 },
-                                 [&](std::string wMode) { builder->append(fieldName, wMode); },
-                                 [&](WTags wTags) { builder->append(fieldName, wTags); }},
-        w);
-}
-
-std::int64_t parseWTimeoutFromBSON(BSONElement element) {
-    constexpr std::array<mongo::BSONType, 4> validTypes{
-        NumberLong, NumberInt, NumberDecimal, NumberDouble};
-    bool isValidType = std::any_of(
-        validTypes.begin(), validTypes.end(), [&](auto type) { return element.type() == type; });
-    return isValidType ? element.safeNumberLong() : 0;
+    return idl;
 }
 
 BSONObj WriteConcernOptions::toBSON() const {
-    BSONObjBuilder builder;
-    serializeWriteConcernW(w, "w", &builder);
-
-    if (syncMode == SyncMode::FSYNC) {
-        builder.append("fsync", true);
-    } else if (syncMode == SyncMode::JOURNAL) {
-        builder.append("j", true);
-    } else if (syncMode == SyncMode::NONE) {
-        builder.append("j", false);
-    }
-
-    // Historically we have serialized this as a int32_t, even though it is defined as an
-    // int64_t in our IDL format.
-    builder.append("wtimeout", static_cast<int32_t>(durationCount<Milliseconds>(wTimeout)));
-
-    _provenance.serialize(&builder);
-
-    return builder.obj();
+    return toWriteConcernIdl().toBSON();
 }
 
 bool WriteConcernOptions::needToWaitForOtherNodes() const {
-    return stdx::holds_alternative<std::string>(w) || stdx::holds_alternative<WTags>(w) ||
-        (stdx::holds_alternative<std::int64_t>(w) && stdx::get<std::int64_t>(w) > 1);
+    return holds_alternative<std::string>(w) || holds_alternative<WTags>(w) ||
+        (holds_alternative<std::int64_t>(w) && get<std::int64_t>(w) > 1);
 }
 
 bool WriteConcernOptions::operator==(const WriteConcernOptions& other) const {
-    return w == other.w && syncMode == other.syncMode && wDeadline == other.wDeadline &&
-        wTimeout == other.wTimeout && _provenance == other._provenance;
+    return w == other.w && syncMode == other.syncMode && wTimeout == other.wTimeout &&
+        _provenance == other._provenance;
 }
 
 }  // namespace mongo

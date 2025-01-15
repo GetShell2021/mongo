@@ -29,11 +29,42 @@
 
 #pragma once
 
+#include <memory>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
+
+void checkCollectionUUIDMismatch(OperationContext* opCtx,
+                                 const NamespaceString& ns,
+                                 const Collection* coll,
+                                 const boost::optional<UUID>& uuid);
+
 void checkCollectionUUIDMismatch(OperationContext* opCtx,
                                  const NamespaceString& ns,
                                  const CollectionPtr& coll,
                                  const boost::optional<UUID>& uuid);
+
+/**
+ * Same as above, but with the catalog passed explicitly.
+ */
+void checkCollectionUUIDMismatch(OperationContext* opCtx,
+                                 const CollectionCatalog& catalog,
+                                 const NamespaceString& ns,
+                                 const Collection* coll,
+                                 const boost::optional<UUID>& uuid);
+
+
+void checkCollectionUUIDMismatch(OperationContext* opCtx,
+                                 const CollectionCatalog& catalog,
+                                 const NamespaceString& ns,
+                                 const CollectionPtr& coll,
+                                 const boost::optional<UUID>& uuid);
+
 }  // namespace mongo

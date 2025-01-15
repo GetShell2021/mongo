@@ -27,19 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/s/shard_id.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/unittest/unittest.h"
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
-const NamespaceString kNss("test.nss");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.nss");
 
 TEST(StaleExceptionTest, StaleConfigInfoSerializationTest) {
     const ShardId kShardId("SHARD_ID");
 
-    StaleConfigInfo info(kNss, ChunkVersion::UNSHARDED(), ChunkVersion::UNSHARDED(), kShardId);
+    StaleConfigInfo info(kNss, ShardVersion::UNSHARDED(), ShardVersion::UNSHARDED(), kShardId);
 
     // Serialize
     BSONObjBuilder bob;
@@ -50,13 +55,13 @@ TEST(StaleExceptionTest, StaleConfigInfoSerializationTest) {
         std::static_pointer_cast<const StaleConfigInfo>(StaleConfigInfo::parse(bob.obj()));
 
     ASSERT_EQUALS(deserializedInfo->getNss(), kNss);
-    ASSERT_EQUALS(deserializedInfo->getVersionReceived(), ChunkVersion::UNSHARDED());
-    ASSERT_EQUALS(*deserializedInfo->getVersionWanted(), ChunkVersion::UNSHARDED());
+    ASSERT_EQUALS(deserializedInfo->getVersionReceived(), ShardVersion::UNSHARDED());
+    ASSERT_EQUALS(*deserializedInfo->getVersionWanted(), ShardVersion::UNSHARDED());
     ASSERT_EQUALS(deserializedInfo->getShardId(), kShardId);
 }
 
 TEST(StaleExceptionTest, StaleEpochInfoSerializationTest) {
-    StaleEpochInfo info(kNss);
+    StaleEpochInfo info(kNss, ShardVersion::UNSHARDED(), ShardVersion::UNSHARDED());
 
     // Serialize
     BSONObjBuilder bob;
@@ -66,7 +71,9 @@ TEST(StaleExceptionTest, StaleEpochInfoSerializationTest) {
     auto deserializedInfo =
         std::static_pointer_cast<const StaleEpochInfo>(StaleEpochInfo::parse(bob.obj()));
 
-    ASSERT_EQUALS(deserializedInfo->getNss(), kNss);
+    ASSERT_EQ(deserializedInfo->getNss(), kNss);
+    ASSERT_EQ(deserializedInfo->getVersionReceived(), ShardVersion::UNSHARDED());
+    ASSERT_EQ(deserializedInfo->getVersionWanted(), ShardVersion::UNSHARDED());
 }
 
 }  // namespace

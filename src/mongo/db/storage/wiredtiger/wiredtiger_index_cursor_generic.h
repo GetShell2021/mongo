@@ -29,9 +29,10 @@
 
 #pragma once
 
-#include "mongo/base/string_data.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_error_util.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_prepare_conflict.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 
 namespace mongo {
 /**
@@ -44,12 +45,9 @@ public:
     virtual ~WiredTigerIndexCursorGeneric() = default;
 
     void resetCursor() {
-        try {
-            if (_cursor)
-                _cursor->reset();
-        } catch (const WriteConflictException&) {
-            // Ignore since this is only called when we are about to kill our transaction
-            // anyway.
+        if (_cursor) {
+            WT_CURSOR* wtCur = _cursor->get();
+            invariantWTOK(WT_READ_CHECK(wtCur->reset(wtCur)), wtCur->session);
         }
     }
 
@@ -71,31 +69,47 @@ public:
     }
 
 protected:
-    bool advanceWTCursor() {
+    /**
+     * Returns false if and only if the cursor advanced to EOF.
+     */
+    [[nodiscard]] bool advanceWTCursor() {
         WT_CURSOR* c = _cursor->get();
-        int ret = wiredTigerPrepareConflictRetry(
-            _opCtx, [&] { return _forward ? c->next(c) : c->prev(c); });
+        int ret =
+            wiredTigerPrepareConflictRetry(_opCtx,
+                                           *shard_role_details::getRecoveryUnit(_opCtx),
+                                           [&] { return _forward ? c->next(c) : c->prev(c); });
         if (ret == WT_NOTFOUND) {
-            return true;
+            return false;
         }
         invariantWTOK(ret, c->session);
-        return false;
+        return true;
     }
 
     void setKey(WT_CURSOR* cursor, const WT_ITEM* item) {
         cursor->set_key(cursor, item);
     }
 
-    void getKey(WT_CURSOR* cursor, WT_ITEM* key) {
+    void getKey(WT_CURSOR* cursor, WT_ITEM* key, ResourceConsumption::MetricsCollector* metrics) {
         invariantWTOK(cursor->get_key(cursor, key), cursor->session);
 
-        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
-        metricsCollector.incrementOneIdxEntryRead(std::string(cursor->internal_uri), key->size);
+        if (metrics) {
+            metrics->incrementOneIdxEntryRead(cursor->internal_uri, key->size);
+        }
+    }
+
+    void getKeyValue(WT_CURSOR* cursor,
+                     WT_ITEM* key,
+                     WT_ITEM* value,
+                     ResourceConsumption::MetricsCollector* metrics) {
+        invariantWTOK(cursor->get_raw_key_value(cursor, key, value), cursor->session);
+
+        if (metrics) {
+            metrics->incrementOneIdxEntryRead(cursor->internal_uri, key->size);
+        }
     }
 
     OperationContext* _opCtx;
     const bool _forward;
-
     boost::optional<WiredTigerCursor> _cursor;
 
     bool _saveStorageCursorOnDetachFromOperationContext = false;

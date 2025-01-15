@@ -7,14 +7,17 @@
 // Checking UUID consistency involves talking to a shard node, which in this test is shutdown
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
-(function() {
-"use strict";
+import {reconfig} from "jstests/replsets/rslib.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-load('jstests/replsets/rslib.js');
-
-var st = new ShardingTest({shards: {rs0: {nodes: 2}}});
-
-var shardPri = st.rs0.getPrimary();
+var st = new ShardingTest({
+    shards: {rs0: {nodes: 2}},
+    // By default, our test infrastructure sets the election timeout to a very high value (24
+    // hours). For this test, we need a shorter election timeout because it relies on nodes running
+    // an election when they do not detect an active primary. Therefore, we are setting the
+    // electionTimeoutMillis to its default value.
+    initiateWithDefaultElectionTimeout: true
+});
 
 // Note: Adding new replica set member by hand because of SERVER-24011.
 
@@ -62,10 +65,27 @@ assert.soon(function() {
     return checkConfigStrUpdated(st.rs0.getPrimary(), expectedConfigStr);
 });
 
-var secConn = st.rs0.getSecondary();
-secConn.setSecondaryOk();
+st.rs0.getSecondaries().forEach(secConn => {
+    secConn.setSecondaryOk();
+    assert.soon(function() {
+        return checkConfigStrUpdated(secConn, expectedConfigStr);
+    });
+});
+
 assert.soon(function() {
-    return checkConfigStrUpdated(secConn, expectedConfigStr);
+    return checkConfigStrUpdated(st.configRS.getPrimary(), expectedConfigStr);
+});
+
+st.configRS.getSecondaries().forEach(secConn => {
+    secConn.setSecondaryOk();
+    assert.soon(function() {
+        return checkConfigStrUpdated(secConn, expectedConfigStr);
+    });
+});
+
+newNode.setSecondaryOk();
+assert.soon(function() {
+    return checkConfigStrUpdated(newNode, expectedConfigStr);
 });
 
 //
@@ -74,8 +94,12 @@ assert.soon(function() {
 // string when they come back up.
 //
 
-st.rs0.stop(0);
-st.rs0.stop(1);
+// We can't reconfigure the config server if some nodes are down, so skip in config shard mode and
+// just verify all nodes update the config string eventually.
+if (!TestData.configShard) {
+    st.rs0.stop(0);
+    st.rs0.stop(1);
+}
 
 MongoRunner.stopMongod(newNode);
 
@@ -85,8 +109,10 @@ replConfig.members.pop();
 
 reconfig(st.configRS, replConfig);
 
-st.rs0.restart(0, {shardsvr: ''});
-st.rs0.restart(1, {shardsvr: ''});
+if (!TestData.configShard) {
+    st.rs0.restart(0, {shardsvr: ''});
+    st.rs0.restart(1, {shardsvr: ''});
+}
 
 st.rs0.waitForPrimary();
 st.rs0.awaitSecondaryNodes();
@@ -95,11 +121,23 @@ assert.soon(function() {
     return checkConfigStrUpdated(st.rs0.getPrimary(), origConfigConnStr);
 });
 
-secConn = st.rs0.getSecondary();
-secConn.setSecondaryOk();
+st.rs0.getSecondaries().forEach(secConn => {
+    secConn.setSecondaryOk();
+    assert.soon(function() {
+        return checkConfigStrUpdated(secConn, origConfigConnStr);
+    });
+});
+
+// Config servers in 7.0 also maintain the connection string in their shard identity document.
 assert.soon(function() {
-    return checkConfigStrUpdated(secConn, origConfigConnStr);
+    return checkConfigStrUpdated(st.configRS.getPrimary(), origConfigConnStr);
+});
+
+st.configRS.getSecondaries().forEach(secConn => {
+    secConn.setSecondaryOk();
+    assert.soon(function() {
+        return checkConfigStrUpdated(secConn, origConfigConnStr);
+    });
 });
 
 st.stop();
-})();

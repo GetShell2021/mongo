@@ -27,89 +27,45 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/damage_vector.h"
 #include "mongo/db/storage/record_store.h"
-#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/transaction_resources.h"
 
 namespace mongo {
-namespace {
-void validateWriteAllowed(OperationContext* opCtx) {
-    uassert(ErrorCodes::IllegalOperation,
-            "Cannot execute a write operation in read-only mode",
-            !opCtx->readOnly());
-}
-}  // namespace
 
-void RecordStore::deleteRecord(OperationContext* opCtx, const RecordId& dl) {
-    validateWriteAllowed(opCtx);
-    doDeleteRecord(opCtx, dl);
+void CappedInsertNotifier::notifyAll() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    ++_version;
+    _notifier.notify_all();
 }
 
-Status RecordStore::insertRecords(OperationContext* opCtx,
-                                  std::vector<Record>* inOutRecords,
-                                  const std::vector<Timestamp>& timestamps) {
-    validateWriteAllowed(opCtx);
-    return doInsertRecords(opCtx, inOutRecords, timestamps);
+uint64_t CappedInsertNotifier::getVersion() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _version;
 }
 
-Status RecordStore::updateRecord(OperationContext* opCtx,
-                                 const RecordId& recordId,
-                                 const char* data,
-                                 int len) {
-    validateWriteAllowed(opCtx);
-    return doUpdateRecord(opCtx, recordId, data, len);
+void CappedInsertNotifier::waitUntil(OperationContext* opCtx,
+                                     uint64_t prevVersion,
+                                     Date_t deadline) const {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    opCtx->waitForConditionOrInterruptUntil(_notifier, lk, deadline, [this, prevVersion]() {
+        return _dead || prevVersion != _version;
+    });
 }
 
-StatusWith<RecordData> RecordStore::updateWithDamages(OperationContext* opCtx,
-                                                      const RecordId& loc,
-                                                      const RecordData& oldRec,
-                                                      const char* damageSource,
-                                                      const mutablebson::DamageVector& damages) {
-    validateWriteAllowed(opCtx);
-    return doUpdateWithDamages(opCtx, loc, oldRec, damageSource, damages);
+void CappedInsertNotifier::kill() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _dead = true;
+    _notifier.notify_all();
 }
 
-Status RecordStore::truncate(OperationContext* opCtx) {
-    validateWriteAllowed(opCtx);
-    return doTruncate(opCtx);
-}
-
-void RecordStore::cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {
-    validateWriteAllowed(opCtx);
-    doCappedTruncateAfter(opCtx, end, inclusive);
-}
-
-Status RecordStore::compact(OperationContext* opCtx) {
-    validateWriteAllowed(opCtx);
-    return doCompact(opCtx);
-}
-
-
-Status RecordStore::oplogDiskLocRegister(OperationContext* opCtx,
-                                         const Timestamp& opTime,
-                                         bool orderedCommit) {
-    // Callers should be updating visibility as part of a write operation. We want to ensure that
-    // we never get here while holding an uninterruptible, read-ticketed lock. That would indicate
-    // that we are operating with the wrong global lock semantics, and either hold too weak a lock
-    // (e.g. IS) or that we upgraded in a way we shouldn't (e.g. IS -> IX).
-    invariant(opCtx->lockState()->isNoop() || !opCtx->lockState()->hasReadTicket() ||
-              !opCtx->lockState()->uninterruptibleLocksRequested());
-
-    return oplogDiskLocRegisterImpl(opCtx, opTime, orderedCommit);
-}
-
-void RecordStore::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const {
-    // Callers are waiting for other operations to finish updating visibility. We want to ensure
-    // that we never get here while holding an uninterruptible, write-ticketed lock. That could
-    // indicate we are holding a stronger lock than we need to, and that we could actually
-    // contribute to ticket-exhaustion. That could prevent the write we are waiting on from
-    // acquiring the lock it needs to update the oplog visibility.
-    invariant(opCtx->lockState()->isNoop() || !opCtx->lockState()->hasWriteTicket() ||
-              !opCtx->lockState()->uninterruptibleLocksRequested());
-
-    waitForAllEarlierOplogWritesToBeVisibleImpl(opCtx);
+bool CappedInsertNotifier::isDead() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _dead;
 }
 
 }  // namespace mongo

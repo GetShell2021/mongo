@@ -9,12 +9,10 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
-load('jstests/noPassthrough/libs/index_build.js');
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {IndexBuildTest} from "jstests/noPassthrough/libs/index_build.js";
 
 const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
@@ -129,7 +127,6 @@ replTest.awaitReplication();
 awaitIndexBuild();
 
 // Make sure that we can see the data from the committed transaction on the secondary.
-assert.docEq(secondaryColl.findOne({_id: 1}), {_id: 1, a: 2});
+assert.docEq({_id: 1, a: 2}, secondaryColl.findOne({_id: 1}));
 
 replTest.stopSet();
-})();

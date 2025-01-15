@@ -134,7 +134,7 @@ var _bulk_api_module = (function() {
         };
 
         this.getWriteError = function() {
-            if (bulkResult.writeErrors.length == 0) {
+            if (!bulkResult.hasOwnProperty("writeErrors") || bulkResult.writeErrors.length == 0) {
                 return null;
             } else {
                 return bulkResult.writeErrors[bulkResult.writeErrors.length - 1];
@@ -146,7 +146,8 @@ var _bulk_api_module = (function() {
         };
 
         this.getWriteConcernError = function() {
-            if (bulkResult.writeConcernErrors.length == 0) {
+            if (!bulkResult.hasOwnProperty("writeConcernErrors") ||
+                bulkResult.writeConcernErrors.length == 0) {
                 return null;
             } else {
                 return bulkResult.writeConcernErrors[0];
@@ -243,7 +244,7 @@ var _bulk_api_module = (function() {
         };
 
         this.hasWriteErrors = function() {
-            return bulkResult.writeErrors.length > 0;
+            return bulkResult.hasOwnProperty("writeErrors") && bulkResult.writeErrors.length > 0;
         };
 
         this.getWriteErrorCount = function() {
@@ -264,7 +265,8 @@ var _bulk_api_module = (function() {
         };
 
         this.hasWriteConcernError = function() {
-            return bulkResult.writeConcernErrors.length > 0;
+            return bulkResult.hasOwnProperty("writeConcernErrors") &&
+                bulkResult.writeConcernErrors.length > 0;
         };
 
         this.getWriteConcernError = function() {
@@ -702,6 +704,11 @@ var _bulk_api_module = (function() {
                 var document =
                     {q: currentOp.selector, u: updateDocument, multi: false, upsert: upsert};
 
+                // Copy over the sort, if we have one.
+                if (currentOp.hasOwnProperty('sort')) {
+                    document.sort = currentOp.sort;
+                }
+
                 // Copy over the hint, if we have one.
                 if (currentOp.hasOwnProperty('hint')) {
                     document.hint = currentOp.hint;
@@ -734,6 +741,11 @@ var _bulk_api_module = (function() {
             upsert: function() {
                 currentOp.upsert = true;
                 // Return the findOperations
+                return findOperations;
+            },
+
+            sort: function(sort) {
+                currentOp.sort = sort;
                 return findOperations;
             },
 
@@ -963,7 +975,7 @@ var _bulk_api_module = (function() {
             executed = true;
 
             // Create final result object
-            typedResult = new BulkWriteResult(
+            let typedResult = new BulkWriteResult(
                 bulkResult, batches.length == 1 ? batches[0].batchType : null, writeConcern);
             // Throw on error
             if (typedResult.hasErrors()) {
@@ -997,7 +1009,7 @@ var _bulk_api_module = (function() {
     // Exports
     //
 
-    module = {};
+    const module = {};
     module.WriteConcern = WriteConcern;
     module.WriteResult = WriteResult;
     module.BulkWriteResult = BulkWriteResult;
@@ -1016,8 +1028,8 @@ var _bulk_api_module = (function() {
 
 // Globals
 WriteConcern = _bulk_api_module.WriteConcern;
-WriteResult = _bulk_api_module.WriteResult;
-BulkWriteResult = _bulk_api_module.BulkWriteResult;
+WriteResult = _bulk_api_module.WriteResult;          // eslint-disable-line
+BulkWriteResult = _bulk_api_module.BulkWriteResult;  // eslint-disable-line
 BulkWriteError = _bulk_api_module.BulkWriteError;
 WriteCommandError = _bulk_api_module.WriteCommandError;
 WriteError = _bulk_api_module.WriteError;

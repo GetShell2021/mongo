@@ -4,14 +4,13 @@
  *  is renamed.
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Bring up a 2 node replset.
 var name = "bg_index_rename";
 var rst = new ReplSetTest({name: name, nodes: 3});
 rst.startSet();
-rst.initiate();
+rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 // Create and populate a collection.
 var primary = rst.getPrimary();
@@ -23,7 +22,7 @@ for (var i = 0; i < 100; i++) {
 }
 
 // Add a background index.
-coll.createIndex({x: 1}, {background: true});
+coll.createIndex({x: 1});
 
 // Rename the collection.
 assert.commandWorked(
@@ -49,4 +48,3 @@ var indexes = barDB.runCommand({listIndexes: "test"});
 assert.eq(indexes.cursor.firstBatch.length, 2);
 
 rst.stopSet();
-}());

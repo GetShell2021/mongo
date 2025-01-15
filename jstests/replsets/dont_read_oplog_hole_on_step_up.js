@@ -8,11 +8,8 @@
  *   multiversion_incompatible,
  * ]
  */
-(function() {
-'use strict';
-
-load("jstests/replsets/rslib.js");
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var rst = new ReplSetTest({
     name: TestData.testName,
@@ -64,10 +61,7 @@ rst.awaitReplication();
 const planExecFP = configureFailPoint(newPrimary, "planExecutorHangWhileYieldedInWaitForInserts");
 
 jsTestLog("Stepping up new primary");
-assert.commandWorked(newPrimary.adminCommand({replSetStepUp: 1}));
-
-// Wait for the node to transition to primary and accept writes.
-assert.eq(newPrimary, rst.getPrimary());
+rst.stepUp(newPrimary);
 
 const createCollFP = configureFailPoint(newPrimary, "hangBeforeLoggingCreateCollection");
 const createShell = startParallelShell(() => {
@@ -97,4 +91,3 @@ createShell();
 
 rst.awaitReplication();
 rst.stopSet();
-}());

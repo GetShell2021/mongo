@@ -1,9 +1,13 @@
 /*
- *  @tags: [multiversion_incompatible]
+ *  @tags: [
+ *     multiversion_incompatible,
+ *     # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *     embedded_router_incompatible,
+ * ]
  */
-const PROGRESS_TIMEOUT_SECONDS = 5;
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+const PROGRESS_TIMEOUT_SECONDS = 3;
 
 const params = {
     setParameter: {
@@ -15,7 +19,6 @@ const params = {
         healthMonitoringIntervals: tojson({values: [{type: "test", interval: NumberInt(500)}]}),
         progressMonitor:
             tojson({interval: PROGRESS_TIMEOUT_SECONDS * 1000, deadline: PROGRESS_TIMEOUT_SECONDS}),
-        featureFlagHealthMonitoring: true
     }
 };
 let st = new ShardingTest({
@@ -45,7 +48,7 @@ assert.commandWorked(
     st.s1.adminCommand({"configureFailPoint": 'hangTestHealthObserver', "mode": "alwaysOn"}));
 
 // Wait for the progress monitor timeout to elapse.
-sleep(1.1 * PROGRESS_TIMEOUT_SECONDS * 1000);
+sleep(2.1 * PROGRESS_TIMEOUT_SECONDS * 1000);
 
 // Servers should be still be alive.
 jsTestLog("Expect mongos processes to still be alive");
@@ -55,7 +58,7 @@ jsTestLog("Change observer to critical");
 changeObserverIntensity(st.s1, 'test', 'critical');
 
 // Wait for the progress monitor timeout to elapse.
-sleep((1.1 * PROGRESS_TIMEOUT_SECONDS * 1000) + 1000);
+sleep((2.1 * PROGRESS_TIMEOUT_SECONDS * 1000) + 1000);
 
 jsTestLog("Done sleeping");
 // Server should be still be alive.
@@ -77,4 +80,3 @@ assert(pingNetworkError, "expected " + st.s1.host + "to be killed");
 
 // Don't validate exit codes, since a mongos will exit on its own with a non-zero exit code.
 st.stop({skipValidatingExitCode: true});
-})();

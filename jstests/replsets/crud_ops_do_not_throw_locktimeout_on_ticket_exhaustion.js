@@ -2,13 +2,15 @@
  * Test ensures that CRUD operations that time out because they cannot acquire a ticket do not
  * return a LockTimeout.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   requires_fcv_70,
+ *   uses_transactions,
+ *   uses_prepare_transaction,
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load('jstests/libs/parallel_shell_helpers.js');
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // We set the number of tickets to be a small value in order to avoid needing to spawn a large
 // number of threads to exhaust all of the available ones.
@@ -19,6 +21,8 @@ const rst = new ReplSetTest({
     nodes: 1,
     nodeOptions: {
         setParameter: {
+            // This test requires a fixed ticket pool size.
+            storageEngineConcurrencyAdjustmentAlgorithm: "fixedConcurrentTransactions",
             wiredTigerConcurrentWriteTransactions: kNumWriteTickets,
             wiredTigerConcurrentReadTransactions: kNumReadTickets,
             logComponentVerbosity: tojson({storage: 1, command: 2})
@@ -142,4 +146,3 @@ for (let joinThread of threads) {
 }
 
 rst.stopSet();
-})();

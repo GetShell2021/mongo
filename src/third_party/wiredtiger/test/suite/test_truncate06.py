@@ -96,7 +96,12 @@ class test_truncate06(wttest.WiredTigerTestCase):
             for k in range(keynum1, keynum2 + 1):
                 cursor.set_key(k)
                 try:
-                    err = cursor.remove()
+                    # In this test some or all the data is already deleted; skip those rows.
+                    err = cursor.search()
+                    if err == wiredtiger.WT_NOTFOUND:
+                        err = 0
+                    else:
+                        err = cursor.remove()
                 except wiredtiger.WiredTigerError as e:
                     if wiredtiger.wiredtiger_strerror(wiredtiger.WT_ROLLBACK) in str(e):
                         err = wiredtiger.WT_ROLLBACK
@@ -170,7 +175,7 @@ class test_truncate06(wttest.WiredTigerTestCase):
 
         # Evict the lot so that we can fast-truncate.
         # For now, evict every 4th key explicitly; FUTURE: improve this to evict each page only
-        # once when we have a good way to do that. 
+        # once when we have a good way to do that.
         if self.do_evict:
             for i in range(1, nrows + 1, 4):
                 self.evict(ds.uri, ds.key(i), value_a)
@@ -193,6 +198,3 @@ class test_truncate06(wttest.WiredTigerTestCase):
         # Move the stable timestamp forward before exiting so we don't waste time rolling
         # back the rest of the changes during shutdown.
         self.conn.set_timestamp('stable_timestamp=' + self.timestamp_str(50))
-        
-if __name__ == '__main__':
-    wttest.run()

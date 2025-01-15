@@ -1,9 +1,11 @@
-doTest = function(signal) {
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
+let doTest = function(signal) {
     // Test orphaned primary steps down
     var replTest = new ReplSetTest({name: 'testSet', nodes: 3});
 
     replTest.startSet();
-    replTest.initiate();
+    replTest.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
     var primary = replTest.getPrimary();
 

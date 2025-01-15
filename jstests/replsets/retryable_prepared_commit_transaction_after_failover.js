@@ -4,10 +4,8 @@
  *
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -53,7 +51,7 @@ rst.awaitLastOpCommitted();
 jsTestLog("Step up the secondary");
 rst.stepUp(secConn);
 assert.eq(secConn, rst.getPrimary());
-rst.waitForState(priConn, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [priConn]);
 
 jsTestLog("commitTransaction command is retryable after failover");
 
@@ -86,12 +84,12 @@ assert.commandFailedWithCode(
 jsTestLog("Step up the original primary");
 rst.stepUp(priConn);
 assert.eq(priConn, rst.getPrimary());
-rst.waitForState(secConn, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [secConn]);
 
 jsTestLog("Step up the original secondary immediately");
 rst.stepUp(secConn);
 assert.eq(secConn, rst.getPrimary());
-rst.waitForState(priConn, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [priConn]);
 
 assert.commandWorked(PrepareHelpers.commitTransaction(secSession, prepareTimestamp2));
 
@@ -104,4 +102,3 @@ assert.eq(priConn.getDB(dbName)[collName].count(), 2);
 assert.eq(priConn.getDB(dbName)[collName].find().itcount(), 2);
 
 rst.stopSet();
-}());

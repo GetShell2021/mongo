@@ -27,16 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/bson/bsonmisc.h"
+#include "mongo/util/assert_util.h"
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/expression/evaluate.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_densify.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
-#include <utility>
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -49,11 +58,57 @@ using DensifyExplicitNumericTest = AggregationContextFixture;
 using DensifyPartitionNumericTest = AggregationContextFixture;
 using DensifyCloneTest = AggregationContextFixture;
 using DensifyStepTest = AggregationContextFixture;
+using DensifySpecTest = AggregationContextFixture;
+using DensifyRedactionTest = AggregationContextFixture;
 
 Date_t makeDate(std::string dateStr) {
     auto statusDate = dateFromISOString(dateStr);
     ASSERT_TRUE(statusDate.isOK());
     return statusDate.getValue();
+}
+
+// Helper to verify that generated values relate correctly to the step.
+bool isOnStepRelativeTo(DensifyValue testVal, DensifyValue base, RangeStatement range) {
+    if (testVal.isDate()) {
+
+        auto date = testVal.getDate();
+        auto unit = range.getUnit().value();
+        long long step = range.getStep().coerceToLong();
+        auto baseDate = base.getDate();
+
+        // Months, quarters and years have variable lengths depending on leap days
+        // and days-in-a-month, so a step is not a constant number of milliseconds
+        // across all dates. For these units, we need to iterate through rather
+        // than performing a calculation with modulo. As long as `baseDate` is not
+        // a large number of steps away from the value we're testing (as is true in
+        // our usage with _current as the base), this should not be a performance
+        // issue.
+        if (unit == TimeUnit::month || unit == TimeUnit::quarter || unit == TimeUnit::year) {
+
+            Date_t steppedDate = baseDate;
+            while (steppedDate < date) {
+                steppedDate = dateAdd(steppedDate, unit, step, TimeZoneDatabase::utcZone());
+            }
+            return steppedDate == date;
+        } else {
+            // Steps with units smaller than one month are always constant sized
+            // (because unix time does not have leap seconds), so we can perform
+            // modulo arithmetic.
+            auto testMillis = date.toMillisSinceEpoch();
+            auto baseMillis = baseDate.toMillisSinceEpoch();
+            auto stepDurationInMillis =
+                dateAdd(Date_t::fromMillisSinceEpoch(0), unit, step, TimeZoneDatabase::utcZone())
+                    .toMillisSinceEpoch();
+            auto diff = testMillis - baseMillis;
+            return diff % stepDurationInMillis == 0;
+        }
+    } else if (testVal.isNumber()) {
+        Value diff = uassertStatusOK(
+            exec::expression::evaluateSubtract(testVal.getNumber(), base.getNumber()));
+        Value remainder = uassertStatusOK(exec::expression::evaluateMod(diff, range.getStep()));
+        return remainder.getDouble() == 0.0;
+    }
+    return false;
 }
 
 DEATH_TEST(DensifyGeneratorTest, ErrorsIfMinOverMax, "lower or equal to max") {
@@ -65,8 +120,10 @@ DEATH_TEST(DensifyGeneratorTest, ErrorsIfMinOverMax, "lower or equal to max") {
                  "path",
                  doc,
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter),
+                 &counter,
+                 false),
         AssertionException,
         5733303);
 }
@@ -80,8 +137,10 @@ DEATH_TEST(DensifyGeneratorTest, ErrorsIfStepIsZero, "be positive") {
                  "path",
                  doc,
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter),
+                 &counter,
+                 false),
         AssertionException,
         5733305);
 }
@@ -95,8 +154,10 @@ DEATH_TEST(DensifyGeneratorTest, ErrorsOnMixedValues, "same type") {
                  "path",
                  doc,
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter),
+                 &counter,
+                 false),
         AssertionException,
         5733300);
 }
@@ -110,8 +171,10 @@ DEATH_TEST(DensifyGeneratorTest, ErrorsIfFieldExistsInDocument, "cannot include 
                  "path",
                  doc,
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter),
+                 &counter,
+                 false),
         AssertionException,
         5733306);
 }
@@ -129,8 +192,10 @@ DEATH_TEST(DensifyGeneratorTest, ErrorsIfFieldExistsButIsArray, "cannot include 
                  "arr",
                  preservedFields,
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter),
+                 &counter,
+                 false),
         AssertionException,
         5733306);
 }
@@ -148,8 +213,10 @@ TEST(DensifyGeneratorTest, ErrorsIfFieldIsInArray) {
                  "arr.path",
                  preservedFields,
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter),
+                 &counter,
+                 false),
         AssertionException,
         5733307);
 }
@@ -163,8 +230,10 @@ TEST(DensifyGeneratorTest, ErrorsIfPrefixOfFieldExists) {
                  "a.b",
                  doc,
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter),
+                 &counter,
+                 false),
         AssertionException,
         5733308);
 }
@@ -178,8 +247,10 @@ TEST(DensifyGeneratorTest, GeneratesNumericDocumentCorrectly) {
                  "a",
                  Document(),
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter);
+                 &counter,
+                 false);
     ASSERT_FALSE(generator.done());
     Document docOne{{"a", 1}};
     ASSERT_DOCUMENT_EQ(docOne, generator.getNextDocument());
@@ -196,8 +267,10 @@ TEST(DensifyGeneratorTest, GeneratesNumericDocumentCorrectlyWithoutFinalDoc) {
                  "a",
                  Document(),
                  boost::none,
+                 boost::none,
                  ValueComparator(),
-                 &counter);
+                 &counter,
+                 false);
     ASSERT_FALSE(generator.done());
     Document docOne{{"a", 1}};
     ASSERT_DOCUMENT_EQ(docOne, generator.getNextDocument());
@@ -214,8 +287,10 @@ TEST(DensifyGeneratorTest, PreservesIncludeFields) {
                  "a",
                  preserveFields,
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter);
+                 &counter,
+                 false);
     ASSERT_FALSE(generator.done());
     Document docOne{{"b", 1}, {"c", 1}, {"a", 1}};
     ASSERT_DOCUMENT_EQ(docOne, generator.getNextDocument());
@@ -233,8 +308,10 @@ TEST(DensifyGeneratorTest, GeneratesNumberOfNumericDocumentsCorrectly) {
                  "a",
                  Document(),
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter);
+                 &counter,
+                 false);
     for (int curVal = 0; curVal < 10; curVal += 2) {
         ASSERT_FALSE(generator.done());
         Document nextDoc{{"a", curVal}};
@@ -255,8 +332,10 @@ TEST(DensifyGeneratorTest, WorksWithNonIntegerStepAndPreserveFields) {
                  "a",
                  preserveFields,
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter);
+                 &counter,
+                 false);
     for (double curVal = 0; curVal < 10; curVal += 1.3) {
         ASSERT_FALSE(generator.done());
         Document nextDoc{{"b", 1}, {"c", 1}, {"a", curVal}};
@@ -276,8 +355,10 @@ TEST(DensifyGeneratorTest, GeneratesOffsetFromMaxDocsCorrectly) {
                  "a",
                  Document(),
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter);
+                 &counter,
+                 false);
     for (int curVal = 1; curVal < 11; curVal += 2) {
         ASSERT_FALSE(generator.done());
         Document nextDoc{{"a", curVal}};
@@ -298,8 +379,10 @@ TEST(DensifyGeneratorTest, GeneratesAtDottedPathCorrectly) {
                  "a.c",
                  preservedFields,
                  doc,
+                 boost::none,
                  ValueComparator(),
-                 &counter);
+                 &counter,
+                 false);
     for (int curVal = 1; curVal < 11; curVal += 2) {
         ASSERT_FALSE(generator.done());
         Document nextDoc{{"a", Document{{"b", 1}, {"c", curVal}}}};
@@ -316,8 +399,10 @@ TEST(DensifyGeneratorTest, GeneratesAtDottedPathCorrectly) {
                          "a.c.d",
                          secondPreservedFields,
                          doc,
+                         boost::none,
                          ValueComparator(),
-                         &counter);
+                         &counter,
+                         false);
     for (int curVal = 1; curVal < 11; curVal += 2) {
         ASSERT_FALSE(generator.done());
         Document nextDoc{{"a", Document{{"b", 1}, {"c", Document{{"d", curVal}}}}}};
@@ -338,8 +423,10 @@ DEATH_TEST(DensifyGeneratorTest, FailsIfDatesAndUnitNotProvided, "date step") {
                                 "a",
                                 Document(),
                                 Document(),
+                                boost::none,
                                 ValueComparator(),
-                                &counter),
+                                &counter,
+                                false),
                        AssertionException,
                        5733501);
 }
@@ -352,8 +439,10 @@ DEATH_TEST(DensifyGeneratorTest, FailsIfNumberAndUnitProvided, "non-date") {
                  "a",
                  Document(),
                  Document(),
+                 boost::none,
                  ValueComparator(),
-                 &counter),
+                 &counter,
+                 false),
         AssertionException,
         5733506);
 }
@@ -368,8 +457,10 @@ DEATH_TEST(DensifyGeneratorTest, DateMinMustBeLessThanMax, "lower or equal to") 
                                 "a",
                                 Document(),
                                 Document(),
+                                boost::none,
                                 ValueComparator(),
-                                &counter),
+                                &counter,
+                                false),
                        AssertionException,
                        5733502);
 }
@@ -384,8 +475,10 @@ DEATH_TEST(DensifyGeneratorTest, DateStepMustBeInt, "whole number") {
                                 "a",
                                 Document(),
                                 Document(),
+                                boost::none,
                                 ValueComparator(),
-                                &counter),
+                                &counter,
+                                false),
                        AssertionException,
                        5733505);
 }
@@ -402,8 +495,10 @@ TEST(DensifyGeneratorTest, GeneratesDatesBySecondCorrectly) {
                               "a",
                               Document(),
                               doc,
+                              boost::none,
                               ValueComparator(),
-                              &counter);
+                              &counter,
+                              false);
     for (int curVal = 1; curVal < 11; curVal += 2) {
         auto appendStr = std::to_string(curVal);
         appendStr.insert(appendStr.begin(), 2 - appendStr.length(), '0');
@@ -428,8 +523,10 @@ TEST(DensifyGeneratorTest, GeneratesDatesByHourCorrectly) {
                               "a",
                               Document(),
                               doc,
+                              boost::none,
                               ValueComparator(),
-                              &counter);
+                              &counter,
+                              false);
     for (int curVal = 1; curVal < 15; curVal += 2) {
         auto appendStr = std::to_string(curVal);
         appendStr.insert(appendStr.begin(), 2 - appendStr.length(), '0');
@@ -454,8 +551,10 @@ TEST(DensifyGeneratorTest, GeneratesDatesByMonthCorrectly) {
                               "a",
                               Document(),
                               doc,
+                              boost::none,
                               ValueComparator(),
-                              &counter);
+                              &counter,
+                              false);
     for (int curVal = 1; curVal < 10; curVal += 2) {
         auto appendStr = std::to_string(curVal);
         appendStr.insert(appendStr.begin(), 2 - appendStr.length(), '0');
@@ -848,6 +947,161 @@ TEST_F(DensifyExplicitNumericTest, CorrectlyDensifiesForNumericExplicitRangeStar
     ASSERT_FALSE(next.isAdvanced());
 }
 
+TEST_F(DensifyExplicitNumericTest,
+       CorrectlyDensifiesForPartionedRangeStartingBeforeBoundsRangeWithDocMatchingBoundsStart) {
+    auto densify = DocumentSourceInternalDensify(
+        getExpCtx(),
+        "b",
+        std::list<FieldPath>({"a"}),
+        RangeStatement(Value(1), ExplicitBounds(Value(4), Value(8)), boost::none));
+    auto source = DocumentSourceMock::createForTest(
+        {"{a: 1, b: 2}", "{a: 1, b: 4}", "{a: 1, b: 6}"}, getExpCtx());
+    densify.setSource(source.get());
+
+    auto next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(4, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(5, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(6, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(7, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT_FALSE(next.isAdvanced());
+
+    next = densify.getNext();
+    ASSERT_FALSE(next.isAdvanced());
+}
+
+TEST_F(DensifyExplicitNumericTest, CorrectlyDensifiesForPartionedRangeAcrossTwoPartitions) {
+    auto densify = DocumentSourceInternalDensify(
+        getExpCtx(),
+        "b",
+        std::list<FieldPath>({"a"}),
+        RangeStatement(Value(1), ExplicitBounds(Value(0), Value(10)), boost::none));
+    auto source = DocumentSourceMock::createForTest(
+        {"{a: 1, b: 2}", "{a: 2, b: 5}", "{a: 1, b: 7}", "{a: 2, b: 9}"}, getExpCtx());
+    densify.setSource(source.get());
+
+    auto next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(1, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(0, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(1, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(1, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(1, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(2, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(0, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(1, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(2, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(3, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(4, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(5, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(1, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(3, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(1, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(4, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(1, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(5, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(1, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(6, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(1, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(7, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(6, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(7, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(8, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(2, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(9, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(1, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(8, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT(next.isAdvanced());
+    ASSERT_EQUALS(1, next.getDocument().getField("a").getDouble());
+    ASSERT_EQUALS(9, next.getDocument().getField("b").getDouble());
+
+    next = densify.getNext();
+    ASSERT_FALSE(next.isAdvanced());
+
+    next = densify.getNext();
+    ASSERT_FALSE(next.isAdvanced());
+}
+
 TEST_F(DensifyExplicitNumericTest, CorrectlyDensifiesForNumericExplicitRangeOnlyInsideRange) {
     auto densify = DocumentSourceInternalDensify(
         getExpCtx(),
@@ -1222,7 +1476,7 @@ TEST_F(DensifyPartitionNumericTest, DensifiesOnImmediateEOFExplicitRange) {
     ASSERT_FALSE(next.isAdvanced());
 }
 
-TEST_F(DensifyCloneTest, InternalDesnifyCanBeCloned) {
+TEST_F(DensifyCloneTest, InternalDensifyCanBeCloned) {
 
     std::list<boost::intrusive_ptr<DocumentSource>> sources;
     sources.push_back(make_intrusive<DocumentSourceInternalDensify>(
@@ -1236,12 +1490,12 @@ TEST_F(DensifyCloneTest, InternalDesnifyCanBeCloned) {
 
 TEST(DensifyStepTest, InternalDensifyIsOnStepWithNumbers) {
     auto range = RangeStatement(Value(2), Full(), boost::none);
-    ASSERT_TRUE(DensifyValue(Value(5)).isOnStepRelativeTo(Value(1), range));
+    ASSERT_TRUE(isOnStepRelativeTo(DensifyValue(Value(5)), Value(1), range));
 }
 
 TEST(DensifyStepTest, InternalDensifyIsOffStepWithNumbers) {
     auto range = RangeStatement(Value(2), Full(), boost::none);
-    ASSERT_FALSE(DensifyValue(Value(5)).isOnStepRelativeTo(Value(2), range));
+    ASSERT_FALSE(isOnStepRelativeTo(DensifyValue(Value(5)), Value(2), range));
 }
 
 TEST(DensifyStepTest, InternalDensifyIsOnStepWithSmallDateStep) {
@@ -1249,7 +1503,7 @@ TEST(DensifyStepTest, InternalDensifyIsOnStepWithSmallDateStep) {
     auto val = DensifyValue(makeDate("2021-01-01T00:00:05.000Z"));
     auto base = DensifyValue(makeDate("2021-01-01T00:00:01.000Z"));
 
-    ASSERT_TRUE(val.isOnStepRelativeTo(base, range));
+    ASSERT_TRUE(isOnStepRelativeTo(val, base, range));
 }
 
 TEST(DensifyStepTest, InternalDensifyIsOffStepWithSmallDateStep) {
@@ -1257,7 +1511,7 @@ TEST(DensifyStepTest, InternalDensifyIsOffStepWithSmallDateStep) {
     auto val = DensifyValue(makeDate("2021-01-01T00:00:05.000Z"));
     auto base = DensifyValue(makeDate("2021-01-01T00:00:02.000Z"));
 
-    ASSERT_FALSE(val.isOnStepRelativeTo(base, range));
+    ASSERT_FALSE(isOnStepRelativeTo(val, base, range));
 }
 
 TEST(DensifyStepTest, InternalDensifyIsOnStepWithLargeDateStep) {
@@ -1265,7 +1519,7 @@ TEST(DensifyStepTest, InternalDensifyIsOnStepWithLargeDateStep) {
     auto val = DensifyValue(makeDate("2021-05-01T00:00:00.000Z"));
     auto base = DensifyValue(makeDate("2021-01-01T00:00:00.000Z"));
 
-    ASSERT_TRUE(val.isOnStepRelativeTo(base, range));
+    ASSERT_TRUE(isOnStepRelativeTo(val, base, range));
 }
 
 TEST(DensifyStepTest, InternalDensifyIsOffStepWithLargeDateStep) {
@@ -1273,7 +1527,7 @@ TEST(DensifyStepTest, InternalDensifyIsOffStepWithLargeDateStep) {
     auto val = DensifyValue(makeDate("2021-05-01T00:00:00.000Z"));
     auto base = DensifyValue(makeDate("2021-01-01T00:00:00.000Z"));
 
-    ASSERT_FALSE(val.isOnStepRelativeTo(base, range));
+    ASSERT_FALSE(isOnStepRelativeTo(val, base, range));
 }
 
 TEST(DensifyStepTest, InternalDensifyIsOffStepForDaysWithLargeDateStep) {
@@ -1281,7 +1535,242 @@ TEST(DensifyStepTest, InternalDensifyIsOffStepForDaysWithLargeDateStep) {
     auto val = DensifyValue(makeDate("2021-05-03T00:00:00.000Z"));
     auto base = DensifyValue(makeDate("2021-01-01T00:00:00.000Z"));
 
-    ASSERT_FALSE(val.isOnStepRelativeTo(base, range));
+    ASSERT_FALSE(isOnStepRelativeTo(val, base, range));
+}
+
+TEST_F(DensifySpecTest, InvalidDensifyField) {
+    auto spec = fromjson(R"({
+        $densify: {
+            field: "a",
+            partitionByFields: ["a"],
+            range: {
+                step: 1,
+                unit: "hour",
+                bounds: [
+                    {$date: "2023-04-23T00:00:00.000Z"},
+                    {$date: "2023-04-23T08:00:00.000Z"}
+                ]
+            }
+        }
+    })");
+
+    ASSERT_THROWS_CODE(
+        DocumentSourceInternalDensify::createFromBson(spec.firstElement(), getExpCtx()),
+        AssertionException,
+        8993000);
+}
+
+TEST_F(DensifySpecTest, InvalidNestedDensifyField) {
+    auto spec = fromjson(R"({
+        $densify: {
+            field: "a.b",
+            partitionByFields: ["a"],
+            range: {
+                step: 1,
+                unit: "hour",
+                bounds: [
+                    {$date: "2023-04-23T00:00:00.000Z"},
+                    {$date: "2023-04-23T08:00:00.000Z"}
+                ]
+            }
+        }
+    })");
+
+    ASSERT_THROWS_CODE(
+        DocumentSourceInternalDensify::createFromBson(spec.firstElement(), getExpCtx()),
+        AssertionException,
+        9554500);
+}
+
+TEST_F(DensifySpecTest, InvalidNestedPartitionByFields) {
+    auto spec = fromjson(R"({
+        $densify: {
+            field: "a",
+            partitionByFields: ["a.b"],
+            range: {
+                step: 1,
+                unit: "hour",
+                bounds: [
+                    {$date: "2023-04-23T00:00:00.000Z"},
+                    {$date: "2023-04-23T08:00:00.000Z"}
+                ]
+            }
+        }
+    })");
+
+    ASSERT_THROWS_CODE(
+        DocumentSourceInternalDensify::createFromBson(spec.firstElement(), getExpCtx()),
+        AssertionException,
+        8993000);
+}
+
+TEST_F(DensifyRedactionTest, RedactionDateBounds) {
+    auto spec = fromjson(R"({
+        $densify: {
+            field: "a",
+            range: {
+                step: 1,
+                unit: "hour",
+                bounds: [
+                    {$date: "2023-04-23T00:00:00.000Z"},
+                    {$date: "2023-04-23T08:00:00.000Z"}
+                ]
+            }
+        }
+    })");
+
+    auto docSource =
+        DocumentSourceInternalDensify::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$_internalDensify": {
+                "field": "HASH<a>",
+                "partitionByFields": [],
+                "range": {
+                    "step": "?number",
+                    "bounds": [
+                        "?date",
+                        "?date"
+                    ],
+                    "unit": "hour"
+                }
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(DensifyRedactionTest, RedactionFullBoundsWithPartitionFields) {
+    auto spec = fromjson(R"({
+        $densify: {
+            field: "foo",
+            partitionByFields: ["a", "b", "c.d"],
+            range: {
+                bounds: "full",
+                step: 100
+            }
+        }
+    })");
+    auto docSource =
+        DocumentSourceInternalDensify::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$_internalDensify": {
+                "field": "HASH<foo>",
+                "partitionByFields": [
+                    "HASH<a>",
+                    "HASH<b>",
+                    "HASH<c>.HASH<d>"
+                ],
+                "range": {
+                    "step": "?number",
+                    "bounds": "full"
+                }
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(DensifyRedactionTest, RedactionPartitionBounds) {
+    auto spec = fromjson(R"({
+        $densify: {
+            field: "x",
+            partitionByFields: ["foo"],
+            range: {
+                bounds: "partition",
+                step: 50,
+                unit: "second"
+            }
+        }
+    })");
+    auto docSource =
+        DocumentSourceInternalDensify::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$_internalDensify": {
+                "field": "HASH<x>",
+                "partitionByFields": [
+                    "HASH<foo>"
+                ],
+                "range": {
+                    "step": "?number",
+                    "bounds": "partition",
+                    "unit": "second"
+                }
+            }
+        })",
+        redact(*docSource));
+}
+
+void assertRangeTimeUnitSerialization(auto expCtx,
+                                      BSONObj inputStage,
+                                      auto expectedStage,
+                                      auto opts) {
+    auto parsedStage =
+        DocumentSourceInternalDensify::createFromBson(inputStage.firstElement(), expCtx);
+    std::vector<Value> serialization;
+    parsedStage->serializeToArray(serialization, opts);
+
+    auto serializedStage = serialization[0].getDocument().toBson();
+    ASSERT_BSONOBJ_EQ(expectedStage, serializedStage);
+}
+
+TEST_F(DensifyRedactionTest, RangeTimeUnitSerializationRepresentative) {
+    assertRangeTimeUnitSerialization(
+        getExpCtx(),
+        fromjson(R"({
+            $densify: {
+                field: "x",
+                partitionByFields: ["foo"],
+                range: {
+                    bounds: "partition",
+                    step: 50,
+                    unit: "second"
+                }
+            }
+        })"),
+        fromjson(R"({
+            $_internalDensify: {
+                field: "x",
+                partitionByFields: [
+                    "foo"
+                ],
+                range: {
+                    step: 1,
+                    bounds: "partition",
+                    unit: "second"
+                }
+            }
+        })"),
+        SerializationOptions::kRepresentativeQueryShapeSerializeOptions);
+}
+
+TEST_F(DensifyRedactionTest, RangeTimeUnitSerializationDebug) {
+    assertRangeTimeUnitSerialization(getExpCtx(),
+                                     fromjson(
+                                         R"({
+            $densify: {
+                field: "x",
+                partitionByFields: ["foo"],
+                range: {
+                    bounds: "partition",
+                    step: 50,
+                    unit: "second"
+                }
+            }
+        })"),
+                                     fromjson(
+                                         R"({
+            $_internalDensify: {
+                field: "x",
+                partitionByFields: ["foo"],
+                range: {
+                    step: "?number",
+                    bounds: "partition",
+                    unit: "second"
+                }
+            }
+        })"),
+                                     SerializationOptions::kDebugQueryShapeSerializeOptions);
 }
 }  // namespace
 }  // namespace mongo

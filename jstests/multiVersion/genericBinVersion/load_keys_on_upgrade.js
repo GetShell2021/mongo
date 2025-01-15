@@ -1,9 +1,6 @@
-//
-// Tests to validate that correct read concern is used to load clusterTime signing keys from
-// admin.system.keys on upgrade.
-//
+import "jstests/multiVersion/libs/multi_rs.js";
 
-load('./jstests/multiVersion/libs/multi_rs.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var oldVersion = "last-lts";
 
@@ -18,8 +15,9 @@ var rst = new ReplSetTest({nodes: nodes, keyFile: keyFile});
 
 rst.startSet();
 
-rst.initiateWithAnyNodeAsPrimary(
-    Object.extend(rst.getReplSetConfig(), {writeConcernMajorityJournalDefault: true}));
+rst.initiate(Object.extend(rst.getReplSetConfig(), {writeConcernMajorityJournalDefault: true}),
+             null,
+             {initiateWithDefaultElectionTimeout: true});
 
 // Wait for a primary node...
 var primary = rst.getPrimary();

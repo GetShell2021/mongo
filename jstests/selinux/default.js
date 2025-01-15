@@ -1,16 +1,10 @@
 // This test does not run any code. As long as mongod is
 // up and running, it is successful
 
-'use strict';
+import {SelinuxBaseTest} from "jstests/selinux/lib/selinux_base_test.js";
 
-load('jstests/selinux/lib/selinux_base_test.js');
-
-class TestDefinition extends SelinuxBaseTest {
-    get config() {
-        return cat("rpm/mongod.conf");
-    }
-
-    run() {
+export class TestDefinition extends SelinuxBaseTest {
+    async run() {
         // The only things we are verifying here:
         // - that we are connected
         // - that process is running in correct SELinux context

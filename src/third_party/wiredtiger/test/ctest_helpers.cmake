@@ -37,6 +37,26 @@ function(create_test_executable target)
 
     # Define our test executable.
     add_executable(${target} ${CREATE_TEST_SOURCES})
+
+    # For MacOS builds we need to generate a dSYM bundle that contains the debug symbols for each
+    # executable. The name of the binary will either be the name of the target or some other name
+    # passed to this function. We need to use the correct one for the dsymutil.
+    if (WT_DARWIN)
+        if("${CREATE_TEST_EXECUTABLE_NAME}" STREQUAL "")
+            set(test_name "${target}")
+        else()
+            set(test_name "${CREATE_TEST_EXECUTABLE_NAME}")
+        endif()
+
+        add_custom_command(
+            TARGET ${target} POST_BUILD
+            COMMAND dsymutil ${test_name}
+            WORKING_DIRECTORY ${test_binary_dir}
+            COMMENT "Running dsymutil on ${test_name}"
+            VERBATIM
+        )
+    endif()
+
     # If we want the output binary to be a different name than the target.
     if (NOT "${CREATE_TEST_EXECUTABLE_NAME}" STREQUAL "")
         set_target_properties(${target}
@@ -77,6 +97,10 @@ function(create_test_executable target)
         target_link_libraries(${target} ${CREATE_TEST_LIBS})
     endif()
 
+    if(ENABLE_ANTITHESIS)
+        target_link_libraries(${target} wt::voidstar)
+    endif()
+
     if(WT_LINUX OR WT_DARWIN)
         # Link the final test executable with a relative runpath to the
         # top-level build directory. This being the build location of the
@@ -94,6 +118,10 @@ function(create_test_executable target)
                 BUILD_WITH_INSTALL_RPATH FALSE
                 LINK_FLAGS "-Wl,-rpath,${origin_linker_variable}/${relative_rpath}"
         )
+    endif()
+
+    if (NOT WT_WIN)
+        target_link_libraries(${target} m)
     endif()
 
     # If compiling for windows, additionally link in the shim library.
@@ -207,9 +235,9 @@ function(define_c_test)
         PARSE_ARGV
         0
         "C_TEST"
-        ""
-        "TARGET;DIR_NAME;DEPENDS;EXEC_SCRIPT"
-        "SOURCES;FLAGS;ARGUMENTS;VARIANTS;ADDITIONAL_FILES"
+        "CXX"
+        "TARGET;DIR_NAME;EXEC_SCRIPT;LABEL"
+        "SOURCES;LIBS;FLAGS;ARGUMENTS;VARIANTS;DEPENDS;ADDITIONAL_FILES"
     )
     if (NOT "${C_TEST_UNPARSED_ARGUMENTS}" STREQUAL "")
         message(FATAL_ERROR "Unknown arguments to define_c_test: ${C_TEST_UNPARSED_ARGUMENTS}")
@@ -239,6 +267,9 @@ function(define_c_test)
         if(NOT "${C_TEST_ADDITIONAL_FILES}" STREQUAL "")
             list(APPEND additional_file_args ${C_TEST_ADDITIONAL_FILES})
         endif()
+        if(C_TEST_CXX)
+            list(APPEND additional_file_args CXX)
+        endif()
         set(exec_wrapper)
         if(WT_WIN)
             # This is a workaround to run our csuite tests under Windows using CTest. When executing a test,
@@ -252,6 +283,7 @@ function(define_c_test)
             # Define the c test to be executed with a script, rather than invoking the binary directly.
             create_test_executable(${C_TEST_TARGET}
                 SOURCES ${C_TEST_SOURCES}
+                LIBS ${C_TEST_LIBS}
                 ADDITIONAL_FILES ${additional_file_args}
                 BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/${C_TEST_DIR_NAME}
                 ${additional_executable_args}
@@ -261,6 +293,7 @@ function(define_c_test)
         else()
             create_test_executable(${C_TEST_TARGET}
                 SOURCES ${C_TEST_SOURCES}
+                LIBS ${C_TEST_LIBS}
                 ADDITIONAL_FILES ${additional_file_args}
                 BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/${C_TEST_DIR_NAME}
                 ${additional_executable_args}
@@ -281,7 +314,7 @@ function(define_c_test)
                 COMMAND ${test_cmd} ${C_TEST_ARGUMENTS}
                 WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/${C_TEST_DIR_NAME}
             )
-            set_tests_properties(${C_TEST_TARGET} PROPERTIES LABELS "check;csuite")
+            set_tests_properties(${C_TEST_TARGET} PROPERTIES LABELS "check;csuite;${C_TEST_LABEL}")
         endif()
     endif()
 endfunction(define_c_test)

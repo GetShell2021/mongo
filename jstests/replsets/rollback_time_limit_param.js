@@ -5,9 +5,7 @@
  * entries.
  */
 
-(function() {
-
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = "rollback_time_limit_param";
 
@@ -19,7 +17,7 @@ assert.throws(function() {
     rstWithBadStartupOptions.startSet();
 });
 
-assert(rawMongoProgramOutput().match("Bad value for parameter \"rollbackTimeLimitSecs\""),
+assert(rawMongoProgramOutput("Bad value for parameter").match("\"rollbackTimeLimitSecs\""),
        "failed to reject bad value for parameter");
 
 // Now initialize the same parameter correctly on startup.
@@ -50,4 +48,3 @@ assert.commandFailedWithCode(primary.adminCommand({setParameter: 1, rollbackTime
                              ErrorCodes.BadValue);
 
 rst.stopSet();
-})();

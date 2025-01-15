@@ -28,18 +28,33 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <set>
 
-#include "mongo/db/s/config_server_op_observer.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/db/s/sharding_ready.h"
 #include "mongo/db/s/topology_time_ticker.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/db/vector_clock_mutable.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/catalog/type_config_version.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/cluster_identity_loader.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/version/releases.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -51,19 +66,15 @@ ConfigServerOpObserver::ConfigServerOpObserver() = default;
 ConfigServerOpObserver::~ConfigServerOpObserver() = default;
 
 void ConfigServerOpObserver::onDelete(OperationContext* opCtx,
-                                      const NamespaceString& nss,
-                                      const UUID& uuid,
+                                      const CollectionPtr& coll,
                                       StmtId stmtId,
-                                      const OplogDeleteEntryArgs& args) {
-    if (nss == VersionType::ConfigNS) {
+                                      const BSONObj& doc,
+                                      const DocumentKey& documentKey,
+                                      const OplogDeleteEntryArgs& args,
+                                      OpStateAccumulator* opAccumulator) {
+    if (coll->ns() == NamespaceString::kConfigVersionNamespace) {
         if (!repl::ReplicationCoordinator::get(opCtx)->getMemberState().rollback()) {
             uasserted(40302, "cannot delete config.version document while in --configsvr mode");
-        } else {
-            // TODO (SERVER-34165): this is only used for rollback via refetch and can be removed
-            // with it.
-            // Throw out any cached information related to the cluster ID.
-            ShardingCatalogManager::get(opCtx)->discardCachedConfigDatabaseInitializationState();
-            ClusterIdentityLoader::get(opCtx)->discardCachedClusterId();
         }
     }
 }
@@ -72,24 +83,18 @@ repl::OpTime ConfigServerOpObserver::onDropCollection(OperationContext* opCtx,
                                                       const NamespaceString& collectionName,
                                                       const UUID& uuid,
                                                       std::uint64_t numRecords,
-                                                      const CollectionDropType dropType) {
-    if (collectionName == VersionType::ConfigNS) {
+                                                      bool markFromMigrate) {
+    if (collectionName == NamespaceString::kConfigVersionNamespace) {
         if (!repl::ReplicationCoordinator::get(opCtx)->getMemberState().rollback()) {
             uasserted(40303, "cannot drop config.version document while in --configsvr mode");
-        } else {
-            // TODO (SERVER-34165): this is only used for rollback via refetch and can be removed
-            // with it.
-            // Throw out any cached information related to the cluster ID.
-            ShardingCatalogManager::get(opCtx)->discardCachedConfigDatabaseInitializationState();
-            ClusterIdentityLoader::get(opCtx)->discardCachedClusterId();
         }
     }
 
     return {};
 }
 
-void ConfigServerOpObserver::_onReplicationRollback(OperationContext* opCtx,
-                                                    const RollbackObserverInfo& rbInfo) {
+void ConfigServerOpObserver::onReplicationRollback(OperationContext* opCtx,
+                                                   const RollbackObserverInfo& rbInfo) {
     if (rbInfo.configServerConfigVersionRolledBack) {
         // Throw out any cached information related to the cluster ID.
         ShardingCatalogManager::get(opCtx)->discardCachedConfigDatabaseInitializationState();
@@ -106,16 +111,39 @@ void ConfigServerOpObserver::_onReplicationRollback(OperationContext* opCtx,
 }
 
 void ConfigServerOpObserver::onInserts(OperationContext* opCtx,
-                                       const NamespaceString& nss,
-                                       const UUID& uuid,
+                                       const CollectionPtr& coll,
                                        std::vector<InsertStatement>::const_iterator begin,
                                        std::vector<InsertStatement>::const_iterator end,
-                                       bool fromMigrate) {
-    if (nss != NamespaceString::kConfigsvrShardsNamespace) {
+                                       const std::vector<RecordId>& recordIds,
+                                       std::vector<bool> fromMigrate,
+                                       bool defaultFromMigrate,
+                                       OpStateAccumulator* opAccumulator) {
+    if (coll->ns() != NamespaceString::kConfigsvrShardsNamespace) {
         return;
     }
 
-    if (!topology_time_ticker_utils::inRecoveryMode(opCtx)) {
+    // (Ignore FCV check): Auto-bootstrapping happens irrespective of the FCV when
+    // gFeatureFlagAllMongodsAreSharded is enabled.
+    if (gFeatureFlagAllMongodsAreSharded.isEnabledAndIgnoreFCVUnsafe() &&
+        !ShardingReady::get(opCtx)->isReady()) {
+        for (auto it = begin; it != end; it++) {
+            const auto& insertedDoc = it->doc;
+            const auto idElem = insertedDoc["_id"];
+            if (idElem.str() == ShardId::kConfigServerId) {
+                /**
+                 * Signal that the config shard is ready when we are certain that the config shard
+                 * document inserted into config.shards is committed.
+                 */
+                shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+                    [&](OperationContext* opCtx, boost::optional<Timestamp>) {
+                        ShardingReady::get(opCtx)->setIsReady();
+                    });
+            }
+        }
+    }
+
+    // TODO (SERVER-91505): Determine if we should change this to check isDataConsistent.
+    if (!repl::ReplicationCoordinator::get(opCtx)->isInInitialSyncOrRollback()) {
         boost::optional<Timestamp> maxTopologyTime;
         for (auto it = begin; it != end; it++) {
             Timestamp newTopologyTime = it->doc[ShardType::topologyTime.name()].timestamp();
@@ -127,18 +155,27 @@ void ConfigServerOpObserver::onInserts(OperationContext* opCtx,
         }
 
         if (maxTopologyTime) {
-            opCtx->recoveryUnit()->onCommit(
-                [opCtx, maxTopologyTime](boost::optional<Timestamp> commitTime) mutable {
+            // Insertions into config.shards may be done inside a transaction. This implies that the
+            // callback from onCommit can be invoked by a different thread. Since the
+            // TopologyTimeTicker is associated to the mongod instance and not to the
+            // OperationContext, we can safely obtain a reference at this point and passed it to the
+            // onCommit callback.
+            auto& topologyTicker = TopologyTimeTicker::get(opCtx);
+            shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+                [&topologyTicker, maxTopologyTime](OperationContext* opCtx,
+                                                   boost::optional<Timestamp> commitTime) mutable {
                     invariant(commitTime);
-                    TopologyTimeTicker::get(opCtx).onNewLocallyCommittedTopologyTimeAvailable(
-                        *commitTime, *maxTopologyTime);
+                    topologyTicker.onNewLocallyCommittedTopologyTimeAvailable(*commitTime,
+                                                                              *maxTopologyTime);
                 });
         }
     }
 }
 
-void ConfigServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
-    if (args.nss != NamespaceString::kConfigsvrShardsNamespace) {
+void ConfigServerOpObserver::onUpdate(OperationContext* opCtx,
+                                      const OplogUpdateEntryArgs& args,
+                                      OpStateAccumulator* opAccumulator) {
+    if (args.coll->ns() != NamespaceString::kConfigsvrShardsNamespace) {
         return;
     }
 
@@ -165,8 +202,9 @@ void ConfigServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdate
     // to the mongod instance and not to the OperationContext, we can safely obtain a reference at
     // this point and passed it to the onCommit callback.
     auto& topologyTicker = TopologyTimeTicker::get(opCtx);
-    opCtx->recoveryUnit()->onCommit(
-        [&topologyTicker, topologyTime](boost::optional<Timestamp> commitTime) mutable {
+    shard_role_details::getRecoveryUnit(opCtx)->onCommit(
+        [&topologyTicker, topologyTime](OperationContext*,
+                                        boost::optional<Timestamp> commitTime) mutable {
             invariant(commitTime);
             topologyTicker.onNewLocallyCommittedTopologyTimeAvailable(*commitTime, topologyTime);
         });

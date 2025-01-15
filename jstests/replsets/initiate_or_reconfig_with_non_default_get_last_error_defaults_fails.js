@@ -4,8 +4,7 @@
  * @tags: [
  * ]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function testInitiate(gleDefaults) {
     const replTest = new ReplSetTest({name: jsTestName(), nodes: 1});
@@ -29,7 +28,7 @@ function testInitiate(gleDefaults) {
 
     assert.soon(
         function() {
-            return rawMongoProgramOutput().search(/Fatal assertion.*5624101/) >= 0;
+            return rawMongoProgramOutput("Fatal assertion").search(/5624101/) >= 0;
         },
         "Node should have fasserted when initiating with a non-default getLastErrorDefaults field",
         ReplSetTest.kDefaultTimeoutMS);
@@ -74,4 +73,3 @@ runTest({getLastErrorDefaults: {w: 1, wtimeout: 0, fsync: true}});
 
 jsTestLog("Testing getLastErrorDefaults with {w:1, wtimeout: 0, j: false}");
 runTest({getLastErrorDefaults: {w: 1, wtimeout: 0, j: false}});
-}());

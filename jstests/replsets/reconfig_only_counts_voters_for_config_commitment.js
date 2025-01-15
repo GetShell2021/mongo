@@ -3,11 +3,9 @@
  * majority.
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/rslib.js");
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isConfigCommitted} from "jstests/replsets/rslib.js";
 
 var replTest = new ReplSetTest({
     nodes: [
@@ -20,7 +18,7 @@ var replTest = new ReplSetTest({
     useBridge: true
 });
 var nodes = replTest.startSet();
-replTest.initiateWithHighElectionTimeout();
+replTest.initiate();
 var primary = replTest.getPrimary();
 var secondary = replTest.getSecondary();
 
@@ -49,4 +47,3 @@ assert.commandWorked(primary.getDB("admin").runCommand({replSetReconfig: config}
 assert.soon(() => isConfigCommitted(primary));
 
 replTest.stopSet();
-}());

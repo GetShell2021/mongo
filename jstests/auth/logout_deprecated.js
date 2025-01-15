@@ -7,8 +7,7 @@
  *   requires_sharding,
  * ]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function runTest(conn) {
     const logId = 5626600;
@@ -47,4 +46,3 @@ function runTest(conn) {
     runTest(st.s0);
     st.stop();
 }
-})();

@@ -28,18 +28,16 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
 #ifdef _WIN32
 #include <crtdbg.h>
+#include <cstdio>
+#include <cstdlib>
 #include <mmsystem.h>
-#include <stdio.h>
-#include <stdlib.h>
 #endif
 
-#include "mongo/base/init.h"
-#include "mongo/logv2/log.h"
-#include "mongo/util/stacktrace.h"
+#include "mongo/base/init.h"        // IWYU pragma: keep
+#include "mongo/logv2/log.h"        // IWYU pragma: keep
+#include "mongo/util/stacktrace.h"  // IWYU pragma: keep
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
@@ -74,7 +72,7 @@ int __cdecl crtDebugCallback(int nRptType, char* originalMessage, int* returnVal
     *returnValue = 0;  // Returned by _CrtDbgReport. (1: starts the debugger).
     bool die = (nRptType != _CRT_WARN);
     LOGV2(23325,
-          "*** C runtime {severity_nRptType}: {firstLine_originalMessage}{die_terminating_sd_sd}",
+          "*** C runtime debug report ***",
           "severity_nRptType"_attr = severity(nRptType),
           "firstLine_originalMessage"_attr = firstLine(originalMessage),
           "die_terminating_sd_sd"_attr = (die ? ", terminating"_sd : ""_sd));

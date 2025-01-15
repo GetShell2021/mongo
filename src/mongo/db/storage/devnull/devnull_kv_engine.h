@@ -29,11 +29,31 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <deque>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/storage/backup_block.h"
+#include "mongo/db/storage/key_format.h"
 #include "mongo/db/storage/kv/kv_engine.h"
-#include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
 
@@ -45,136 +65,138 @@ class JournalListener;
 class DevNullKVEngine : public KVEngine {
 public:
     DevNullKVEngine();
+    ~DevNullKVEngine() override;
 
-    virtual ~DevNullKVEngine() {}
+    RecoveryUnit* newRecoveryUnit() override;
 
-    virtual RecoveryUnit* newRecoveryUnit() {
-        return new RecoveryUnitNoop();
+    Status createRecordStore(const NamespaceString& nss,
+                             StringData ident,
+                             const CollectionOptions& options,
+                             KeyFormat keyFormat = KeyFormat::Long) override {
+        return Status::OK();
     }
 
-    virtual Status createRecordStore(OperationContext* opCtx,
+    std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                StringData ident,
+                                                const CollectionOptions& options) override;
+
+    std::unique_ptr<RecordStore> getTemporaryRecordStore(OperationContext* opCtx,
+                                                         StringData ident,
+                                                         KeyFormat keyFormat) override;
+
+    std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                          StringData ident,
+                                                          KeyFormat keyFormat) override;
+
+    Status createSortedDataInterface(RecoveryUnit&,
                                      const NamespaceString& nss,
+                                     const CollectionOptions& collOptions,
                                      StringData ident,
-                                     const CollectionOptions& options,
-                                     KeyFormat keyFormat = KeyFormat::Long) {
+                                     const IndexDescriptor* desc) override {
         return Status::OK();
     }
 
-    virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
-                                                        const NamespaceString& nss,
-                                                        StringData ident,
-                                                        const CollectionOptions& options);
-
-    virtual std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
-                                                                  StringData ident,
-                                                                  KeyFormat keyFormat) override;
-
-    virtual Status createSortedDataInterface(OperationContext* opCtx,
-                                             const NamespaceString& nss,
-                                             const CollectionOptions& collOptions,
-                                             StringData ident,
-                                             const IndexDescriptor* desc) {
+    Status dropSortedDataInterface(RecoveryUnit&, StringData ident) override {
         return Status::OK();
     }
 
-    virtual Status dropSortedDataInterface(OperationContext* opCtx, StringData ident) {
-        return Status::OK();
-    }
-
-    virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
+    std::unique_ptr<SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx,
         const NamespaceString& nss,
         const CollectionOptions& collOptions,
         StringData ident,
-        const IndexDescriptor* desc);
-    std::unique_ptr<ColumnStore> getColumnStore(OperationContext* opCtx,
-                                                const NamespaceString& nss,
-                                                const CollectionOptions& collOptions,
-                                                StringData ident,
-                                                const IndexDescriptor*) override {
-        uasserted(ErrorCodes::NotImplemented, "getColumnStore()");
-    }
+        const IndexDescriptor* desc) override;
 
-    virtual Status dropIdent(RecoveryUnit* ru,
-                             StringData ident,
-                             StorageEngine::DropIdentCallback&& onDrop) {
+    Status dropIdent(RecoveryUnit* ru,
+                     StringData ident,
+                     bool identHasSizeInfo,
+                     const StorageEngine::DropIdentCallback& onDrop) override {
         return Status::OK();
     }
 
-    virtual void dropIdentForImport(OperationContext* opCtx, StringData ident) {}
+    void dropIdentForImport(Interruptible&, RecoveryUnit&, StringData ident) override {}
 
-    virtual bool supportsDirectoryPerDB() const {
+    bool supportsDirectoryPerDB() const override {
         return false;
     }
 
-    /**
-     * devnull does no journaling, so don't report the engine as durable.
-     */
-    virtual bool isDurable() const {
-        return false;
-    }
-
-    virtual bool isEphemeral() const {
+    bool isEphemeral() const override {
         return true;
     }
 
-    virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) {
+    int64_t getIdentSize(RecoveryUnit&, StringData ident) override {
         return 1;
     }
 
-    virtual Status repairIdent(OperationContext* opCtx, StringData ident) {
+    Status repairIdent(RecoveryUnit&, StringData ident) override {
         return Status::OK();
     }
 
-    virtual bool hasIdent(OperationContext* opCtx, StringData ident) const {
+    bool hasIdent(RecoveryUnit&, StringData ident) const override {
         return true;
     }
 
-    std::vector<std::string> getAllIdents(OperationContext* opCtx) const {
+    std::vector<std::string> getAllIdents(RecoveryUnit&) const override {
         return std::vector<std::string>();
     }
 
-    virtual void cleanShutdown(){};
+    void cleanShutdown() override {}
 
-    void setJournalListener(JournalListener* jl) final {}
+    void setJournalListener(JournalListener* jl) override {}
 
-    virtual Timestamp getAllDurableTimestamp() const override {
+    Timestamp getAllDurableTimestamp() const override {
         return Timestamp();
     }
 
-    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {
+    boost::optional<Timestamp> getOplogNeededForCrashRecovery() const override {
         return boost::none;
     }
 
-    virtual Status beginBackup(OperationContext* opCtx) override {
+    Status beginBackup() override {
         return Status::OK();
     }
 
-    virtual void endBackup(OperationContext* opCtx) {}
+    void endBackup() override {}
 
-    virtual StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
-        OperationContext* opCtx,
-        boost::optional<Timestamp> checkpointTimestamp,
+    StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
         const StorageEngine::BackupOptions& options) override;
 
-    virtual void endNonBlockingBackup(OperationContext* opCtx) override {}
+    void endNonBlockingBackup() override {}
 
-    virtual StatusWith<std::deque<std::string>> extendBackupCursor(
-        OperationContext* opCtx) override;
+    StatusWith<std::deque<std::string>> extendBackupCursor() override;
 
-    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override {
+    boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override {
         return boost::none;
     }
 
-    virtual Timestamp getOldestTimestamp() const override {
+    Timestamp getOldestTimestamp() const override {
         return Timestamp();
     }
 
-    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
+    boost::optional<Timestamp> getRecoveryTimestamp() const override {
         return boost::none;
     }
 
-    virtual void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) {}
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) override {}
+
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                 RecordStore* recordsStore) const override {}
+
+    Status oplogDiskLocRegister(RecoveryUnit&,
+                                RecordStore* oplogRecordStore,
+                                const Timestamp& opTime,
+                                bool orderedCommit) override {
+        return Status::OK();
+    }
+
+    bool waitUntilDurable(OperationContext* opCtx) override {
+        return true;
+    }
+
+    bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx, bool) override {
+        return true;
+    }
 
     void dump() const override {}
 
@@ -187,5 +209,6 @@ private:
     std::shared_ptr<void> _catalogInfo;
     int _cachePressureForTest;
     std::deque<BackupBlock> _mockBackupBlocks;
+    boost::filesystem::path _engineDbPath;
 };
 }  // namespace mongo

@@ -32,41 +32,66 @@
  * fetch so we cannot test it outside of a dbtest.
  */
 
-
-#include "mongo/platform/basic.h"
-
+#include <cstddef>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/client/dbclient_cursor.h"
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/mock_stage.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/json.h"
-#include "mongo/db/matcher/expression_parser.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 #include "mongo/util/str.h"
 
+namespace mongo {
 namespace QueryStageAnd {
-
-using std::set;
-using std::shared_ptr;
-using std::unique_ptr;
 
 class QueryStageAndBase {
 public:
     QueryStageAndBase() : _client(&_opCtx) {}
 
     virtual ~QueryStageAndBase() {
-        _client.dropCollection(ns());
+        _client.dropCollection(nss());
     }
 
     void addIndex(const BSONObj& obj) {
@@ -94,7 +119,7 @@ public:
         return params;
     }
 
-    void getRecordIds(set<RecordId>* out, const CollectionPtr& coll) {
+    void getRecordIds(std::set<RecordId>* out, const CollectionPtr& coll) {
         auto cursor = coll->getCursor(&_opCtx);
         while (auto record = cursor->next()) {
             out->insert(record->id);
@@ -102,11 +127,11 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(ns(), obj);
+        _client.insert(nss(), obj);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(ns(), obj);
+        _client.remove(nss(), obj);
     }
 
     /**
@@ -149,19 +174,23 @@ public:
         return BSONObj();
     }
 
-    static const char* ns() {
-        return "unittests.QueryStageAnd";
+    StringData ns() {
+        return _nss.ns_forTest();
     }
-    NamespaceString nss() {
-        return NamespaceString(ns());
+    const NamespaceString& nss() {
+        return _nss;
     }
+
+private:
+    const NamespaceString _nss =
+        NamespaceString::createNamespaceString_forTest("unittests.QueryStageAnd");
 
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
 
     boost::intrusive_ptr<ExpressionContext> _expCtx =
-        make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss());
+        ExpressionContextBuilder{}.opCtx(&_opCtx).ns(_nss).build();
 
 private:
     DBDirectClient _client;
@@ -203,12 +232,12 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar >= 10.
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // 'ah' reads the first child into its hash table: foo=20, foo=19, ..., foo=0
         // in that order. Read half of them.
@@ -220,10 +249,10 @@ public:
 
         // Save state and delete one of the read objects.
         ah->saveState();
-        set<RecordId> data;
+        std::set<RecordId> data;
         getRecordIds(&data, coll);
         size_t memUsageBefore = ah->getMemUsage();
-        for (set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
+        for (std::set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
             if (coll->docFor(&_opCtx, *it).value()["foo"].numberInt() == 15) {
                 remove(coll->docFor(&_opCtx, *it).value());
                 break;
@@ -289,13 +318,13 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar <= 19 (descending).
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 19);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // First call to work reads the first result from the children. The first result for the
         // first scan over foo is {foo: 20, bar: 20, baz: 20}. The first result for the second scan
@@ -307,7 +336,7 @@ public:
         // Delete 'deletedObj' from the collection.
         BSONObj deletedObj = BSON("_id" << 20 << "foo" << 20 << "bar" << 20 << "baz" << 20);
         ah->saveState();
-        set<RecordId> data;
+        std::set<RecordId> data;
         getRecordIds(&data, coll);
 
         size_t memUsageBefore = ah->getMemUsage();
@@ -369,13 +398,13 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar >= 10
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // foo == bar == baz, and foo<=20, bar>=10, so our values are:
         // foo == 10, 11, 12, 13, 14, 15. 16, 17, 18, 19, 20
@@ -418,13 +447,13 @@ public:
             makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1 << "big" << 1), coll));
         params.bounds.startKey = BSON("" << 20 << "" << big);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar >= 10
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         ASSERT_THROWS_CODE(countResults(ah.get()),
                            DBException,
@@ -465,13 +494,13 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar >= 10
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1 << "big" << 1), coll));
         params.bounds.startKey = BSON("" << 10 << "" << big);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // foo == bar == baz, and foo<=20, bar>=10, so our values are:
         // foo == 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20.
@@ -506,18 +535,18 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar >= 10
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // 5 <= baz <= 15
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("baz" << 1), coll));
         params.bounds.startKey = BSON("" << 5);
         params.bounds.endKey = BSON("" << 15);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // foo == bar == baz, and foo<=20, bar>=10, 5<=baz<=15, so our values are:
         // foo == 10, 11, 12, 13, 14, 15.
@@ -564,18 +593,18 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar >= 10
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1 << "big" << 1), coll));
         params.bounds.startKey = BSON("" << 10 << "" << big);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // 5 <= baz <= 15
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("baz" << 1), coll));
         params.bounds.startKey = BSON("" << 5);
         params.bounds.endKey = BSON("" << 15);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Stage execution should fail.
         ASSERT_THROWS_CODE(countResults(ah.get()),
@@ -611,13 +640,13 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar == 5.  Index scan should be eof.
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 5);
         params.bounds.endKey = BSON("" << 5);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         int count = 0;
         int works = 0;
@@ -666,7 +695,7 @@ public:
         // Foo >= 100
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 100);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar <= 100
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
@@ -678,7 +707,7 @@ public:
                                     << "");
         params.bounds.boundInclusion = BoundInclusion::kIncludeStartKeyOnly;
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         ASSERT_EQUALS(0, countResults(ah.get()));
     }
@@ -714,18 +743,18 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        auto firstScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr);
+        auto firstScan = std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr);
 
         // First child of the AND_HASH stage is a Fetch. The NULL in the
         // constructor means there is no filter.
         auto fetch =
-            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(firstScan), nullptr, coll);
+            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(firstScan), nullptr, &coll);
         ah->addChild(std::move(fetch));
 
         // Bar >= 10
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Check that the AndHash stage returns docs {foo: 10, bar: 10}
         // through {foo: 20, bar: 20}.
@@ -767,17 +796,17 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.direction = -1;
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar >= 10
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 10);
-        auto secondScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr);
+        auto secondScan = std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr);
 
         // Second child of the AND_HASH stage is a Fetch. The NULL in the
         // constructor means there is no filter.
         auto fetch =
-            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(secondScan), nullptr, coll);
+            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(secondScan), nullptr, &coll);
         ah->addChild(std::move(fetch));
 
         // Check that the AndHash stage returns docs {foo: 10, bar: 10}
@@ -799,7 +828,7 @@ public:
         CollectionPtr coll = ctx.getCollection();
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
-            coll = db->createCollection(&_opCtx, nss());
+            coll = CollectionPtr(db->createCollection(&_opCtx, nss()));
             wuow.commit();
         }
 
@@ -938,16 +967,16 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Scan over bar == 1.
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Get the set of RecordIds in our collection to use later.
-        set<RecordId> data;
+        std::set<RecordId> data;
         getRecordIds(&data, coll);
 
         // We're making an assumption here that happens to be true because we clear out the
@@ -1055,19 +1084,19 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // bar == 1
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // baz == 1
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("baz" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         ASSERT_EQUALS(50, countResults(ah.get()));
     }
@@ -1100,13 +1129,13 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 7);
         params.bounds.endKey = BSON("" << 7);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Bar == 20, not EOF.
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSON("" << 20);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         ASSERT_EQUALS(0, countResults(ah.get()));
     }
@@ -1143,13 +1172,13 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 7);
         params.bounds.endKey = BSON("" << 7);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // bar == 20.
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 20);
         params.bounds.endKey = BSON("" << 20);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         ASSERT_EQUALS(0, countResults(ah.get()));
     }
@@ -1182,13 +1211,13 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // Intersect with 7 <= bar < 10000
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 7);
         params.bounds.endKey = BSON("" << 10000);
-        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        ah->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         WorkingSetID lastId = WorkingSet::INVALID_ID;
 
@@ -1238,25 +1267,25 @@ public:
         CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
-        unique_ptr<AndSortedStage> as = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
+        std::unique_ptr<AndSortedStage> as = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
 
         // Scan over foo == 1
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        auto firstScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr);
+        auto firstScan = std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr);
 
         // First child of the AND_SORTED stage is a Fetch. The NULL in the
         // constructor means there is no filter.
         auto fetch =
-            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(firstScan), nullptr, coll);
+            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(firstScan), nullptr, &coll);
         as->addChild(std::move(fetch));
 
         // bar == 1
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        as->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        as->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         for (int i = 0; i < 50; i++) {
             BSONObj obj = getNext(as.get(), &ws);
@@ -1291,24 +1320,24 @@ public:
         CollectionPtr coll = ctx.getCollection();
 
         WorkingSet ws;
-        unique_ptr<AndSortedStage> as = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
+        std::unique_ptr<AndSortedStage> as = std::make_unique<AndSortedStage>(_expCtx.get(), &ws);
 
         // Scan over foo == 1
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("foo" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        as->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr));
+        as->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
 
         // bar == 1
         params = makeIndexScanParams(&_opCtx, coll, getIndex(BSON("bar" << 1), coll));
         params.bounds.startKey = BSON("" << 1);
         params.bounds.endKey = BSON("" << 1);
-        auto secondScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr);
+        auto secondScan = std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr);
 
         // Second child of the AND_SORTED stage is a Fetch. The NULL in the
         // constructor means there is no filter.
         auto fetch =
-            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(secondScan), nullptr, coll);
+            std::make_unique<FetchStage>(_expCtx.get(), &ws, std::move(secondScan), nullptr, &coll);
         as->addChild(std::move(fetch));
 
         for (int i = 0; i < 50; i++) {
@@ -1320,11 +1349,11 @@ public:
 };
 
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query_stage_and") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageAndHashDeleteDuringYield>();
         add<QueryStageAndHashTwoLeaf>();
         add<QueryStageAndHashTwoLeafFirstChildLargeKeys>();
@@ -1347,6 +1376,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> queryStageAndAll;
+unittest::OldStyleSuiteInitializer<All> queryStageAndAll;
 
 }  // namespace QueryStageAnd
+}  // namespace mongo

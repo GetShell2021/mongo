@@ -2,18 +2,17 @@
  * Test that crud operations in transactions target the right shards during migration.
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
-(function() {
-'use strict';
-
-load('jstests/libs/chunk_manipulation_util.js');
-load("jstests/sharding/libs/chunk_bounds_util.js");
-load("jstests/sharding/libs/find_chunks_util.js");  // for findChunksForNs
+import {withTxnAndAutoRetryOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {runCommandDuringTransferMods} from "jstests/libs/chunk_manipulation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {chunkBoundsUtil} from "jstests/sharding/libs/chunk_bounds_util.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 function runCommandInTxn(cmdFunc) {
     let session = st.s.startSession();
-    session.startTransaction();
-    cmdFunc(session);
-    assert.commandWorked(session.commitTransaction_forTesting());
+    withTxnAndAutoRetryOnMongos(session, () => {
+        cmdFunc(session);
+    });
     session.endSession();
 }
 
@@ -27,17 +26,18 @@ let testDB = st.s.getDB(dbName);
 // For startParallelOps to write its state.
 let staticMongod = MongoRunner.runMongod({});
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard1.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard1.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 'hashed'}}));
-
-let chunkDocs = findChunksUtil.findChunksByNs(configDB, ns).toArray();
-let shardChunkBounds = chunkBoundsUtil.findShardChunkBounds(chunkDocs);
 
 jsTest.log("Test 'insert'");
 // Insert a doc while migrating the chunk that the doc belongs to.
-let doc = {x: 0};
+let doc = {x: 14};
 let hash = convertShardKeyToHashed(doc.x);
+// Create a chunk dedicated for the inserted document
+assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: hash}}));
+let chunkDocs = findChunksUtil.findChunksByNs(configDB, ns).toArray();
+let shardChunkBounds = chunkBoundsUtil.findShardChunkBounds(chunkDocs);
 let shardBoundsPair =
     chunkBoundsUtil.findShardAndChunkBoundsForShardKey(st, shardChunkBounds, {x: hash});
 let fromShard = shardBoundsPair.shard;
@@ -144,4 +144,3 @@ assert.eq(1, shards[2].getCollection(ns).find({}).count());
 
 st.stop();
 MongoRunner.stopMongod(staticMongod);
-})();

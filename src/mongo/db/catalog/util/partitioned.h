@@ -30,16 +30,16 @@
 #pragma once
 
 #include <algorithm>
+#include <boost/align/aligned_allocator.hpp>
 #include <cstdlib>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <utility>
 #include <vector>
 
-#include <boost/align/aligned_allocator.hpp>
-
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/aligned.h"
 #include "mongo/util/assert_util.h"
 

@@ -29,10 +29,30 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <type_traits>
+#include <utility>
+
 #include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog/type_tags.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future_util.h"
 #include "mongo/util/out_of_line_executor.h"
 
@@ -44,7 +64,8 @@ void checkErrorStatusAndMaxRetries(const Status& status,
                                    const NamespaceString& nss,
                                    CatalogCache* catalogCache,
                                    StringData taskDescription,
-                                   size_t numAttempts);
+                                   size_t numAttempts,
+                                   size_t altMaxNumRetries = 0);
 
 /**
  * Performs necessary cache invalidations based on the error status.
@@ -55,9 +76,10 @@ void checkErrorStatusAndMaxRetries(const StatusWith<T>& status,
                                    const NamespaceString& nss,
                                    CatalogCache* catalogCache,
                                    StringData taskDescription,
-                                   size_t numAttempts) {
+                                   size_t numAttempts,
+                                   size_t altMaxNumRetries) {
     return checkErrorStatusAndMaxRetries(
-        status.getStatus(), nss, catalogCache, taskDescription, numAttempts);
+        status.getStatus(), nss, catalogCache, taskDescription, numAttempts, altMaxNumRetries);
 }
 
 }  // namespace shard_version_retry
@@ -67,77 +89,26 @@ void checkErrorStatusAndMaxRetries(const StatusWith<T>& status,
  * encountered, the CatalogCache is marked for refresh and 'callback' is retried. When retried,
  * 'callback' will trigger a refresh of the CatalogCache and block until it's done when it next
  * consults the CatalogCache.
+ * If retryLimitForTesting is non-zero, it is used as the maximum number of times to retry; if it is
+ * zero, kMaxNumStaleVersionRetries is used instead.
  */
 template <typename F>
 auto shardVersionRetry(OperationContext* opCtx,
                        CatalogCache* catalogCache,
                        NamespaceString nss,
                        StringData taskDescription,
-                       F&& callbackFn) {
+                       const F& callbackFn,
+                       size_t altMaxNumRetries = 0) {
     size_t numAttempts = 0;
 
     while (true) {
-        catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, numAttempts);
-
         try {
             return callbackFn();
         } catch (const DBException& ex) {
             shard_version_retry::checkErrorStatusAndMaxRetries(
-                ex.toStatus(), nss, catalogCache, taskDescription, ++numAttempts);
+                ex.toStatus(), nss, catalogCache, taskDescription, ++numAttempts, altMaxNumRetries);
         }
     }
-}
-
-/**
- * Async loop for retrying stale database/shard version a finite number of times. callbackFn should
- * accept OperationContext* as an argument.
- *
- * Note: Currently only supports void return type for callbackFn.
- */
-template <typename Callable>
-auto shardVersionRetry(ServiceContext* service,
-                       NamespaceString nss,
-                       CatalogCache* catalogCache,
-                       StringData taskDescription,
-                       ExecutorPtr executor,
-                       CancellationToken cancelToken,
-                       Callable&& callbackFn) {
-    auto numAttempts = std::make_shared<size_t>(0);
-
-    auto body = [service,
-                 catalogCache,
-                 taskDescription,
-                 numAttempts,
-                 _callbackFn = std::move(callbackFn),
-                 executor,
-                 cancelToken] {
-        boost::optional<ThreadClient> threadClient;
-        if (!haveClient()) {
-            threadClient.emplace(taskDescription, service);
-        }
-
-        CancelableOperationContextFactory opCtxFactory(cancelToken, executor);
-        auto cancelableOpCtx = opCtxFactory.makeOperationContext(&cc());
-        auto opCtx = cancelableOpCtx.get();
-
-        catalogCache->setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, *numAttempts);
-        return _callbackFn(opCtx);
-    };
-
-    using ResultType = std::invoke_result_t<Callable, OperationContext*>;
-
-    return AsyncTry<decltype(body)>(std::move(body))
-        .until([numAttempts, _nss = std::move(nss), catalogCache, taskDescription](
-                   const StatusOrStatusWith<ResultType>& statusOrStatusWith) {
-            if (statusOrStatusWith.isOK()) {
-                return true;
-            }
-
-            shard_version_retry::checkErrorStatusAndMaxRetries(
-                statusOrStatusWith, _nss, catalogCache, taskDescription, ++(*numAttempts));
-            return false;
-        })
-        .on(std::move(executor), cancelToken);
 }
 
 }  // namespace mongo

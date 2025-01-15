@@ -29,17 +29,20 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
-#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/repl/member_config_gen.h"
-#include "mongo/db/repl/member_id.h"
 #include "mongo/db/repl/repl_set_tag.h"
 #include "mongo/db/repl/split_horizon.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
-#include "mongo/util/string_map.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -115,10 +118,10 @@ public:
     }
 
     /**
-     * Gets the horizon name for which the parameters (captured during the first `isMaster`)
+     * Gets the horizon name for which the parameters (captured during the first `hello`)
      * correspond.
      */
-    StringData determineHorizon(const SplitHorizon::Parameters& params) const {
+    std::string determineHorizon(const SplitHorizon::Parameters& params) const {
         return _splitHorizon.determineHorizon(params);
     }
 
@@ -194,7 +197,7 @@ public:
     }
 
     /**
-     * Returns true if this member is hidden (not reported by isMaster, not electable).
+     * Returns true if this member is hidden (not reported by "hello", not electable).
      */
     bool isHidden() const {
         return getHidden();
@@ -260,7 +263,7 @@ private:
     // Allow MutableReplSetConfig to modify the newlyAdded field.
     friend class MutableReplSetConfig;
 
-    friend void setNewlyAdded_ForTest(MemberConfig*, boost::optional<bool>);
+    friend void setNewlyAdded_forTest(MemberConfig*, boost::optional<bool>);
 
     /**
      * Constructor used by IDL; does not set up tags because we cannot pass TagConfig through IDL.

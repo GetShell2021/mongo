@@ -5,37 +5,14 @@ Import("env")
 env = env.Clone()
 
 env.CppUnitTest(
-    target='logv2_test',
-    source=[
-        'logv2_component_test.cpp',
-        'logv2_test.cpp',
-        'redaction_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/auth/security_token',
-        '$BUILD_DIR/mongo/db/multitenancy_params',
-    ],
+    target="logv2_test",
+    source=[],
+    LIBDEPS=[],
 )
 
 env.Benchmark(
-    target='logv2_bm',
-    source=[
-        'logv2_bm.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.Library(
-    target='logv2_options',
-    source=[
-        'logv2_options.cpp',
-        'logv2_options.idl',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/idl/server_parameter',
-    ],
+    target="logv2_bm",
+    source=[],
+    LIBDEPS=[],
+    BAZEL_BENCHMARK_TAG="first_half_bm",
 )

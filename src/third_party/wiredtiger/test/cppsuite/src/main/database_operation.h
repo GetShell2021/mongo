@@ -26,15 +26,14 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef DATABASE_OPERATION_H
-#define DATABASE_OPERATION_H
+#pragma once
 
 #include "database.h"
 #include "thread_worker.h"
 
 namespace test_harness {
 class database_operation {
-    public:
+public:
     /*
      * Function that performs the following steps using the configuration that is defined by the
      * test:
@@ -46,6 +45,9 @@ class database_operation {
      */
     virtual void populate(database &database, timestamp_manager *tsm, configuration *config,
       operation_tracker *op_tracker);
+
+    /* Enabled the background compaction server. */
+    virtual void background_compact_operation(thread_worker *tc);
 
     /* Performs a checkpoint periodically. */
     virtual void checkpoint_operation(thread_worker *tc);
@@ -65,10 +67,9 @@ class database_operation {
     /* Basic update operation that chooses a random key and updates it. */
     virtual void update_operation(thread_worker *tc);
 
-    virtual void validate(const std::string &operation_table_name,
-      const std::string &schema_table_name, const std::vector<uint64_t> &known_collection_ids);
+    virtual void validate(bool tracking_enabled, const std::string &operation_table_name,
+      const std::string &schema_table_name, database &db);
 
     virtual ~database_operation() = default;
 };
 } // namespace test_harness
-#endif

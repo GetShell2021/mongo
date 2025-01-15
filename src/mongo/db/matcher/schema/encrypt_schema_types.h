@@ -30,12 +30,15 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/matcher/schema/json_pointer.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -69,7 +72,7 @@ public:
      * Callers must check that the result of type() is kUUIDs first.
      */
     const std::vector<UUID>& uuids() const {
-        invariant(_type == Type::kUUIDs);
+        tassert(9584000, "Invalid type for uuids()", _type == Type::kUUIDs);
         return _uuids;
     }
 
@@ -77,7 +80,7 @@ public:
      * Callers must check that the result of type() is kJSONPointer first.
      */
     const JSONPointer& jsonPointer() const {
-        invariant(_type == Type::kJSONPointer);
+        tassert(9584001, "Invalid type for jsonPointer()", _type == Type::kJSONPointer);
         return _pointer;
     }
 

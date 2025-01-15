@@ -28,35 +28,46 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-
-#include "mongo/dbtests/framework_options.h"
-
 #include <boost/filesystem/operations.hpp>
 #include <iostream>
+#include <map>
+#include <utility>
 
+#include <boost/filesystem/directory.hpp>
+#include <boost/filesystem/exception.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/query/find.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/server_parameter.h"
 #include "mongo/db/storage/flow_control_parameters_gen.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/dbtests/framework_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/unittest/log_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/options_parser/environment.h"
+#include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/startup_options.h"
-#include "mongo/util/password.h"
+#include "mongo/util/options_parser/value.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-
 namespace mongo {
-
-using std::cout;
-using std::endl;
-using std::string;
-using std::vector;
 
 FrameworkGlobalParams frameworkGlobalParams;
 
@@ -89,11 +100,11 @@ bool handlePreValidationTestFrameworkOptions(const moe::Environment& params,
 Status storeTestFrameworkOptions(const moe::Environment& params,
                                  const std::vector<std::string>& args) {
     if (params.count("dbpath")) {
-        frameworkGlobalParams.dbpathSpec = params["dbpath"].as<string>();
+        frameworkGlobalParams.dbpathSpec = params["dbpath"].as<std::string>();
     }
 
     if (params.count("debug") || params.count("verbose")) {
-        setMinimumLoggedSeverity(logv2::LogSeverity::Debug(1));
+        unittest::setMinimumLoggedSeverity(logv2::LogSeverity::Debug(1));
     }
 
     boost::filesystem::path p(frameworkGlobalParams.dbpathSpec);
@@ -124,19 +135,14 @@ Status storeTestFrameworkOptions(const moe::Environment& params,
     if (kDebugBuild)
         LOGV2(22491, "DEBUG build");
 
-    string dbpathString = p.string();
+    std::string dbpathString = p.string();
     storageGlobalParams.dbpath = dbpathString.c_str();
 
-    storageGlobalParams.engine = params["storage.engine"].as<string>();
+    storageGlobalParams.engine = params["storage.engine"].as<std::string>();
     gFlowControlEnabled.store(params["enableFlowControl"].as<bool>());
 
     if (gFlowControlEnabled.load()) {
         LOGV2(22492, "Flow Control enabled");
-    }
-
-    if (params.count("replication.enableMajorityReadConcern")) {
-        serverGlobalParams.enableMajorityReadConcern =
-            params["replication.enableMajorityReadConcern"].as<bool>();
     }
 
     if (params.count("setParameter")) {
@@ -155,7 +161,7 @@ Status storeTestFrameworkOptions(const moe::Environment& params,
                         str::stream() << "Cannot use --setParameter to set \"" << it.first
                                       << "\" at startup"};
             }
-            Status status = parameter->setFromString(it.second);
+            Status status = parameter->setFromString(it.second, boost::none);
             if (!status.isOK()) {
                 return {ErrorCodes::BadValue,
                         str::stream() << "Bad value for parameter \"" << it.first
@@ -171,4 +177,5 @@ Status storeTestFrameworkOptions(const moe::Environment& params,
 
     return Status::OK();
 }
+
 }  // namespace mongo

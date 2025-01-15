@@ -29,15 +29,19 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <string>
+
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/clustered_collection_options_gen.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo {
 
 class Collection;
 class CollectionPtr;
-
 class IndexDescriptor;
 
 class ShardKeyIndex {
@@ -85,25 +89,25 @@ bool isCompatibleWithShardKey(OperationContext* opCtx,
  * - must be prefixed by 'shardKey', and
  * - must not be a partial index.
  * - must have the simple collation.
+ * - must not be hidden.
  *
  * If the parameter 'requireSingleKey' is true, then this index additionally must not be
  * multi-key.
  */
 boost::optional<ShardKeyIndex> findShardKeyPrefixedIndex(OperationContext* opCtx,
                                                          const CollectionPtr& collection,
-                                                         const IndexCatalog* indexCatalog,
                                                          const BSONObj& shardKey,
                                                          bool requireSingleKey,
                                                          std::string* errMsg = nullptr);
 
 /**
- * Returns true if the given index name is the last remaining index that is compatible with the
- * shard key index.
+ * Returns true if the given index exists and it is the last non-hidden index compatible with the
+ * ranged shard key. False otherwise. Hashed indexes are excluded here because users are allowed
+ * to drop shard key compatible hashed indexes.
  */
-bool isLastShardKeyIndex(OperationContext* opCtx,
-                         const CollectionPtr& collection,
-                         const IndexCatalog* indexCatalog,
-                         const std::string& indexName,
-                         const BSONObj& shardKey);
+bool isLastNonHiddenRangedShardKeyIndex(OperationContext* opCtx,
+                                        const CollectionPtr& collection,
+                                        const std::string& indexName,
+                                        const BSONObj& shardKey);
 
 }  // namespace mongo

@@ -27,21 +27,38 @@
  *    it in the license file.
  */
 
+#include <memory>
+#include <string>
 
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/client.h"
 #include "mongo/db/coll_mod_gen.h"
 #include "mongo/db/coll_mod_reply_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/profile_settings.h"
 #include "mongo/db/s/collmod_coordinator.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/db/s/sharding_util.h"
-#include "mongo/db/timeseries/catalog_helper.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/s/collmod_coordinator_document_gen.h"
+#include "mongo/db/s/sharding_ddl_coordinator_gen.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/string_map.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 
 namespace mongo {
 namespace {
@@ -70,12 +87,17 @@ public:
                "directly. Modifies collection.";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-        return auth::checkAuthForCollMod(
-            client->getOperationContext(), AuthorizationSession::get(client), nss, cmdObj, false);
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* client = opCtx->getClient();
+        const NamespaceString nss(parseNs(dbName, cmdObj));
+        return auth::checkAuthForCollMod(client->getOperationContext(),
+                                         AuthorizationSession::get(client),
+                                         nss,
+                                         cmdObj,
+                                         false,
+                                         SerializationContext::stateCommandRequest());
     }
 
     bool skipApiVersionCheck() const override {
@@ -84,12 +106,12 @@ public:
     }
 
     bool runWithRequestParser(OperationContext* opCtx,
-                              const std::string& db,
+                              const DatabaseName& dbName,
                               const BSONObj& cmdObj,
                               const RequestParser& requestParser,
                               BSONObjBuilder& result) override {
         auto const shardingState = ShardingState::get(opCtx);
-        uassertStatusOK(shardingState->canAcceptShardedCommands());
+        shardingState->assertCanAcceptShardedCommands();
 
         CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                       opCtx->getWriteConcern());
@@ -100,7 +122,8 @@ public:
         // profile level increase in order to be logged in "<db>.system.profile"
         const auto& cmd = requestParser.request();
         CurOp::get(opCtx)->raiseDbProfileLevel(
-            CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(cmd.getNamespace().dbName()));
+            DatabaseProfileSettings::get(opCtx->getServiceContext())
+                .getDatabaseProfileLevel(cmd.getNamespace().dbName()));
 
         auto coordinatorDoc = CollModCoordinatorDocument();
         coordinatorDoc.setCollModRequest(cmd.getCollModRequest());
@@ -109,17 +132,19 @@ public:
         auto service = ShardingDDLCoordinatorService::getService(opCtx);
         auto collModCoordinator = checked_pointer_cast<CollModCoordinator>(
             service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+
         result.appendElements(collModCoordinator->getResult(opCtx));
         return true;
     }
 
     void validateResult(const BSONObj& resultObj) final {
         StringDataSet ignorableFields({"raw", "ok", "errmsg"});
-        auto reply = Response::parse(IDLParserErrorContext("CollModReply"),
+        auto reply = Response::parse(IDLParserContext("CollModReply"),
                                      resultObj.removeFields(ignorableFields));
         coll_mod_reply_validation::validateReply(reply);
     }
-} shardsvrCollModCommand;
+};
+MONGO_REGISTER_COMMAND(ShardsvrCollModCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

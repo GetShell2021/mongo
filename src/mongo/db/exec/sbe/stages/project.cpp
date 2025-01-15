@@ -27,32 +27,42 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <set>
 
-#include "mongo/db/exec/sbe/stages/project.h"
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/inlined_vector.h>
+#include <absl/meta/type_traits.h>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/stages/project.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace sbe {
 ProjectStage::ProjectStage(std::unique_ptr<PlanStage> input,
-                           value::SlotMap<std::unique_ptr<EExpression>> projects,
+                           SlotExprPairVector projects,
                            PlanNodeId nodeId,
                            bool participateInTrialRunTracking)
-    : PlanStage("project"_sd, nodeId, participateInTrialRunTracking),
+    : PlanStage("project"_sd, nullptr /* yieldPolicy */, nodeId, participateInTrialRunTracking),
       _projects(std::move(projects)) {
     _children.emplace_back(std::move(input));
 }
 
 std::unique_ptr<PlanStage> ProjectStage::clone() const {
-    value::SlotMap<std::unique_ptr<EExpression>> projects;
+    SlotExprPairVector projects;
     for (auto& [k, v] : _projects) {
-        projects.emplace(k, v->clone());
+        projects.emplace_back(k, v->clone());
     }
     return std::make_unique<ProjectStage>(_children[0]->clone(),
                                           std::move(projects),
                                           _commonStats.nodeId,
-                                          _participateInTrialRunTracking);
+                                          participateInTrialRunTracking());
 }
 
 void ProjectStage::prepare(CompileCtx& ctx) {
@@ -115,9 +125,9 @@ std::unique_ptr<PlanStageStats> ProjectStage::getStats(bool includeDebugInfo) co
     if (includeDebugInfo) {
         DebugPrinter printer;
         BSONObjBuilder bob;
-        value::orderedSlotMapTraverse(_projects, [&](auto slot, auto&& expr) {
+        for (auto&& [slot, expr] : _projects) {
             bob.append(str::stream() << slot, printer.print(expr->debugPrint()));
-        });
+        }
         ret->debugInfo = BSON("projections" << bob.obj());
     }
 
@@ -134,7 +144,7 @@ std::vector<DebugPrinter::Block> ProjectStage::debugPrint() const {
 
     ret.emplace_back("[`");
     bool first = true;
-    value::orderedSlotMapTraverse(_projects, [&](auto slot, auto&& expr) {
+    for (auto&& [slot, expr] : _projects) {
         if (!first) {
             ret.emplace_back(DebugPrinter::Block("`,"));
         }
@@ -143,7 +153,7 @@ std::vector<DebugPrinter::Block> ProjectStage::debugPrint() const {
         ret.emplace_back("=");
         DebugPrinter::addBlocks(ret, expr->debugPrint());
         first = false;
-    });
+    }
     ret.emplace_back("`]");
 
     DebugPrinter::addNewLine(ret);
@@ -159,13 +169,13 @@ size_t ProjectStage::estimateCompileTimeSize() const {
 }
 
 void ProjectStage::doSaveState(bool relinquishCursor) {
-    if (!slotsAccessible() || !relinquishCursor) {
+    if (!relinquishCursor) {
         return;
     }
 
     for (auto& [slotId, codeAndAccessor] : _fields) {
         auto& [code, accessor] = codeAndAccessor;
-        prepareForYielding(accessor);
+        prepareForYielding(accessor, slotsAccessible());
     }
 }
 

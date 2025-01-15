@@ -27,26 +27,41 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/exec/inclusion_projection_executor.h"
-
+#include <bitset>
 #include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <boost/type_traits/decay.hpp>
 
 #include "mongo/base/exact_cast.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/inclusion_projection_executor.h"
 #include "mongo/db/exec/projection_executor.h"
 #include "mongo/db/exec/projection_executor_builder.h"
+#include "mongo/db/matcher/copyable_match_expression.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/projection.h"
 #include "mongo/db/query/projection_parser.h"
+#include "mongo/db/record_id.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -66,7 +81,7 @@ BSONObj wrapInLiteral(const T& arg) {
  *
  * The 'AllowFallBackToDefault' parameter should be set to 'true', if the executor is allowed to
  * fall back to the default inclusion projection implementation if the fast-path projection cannot
- * be used for a specific test. If set to 'false', an invariant will be triggered if fast-path
+ * be used for a specific test. If set to 'false', a tassert will be triggered if fast-path
  * projection was expected to be chosen, but the default one has been picked instead.
  */
 template <bool AllowFallBackToDefault>
@@ -115,8 +130,9 @@ protected:
         }
 
         auto executor = buildProjectionExecutor(expCtx, &projection, policies, builderParams);
-        invariant(executor->getType() ==
-                  TransformerInterface::TransformerType::kInclusionProjection);
+        tassert(7241743,
+                "projection executor must be inclusion projections",
+                executor->getType() == TransformerInterface::TransformerType::kInclusionProjection);
         auto inclusionExecutor = static_cast<InclusionProjectionExecutor*>(executor.get());
         auto fastPathRootNode =
             exact_pointer_cast<FastPathEligibleInclusionNode*>(inclusionExecutor->getRoot());
@@ -276,15 +292,16 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
                           "{y: {$const: 4}}}"));
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation(boost::none));
-    ASSERT_DOCUMENT_EQ(
-        expectedSerialization,
-        inclusion->serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation());
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       inclusion->serializeTransformation(ExplainOptions::Verbosity::kExecStats));
-    ASSERT_DOCUMENT_EQ(
-        expectedSerialization,
-        inclusion->serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
 }
 
 TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault,
@@ -296,27 +313,28 @@ TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault,
     auto expectedSerialization = Document{{"a", true}, {"_id", false}};
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation(boost::none));
-    ASSERT_DOCUMENT_EQ(
-        expectedSerialization,
-        inclusion->serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation());
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       inclusion->serializeTransformation(ExplainOptions::Verbosity::kExecStats));
-    ASSERT_DOCUMENT_EQ(
-        expectedSerialization,
-        inclusion->serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
 }
 
 TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault, ShouldSerializeWithTopLevelID) {
     auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a" << 1 << "b" << 1));
-    auto serialization = inclusion->serializeTransformation(boost::none);
+    auto serialization = inclusion->serializeTransformation();
     ASSERT_VALUE_EQ(serialization["a"], Value(true));
     ASSERT_VALUE_EQ(serialization["b"], Value(true));
     ASSERT_VALUE_EQ(serialization["_id"], Value(true));
 
     inclusion = makeInclusionProjectionWithDefaultPolicies(
         BSON("a" << 1 << "b" << BSON("c" << 1 << "d" << 1)));
-    serialization = inclusion->serializeTransformation(boost::none);
+    serialization = inclusion->serializeTransformation();
     ASSERT_VALUE_EQ(serialization["a"], Value(true));
     ASSERT_VALUE_EQ(serialization["b"]["c"], Value(true));
     ASSERT_VALUE_EQ(serialization["b"]["d"], Value(true));
@@ -324,21 +342,21 @@ TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault, ShouldSerialize
     ASSERT_VALUE_EQ(serialization["b"]["_id"], Value());
 
     inclusion = makeInclusionProjectionWithDefaultIdExclusion(BSON("a" << true << "b" << true));
-    serialization = inclusion->serializeTransformation(boost::none);
+    serialization = inclusion->serializeTransformation();
     ASSERT_VALUE_EQ(serialization["a"], Value(true));
     ASSERT_VALUE_EQ(serialization["b"], Value(true));
     ASSERT_VALUE_EQ(serialization["_id"], Value(false));
 
     inclusion = makeInclusionProjectionWithDefaultIdExclusion(
         BSON("a" << true << "b" << true << "_id" << false));
-    serialization = inclusion->serializeTransformation(boost::none);
+    serialization = inclusion->serializeTransformation();
     ASSERT_VALUE_EQ(serialization["a"], Value(true));
     ASSERT_VALUE_EQ(serialization["b"], Value(true));
     ASSERT_VALUE_EQ(serialization["_id"], Value(false));
 
     inclusion = makeInclusionProjectionWithDefaultIdExclusion(
         BSON("a" << true << "b" << true << "_id" << true));
-    serialization = inclusion->serializeTransformation(boost::none);
+    serialization = inclusion->serializeTransformation();
     ASSERT_VALUE_EQ(serialization["a"], Value(true));
     ASSERT_VALUE_EQ(serialization["b"], Value(true));
     ASSERT_VALUE_EQ(serialization["_id"], Value(true));
@@ -353,15 +371,16 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldOptimizeTopL
     auto expectedSerialization = Document{{"_id", true}, {"a", Document{{"$const", 3}}}};
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation(boost::none));
-    ASSERT_DOCUMENT_EQ(
-        expectedSerialization,
-        inclusion->serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation());
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       inclusion->serializeTransformation(ExplainOptions::Verbosity::kExecStats));
-    ASSERT_DOCUMENT_EQ(
-        expectedSerialization,
-        inclusion->serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
 }
 
 TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldOptimizeNestedExpressions) {
@@ -374,15 +393,16 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldOptimizeNest
         Document{{"_id", true}, {"a", Document{{"b", Document{{"$const", 3}}}}}};
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation(boost::none));
-    ASSERT_DOCUMENT_EQ(
-        expectedSerialization,
-        inclusion->serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, inclusion->serializeTransformation());
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       inclusion->serializeTransformation(ExplainOptions::Verbosity::kExecStats));
-    ASSERT_DOCUMENT_EQ(
-        expectedSerialization,
-        inclusion->serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
+    ASSERT_DOCUMENT_EQ(expectedSerialization,
+                       inclusion->serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
 }
 
 TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
@@ -597,13 +617,8 @@ TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault,
                                                             Document{{"b", 1}, {"c", 2}},
                                                             vector<Value>{},
                                                             {1, Document{{"c", 1}}}}}});
-    auto expectedResult = Document{{"a",
-                                    {Value(),
-                                     Document{},
-                                     Document{{"b", 1}},
-                                     Document{{"b", 1}},
-                                     vector<Value>{},
-                                     {Value(), Document{}}}}};
+    auto expectedResult = Document{
+        {"a", {Document{}, Document{{"b", 1}}, Document{{"b", 1}}, vector<Value>{}, {Document{}}}}};
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
 
@@ -816,18 +831,22 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
                                                             "i: {$meta: 'recordId'}, "
                                                             "j: {$meta: 'indexKey'}, "
                                                             "k: {$meta: 'sortKey'}, "
-                                                            "l: {$meta: 'searchScoreDetails'}}"));
+                                                            "l: {$meta: 'searchScoreDetails'}}, "
+                                                            "m: {$meta: 'vectorSearchScore'}, "
+                                                            "n: {$meta: 'score'}}"));
 
     DepsTracker deps;
     inclusion->addDependencies(&deps);
 
     ASSERT_EQ(deps.fields.size(), 2UL);
 
-    // We do not add the dependencies for searchScore, searchHighlights, or searchScoreDetails
-    // because those values are not stored in the collection (or in mongod at all).
+    // We do not add the dependencies for searchScore, searchHighlights, searchScoreDetails, or
+    // distance because those values are not stored in the collection (or in mongod at all).
     ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScore]);
     ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchHighlights]);
     ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kSearchScoreDetails]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kVectorSearchScore]);
+    ASSERT_FALSE(deps.metadataDeps()[DocumentMetadataFields::kScore]);
 
     ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kTextScore]);
     ASSERT_TRUE(deps.metadataDeps()[DocumentMetadataFields::kRandVal]);
@@ -839,6 +858,8 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
 }
 
 TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldEvaluateMetaExpressions) {
+    // Used to set 'score' metadata.
+    RAIIServerParameterControllerForTest featureFlagController("featureFlagRankFusionFull", true);
     auto inclusion =
         makeInclusionProjectionWithDefaultPolicies(fromjson("{a: 1, c: {$meta: 'textScore'}, "
                                                             "d: {$meta: 'randVal'}, "
@@ -849,7 +870,9 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldEvaluateMeta
                                                             "i: {$meta: 'recordId'}, "
                                                             "j: {$meta: 'indexKey'}, "
                                                             "k: {$meta: 'sortKey'}, "
-                                                            "l: {$meta: 'searchScoreDetails'}}"));
+                                                            "l: {$meta: 'searchScoreDetails'}, "
+                                                            "m: {$meta: 'vectorSearchScore'}, "
+                                                            "n: {$meta: 'score'}}"));
 
     MutableDocument inputDocBuilder(Document{{"a", 1}});
     inputDocBuilder.metadata().setTextScore(0.0);
@@ -863,6 +886,8 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldEvaluateMeta
     inputDocBuilder.metadata().setSortKey(Value{Document{{"bar", 8}}}, true);
     inputDocBuilder.metadata().setSearchScoreDetails(BSON("scoreDetails"
                                                           << "foo"));
+    inputDocBuilder.metadata().setVectorSearchScore(9.0);
+    inputDocBuilder.metadata().setScore(10.0);
     Document inputDoc = inputDocBuilder.freeze();
 
     auto result = inclusion->applyTransformation(inputDoc);
@@ -870,7 +895,7 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ShouldEvaluateMeta
     ASSERT_DOCUMENT_EQ(result,
                        Document{fromjson("{a: 1, c: 0.0, d: 1.0, e: 2.0, f: 'foo', g: 3.0, "
                                          "h: [4, 5], i: 6, j: {foo: 7}, k: [{bar: 8}], "
-                                         "l: {scoreDetails: 'foo'}}")});
+                                         "l: {scoreDetails: 'foo'}, m: 9.0, n: 10.0}")});
 }
 
 //
@@ -963,8 +988,7 @@ TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault,
         {"a",
          {1, Document{{"b", 2}, {"c", 3}}, {Document{{"b", 4}, {"c", 5}}}, Document{{"d", 6}}}}});
 
-    auto expectedResult =
-        Document{{"a", {Value(), Document{{"b", 2}}, {Document{{"b", 4}}}, Document{}}}};
+    auto expectedResult = Document{{"a", {Document{{"b", 2}}, {Document{{"b", 4}}}, Document{}}}};
 
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
@@ -978,7 +1002,7 @@ TEST_F(InclusionProjectionExecutionTestWithoutFallBackToDefault,
         {"a",
          {1, Document{{"b", 2}, {"c", 3}}, {Document{{"b", 4}, {"c", 5}}}, Document{{"d", 6}}}}});
 
-    auto expectedResult = Document{{"a", {Value(), Document{{"b", 2}}, Value(), Document{}}}};
+    auto expectedResult = Document{{"a", {Document{{"b", 2}}, Document{}}}};
 
     ASSERT_DOCUMENT_EQ(result, expectedResult);
 }
@@ -1068,9 +1092,9 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ExtractComputedPro
     ASSERT_EQ(deleteFlag, false);
 
     auto expectedProjection =
-        Document(fromjson("{_id: true, computedMeta1: true, computed2: {$add: [\"$c\", {$const: "
-                          "1}]}, computedMeta3: \"$computedMeta3\"}"));
-    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation(boost::none));
+        Document(fromjson("{_id: true, computedMeta1: true, computed2: {$add: [{$const: "
+                          "1}, \"$c\"]}, computedMeta3: \"$computedMeta3\"}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
 }
 
 TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
@@ -1089,7 +1113,63 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
     ASSERT_EQ(deleteFlag, false);
 
     auto expectedProjection = Document(fromjson("{_id: true, a: '$myMeta', b: '$a'}"));
-    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
+}
+
+TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ExtractComputedProjectionInProjectShouldNotIncludeId) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(
+        BSON("a" << BSON("$sum" << BSON_ARRAY("$myMeta"
+                                              << "$_id"))));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<StringData> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{_id: true, a: {$sum: ['$myMeta', '$_id']}}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
+}
+
+TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ExtractComputedProjectionInProjectShouldNotHideDependentSubFields) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a"
+                                                                     << "$myMeta"
+                                                                     << "b"
+                                                                     << "$a.x"));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<StringData> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{_id: true, a: '$myMeta', b: '$a.x'}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
+}
+
+TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault,
+       ExtractComputedProjectionInProjectShouldNotHideDependentSubFieldsWithDottedSibling) {
+    auto inclusion = makeInclusionProjectionWithDefaultPolicies(BSON("a"
+                                                                     << "$myMeta"
+                                                                     << "c.b"
+                                                                     << "$a.x"));
+
+    auto r = static_cast<InclusionProjectionExecutor*>(inclusion.get())->getRoot();
+    const std::set<StringData> reservedNames{};
+    auto [addFields, deleteFlag] =
+        r->extractComputedProjectionsInProject("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(addFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{_id: true, a: '$myMeta', c: {b: '$a.x'}}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
 }
 
 TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, ApplyProjectionAfterSplit) {
@@ -1135,7 +1215,7 @@ TEST_F(InclusionProjectionExecutionTestWithFallBackToDefault, DoNotExtractReserv
 
     auto expectedProjection = Document(fromjson(
         "{_id: true, a: true, data: {\"$toUpper\" : [\"$myMeta.x\"]}, newMeta: \"$newMeta\"}"));
-    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedProjection, inclusion->serializeTransformation());
 }
 }  // namespace
 

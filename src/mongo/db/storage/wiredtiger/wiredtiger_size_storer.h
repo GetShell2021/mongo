@@ -29,14 +29,14 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
 #include <string>
-
 #include <wiredtiger.h>
 
 #include "mongo/base/string_data.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -45,7 +45,7 @@ namespace mongo {
  * The WiredTigerSizeStorer class serves as a write buffer to durably store size information for
  * MongoDB collections. The size storer uses a separate WiredTiger table as key-value store, where
  * the URI serves as key and the value is a BSON document with `numRecords` and `dataSize` fields.
- * This buffering is neccessary to allow concurrent updates of size information without causing
+ * This buffering is necessary to allow concurrent updates of size information without causing
  * write conflicts. The dirty size information is periodically stored written back to the table,
  * including on clean shutdown and/or catalog reload. Crashes or replica-set fail-overs may result
  * in size updates to be lost, so size information is only approximate. Reads use the buffer for
@@ -85,7 +85,17 @@ public:
      */
     void store(StringData uri, std::shared_ptr<SizeInfo> sizeInfo);
 
-    std::shared_ptr<SizeInfo> load(OperationContext* opCtx, StringData uri) const;
+    /**
+     * Returns the size info for the given URI. Creates a default-initialized SizeInfo if there is
+     * no existing size info for the given URI. Never returns nullptr.
+     */
+    std::shared_ptr<SizeInfo> load(StringData uri) const;
+
+    /**
+     * Informs the size storer that the size information about the given ident should be removed
+     * upon the next flush.
+     */
+    void remove(StringData uri);
 
     /**
      * Writes all changes to the underlying table.
@@ -98,12 +108,11 @@ private:
     const uint64_t _tableId;  // Not persisted
 
     // Serializes flushes to disk.
-    Mutex _flushMutex = MONGO_MAKE_LATCH("WiredTigerSessionStorer::_flushMutex");
+    stdx::mutex _flushMutex;
 
     using Buffer = StringMap<std::shared_ptr<SizeInfo>>;
 
-    mutable Mutex _bufferMutex =
-        MONGO_MAKE_LATCH("WiredTigerSessionStorer::_bufferMutex");  // Guards _buffer
+    mutable stdx::mutex _bufferMutex;  // Guards _buffer
     Buffer _buffer;
 };
 }  // namespace mongo

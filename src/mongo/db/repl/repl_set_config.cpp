@@ -28,23 +28,42 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/repl_set_config.h"
-
+#include <absl/container/node_hash_set.h>
 #include <algorithm>
+#include <boost/cstdint.hpp>
+#include <cstdint>
 #include <fmt/format.h>
-#include <fmt/ranges.h>
-#include <functional>
+#include <fmt/ranges.h>  // IWYU pragma: keep
+#include <iterator>
+#include <map>
+#include <utility>
+#include <variant>
 
-#include "mongo/bson/util/bson_check.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/mongod_options.h"
+#include <absl/container/flat_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/repl/member_config_gen.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_config_params_gen.h"
+#include "mongo/db/repl/repl_set_write_concern_mode_definitions.h"
+#include "mongo/db/repl/split_horizon.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/net/cidr.h"
 #include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
@@ -52,6 +71,7 @@
 
 namespace mongo {
 namespace repl {
+using namespace fmt::literals;
 
 // Allow the heartbeat interval to be forcibly overridden on this node.
 MONGO_FAIL_POINT_DEFINE(forceHeartbeatIntervalMS);
@@ -104,10 +124,6 @@ BSONObj ReplSetConfig::toBSON() const {
     BSONObjBuilder builder;
     serialize(&builder);
 
-    if (_recipientConfig) {
-        builder.append(kRecipientConfigFieldName, _recipientConfig->toBSON());
-    }
-
     return builder.obj();
 }
 
@@ -135,14 +151,8 @@ ReplSetConfig::ReplSetConfig(const BSONObj& cfg,
     // The settings field is optional, but we always serialize it.  Because we can't default it in
     // the IDL, we default it here.
     setSettings(ReplSetConfigSettings());
-    ReplSetConfigBase::parseProtected(IDLParserErrorContext("ReplSetConfig"), cfg);
+    ReplSetConfigBase::parseProtected(IDLParserContext("ReplSetConfig"), cfg);
     uassertStatusOK(_initialize(forInitiate, forceTerm, defaultReplicaSetId));
-
-    if (cfg.hasField(kRecipientConfigFieldName)) {
-        auto splitConfig = cfg[kRecipientConfigFieldName].Obj();
-        _recipientConfig.reset(new ReplSetConfig(
-            splitConfig, false /* forInitiate */, forceTerm, defaultReplicaSetId));
-    }
 }
 
 Status ReplSetConfig::_initialize(bool forInitiate,
@@ -171,9 +181,9 @@ Status ReplSetConfig::_initialize(bool forInitiate,
     //
     // Initialize configServer
     //
-    if (forInitiate && serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
-        !getConfigServer().has_value()) {
-        setConfigServer(true);
+    if (forInitiate && serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) &&
+        !getConfigServer_deprecated().has_value()) {
+        setConfigServer_deprecated(true);
     }
 
     //
@@ -194,6 +204,14 @@ Status ReplSetConfig::_initialize(bool forInitiate,
     _calculateMajorities();
     _addInternalWriteConcernModes();
     _initializeConnectionString();
+
+    // Count how many members can vote
+    for (const MemberConfig& m : getMembers()) {
+        if (m.getNumVotes() > 0) {
+            ++_votingMemberCount;
+        }
+    }
+
     return Status::OK();
 }
 
@@ -285,7 +303,9 @@ Status ReplSetConfig::_validate(bool allowSplitHorizonIP) const {
         if (memberI.getHostAndPort().isLocalHost()) {
             ++localhostCount;
         }
-        if (memberI.isVoter()) {
+        // Using getBaseNumVotes() here instead of isVoter() because isVoter does not count voting
+        // members with the newlyAdded field while getBaseNumVotes() counts all nodes with votes: 1.
+        if (memberI.getBaseNumVotes()) {
             ++voterCount;
         }
         // Nodes may be arbiters or electable, or neither, but never both.
@@ -384,7 +404,11 @@ Status ReplSetConfig::_validate(bool allowSplitHorizonIP) const {
                       "one non-arbiter member with priority > 0");
     }
 
-    if (getConfigServer()) {
+    // (Ignore FCV check): If gFeatureFlagAllMongodsAreSharded is on, we want to allow reconfig-ing
+    // the replset even if it doesn't have configsvr: true in the config, regardless of the FCV.
+    if (getConfigServer_deprecated() ||
+        (gFeatureFlagAllMongodsAreSharded.isEnabledAndIgnoreFCVUnsafe() &&
+         serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer))) {
         if (arbiterCount > 0) {
             return Status(ErrorCodes::BadValue,
                           "Arbiters are not allowed in replica set configurations being used for "
@@ -402,7 +426,7 @@ Status ReplSetConfig::_validate(bool allowSplitHorizonIP) const {
                               "servers cannot have a non-zero secondaryDelaySecs");
             }
         }
-        if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer &&
+        if (!serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) &&
             !skipShardingConfigurationChecks) {
             return Status(ErrorCodes::BadValue,
                           "Nodes being used for config servers must be started with the "
@@ -414,10 +438,24 @@ Status ReplSetConfig::_validate(bool allowSplitHorizonIP) const {
                                         << " must be true in replica set configurations being "
                                            "used for config servers");
         }
-    } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        return Status(ErrorCodes::BadValue,
-                      "Nodes started with the --configsvr flag must have configsvr:true in "
-                      "their config");
+    } else if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+        // TODO: SERVER-82024 Remove this when master is 8.1.
+        //
+        // Skip this check to allow upgrading a 7.0 non auto-bootstrapped replica set node to a 8.0
+        // node with auto-bootstrapping enabled despite not having `configsvr:true` in the
+        // replication config. The `configsvr` field will get set during the upgrade process.
+        //
+        // By skipping this check there is the possibility of having a replica
+        // set where some nodes are shard servers and some are config servers. To ensure
+        // that all nodes in the replica set eventually have the same cluster role, the server
+        // fasserts (on startup or replication) if the shard identity document matches the server's
+        // cluster role. For why this is correct and for more context see: SERVER-80249
+        if (!gFeatureFlagAllMongodsAreSharded.isEnabledUseLatestFCVWhenUninitialized(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+            return Status(ErrorCodes::BadValue,
+                          "Nodes started with the --configsvr flag must have configsvr:true in "
+                          "their config");
+        }
     }
 
     if (!allowMultipleArbiters && arbiterCount > 1) {
@@ -436,7 +474,7 @@ Status ReplSetConfig::_validate(bool allowSplitHorizonIP) const {
 
 Status ReplSetConfig::checkIfWriteConcernCanBeSatisfied(
     const WriteConcernOptions& writeConcern) const {
-    if (auto wNumNodes = stdx::get_if<int64_t>(&writeConcern.w)) {
+    if (auto wNumNodes = get_if<int64_t>(&writeConcern.w)) {
         if (*wNumNodes > getNumDataBearingMembers()) {
             return Status(ErrorCodes::UnsatisfiableWriteConcern, "Not enough data-bearing nodes");
         }
@@ -445,9 +483,9 @@ Status ReplSetConfig::checkIfWriteConcernCanBeSatisfied(
     }
 
     StatusWith<ReplSetTagPattern> tagPatternStatus = [&]() {
-        auto wMode = stdx::get_if<std::string>(&writeConcern.w);
+        auto wMode = get_if<std::string>(&writeConcern.w);
         return wMode ? findCustomWriteMode(*wMode)
-                     : makeCustomWriteMode(stdx::get<WTags>(writeConcern.w));
+                     : makeCustomWriteMode(get<WTags>(writeConcern.w));
     }();
 
     if (!tagPatternStatus.isOK()) {
@@ -468,9 +506,9 @@ Status ReplSetConfig::checkIfWriteConcernCanBeSatisfied(
     // Even if all the nodes in the set had a given write it still would not satisfy this
     // write concern mode.
     auto wModeForError = [&]() {
-        auto wMode = stdx::get_if<std::string>(&writeConcern.w);
+        auto wMode = get_if<std::string>(&writeConcern.w);
         return wMode ? fmt::format("\"{}\"", *wMode)
-                     : fmt::format("{}", stdx::get<WTags>(writeConcern.w));
+                     : fmt::format("{}", get<WTags>(writeConcern.w));
     }();
 
     return Status(ErrorCodes::UnsatisfiableWriteConcern,
@@ -743,8 +781,7 @@ bool ReplSetConfig::containsCustomizedGetLastErrorDefaults() const {
     // Since the ReplSetConfig always has a WriteConcernOptions, the only way to know if it has been
     // customized through getLastErrorDefaults is if it's different from { w: 1, wtimeout: 0 }.
     const auto& getLastErrorDefaults = getDefaultWriteConcern();
-    if (auto wNumNodes = stdx::get_if<int64_t>(&getLastErrorDefaults.w);
-        !wNumNodes || *wNumNodes != 1)
+    if (auto wNumNodes = get_if<int64_t>(&getLastErrorDefaults.w); !wNumNodes || *wNumNodes != 1)
         return true;
     if (getLastErrorDefaults.wTimeout != Milliseconds::zero())
         return true;
@@ -755,17 +792,9 @@ bool ReplSetConfig::containsCustomizedGetLastErrorDefaults() const {
 
 Status ReplSetConfig::validateWriteConcern(const WriteConcernOptions& writeConcern) const {
     if (writeConcern.hasCustomWriteMode()) {
-        return findCustomWriteMode(stdx::get<std::string>(writeConcern.w)).getStatus();
+        return findCustomWriteMode(get<std::string>(writeConcern.w)).getStatus();
     }
     return Status::OK();
-}
-
-bool ReplSetConfig::isSplitConfig() const {
-    return !!_recipientConfig;
-}
-
-ReplSetConfigPtr ReplSetConfig::getRecipientConfig() const {
-    return _recipientConfig;
 }
 
 bool ReplSetConfig::areWriteConcernModesTheSame(ReplSetConfig* otherConfig) const {

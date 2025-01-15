@@ -29,54 +29,92 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <variant>
+
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/metrics/metrics_state_holder.h"
+#include "mongo/db/s/metrics/sharding_data_transform_cumulative_metrics.h"
+#include "mongo/db/s/metrics/sharding_data_transform_instance_metrics.h"
+#include "mongo/db/s/metrics/with_oplog_application_count_metrics.h"
+#include "mongo/db/s/metrics/with_oplog_application_count_metrics_also_updating_cumulative_metrics.h"
+#include "mongo/db/s/metrics/with_oplog_application_latency_metrics_interface_updating_cumulative_metrics.h"
+#include "mongo/db/s/metrics/with_phase_duration_management.h"
+#include "mongo/db/s/metrics/with_state_management_for_cumulative_metrics.h"
+#include "mongo/db/s/metrics/with_state_management_for_instance_metrics.h"
+#include "mongo/db/s/metrics/with_typed_cumulative_metrics_provider.h"
+#include "mongo/db/s/resharding/coordinator_document_gen.h"
+#include "mongo/db/s/resharding/recipient_document_gen.h"
+#include "mongo/db/s/resharding/resharding_cumulative_metrics.h"
+#include "mongo/db/s/resharding/resharding_metrics_field_name_provider.h"
 #include "mongo/db/s/resharding/resharding_metrics_helpers.h"
 #include "mongo/db/s/resharding/resharding_oplog_applier_progress_gen.h"
-#include "mongo/db/s/sharding_data_transform_instance_metrics.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class ReshardingMetrics : public ShardingDataTransformInstanceMetrics {
+namespace resharding_metrics {
+
+enum TimedPhase { kCloning, kApplying, kCriticalSection, kBuildingIndex };
+constexpr auto kNumTimedPhase = 4;
+
+namespace detail {
+using PartialBase1 = WithTypedCumulativeMetricsProvider<ShardingDataTransformInstanceMetrics,
+                                                        ReshardingCumulativeMetrics>;
+using PartialBase2 =
+    WithStateManagementForInstanceMetrics<PartialBase1, ReshardingCumulativeMetrics::AnyState>;
+
+using PartialBaseFinal = WithPhaseDurationManagement<PartialBase2, TimedPhase, kNumTimedPhase>;
+
+using Base = WithOplogApplicationLatencyMetricsInterfaceUpdatingCumulativeMetrics<
+    WithOplogApplicationCountMetricsAlsoUpdatingCumulativeMetrics<
+        WithOplogApplicationCountMetrics<detail::PartialBaseFinal>>>;
+}  // namespace detail
+}  // namespace resharding_metrics
+
+class ReshardingMetrics : public resharding_metrics::detail::Base {
 public:
-    using State = stdx::variant<CoordinatorStateEnum, RecipientStateEnum, DonorStateEnum>;
+    using State = ReshardingCumulativeMetrics::AnyState;
+    using Base = resharding_metrics::detail::Base;
+    using TimedPhase = resharding_metrics::TimedPhase;
 
-    class DonorState {
+    struct ExternallyTrackedRecipientFields {
     public:
-        using MetricsType = ShardingDataTransformCumulativeMetrics::DonorStateEnum;
+        void accumulateFrom(const ReshardingOplogApplierProgress& progressDoc);
 
-        explicit DonorState(DonorStateEnum enumVal);
-        MetricsType toMetrics() const;
-        DonorStateEnum getState() const;
-
-    private:
-        const DonorStateEnum _enumVal;
+        boost::optional<int64_t> documentCountCopied;
+        boost::optional<int64_t> documentBytesCopied;
+        boost::optional<int64_t> oplogEntriesFetched;
+        boost::optional<int64_t> oplogEntriesApplied;
+        boost::optional<int64_t> insertsApplied;
+        boost::optional<int64_t> updatesApplied;
+        boost::optional<int64_t> deletesApplied;
+        boost::optional<int64_t> writesToStashCollections;
     };
 
-    class RecipientState {
-    public:
-        using MetricsType = ShardingDataTransformCumulativeMetrics::RecipientStateEnum;
+    ReshardingMetrics(const CommonReshardingMetadata& metadata,
+                      Role role,
+                      ClockSource* clockSource,
+                      ShardingDataTransformCumulativeMetrics* cumulativeMetrics);
 
-        explicit RecipientState(RecipientStateEnum enumVal);
-        MetricsType toMetrics() const;
-        RecipientStateEnum getState() const;
-
-    private:
-        RecipientStateEnum _enumVal;
-    };
-
-    class CoordinatorState {
-    public:
-        using MetricsType = ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum;
-
-        explicit CoordinatorState(CoordinatorStateEnum enumVal);
-        MetricsType toMetrics() const;
-        CoordinatorStateEnum getState() const;
-
-    private:
-        CoordinatorStateEnum _enumVal;
-    };
+    ReshardingMetrics(const CommonReshardingMetadata& metadata,
+                      Role role,
+                      ClockSource* clockSource,
+                      ShardingDataTransformCumulativeMetrics* cumulativeMetrics,
+                      State state);
 
     ReshardingMetrics(UUID instanceId,
                       BSONObj shardKey,
@@ -85,10 +123,18 @@ public:
                       Date_t startTime,
                       ClockSource* clockSource,
                       ShardingDataTransformCumulativeMetrics* cumulativeMetrics);
-    ReshardingMetrics(const CommonReshardingMetadata& metadata,
+
+    ReshardingMetrics(UUID instanceId,
+                      BSONObj shardKey,
+                      NamespaceString nss,
                       Role role,
+                      Date_t startTime,
                       ClockSource* clockSource,
-                      ShardingDataTransformCumulativeMetrics* cumulativeMetrics);
+                      ShardingDataTransformCumulativeMetrics* cumulativeMetrics,
+                      State state,
+                      ProvenanceEnum provenance = ProvenanceEnum::kReshardCollection);
+
+    ~ReshardingMetrics() override;
 
     static std::unique_ptr<ReshardingMetrics> makeInstance(UUID instanceId,
                                                            BSONObj shardKey,
@@ -106,55 +152,79 @@ public:
             std::make_unique<ReshardingMetrics>(document.getCommonReshardingMetadata(),
                                                 resharding_metrics::getRoleForStateDocument<T>(),
                                                 clockSource,
-                                                cumulativeMetrics);
-        result->setState(resharding_metrics::getState(document));
+                                                cumulativeMetrics,
+                                                resharding_metrics::getState(document));
         result->restoreRoleSpecificFields(document);
         return result;
     }
 
     template <typename T>
     static auto initializeFrom(const T& document, ServiceContext* serviceContext) {
-        return initializeFrom(
-            document,
-            serviceContext->getFastClockSource(),
-            ShardingDataTransformCumulativeMetrics::getForResharding(serviceContext));
+        auto cumulativeMetrics = [&] {
+            auto provenance = document.getCommonReshardingMetadata().getProvenance().value_or(
+                ProvenanceEnum::kReshardCollection);
+            switch (provenance) {
+                case ProvenanceEnum::kMoveCollection:
+                    return ShardingDataTransformCumulativeMetrics::getForMoveCollection(
+                        serviceContext);
+                case ProvenanceEnum::kBalancerMoveCollection:
+                    return ShardingDataTransformCumulativeMetrics::getForBalancerMoveCollection(
+                        serviceContext);
+                case ProvenanceEnum::kUnshardCollection:
+                    return ShardingDataTransformCumulativeMetrics::getForUnshardCollection(
+                        serviceContext);
+                case ProvenanceEnum::kReshardCollection:
+                    return ShardingDataTransformCumulativeMetrics::getForResharding(serviceContext);
+            }
+            MONGO_UNREACHABLE;
+        }();
+
+        return initializeFrom(document, serviceContext->getFastClockSource(), cumulativeMetrics);
     }
 
-    template <typename T>
-    void onStateTransition(T before, boost::none_t after) {
-        getCumulativeMetrics()->onStateTransition<typename T::MetricsType>(before.toMetrics(),
-                                                                           after);
+    template <typename StateOrStateVariant>
+    static bool mustRestoreExternallyTrackedRecipientFields(StateOrStateVariant stateOrVariant) {
+        if constexpr (std::is_same_v<StateOrStateVariant, State>) {
+            return visit([](auto v) { return mustRestoreExternallyTrackedRecipientFieldsImpl(v); },
+                         stateOrVariant);
+        } else {
+            return mustRestoreExternallyTrackedRecipientFieldsImpl(stateOrVariant);
+        }
     }
 
-    template <typename T>
-    void onStateTransition(boost::none_t before, T after) {
-        setState(after.getState());
-        getCumulativeMetrics()->onStateTransition<typename T::MetricsType>(before,
-                                                                           after.toMetrics());
+    void deregisterMetrics() {
+        _scopedObserver.reset();
     }
 
-    template <typename T>
-    void onStateTransition(T before, T after) {
-        setState(after.getState());
-        getCumulativeMetrics()->onStateTransition<typename T::MetricsType>(before.toMetrics(),
-                                                                           after.toMetrics());
-    }
+    BSONObj reportForCurrentOp() const noexcept override;
 
-    template <typename T>
-    void setState(T state) {
-        static_assert(std::is_assignable_v<State, T>);
-        _state.store(state);
-    }
+    void restoreExternallyTrackedRecipientFields(const ExternallyTrackedRecipientFields& values);
 
-    void accumulateFrom(const ReshardingOplogApplierProgress& progressDoc);
+    void reportOnCompletion(BSONObjBuilder* builder);
+
+    // Update donor and recipient related metrics in _recipientCtx so the coordinator can get them.
+    void fillDonorCtxOnCompletion(DonorShardContext& donorCtx);
+    void fillRecipientCtxOnCompletion(RecipientShardContext& recipientCtx);
+
+    void onStarted();
+    void onSuccess();
+    void onFailure();
+    void onCanceled();
+
+    void setIsSameKeyResharding(bool isSameKeyResharding);
+    void setIndexesToBuild(int64_t numIndexes);
+    void setIndexesBuilt(int64_t numIndexes);
 
 protected:
-    virtual StringData getStateString() const noexcept override;
+    boost::optional<Milliseconds> getRecipientHighEstimateRemainingTimeMillis() const override;
+    StringData getStateString() const noexcept override;
 
 private:
     std::string createOperationDescription() const noexcept override;
     void restoreRecipientSpecificFields(const ReshardingRecipientDocument& document);
     void restoreCoordinatorSpecificFields(const ReshardingCoordinatorDocument& document);
+    void restoreIndexBuildDurationFields(const ReshardingRecipientMetrics& metrics);
+    ReshardingCumulativeMetrics* getReshardingCumulativeMetrics();
 
     template <typename T>
     void restoreRoleSpecificFields(const T& document) {
@@ -169,6 +239,16 @@ private:
     }
 
     template <typename T>
+    static bool mustRestoreExternallyTrackedRecipientFieldsImpl(T state) {
+        static_assert(resharding_metrics::isState<T>);
+        if constexpr (std::is_same_v<T, RecipientStateEnum>) {
+            return state > RecipientStateEnum::kAwaitingFetchTimestamp;
+        } else {
+            return false;
+        }
+    }
+
+    template <typename T>
     void restorePhaseDurationFields(const T& document) {
         static_assert(resharding_metrics::isStateDocument<T>);
         auto metrics = document.getMetrics();
@@ -179,27 +259,43 @@ private:
         if (copyDurations) {
             auto copyingBegin = copyDurations->getStart();
             if (copyingBegin) {
-                restoreCopyingBegin(*copyingBegin);
+                setStartFor(TimedPhase::kCloning, *copyingBegin);
             }
             auto copyingEnd = copyDurations->getStop();
             if (copyingEnd) {
-                restoreCopyingEnd(*copyingEnd);
+                setEndFor(TimedPhase::kCloning, *copyingEnd);
             }
         }
         auto applyDurations = metrics->getOplogApplication();
         if (applyDurations) {
             auto applyingBegin = applyDurations->getStart();
             if (applyingBegin) {
-                restoreApplyingBegin(*applyingBegin);
+                setStartFor(TimedPhase::kApplying, *applyingBegin);
             }
             auto applyingEnd = applyDurations->getStop();
             if (applyingEnd) {
-                restoreApplyingEnd(*applyingEnd);
+                setEndFor(TimedPhase::kApplying, *applyingEnd);
             }
         }
     }
 
-    AtomicWord<State> _state;
+    template <typename MemberFn, typename... T>
+    void invokeIfAllSet(MemberFn&& fn, const boost::optional<T>&... args) {
+        if (!(args && ...)) {
+            return;
+        }
+        std::invoke(fn, this, *args...);
+    }
+
+    AtomicWord<bool> _ableToEstimateRemainingRecipientTime;
+
+    AtomicWord<bool> _isSameKeyResharding;
+    AtomicWord<int64_t> _indexesToBuild;
+    AtomicWord<int64_t> _indexesBuilt;
+
+    ShardingDataTransformInstanceMetrics::UniqueScopedObserver _scopedObserver;
+    ReshardingMetricsFieldNameProvider* _reshardingFieldNames;
+    const ProvenanceEnum _provenance;
 };
 
 }  // namespace mongo

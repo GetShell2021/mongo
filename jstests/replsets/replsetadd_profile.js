@@ -4,6 +4,8 @@
 // One of the ways to exercise the oplog replay hack is to
 // add a new node to an existing active replica set.
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 // Initialize a single node replica set where
 // the only node is running at a profiling level of 2.
 var collectionName = 'jstests_replsetadd_profile';
@@ -19,7 +21,7 @@ primaryCollection.save({a: 1});
 var newNode = replTest.add();
 replTest.reInitiate();
 
-replTest.waitForState(replTest.nodes[1], ReplSetTest.State.SECONDARY);
+replTest.awaitSecondaryNodes(null, [replTest.nodes[1]]);
 // Allow documents to propagate to new replica set member.
 replTest.awaitReplication();
 

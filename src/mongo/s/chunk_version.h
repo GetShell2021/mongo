@@ -29,9 +29,22 @@
 
 #pragma once
 
+#include <cstdint>
+#include <iosfwd>
+#include <limits>
+#include <string>
+
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -64,6 +77,17 @@ public:
     }
 
 protected:
+    static CollectionGeneration IGNORED() {
+        CollectionGeneration gen{OID(), Timestamp()};
+        gen._epoch.init(Date_t(), true);    // ignored OID is zero time, max machineId/inc
+        gen._timestamp = Timestamp::max();  // ignored Timestamp is the largest timestamp
+        return gen;
+    }
+
+    static CollectionGeneration UNSHARDED() {
+        return CollectionGeneration{OID(), Timestamp()};
+    }
+
     OID _epoch;
     Timestamp _timestamp;
 };
@@ -107,17 +131,17 @@ protected:
  * Version configurations (format: major version, epoch):
  *
  * 1. (0, 0) - collection is dropped.
- * 2. (0, n), n > 0 - applicable only to shardVersion; shard has no chunk.
+ * 2. (0, n), n > 0 - applicable only to shard placement version; shard has no chunk.
  * 3. (n, 0), n > 0 - invalid configuration.
- * 4. (n, m), n > 0, m > 0 - normal sharded collection version.
+ * 4. (n, m), n > 0, m > 0 - normal sharded collection placement version.
  */
 class ChunkVersion : public CollectionGeneration, public CollectionPlacement {
 public:
     /**
-     * The name for the shard version information field, which shard-aware commands should include
-     * if they want to convey shard version.
+     * The name for the chunk version information field, which ddl operations use to send only
+     * the placement information. String is shardVersion for compatibility with previous versions.
      */
-    static constexpr StringData kShardVersionField = "shardVersion"_sd;
+    static constexpr StringData kChunkVersionField = "shardVersion"_sd;
 
     ChunkVersion(CollectionGeneration geneneration, CollectionPlacement placement)
         : CollectionGeneration(geneneration), CollectionPlacement(placement) {}
@@ -128,22 +152,14 @@ public:
      * Indicates that the collection is not sharded.
      */
     static ChunkVersion UNSHARDED() {
-        return ChunkVersion();
+        return ChunkVersion(CollectionGeneration::UNSHARDED(), {0, 0});
     }
 
     /**
-     * Indicates that the shard version checking must be skipped.
+     * Indicates that placement version checking must be skipped.
      */
     static ChunkVersion IGNORED() {
-        ChunkVersion version;
-        version._epoch.init(Date_t(), true);    // ignored OID is zero time, max machineId/inc
-        version._timestamp = Timestamp::max();  // ignored Timestamp is the largest timestamp
-        return version;
-    }
-
-    static bool isIgnoredVersion(const ChunkVersion& version) {
-        return version.majorVersion() == 0 && version.minorVersion() == 0 &&
-            version.getTimestamp() == IGNORED().getTimestamp();
+        return ChunkVersion(CollectionGeneration::IGNORED(), {0, 0});
     }
 
     void incMajor() {
@@ -221,7 +237,7 @@ public:
     }
 
     static ChunkVersion parse(const BSONElement& element);
-    void serializeToBSON(StringData field, BSONObjBuilder* builder) const;
+    void serialize(StringData field, BSONObjBuilder* builder) const;
 
     std::string toString() const;
 };

@@ -28,20 +28,46 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
+#include <boost/smart_ptr.hpp>
+#include <cstddef>
+#include <functional>
+#include <string>
+#include <tuple>
 #include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
-#include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/thread_pool_mock.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/idl/server_parameter_test_util.h"
-#include "mongo/logv2/log.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -87,7 +113,7 @@ class ReshardingDonorOplogIterTest : public ShardServerTestFixture {
 public:
     repl::MutableOplogEntry makeInsertOplog(Timestamp ts, BSONObj doc) {
         ReshardingDonorOplogId oplogId(ts, ts);
-        return makeOplog(_crudNss, _uuid, repl::OpTypeEnum::kInsert, std::move(doc), {}, oplogId);
+        return makeOplog(_crudNss, _uuid, repl::OpTypeEnum::kInsert, doc, {}, oplogId);
     }
 
     repl::MutableOplogEntry makeFinalOplog(Timestamp ts) {
@@ -129,12 +155,8 @@ public:
         // recipient's primary-only service is set up.
         executor::ThreadPoolMock::Options threadPoolOptions;
         threadPoolOptions.onCreateThread = [] {
-            Client::initThread("TestReshardingDonorOplogIterator");
-            auto& client = cc();
-            {
-                stdx::lock_guard<Client> lk(client);
-                client.setSystemOperationKillableByStepdown(lk);
-            }
+            Client::initThread("TestReshardingDonorOplogIterator",
+                               getGlobalServiceContext()->getService());
         };
 
         auto executor = executor::makeThreadPoolTestExecutor(
@@ -165,7 +187,7 @@ public:
         // destructor has run. Otherwise `executor` could end up outliving the ServiceContext and
         // triggering an invariant due to the task executor's thread having a Client still.
         return ExecutorFuture(executor)
-            .then([iter, executor, factory] {
+            .then([iter, executor, factory]() mutable {
                 return iter->getNextBatch(
                     std::move(executor), CancellationToken::uncancelable(), factory);
             })
@@ -174,16 +196,15 @@ public:
     }
 
     ServiceContext::UniqueClient makeKillableClient() {
-        auto client = getServiceContext()->makeClient("ReshardingDonorOplogIterator");
-        stdx::lock_guard<Client> lk(*client);
-        client->setSystemOperationKillableByStepdown(lk);
+        auto client = getServiceContext()->getService()->makeClient("ReshardingDonorOplogIterator");
         return client;
     }
 
 private:
-    const NamespaceString _oplogNss{"{}.{}xxx.yyy"_format(
-        NamespaceString::kConfigDb, NamespaceString::kReshardingLocalOplogBufferPrefix)};
-    const NamespaceString _crudNss{"test.foo"};
+    const NamespaceString _oplogNss = NamespaceString::createNamespaceString_forTest(
+        DatabaseName::kConfig,
+        "{}xxx.yyy"_format(NamespaceString::kReshardingLocalOplogBufferPrefix));
+    const NamespaceString _crudNss = NamespaceString::createNamespaceString_forTest("test.foo");
     const UUID _uuid{UUID::gen()};
 
     RAIIServerParameterControllerForTest controller{"reshardingOplogBatchLimitOperations", 1};
@@ -195,10 +216,10 @@ TEST_F(ReshardingDonorOplogIterTest, BasicExhaust) {
     const auto finalOplog = makeFinalOplog(Timestamp(43, 24));
 
     DBDirectClient client(operationContext());
-    const auto ns = oplogNss().ns();
-    client.insert(ns, oplog1.toBSON());
-    client.insert(ns, oplog2.toBSON());
-    client.insert(ns, finalOplog.toBSON());
+    const auto nss = oplogNss();
+    client.insert(nss, oplog1.toBSON());
+    client.insert(nss, oplog2.toBSON());
+    client.insert(nss, finalOplog.toBSON());
 
     ReshardingDonorOplogIterator iter(oplogNss(), kResumeFromBeginning, &onInsertAlwaysReady);
     auto executor = makeTaskExecutorForIterator();
@@ -227,10 +248,10 @@ TEST_F(ReshardingDonorOplogIterTest, ResumeFromMiddle) {
     const auto finalOplog = makeFinalOplog(Timestamp(43, 24));
 
     DBDirectClient client(operationContext());
-    const auto ns = oplogNss().ns();
-    client.insert(ns, oplog1.toBSON());
-    client.insert(ns, oplog2.toBSON());
-    client.insert(ns, finalOplog.toBSON());
+    const auto nss = oplogNss();
+    client.insert(nss, oplog1.toBSON());
+    client.insert(nss, oplog2.toBSON());
+    client.insert(nss, finalOplog.toBSON());
 
     ReshardingDonorOplogId resumeToken(Timestamp(2, 4), Timestamp(2, 4));
     ReshardingDonorOplogIterator iter(oplogNss(), resumeToken, &onInsertAlwaysReady);
@@ -253,8 +274,8 @@ TEST_F(ReshardingDonorOplogIterTest, ExhaustWithIncomingInserts) {
     const auto finalOplog = makeFinalOplog(Timestamp(43, 24));
 
     DBDirectClient client(operationContext());
-    const auto ns = oplogNss().ns();
-    client.insert(ns, oplog1.toBSON());
+    const auto nss = oplogNss();
+    client.insert(nss, oplog1.toBSON());
 
     class InsertNotifier : public resharding::OnInsertAwaitable {
     public:
@@ -266,7 +287,7 @@ TEST_F(ReshardingDonorOplogIterTest, ExhaustWithIncomingInserts) {
         Future<void> awaitInsert(const ReshardingDonorOplogId& lastSeen) override {
             ++numCalls;
 
-            auto client = _serviceContext->makeClient("onAwaitInsertCalled");
+            auto client = _serviceContext->getService()->makeClient("onAwaitInsertCalled");
             AlternativeClientRegion acr(client);
             auto opCtx = cc().makeOperationContext();
             _onAwaitInsertCalled(opCtx.get(), numCalls);
@@ -283,9 +304,9 @@ TEST_F(ReshardingDonorOplogIterTest, ExhaustWithIncomingInserts) {
                          DBDirectClient client(opCtx);
 
                          if (numCalls == 1) {
-                             client.insert(ns, oplog2.toBSON());
+                             client.insert(nss, oplog2.toBSON());
                          } else {
-                             client.insert(ns, finalOplog.toBSON());
+                             client.insert(nss, finalOplog.toBSON());
                          }
                      }};
 
@@ -318,10 +339,10 @@ TEST_F(ReshardingDonorOplogIterTest, BatchIncludesProgressMarkEntries) {
     const auto finalOplog = makeFinalOplog(Timestamp(43, 24));
 
     DBDirectClient client(operationContext());
-    const auto ns = oplogNss().ns();
-    client.insert(ns, oplog1.toBSON());
-    client.insert(ns, progressMarkOplog1.toBSON());
-    client.insert(ns, finalOplog.toBSON());
+    const auto nss = oplogNss();
+    client.insert(nss, oplog1.toBSON());
+    client.insert(nss, progressMarkOplog1.toBSON());
+    client.insert(nss, finalOplog.toBSON());
 
     ReshardingDonorOplogIterator iter(oplogNss(), kResumeFromBeginning, &onInsertAlwaysReady);
     auto executor = makeTaskExecutorForIterator();
@@ -355,13 +376,13 @@ DEATH_TEST_REGEX_F(ReshardingDonorOplogIterTest,
     const auto progressMarkOplog4 = makeProgressMarkOplogEntry(Timestamp(65, 4));
 
     DBDirectClient client(operationContext());
-    const auto ns = oplogNss().ns();
-    client.insert(ns, oplog1.toBSON());
-    client.insert(ns, progressMarkOplog1.toBSON());
-    client.insert(ns, finalOplog.toBSON());
-    client.insert(ns, progressMarkOplog2.toBSON());
-    client.insert(ns, progressMarkOplog3.toBSON());
-    client.insert(ns, progressMarkOplog4.toBSON());
+    const auto nss = oplogNss();
+    client.insert(nss, oplog1.toBSON());
+    client.insert(nss, progressMarkOplog1.toBSON());
+    client.insert(nss, finalOplog.toBSON());
+    client.insert(nss, progressMarkOplog2.toBSON());
+    client.insert(nss, progressMarkOplog3.toBSON());
+    client.insert(nss, progressMarkOplog4.toBSON());
 
     ReshardingDonorOplogIterator iter(oplogNss(), kResumeFromBeginning, &onInsertAlwaysReady);
     auto executor = makeTaskExecutorForIterator();

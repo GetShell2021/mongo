@@ -1,5 +1,6 @@
 /*
- * Helper functions which connect to a server, and check its logs for particular strings.
+ * Helper functions which connect to a server or reads a log file, and check its logs for particular
+ * strings.
  */
 var checkLog;
 
@@ -11,18 +12,28 @@ if (checkLog) {
 }
 
 checkLog = (function() {
-    let getGlobalLog = function(conn) {
-        assert(typeof conn !== 'undefined', "Connection is undefined");
+    let getGlobalLog = function(connOrFile) {
+        assert(typeof connOrFile !== 'undefined', "Connection is undefined");
         let cmdRes;
-        try {
-            cmdRes = conn.adminCommand({getLog: 'global'});
-        } catch (e) {
-            // Retry with network errors.
-            print("checkLog ignoring failure: " + e);
-            return null;
+        if (typeof connOrFile === 'object') {
+            try {
+                cmdRes = connOrFile.adminCommand({getLog: 'global'});
+            } catch (e) {
+                // Retry with network errors.
+                print("checkLog ignoring failure: " + e);
+                return null;
+            }
+            return assert.commandWorked(cmdRes).log;
+        } else {
+            assert(typeof connOrFile === 'string', "Connection or path to log file must be used");
+            try {
+                // Attempt to read the file.
+                return cat(connOrFile).trim().split("\n");
+            } catch (e) {
+                print(`Failed to read the file at path: ${connOrFile}. Error: ${tojson(e)}`);
+                throw e;
+            }
         }
-
-        return assert.commandWorked(cmdRes).log;
     };
 
     /*
@@ -30,8 +41,8 @@ checkLog = (function() {
      * is found in the logs. Note: this function does not throw an exception, so the return
      * value should not be ignored.
      */
-    const getLogMessage = function(conn, msg) {
-        const logMessages = getGlobalLog(conn);
+    const getLogMessage = function(connOrFile, msg) {
+        const logMessages = getGlobalLog(connOrFile);
         if (logMessages === null) {
             return null;
         }
@@ -52,12 +63,12 @@ checkLog = (function() {
     };
 
     /*
-     * Calls the 'getLog' function on the provided connection 'conn' to see if the provided msg
-     * is found in the logs. Note: this function does not throw an exception, so the return
-     * value should not be ignored.
+     * Calls the 'getLog' function on the provided connection or log file 'connOrFile' to see if the
+     * provided msg is found in the logs. Note: this function does not throw an exception, so the
+     * return value should not be ignored.
      */
-    const checkContainsOnce = function(conn, msg) {
-        const logMessages = getGlobalLog(conn);
+    const checkContainsOnce = function(connOrFile, msg) {
+        const logMessages = getGlobalLog(connOrFile);
         if (logMessages === null) {
             return false;
         }
@@ -77,8 +88,8 @@ checkLog = (function() {
         return false;
     };
 
-    const checkContainsOnceJson = function(conn, id, attrsDict, severity = null) {
-        const logMessages = getGlobalLog(conn);
+    const checkContainsOnceJson = function(connOrFile, id, attrsDict, severity = null) {
+        const logMessages = getGlobalLog(connOrFile);
         if (logMessages === null) {
             return false;
         }
@@ -111,7 +122,7 @@ checkLog = (function() {
      * applied to appropriately compare the count with `expectedCount`. `context` allows to check
      * the `ctx` field of the logs.
      */
-    const checkContainsWithCountJson = function(conn,
+    const checkContainsWithCountJson = function(connOrFile,
                                                 id,
                                                 attrsDict,
                                                 expectedCount,
@@ -122,26 +133,10 @@ checkLog = (function() {
                                                         return actual === expected;
                                                     },
                                                 context = null) {
-        const logMessages = getGlobalLog(conn);
-        if (logMessages === null) {
-            return false;
-        }
+        const messages =
+            getFilteredLogMessages(connOrFile, id, attrsDict, severity, isRelaxed, context);
 
-        let count = 0;
-        for (let logMsg of logMessages) {
-            let obj;
-            try {
-                obj = JSON.parse(logMsg);
-            } catch (ex) {
-                print('checkLog.checkContainsOnce: JsonJSON.parse() failed: ' + tojson(ex) + ': ' +
-                      logMsg);
-                throw ex;
-            }
-
-            if (_compareLogs(obj, id, severity, context, attrsDict, isRelaxed)) {
-                count++;
-            }
-        }
+        const count = messages.length;
 
         return comparator(count, expectedCount);
     };
@@ -150,22 +145,27 @@ checkLog = (function() {
      * Similar to checkContainsWithCountJson, but checks whether there are at least 'expectedCount'
      * instances of 'id' in the logs.
      */
-    const checkContainsWithAtLeastCountJson = function(
-        conn, id, attrsDict, expectedCount, severity = null, isRelaxed = false, context = null) {
+    const checkContainsWithAtLeastCountJson = function(connOrFile,
+                                                       id,
+                                                       attrsDict,
+                                                       expectedCount,
+                                                       severity = null,
+                                                       isRelaxed = false,
+                                                       context = null) {
         return checkContainsWithCountJson(
-            conn, id, attrsDict, expectedCount, severity, isRelaxed, (actual, expected) => {
+            connOrFile, id, attrsDict, expectedCount, severity, isRelaxed, (actual, expected) => {
                 return actual >= expected;
             }, context);
     };
 
     /*
-     * Calls the 'getLog' function on the provided connection 'conn' to see if a log with the
-     * provided id is found in the logs. If the id is found it looks up the specified attrribute by
-     * attrName and checks if the msg is found in its value. Note: this function does not throw an
-     * exception, so the return value should not be ignored.
+     * Calls the 'getLog' function on the provided connection or log file 'connOrFile' to see if a
+     * log with the provided id is found in the logs. If the id is found it looks up the specified
+     * attrribute by attrName and checks if the msg is found in its value. Note: this function does
+     * not throw an exception, so the return value should not be ignored.
      */
-    const checkContainsOnceJsonStringMatch = function(conn, id, attrName, msg) {
-        const logMessages = getGlobalLog(conn);
+    const checkContainsOnceJsonStringMatch = function(connOrFile, id, attrName, msg) {
+        const logMessages = getGlobalLog(connOrFile);
         if (logMessages === null) {
             return false;
         }
@@ -182,14 +182,45 @@ checkLog = (function() {
     };
 
     /*
-     * Calls the 'getLog' function at regular intervals on the provided connection 'conn' until
-     * the provided 'msg' is found in the logs, or it times out. Throws an exception on timeout.
+     * See checkContainsWithCountJson comment.
      */
-    let contains = function(conn, msg, timeoutMillis = 5 * 60 * 1000, retryIntervalMS = 300) {
+    const getFilteredLogMessages = function(
+        connOrFile, id, attrsDict, severity = null, isRelaxed = false, context = null) {
+        const logMessages = getGlobalLog(connOrFile);
+        if (logMessages === null) {
+            return false;
+        }
+
+        let messages = [];
+
+        for (let logMsg of logMessages) {
+            let obj;
+            try {
+                obj = JSON.parse(logMsg);
+            } catch (ex) {
+                print('checkLog.checkContainsOnce: JsonJSON.parse() failed: ' + tojson(ex) + ': ' +
+                      logMsg);
+                throw ex;
+            }
+
+            if (_compareLogs(obj, id, severity, context, attrsDict, isRelaxed)) {
+                messages.push(obj);
+            }
+        }
+
+        return messages;
+    };
+
+    /*
+     * Calls the 'getLog' function at regular intervals on the provided connection or log file
+     * 'connOrFile' until the provided 'msg' is found in the logs, or it times out. Throws an
+     * exception on timeout.
+     */
+    let contains = function(connOrFile, msg, timeoutMillis = 5 * 60 * 1000, retryIntervalMS = 300) {
         // Don't run the hang analyzer because we don't expect contains() to always succeed.
         assert.soon(
             function() {
-                return checkContainsOnce(conn, msg);
+                return checkContainsOnce(connOrFile, msg);
             },
             'Could not find log entries containing the following message: ' + msg,
             timeoutMillis,
@@ -197,11 +228,35 @@ checkLog = (function() {
             {runHangAnalyzer: false});
     };
 
-    let containsJson = function(conn, id, attrsDict, timeoutMillis = 5 * 60 * 1000) {
+    /*
+     * Calls the 'getLog' function at regular intervals on the provided connection or log
+     * file'connOrFile' until the provided 'msg' is found in the logs and returned, or it times out.
+     * Throws an exception on timeout.
+     */
+    let containsLog = function(
+        connOrFile, msg, timeoutMillis = 5 * 60 * 1000, retryIntervalMS = 300) {
+        // Don't run the hang analyzer because we don't expect contains() to always succeed.
+        let logMsg = null;
+        assert.soon(
+            function() {
+                logMsg = getLogMessage(connOrFile, msg);
+                if (logMsg) {
+                    return true;
+                }
+                return false;
+            },
+            'Could not find log entries containing the following message: ' + msg,
+            timeoutMillis,
+            retryIntervalMS,
+            {runHangAnalyzer: false});
+        return logMsg;
+    };
+
+    let containsJson = function(connOrFile, id, attrsDict, timeoutMillis = 5 * 60 * 1000) {
         // Don't run the hang analyzer because we don't expect contains() to always succeed.
         assert.soon(
             function() {
-                return checkContainsOnceJson(conn, id, attrsDict);
+                return checkContainsOnceJson(connOrFile, id, attrsDict);
             },
             'Could not find log entries containing the following id: ' + id +
                 ', and attrs: ' + tojson(attrsDict),
@@ -212,12 +267,12 @@ checkLog = (function() {
 
     /*
      * Calls checkContainsWithCountJson with the `isRelaxed` parameter set to true at regular
-     * intervals on the provided connection 'conn'. It terminates when a log with id 'id', ctx
-     * 'context', and all of the attributes in 'attrsDict' is found at least, at most, or exactly
-     * `expectedCount` times based on the `comparator` function passed in or the timeout (in ms) is
-     * reached.
+     * intervals on the provided connection or log file 'connOrFile'. It terminates when a log with
+     * id 'id', ctx 'context', and all of the attributes in 'attrsDict' is found at least, at most,
+     * or exactly `expectedCount` times based on the `comparator` function passed in or the timeout
+     * (in ms) is reached.
      */
-    let containsRelaxedJson = function(conn,
+    let containsRelaxedJson = function(connOrFile,
                                        id,
                                        attrsDict,
                                        expectedCount = 1,
@@ -231,7 +286,7 @@ checkLog = (function() {
         assert.soon(
             function() {
                 return checkContainsWithCountJson(
-                    conn, id, attrsDict, expectedCount, null, true, comparator, context);
+                    connOrFile, id, attrsDict, expectedCount, null, true, comparator, context);
             },
             'Could not find log entries containing the following id: ' + id +
                 ', and attrs: ' + tojson(attrsDict),
@@ -241,19 +296,19 @@ checkLog = (function() {
     };
 
     /*
-     * Calls the 'getLog' function at regular intervals on the provided connection 'conn' until
-     * the provided 'msg' is found in the logs 'expectedCount' times, or it times out.
-     * Throws an exception on timeout. If 'exact' is true, checks whether the count is exactly
+     * Calls the 'getLog' function at regular intervals on the provided connection or log file
+     * 'connOrFile' until the provided 'msg' is found in the logs 'expectedCount' times, or it times
+     * out. Throws an exception on timeout. If 'exact' is true, checks whether the count is exactly
      * equal to 'expectedCount'. Otherwise, checks whether the count is at least equal to
      * 'expectedCount'. Early returns when at least 'expectedCount' entries are found.
      */
     let containsWithCount = function(
-        conn, msg, expectedCount, timeoutMillis = 5 * 60 * 1000, exact = true) {
+        connOrFile, msg, expectedCount, timeoutMillis = 5 * 60 * 1000, exact = true) {
         let expectedStr = exact ? 'exactly ' : 'at least ';
         assert.soon(
             function() {
                 let count = 0;
-                let logMessages = getGlobalLog(conn);
+                let logMessages = getGlobalLog(connOrFile);
                 if (logMessages === null) {
                     return false;
                 }
@@ -287,8 +342,8 @@ checkLog = (function() {
      * instances of 'msg' in the logs.
      */
     let containsWithAtLeastCount = function(
-        conn, msg, expectedCount, timeoutMillis = 5 * 60 * 1000) {
-        containsWithCount(conn, msg, expectedCount, timeoutMillis, /*exact*/ false);
+        connOrFile, msg, expectedCount, timeoutMillis = 5 * 60 * 1000) {
+        containsWithCount(connOrFile, msg, expectedCount, timeoutMillis, /*exact*/ false);
     };
 
     /*
@@ -443,12 +498,14 @@ checkLog = (function() {
         checkContainsWithAtLeastCountJson: checkContainsWithAtLeastCountJson,
         checkContainsOnceJsonStringMatch: checkContainsOnceJsonStringMatch,
         contains: contains,
+        containsLog: containsLog,
         containsJson: containsJson,
         containsRelaxedJson: containsRelaxedJson,
         containsWithCount: containsWithCount,
         containsWithAtLeastCount: containsWithAtLeastCount,
         formatAsLogLine: formatAsLogLine,
-        formatAsJsonLogLine: formatAsJsonLogLine
+        formatAsJsonLogLine: formatAsJsonLogLine,
+        getFilteredLogMessages: getFilteredLogMessages,
     };
 })();
 })();

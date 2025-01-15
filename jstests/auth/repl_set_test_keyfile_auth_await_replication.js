@@ -3,8 +3,7 @@
  *
  * @tags: [requires_persistence, requires_replication]
  */
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({
     nodes: 3,
@@ -12,7 +11,7 @@ const rst = new ReplSetTest({
     keyFile: "jstests/libs/key1",
 });
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 jsTestLog("Running 'awaitReplication()' while not authenticated in the test");
 rst.awaitReplication();
@@ -42,4 +41,3 @@ for (const secondary of rst.getSecondaries()) {
 }
 
 rst.stopSet();
-})();

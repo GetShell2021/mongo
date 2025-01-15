@@ -28,13 +28,38 @@
  */
 
 
-#include "mongo/logv2/log.h"
+#include <algorithm>
+#include <boost/smart_ptr.hpp>
+#include <cstdint>
+#include <mutex>
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shutdown_in_progress_quiesce_info.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/s/mongos_topology_coordinator.h"
+#include "mongo/transport/hello_metrics.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -154,6 +179,14 @@ std::shared_ptr<const MongosHelloResponse> MongosTopologyCoordinator::awaitHello
     invariant(deadline);
 
     HelloMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
+
+    // Wait for a mongos topology change with timeout set to deadline.
+    LOGV2_DEBUG(4695502,
+                1,
+                "Waiting for a hello response from a topology change or until deadline",
+                "deadline"_attr = deadline.value(),
+                "currentMongosTopologyVersionCounter"_attr = _topologyVersion.getCounter());
+
     lk.unlock();
 
     if (MONGO_unlikely(waitForHelloResponseMongos.shouldFail())) {
@@ -167,15 +200,8 @@ std::shared_ptr<const MongosHelloResponse> MongosTopologyCoordinator::awaitHello
         hangWhileWaitingForHelloResponseMongos.pauseWhileSet(opCtx);
     }
 
-    // Wait for a mongos topology change with timeout set to deadline.
-    LOGV2_DEBUG(4695502,
-                1,
-                "Waiting for a hello response from a topology change or until deadline",
-                "deadline"_attr = deadline.get(),
-                "currentMongosTopologyVersionCounter"_attr = _topologyVersion.getCounter());
-
     auto statusWithHello =
-        futureGetNoThrowWithDeadline(opCtx, future, deadline.get(), opCtx->getTimeoutError());
+        futureGetNoThrowWithDeadline(opCtx, future, deadline.value(), opCtx->getTimeoutError());
     auto status = statusWithHello.getStatus();
 
     setCustomErrorInHelloResponseMongoS.execute([&](const BSONObj& data) {
@@ -187,11 +213,8 @@ std::shared_ptr<const MongosHelloResponse> MongosTopologyCoordinator::awaitHello
         status = Status(ErrorCodes::Error(errorCode),
                         "Set by setCustomErrorInHelloResponseMongoS fail point.");
     });
-
-    if (!status.isOK()) {
-        LOGV2_DEBUG(6208205, 1, "Error while waiting for hello response", "status"_attr = status);
-
-        // We decrement the counter on most errors. Note that some errors may already be covered
+    ON_BLOCK_EXIT([&, opCtx] {
+        // We decrement the counter. Note that some errors may already be covered
         // by calls to resetNumAwaitingTopologyChanges(), which sets the counter to zero, so we
         // only decrement non-zero counters. This is safe so long as:
         // 1) Increment + decrement calls always occur at a 1:1 ratio and in that order.
@@ -201,10 +224,15 @@ std::shared_ptr<const MongosHelloResponse> MongosTopologyCoordinator::awaitHello
             HelloMetrics::get(opCtx)->getNumAwaitingTopologyChanges() > 0) {
             HelloMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges();
         }
+    });
+
+    if (!status.isOK()) {
+        LOGV2_DEBUG(6208205, 1, "Error while waiting for hello response", "status"_attr = status);
 
         // Return a MongosHelloResponse with the current topology version on timeout when
         // waiting for a topology change.
         if (status == ErrorCodes::ExceededTimeLimit) {
+            stdx::lock_guard lk(_mutex);
             return _makeHelloResponse(lk);
         }
     }
@@ -231,7 +259,8 @@ void MongosTopologyCoordinator::enterQuiesceModeAndWait(OperationContext* opCtx,
 
         // Reset counter to 0 since we will respond to all waiting hello requests with an error.
         // All new hello requests will immediately fail with ShutdownInProgress.
-        HelloMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
+        HelloMetrics::resetNumAwaitingTopologyChangesForAllSessionManagers(
+            getGlobalServiceContext());
     }
 
     if (MONGO_unlikely(hangDuringQuiesceModeMongos.shouldFail())) {

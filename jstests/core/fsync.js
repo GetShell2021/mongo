@@ -7,19 +7,18 @@
  * - Confirm that the command can be run repeatedly without breaking things
  *
  * @tags: [
+ *   # The test runs commands that are not allowed with security token: fsync, fsyncUnlock.
+ *   not_allowed_with_signed_security_token,
  *   requires_fastcount,
  *   requires_fsync,
  *   uses_parallel_shell,
  * ]
  */
-(function() {
-"use strict";
-
 function waitUntilOpCountIs(opFilter, num) {
     assert.soon(() => {
         let ops = db.getSiblingDB('admin')
                       .aggregate([
-                          {$currentOp: {}},
+                          {$currentOp: {allUsers: true, idleConnections: true}},
                           {$match: opFilter},
                       ])
                       .toArray();
@@ -46,7 +45,7 @@ var supportsFsync = db.fsyncLock();
 if (!supportsFsync.ok) {
     assert.commandFailedWithCode(supportsFsync, ErrorCodes.CommandNotSupported);
     jsTestLog("Skipping test for " + storageEngine + " as it does not support fsync");
-    return;
+    quit();
 }
 db.fsyncUnlock();
 
@@ -62,6 +61,11 @@ assert.commandWorked(fsyncLockDB.coll.insert({x: 1}));
 // Test that fsyncLock doesn't work unless invoked against the admin DB.
 var resFail = fsyncLockDB.runCommand({fsync: 1, lock: 1});
 assert(!resFail.ok, "fsyncLock command succeeded against DB other than admin.");
+
+// Ensure that fsync (and fsyncLock) are strict, see HELP-58426
+assert.commandFailed(db.adminCommand({fsync: 1, unlock: true}));
+assert.commandFailed(db.adminCommand({fsync: 1, unlock: false}));
+assert.commandFailed(db.adminCommand({fsync: 1, lock: "not_valid_boolean"}));
 
 // Uses admin automatically and locks the server for writes.
 var fsyncLockRes = db.fsyncLock();
@@ -136,4 +140,3 @@ assert(fsyncUnlockRes.lockCount == 0, tojson(fsyncLockRes));
 shellHandle1();
 shellHandle2();
 assert.eq(2, fsyncLockDB.multipleLock.find({}).itcount());
-}());

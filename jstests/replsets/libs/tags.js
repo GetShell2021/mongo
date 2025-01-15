@@ -3,9 +3,10 @@
  *
  * https://docs.mongodb.com/v3.0/tutorial/configure-replica-set-tag-sets/
  */
-var TagsTest = function(options) {
-    'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
+export var TagsTest = function(options) {
     // Skip db hash check since this test leaves replset partitioned.
     TestData.skipCheckDBHashes = true;
 
@@ -23,9 +24,6 @@ var TagsTest = function(options) {
      */
     this.run = function() {
         var options = this.options;
-
-        load('jstests/replsets/rslib.js');
-
         let nodes = options.nodes;
         var host = getHostName();
         var name = 'tags';
@@ -39,8 +37,10 @@ var TagsTest = function(options) {
         // upgrading some of our nodes to the latest version while performing write operations under
         // different network partition scenarios.
         if (options.setFeatureCompatibilityVersion) {
-            assert.commandWorked(replTest.getPrimary().adminCommand(
-                {setFeatureCompatibilityVersion: options.setFeatureCompatibilityVersion}));
+            assert.commandWorked(replTest.getPrimary().adminCommand({
+                setFeatureCompatibilityVersion: options.setFeatureCompatibilityVersion,
+                confirm: true
+            }));
         }
 
         for (let i = 1; i < nodes.length; ++i) {
@@ -164,13 +164,13 @@ var TagsTest = function(options) {
 
             // Wait until nodes know about the new primary.
             replTest.awaitNodesAgreeOnPrimary(
-                replTest.kDefaultTimeoutMS, expectedNodesAgreeOnPrimary, nodeId);
+                replTest.timeoutMS, expectedNodesAgreeOnPrimary, nodeId);
             jsTestLog('ensurePrimary - Nodes ' + tojson(expectedNodesAgreeOnPrimary) +
                       ' agree that ' + nodeId + ' (' + replTest.nodes[nodeId].host +
                       ') should be primary.');
 
             var writeConcern = {
-                writeConcern: {w: expectedWritableNodesCount, wtimeout: replTest.kDefaultTimeoutMS}
+                writeConcern: {w: expectedWritableNodesCount, wtimeout: replTest.timeoutMS}
             };
             assert.commandWorked(primary.getDB('foo').bar.insert({x: 100}, writeConcern));
             jsTestLog('ensurePrimary - Successfully written a document to primary node (' +

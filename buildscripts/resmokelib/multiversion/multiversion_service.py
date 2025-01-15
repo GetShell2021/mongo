@@ -1,18 +1,21 @@
 """A service for working with multiversion testing."""
+
 from __future__ import annotations
 
 import re
 from bisect import bisect_left, bisect_right
 from typing import List, NamedTuple, Optional
 
+import structlog
+import yaml
 from packaging.version import Version
 from pydantic import BaseModel, Field
-import yaml
 
 # These values must match the include paths for artifacts.tgz in evergreen.yml.
 MONGO_VERSION_YAML = ".resmoke_mongo_version.yml"
 RELEASES_YAML = ".resmoke_mongo_release_values.yml"
-VERSION_RE = re.compile(r'^[0-9]+\.[0-9]+')
+VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+")
+LOGGER = structlog.getLogger(__name__)
 
 
 def tag_str(version: Version) -> str:
@@ -78,6 +81,10 @@ class VersionConstantValues(NamedTuple):
         """Get a string version of the latest FCV."""
         return version_str(self.latest)
 
+    def get_fcv_tags_less_than_latest(self) -> List[str]:
+        """Get the list of all fcv tags less than the latest."""
+        return [tag_str(fcv) for fcv in self.fcvs_less_than_latest]
+
     def build_last_lts_binary(self, base_name: str) -> str:
         """
         Build the name of the binary that the LTS version of the given tool will have.
@@ -120,7 +127,7 @@ class MongoVersion(BaseModel):
         :param yaml_file: Path to yaml file.
         :return: MongoVersion read from file.
         """
-        mongo_version_yml_file = open(yaml_file, 'r')
+        mongo_version_yml_file = open(yaml_file, "r")
         return cls(**yaml.safe_load(mongo_version_yml_file))
 
     def get_version(self) -> Version:
@@ -128,7 +135,8 @@ class MongoVersion(BaseModel):
         version_match = VERSION_RE.match(self.mongo_version)
         if version_match is None:
             raise ValueError(
-                f"Could not determine version from mongo version string '{self.mongo_version}'")
+                f"Could not determine version from mongo version string '{self.mongo_version}'"
+            )
         return Version(version_match.group(0))
 
 
@@ -146,8 +154,9 @@ class MongoReleases(BaseModel):
     feature_compatibility_versions: List[str] = Field(alias="featureCompatibilityVersions")
     long_term_support_releases: List[str] = Field(alias="longTermSupportReleases")
     eol_versions: List[str] = Field(alias="eolVersions")
-    generate_fcv_lower_bound_override: Optional[str] = Field(None,
-                                                             alias="generateFCVLowerBoundOverride")
+    generate_fcv_lower_bound_override: Optional[str] = Field(
+        None, alias="generateFCVLowerBoundOverride"
+    )
 
     @classmethod
     def from_yaml_file(cls, yaml_file: str) -> MongoReleases:
@@ -158,20 +167,31 @@ class MongoReleases(BaseModel):
         :return: MongoReleases read from file.
         """
 
-        mongo_releases_file = open(yaml_file, 'r')
-        return cls(**yaml.safe_load(mongo_releases_file))
+        with open(yaml_file, "r") as mongo_releases_file:
+            yaml_contents = mongo_releases_file.read()
+        safe_load_result = yaml.safe_load(yaml_contents)
+        try:
+            return cls(**safe_load_result)
+        except:
+            LOGGER.info(
+                "MongoReleases.from_yaml_file() failed\n"
+                f"yaml_file = {yaml_file}\n"
+                f"yaml_contents = {yaml_contents}\n"
+                f"safe_load_result = {safe_load_result}"
+            )
+            raise
 
     def get_fcv_versions(self) -> List[Version]:
         """Get the Version representation of all fcv versions."""
-        return [Version(fcv) for fcv in self.feature_compatibility_versions]
+        return [Version(fcv) for fcv in self.feature_compatibility_versions]  # pylint: disable=not-an-iterable
 
     def get_lts_versions(self) -> List[Version]:
         """Get the Version representation of the lts versions."""
-        return [Version(lts) for lts in self.long_term_support_releases]
+        return [Version(lts) for lts in self.long_term_support_releases]  # pylint: disable=not-an-iterable
 
     def get_eol_versions(self) -> List[Version]:
         """Get the Version representation of the EOL versions."""
-        return [Version(eol) for eol in self.eol_versions]
+        return [Version(eol) for eol in self.eol_versions]  # pylint: disable=not-an-iterable
 
 
 class MultiversionService:
@@ -193,7 +213,6 @@ class MultiversionService:
         fcvs = self.mongo_releases.get_fcv_versions()
         lts = self.mongo_releases.get_lts_versions()
         eols = self.mongo_releases.get_eol_versions()
-        lower_bound_override = self.mongo_releases.generate_fcv_lower_bound_override
 
         # Highest release less than latest.
         last_continuous = fcvs[bisect_left(fcvs, latest) - 1]
@@ -201,17 +220,12 @@ class MultiversionService:
         # Highest LTS release less than latest.
         last_lts = lts[bisect_left(lts, latest) - 1]
 
-        # Normally, this list includes all FCVs greater than last LTS, up to latest.
-        # However, if we have 'generateFCVLowerBoundOverride' set in releases.yml, we will
-        # extend the lower bound to also include the previous value of lastLTS.
-        lts_cutoff = last_lts
-        if lower_bound_override is not None:
-            lts_cutoff = Version(lower_bound_override)
-        requires_fcv_tag_list = fcvs[bisect_right(fcvs, lts_cutoff):bisect_right(fcvs, latest)]
+        # All FCVs greater than last LTS, up to latest.
+        requires_fcv_tag_list = fcvs[bisect_right(fcvs, last_lts) : bisect_right(fcvs, latest)]
         requires_fcv_tag_list_continuous = [latest]
 
         # All FCVs less than latest.
-        fcvs_less_than_latest = fcvs[:bisect_left(fcvs, latest)]
+        fcvs_less_than_latest = fcvs[: bisect_left(fcvs, latest)]
 
         return VersionConstantValues(
             latest=latest,

@@ -29,18 +29,35 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 #include <memory>
+#include <tuple>
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_contract.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/auth/role_name.h"
+#include "mongo/db/auth/user.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -62,21 +79,18 @@ class Client;
  */
 class AuthorizationSessionImpl : public AuthorizationSession {
 public:
-    struct InstallMockForTestingOrAuthImpl {
-        explicit InstallMockForTestingOrAuthImpl() = default;
-    };
     explicit AuthorizationSessionImpl(std::unique_ptr<AuthzSessionExternalState> externalState,
-                                      InstallMockForTestingOrAuthImpl);
+                                      Client* client);
 
     ~AuthorizationSessionImpl() override;
-
-    AuthorizationManager& getAuthorizationManager() override;
 
     void startRequest(OperationContext* opCtx) override;
 
     void startContractTracking() override;
 
-    Status addAndAuthorizeUser(OperationContext* opCtx, const UserName& userName) override;
+    Status addAndAuthorizeUser(OperationContext* opCtx,
+                               std::unique_ptr<UserRequest> userRequest,
+                               boost::optional<Date_t> expirationTime) override;
 
     User* lookupUser(const UserName& name) override;
 
@@ -86,24 +100,23 @@ public:
 
     boost::optional<UserHandle> getAuthenticatedUser() override;
 
+    boost::optional<TenantId> getUserTenantId() const override;
+
     boost::optional<UserName> getAuthenticatedUserName() override;
 
     RoleNameIterator getAuthenticatedRoleNames() override;
 
-    void logoutSecurityTokenUser(Client* client) override;
-    void logoutAllDatabases(Client* client, StringData reason) override;
-    void logoutDatabase(Client* client, StringData dbname, StringData reason) override;
+    void logoutSecurityTokenUser() override;
+    void logoutAllDatabases(StringData reason) override;
+    void logoutDatabase(const DatabaseName& dbname, StringData reason) override;
 
     AuthenticationMode getAuthenticationMode() const override {
         return _authenticationMode;
     }
 
-    void grantInternalAuthorization(Client* client) override;
+    void grantInternalAuthorization() override;
 
-    void grantInternalAuthorization(OperationContext* opCtx) override;
-
-    StatusWith<PrivilegeVector> checkAuthorizedToListCollections(StringData dbname,
-                                                                 const BSONObj& cmdObj) override;
+    StatusWith<PrivilegeVector> checkAuthorizedToListCollections(const ListCollections&) override;
 
     bool isUsingLocalhostBypass() override;
 
@@ -132,9 +145,12 @@ public:
     bool isAuthorizedForActionsOnNamespace(const NamespaceString& ns,
                                            const ActionSet& actions) override;
 
-    bool isAuthorizedForAnyActionOnAnyResourceInDB(StringData dbname) override;
+    bool isAuthorizedForAnyActionOnAnyResourceInDB(const DatabaseName&) override;
 
     bool isAuthorizedForAnyActionOnResource(const ResourcePattern& resource) override;
+
+    bool isAuthorizedForClusterActions(const ActionSet& actionSet,
+                                       const boost::optional<TenantId>& tenantId) override;
 
     void setImpersonatedUserData(const UserName& username,
                                  const std::vector<RoleName>& roles) override;
@@ -158,12 +174,16 @@ public:
 
     bool mayBypassWriteBlockingMode() const override;
 
+    bool isExpired() const override;
+    const boost::optional<Date_t>& getExpiration() const override {
+        return _expirationTime;
+    }
+
 protected:
     friend class AuthorizationSessionImplTestHelper;
 
     // Updates internal cached authorization state, i.e.:
-    // - _mayBypassWriteBlockingMode, reflecting whether the connection is authorized for the
-    // privilege of bypassing write blocking mode on cluster resource.
+    // - _nonTenantClusterActions, see below.
     // - _authenticatedRoleNames, which stores all roles held by users who are authenticated on this
     // connection.
     // - _authenticationMode -- we just update this to None if there are no users on the connection.
@@ -171,6 +191,7 @@ protected:
     // date.
     void _updateInternalAuthorizationState();
 
+    AuthorizationManager* _getAuthorizationManager();
 
     // The User who has been authenticated on this connection.
     boost::optional<UserHandle> _authenticatedUser;
@@ -193,10 +214,9 @@ private:
     // lock on the admin database (to update out-of-date user privilege information).
     bool _isAuthorizedForPrivilege(const Privilege& privilege);
 
-    std::tuple<boost::optional<UserName>*, std::vector<RoleName>*> _getImpersonations() override {
+    std::tuple<std::shared_ptr<UserName>*, std::vector<RoleName>*> _getImpersonations() override {
         return std::make_tuple(&_impersonatedUserName, &_impersonatedRoleNames);
     }
-
 
     // Generates a vector of default privileges that are granted to any user,
     // regardless of which roles that user does or does not possess.
@@ -208,11 +228,9 @@ private:
 private:
     std::unique_ptr<AuthzSessionExternalState> _externalState;
 
-    // A vector of impersonated UserNames and a vector of those users' RoleNames.
     // These are used in the auditing system. They are not used for authz checks.
-    boost::optional<UserName> _impersonatedUserName;
+    std::shared_ptr<UserName> _impersonatedUserName;
     std::vector<RoleName> _impersonatedRoleNames;
-    bool _impersonationFlag;
 
     // A record of privilege checks and other authorization like function calls made on
     // AuthorizationSession. IDL Typed Commands can optionally define a contract declaring the set
@@ -220,6 +238,24 @@ private:
     // set of checks performed is a subset of the checks declared in the contract.
     AuthorizationContract _contract;
 
-    bool _mayBypassWriteBlockingMode;
+    // Optimized check for actions which may be performed on the non-tenanted cluster resource.
+    // It is a union of ClusterResource and AnyResource permissions.
+    ActionSet _nonTenantClusterActions;
+
+    // The expiration time for this session, expressed as a Unix timestamp. After this time passes,
+    // the session will be expired and requests will fail until the expiration time is refreshed.
+    // If boost::none, then the session never expires (default behavior).
+    boost::optional<Date_t> _expirationTime;
+
+    // If the session is expired, this represents the UserName that was formerly authenticated on
+    // this connection.
+    boost::optional<UserName> _expiredUserName;
+
+    // login time is recorded when the user is added and authorized. This information is used in
+    // lout logs.
+    boost::optional<Date_t> _loginTime;
+
+    // Pointer to owning client.
+    Client* _client;
 };
 }  // namespace mongo

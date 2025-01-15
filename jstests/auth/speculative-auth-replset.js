@@ -2,8 +2,7 @@
 // to each other during intra-cluster communication.
 // @tags: [requires_replication]
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const kAuthenticationSuccessfulLogId = 5286306;
 const kAuthenticationFailedLogId = 5286307;
@@ -11,7 +10,7 @@ const kAuthenticationFailedLogId = 5286307;
 function countAuthInLog(conn) {
     let logCounts = {speculative: 0, cluster: 0, speculativeCluster: 0};
 
-    checkLog.getGlobalLog(conn).forEach((line) => {
+    cat(conn.fullOptions.logFile).trim().split("\n").forEach((line) => {
         // Iterate through the log and verify our auth.
         const entry = JSON.parse(line);
         if (entry.id === kAuthenticationSuccessfulLogId) {
@@ -27,8 +26,9 @@ function countAuthInLog(conn) {
             }
         } else if (entry.id === kAuthenticationFailedLogId) {
             // Authentication can fail legitimately because the secondary abandons the connection
-            // during shutdown.
-            assert.eq(entry.attr.error.code, ErrorCodes.AuthenticationAbandoned);
+            // during shutdown - if we do encounter an authentication failure in the log, make sure
+            // that it is only of this type, fail anything else
+            assert.eq(entry.attr.result, ErrorCodes.AuthenticationAbandoned);
         } else {
             // Irrelevant.
             return;
@@ -39,7 +39,18 @@ function countAuthInLog(conn) {
     return logCounts;
 }
 
-const rst = new ReplSetTest({nodes: 1, keyFile: 'jstests/libs/key1'});
+const rst = new ReplSetTest({
+    nodes: 1,
+    nodeOptions: {
+        setParameter: {
+            // Disable heartbeat logging to prevent exceeding the maximum log lines in checklog.
+            logComponentVerbosity: tojson({replication: {heartbeats: 0}}),
+            "failpoint.disableQueryAnalysisSampler": tojson({mode: "alwaysOn"}),
+        },
+        useLogFiles: true,
+    },
+    keyFile: 'jstests/libs/key1',
+});
 rst.startSet();
 rst.initiate();
 rst.awaitReplication();
@@ -88,7 +99,7 @@ Object.keys(initialMechStats).forEach(function(mech) {
 
     const newNode = rst.add({});
     rst.reInitiate();
-    rst.waitForState(newNode, ReplSetTest.State.SECONDARY);
+    rst.awaitSecondaryNodes(null, [newNode]);
     rst.awaitReplication();
 
     rst.stop(newNode);
@@ -101,7 +112,7 @@ Object.keys(initialMechStats).forEach(function(mech) {
 
 {
     // Capture new statistics, and assert that they're consistent.
-    const newMechStats = getMechStats(admin);
+    let newMechStats = getMechStats(admin);
     printjson(newMechStats);
 
     // Speculative and cluster statistics should be incremented by intracluster auth.
@@ -110,24 +121,37 @@ Object.keys(initialMechStats).forEach(function(mech) {
     assert.gt(newMechStats["SCRAM-SHA-256"].clusterAuthenticate.successful,
               initialMechStats["SCRAM-SHA-256"].clusterAuthenticate.successful);
 
-    // Speculative and cluster auth counts should align with the authentication events in the server
-    // log
-    const logCounts = countAuthInLog(admin);
+    // Speculative and cluster auth counts should align with the authentication
+    // events in the server log.
+    let logCounts = countAuthInLog(admin.getMongo());
 
     assert.eq(logCounts.speculative,
-              newMechStats["SCRAM-SHA-256"].speculativeAuthenticate.successful);
-
-    // Subtract the initial mech stats for cluster authentication that were incremented
-    // during test setup, so we can assert on only the "real" cluster authetnication count
-    assert.eq(logCounts.cluster,
-              newMechStats["SCRAM-SHA-256"].clusterAuthenticate.successful -
-                  initialMechStats["SCRAM-SHA-256"].clusterAuthenticate.successful);
+              newMechStats["SCRAM-SHA-256"].speculativeAuthenticate.successful -
+                  initialMechStats["SCRAM-SHA-256"].speculativeAuthenticate.successful);
 
     assert.gt(logCounts.speculativeCluster,
               0,
               "Expected to observe at least one speculative cluster authentication attempt");
+
+    // Retry cluster count a few times since random intracluster auth may surprise us.
+    const kClusterCountNumRetries = 5;
+    const kClusterCountRetryIntervalMS = 5 * 1000;
+    assert.retry(function() {
+        const logCount = logCounts.cluster;
+        const mechStatCount = newMechStats["SCRAM-SHA-256"].clusterAuthenticate.successful;
+        if (logCount == mechStatCount) {
+            return true;
+        }
+
+        // Cluster count does not match.
+        // Possible that a background cluster-auth happened between getMechStats and countAuthInLog.
+        // Repoll values for a retry.
+        jsTest.log('Cluster counts mismatched: ' + logCount + ' != ' + mechStatCount);
+        newMechStats = getMechStats(admin);
+        logCounts = countAuthInLog(admin.getMongo());
+        return false;
+    }, "Cluster counts never stabilized", kClusterCountNumRetries, kClusterCountRetryIntervalMS);
 }
 
 admin.logout();
 rst.stopSet();
-}());

@@ -29,22 +29,48 @@
 
 #include "mongo/db/pipeline/document_source_change_stream_handle_topology_change.h"
 
-#include <algorithm>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <string>
+#include <utility>
 
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/change_stream_topology_change_info.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/pipeline/resume_token.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
-#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/query/async_results_merger_params_gen.h"
-#include "mongo/s/query/establish_cursors.h"
+#include "mongo/s/query/exec/establish_cursors.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/serialization_context.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
+
+REGISTER_INTERNAL_DOCUMENT_SOURCE(_internalChangeStreamHandleTopologyChange,
+                                  LiteParsedDocumentSourceChangeStreamInternal::parse,
+                                  DocumentSourceChangeStreamHandleTopologyChange::createFromBson,
+                                  true);
 
 // Failpoint to throw an exception when the 'kNewShardDetected' event is observed.
 MONGO_FAIL_POINT_DEFINE(throwChangeStreamTopologyChangeExceptionToClient);
@@ -82,7 +108,8 @@ bool isShardConfigEvent(const Document& eventDoc) {
     // Check whether this event occurred on the config.shards collection.
     auto nsObj = eventDoc[DocumentSourceChangeStream::kNamespaceField];
     const bool isConfigDotShardsEvent = nsObj["db"_sd].getType() == BSONType::String &&
-        nsObj["db"_sd].getStringData() == NamespaceString::kConfigsvrShardsNamespace.db() &&
+        nsObj["db"_sd].getStringData() ==
+            NamespaceString::kConfigsvrShardsNamespace.db(omitTenant) &&
         nsObj["coll"_sd].getType() == BSONType::String &&
         nsObj["coll"_sd].getStringData() == NamespaceString::kConfigsvrShardsNamespace.coll();
 
@@ -110,6 +137,15 @@ bool isShardConfigEvent(const Document& eventDoc) {
 }  // namespace
 
 boost::intrusive_ptr<DocumentSourceChangeStreamHandleTopologyChange>
+DocumentSourceChangeStreamHandleTopologyChange::createFromBson(
+    const BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    uassert(8131300,
+            str::stream() << "the '" << kStageName << "' spec must be an empty object",
+            elem.type() == Object && elem.Obj().isEmpty());
+    return new DocumentSourceChangeStreamHandleTopologyChange(expCtx);
+}
+
+boost::intrusive_ptr<DocumentSourceChangeStreamHandleTopologyChange>
 DocumentSourceChangeStreamHandleTopologyChange::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     return new DocumentSourceChangeStreamHandleTopologyChange(expCtx);
@@ -117,13 +153,13 @@ DocumentSourceChangeStreamHandleTopologyChange::create(
 
 DocumentSourceChangeStreamHandleTopologyChange::DocumentSourceChangeStreamHandleTopologyChange(
     const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(kStageName, expCtx) {}
+    : DocumentSourceInternalChangeStreamStage(kStageName, expCtx) {}
 
 StageConstraints DocumentSourceChangeStreamHandleTopologyChange::constraints(
     Pipeline::SplitState) const {
     StageConstraints constraints{StreamType::kStreaming,
                                  PositionRequirement::kNone,
-                                 HostTypeRequirement::kMongoS,
+                                 HostTypeRequirement::kRouter,
                                  DiskUseRequirement::kNoDiskUse,
                                  FacetRequirement::kNotAllowed,
                                  TransactionRequirement::kNotAllowed,
@@ -131,11 +167,11 @@ StageConstraints DocumentSourceChangeStreamHandleTopologyChange::constraints(
                                  UnionRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage};
 
-    // Can be swapped with the '$match' and 'DocumentSourceSingleDocumentTransformation' stages and
-    // ensures that they get pushed down to the shards, as this stage bisects the change streams
-    // pipeline.
+    // Can be swapped with the '$match', '$redact', and 'DocumentSourceSingleDocumentTransformation'
+    // stages and ensures that they get pushed down to the shards, as this stage bisects the change
+    // streams pipeline.
     constraints.canSwapWithMatch = true;
-    constraints.canSwapWithSingleDocTransform = true;
+    constraints.canSwapWithSingleDocTransformOrRedact = true;
 
     return constraints;
 }
@@ -145,7 +181,7 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamHandleTopologyChange::do
     // populated. We also resolve the original aggregation command from the expression context.
     if (!_mergeCursors) {
         _mergeCursors = dynamic_cast<DocumentSourceMergeCursors*>(pSource);
-        _originalAggregateCommand = pExpCtx->originalAggregateCommand.getOwned();
+        _originalAggregateCommand = pExpCtx->getOriginalAggregateCommand().getOwned();
 
         tassert(5549100, "Missing $mergeCursors stage", _mergeCursors);
         tassert(
@@ -175,7 +211,7 @@ std::vector<RemoteCursor>
 DocumentSourceChangeStreamHandleTopologyChange::establishShardCursorsOnNewShards(
     const Document& newShardDetectedObj) {
     // Reload the shard registry to see the new shard.
-    auto* opCtx = pExpCtx->opCtx;
+    auto* opCtx = pExpCtx->getOperationContext();
     Grid::get(opCtx)->shardRegistry()->reload(opCtx);
 
     // Parse the new shard's information from the document inserted into 'config.shards'.
@@ -192,8 +228,8 @@ DocumentSourceChangeStreamHandleTopologyChange::establishShardCursorsOnNewShards
 
     const bool allowPartialResults = false;  // partial results are not allowed
     return establishCursors(opCtx,
-                            pExpCtx->mongoProcessInterface->taskExecutor,
-                            pExpCtx->ns,
+                            pExpCtx->getMongoProcessInterface()->taskExecutor,
+                            pExpCtx->getNamespaceString(),
                             ReadPreferenceSetting::get(opCtx),
                             {{newShard.getName(), cmdObj}},
                             allowPartialResults);
@@ -204,31 +240,31 @@ BSONObj DocumentSourceChangeStreamHandleTopologyChange::createUpdatedCommandForN
     // We must start the new cursor from the moment at which the shard became visible.
     const auto newShardAddedTime = LogicalTime{shardAddedTime};
     auto resumeTokenForNewShard = ResumeToken::makeHighWaterMarkToken(
-        newShardAddedTime.addTicks(1).asTimestamp(), pExpCtx->changeStreamTokenVersion);
+        newShardAddedTime.addTicks(1).asTimestamp(), pExpCtx->getChangeStreamTokenVersion());
 
     // Create a new shard command object containing the new resume token.
     auto shardCommand = replaceResumeTokenInCommand(resumeTokenForNewShard.toDocument());
 
-    auto* opCtx = pExpCtx->opCtx;
-    bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
-
-    // Create the 'AggregateCommandRequest' object which will help in creating the parsed pipeline.
-    auto aggCmdRequest = aggregation_request_helper::parseFromBSON(
-        opCtx, pExpCtx->ns, shardCommand, boost::none, apiStrict);
+    tassert(7663502,
+            str::stream() << "SerializationContext on the expCtx should not be empty, with ns: "
+                          << pExpCtx->getNamespaceString().toStringForErrorMsg(),
+            pExpCtx->getSerializationContext() != SerializationContext::stateDefault());
 
     // Parse and optimize the pipeline.
-    auto pipeline = Pipeline::parse(aggCmdRequest.getPipeline(), pExpCtx);
+    auto pipeline = Pipeline::parseFromArray(
+        shardCommand[AggregateCommandRequest::kPipelineFieldName], pExpCtx);
     pipeline->optimizePipeline();
 
     // Split the full pipeline to get the shard pipeline.
-    auto splitPipelines = sharded_agg_helpers::splitPipeline(std::move(pipeline));
+    auto splitPipelines = sharded_agg_helpers::SplitPipeline::split(std::move(pipeline));
 
     // Create the new command that will run on the shard.
     return sharded_agg_helpers::createCommandForTargetedShards(pExpCtx,
                                                                Document{shardCommand},
                                                                splitPipelines,
                                                                boost::none, /* exhangeSpec */
-                                                               true /* needsMerge */);
+                                                               true /* needsMerge */,
+                                                               boost::none /* explain */);
 }
 
 BSONObj DocumentSourceChangeStreamHandleTopologyChange::replaceResumeTokenInCommand(
@@ -252,13 +288,13 @@ BSONObj DocumentSourceChangeStreamHandleTopologyChange::replaceResumeTokenInComm
     pipeline[0] =
         Value(Document{{DocumentSourceChangeStream::kStageName, changeStreamStage.freeze()}});
     MutableDocument newCmd(std::move(originalCmd));
-    newCmd[AggregateCommandRequest::kPipelineFieldName] = Value(pipeline);
+    newCmd[AggregateCommandRequest::kPipelineFieldName] = Value(std::move(pipeline));
     return newCmd.freeze().toBson();
 }
 
-Value DocumentSourceChangeStreamHandleTopologyChange::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {
+Value DocumentSourceChangeStreamHandleTopologyChange::doSerialize(
+    const SerializationOptions& opts) const {
+    if (opts.verbosity) {
         return Value(DOC(DocumentSourceChangeStream::kStageName
                          << DOC("stage"
                                 << "internalHandleTopologyChange"_sd)));

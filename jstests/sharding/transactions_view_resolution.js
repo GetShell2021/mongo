@@ -7,11 +7,13 @@
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");  // For arrayEq.
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
+import {withTxnAndAutoRetryOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    flushRoutersAndRefreshShardMetadata
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const shardedDbName = "shardedDB";
 const shardedCollName = "sharded";
@@ -24,9 +26,11 @@ const unshardedViewName = "unsharded_view";
 const viewOnShardedViewName = "sharded_view_view";
 
 function setUpUnshardedCollectionAndView(st, session, primaryShard) {
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: unshardedDbName, primaryShard: primaryShard}));
+
     assert.commandWorked(st.s.getDB(unshardedDbName)[unshardedCollName].insert(
         {_id: 1, x: "unsharded"}, {writeConcern: {w: "majority"}}));
-    st.ensurePrimaryShard(unshardedDbName, primaryShard);
 
     const unshardedView = session.getDatabase(unshardedDbName)[unshardedViewName];
     assert.commandWorked(unshardedView.runCommand(
@@ -38,12 +42,12 @@ function setUpUnshardedCollectionAndView(st, session, primaryShard) {
 function setUpShardedCollectionAndView(st, session, primaryShard) {
     const ns = shardedDbName + "." + shardedCollName;
 
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: shardedDbName, primaryShard: primaryShard}));
     assert.commandWorked(st.s.getDB(shardedDbName)[shardedCollName].insert(
-        {_id: -1}, {writeConcern: {w: "majority"}}));
+        {_id: -1, x: "sharded -1"}, {writeConcern: {w: "majority"}}));
     assert.commandWorked(st.s.getDB(shardedDbName)[shardedCollName].insert(
-        {_id: 1}, {writeConcern: {w: "majority"}}));
-    assert.commandWorked(st.s.adminCommand({enableSharding: shardedDbName}));
-    st.ensurePrimaryShard(shardedDbName, primaryShard);
+        {_id: 1, x: "sharded +1"}, {writeConcern: {w: "majority"}}));
 
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
@@ -79,9 +83,9 @@ assert.commandWorked(viewOnShardedView.runCommand(
 //
 
 function readFromViewOnFirstParticipantStatement(session, view, viewFunc, numDocsExpected) {
-    session.startTransaction();
-    assert.eq(viewFunc(view), numDocsExpected);
-    assert.commandWorked(session.commitTransaction_forTesting());
+    withTxnAndAutoRetryOnMongos(session, () => {
+        assert.eq(viewFunc(view), numDocsExpected);
+    });
 }
 
 // Unsharded view.
@@ -122,10 +126,10 @@ readFromViewOnFirstParticipantStatement(session, viewOnShardedView, (view) => {
 //
 
 function readFromViewOnLaterParticipantStatement(session, view, viewFunc, numDocsExpected) {
-    session.startTransaction();
-    assert.eq(view.aggregate({$match: {}}).itcount(), numDocsExpected);
-    assert.eq(viewFunc(view), numDocsExpected);
-    assert.commandWorked(session.commitTransaction_forTesting());
+    withTxnAndAutoRetryOnMongos(session, () => {
+        assert.eq(view.aggregate({$match: {}}).itcount(), numDocsExpected);
+        assert.eq(viewFunc(view), numDocsExpected);
+    });
 }
 
 // Unsharded view.
@@ -225,12 +229,12 @@ primaryShardNotReTargeted_FirstStatement(session, viewOnShardedView, (view) => {
 
 // Assumes the primary shard for view is Shard0.
 function primaryShardNotReTargeted_LaterStatement(session, view, viewFunc, numDocsExpected) {
-    session.startTransaction();
-    // Complete a statement on the primary shard for the view.
-    assert.eq(view.aggregate({$match: {_id: -1}}).itcount(), 1);
-    // Targets the primary first, but the resolved retry only targets Shard1.
-    assert.eq(viewFunc(view), numDocsExpected);
-    assert.commandWorked(session.commitTransaction_forTesting());
+    withTxnAndAutoRetryOnMongos(session, () => {
+        // Complete a statement on the primary shard for the view.
+        assert.eq(view.aggregate({$match: {_id: -1}}).itcount(), 1);
+        // Targets the primary first, but the resolved retry only targets Shard1.
+        assert.eq(viewFunc(view), numDocsExpected);
+    });
 }
 
 // This is only possible against sharded views.
@@ -260,34 +264,39 @@ primaryShardNotReTargeted_LaterStatement(session, viewOnShardedView, (view) => {
 //
 
 function assertAggResultEqInTransaction(coll, pipeline, expected) {
-    session.startTransaction();
-    const resArray = coll.aggregate(pipeline).toArray();
-    assert(arrayEq(resArray, expected), tojson({got: resArray, expected: expected}));
-    assert.commandWorked(session.commitTransaction_forTesting());
+    withTxnAndAutoRetryOnMongos(session, () => {
+        const resArray = coll.aggregate(pipeline).toArray();
+        assert(arrayEq(resArray, expected), tojson({got: resArray, expected: expected}));
+    });
 }
 
-// Set up an unsharded collection to use for $lookup, as lookup into a sharded collection in a
-// transaction is not yet supported.
-// TODO SERVER-39162: Add testing for lookup into sharded collections in a transaction.
-const lookupDbName = "dbForLookup";
-const lookupCollName = "collForLookup";
-assert.commandWorked(
-    st.s.getDB(lookupDbName)[lookupCollName].insert({_id: 1}, {writeConcern: {w: "majority"}}));
-const lookupColl = session.getDatabase(unshardedDbName)[unshardedCollName];
+// TODO SERVER-88936 Remove this check once last-lts has the feature flag enabled.
+const areAdditionalParticipantsAllowed =
+    FeatureFlagUtil.isPresentAndEnabled(st.s.getDB('admin'), "AllowAdditionalParticipants");
+if (areAdditionalParticipantsAllowed) {
+    // Test unsharded collection lookup.
+    let lookupDbName = unshardedDbName;
+    const lookupCollName = "collForLookup";
+    assert.commandWorked(
+        st.s.getDB(lookupDbName)[lookupCollName].insert({_id: 1}, {writeConcern: {w: "majority"}}));
+    let lookupColl = session.getDatabase(lookupDbName)[lookupCollName];
 
-// Lookup the document in the unsharded collection with _id: 1 through the unsharded view.
-assertAggResultEqInTransaction(
-    lookupColl,
-    [
-        {$match: {_id: 1}},
-        {$lookup: {from: unshardedViewName, localField: "_id", foreignField: "_id", as: "matched"}},
-        {$unwind: "$matched"},
-        {$project: {_id: 1, matchedX: "$matched.x"}}
-    ],
-    [{_id: 1, matchedX: "unsharded"}]);
+    // Lookup the document in the unsharded collection with _id: 1 through the unsharded view.
+    assertAggResultEqInTransaction(
+        lookupColl,
+        [
+            {$match: {_id: 1}},
+            {
+                $lookup:
+                    {from: unshardedViewName, localField: "_id", foreignField: "_id", as: "matched"}
+            },
+            {$unwind: "$matched"},
+            {$project: {_id: 1, matchedX: "$matched.x"}}
+        ],
+        [{_id: 1, matchedX: "unsharded"}]);
 
-// Find the same document through the view using $graphLookup.
-assertAggResultEqInTransaction(lookupColl,
+    // Find the same document through the view using $graphLookup.
+    assertAggResultEqInTransaction(lookupColl,
                                    [
                                      {$match: {_id: 1}},
                                      {
@@ -304,5 +313,49 @@ assertAggResultEqInTransaction(lookupColl,
                                    ],
                                    [{_id: 1, matchedX: "unsharded"}]);
 
+    // We now proceed to test sharded collection lookup. We do this by reusing the same collection
+    // here but sharding it first.
+    lookupDbName = shardedDbName;
+    lookupColl = session.getDatabase(lookupDbName)[lookupCollName];
+    assert.commandWorked(
+        st.s.getDB(lookupDbName)[lookupCollName].insert({_id: 1}, {writeConcern: {w: "majority"}}));
+    assert.commandWorked(st.s.getDB(lookupDbName)[lookupCollName].insert(
+        {_id: -1}, {writeConcern: {w: "majority"}}));
+
+    assert.commandWorked(
+        st.s.adminCommand({shardCollection: lookupColl.getFullName(), key: {_id: 1}}));
+    assert.commandWorked(st.s.adminCommand({split: lookupColl.getFullName(), middle: {_id: 0}}));
+    assert.commandWorked(st.s.adminCommand(
+        {moveChunk: lookupColl.getFullName(), find: {_id: 1}, to: st.shard1.shardName}));
+
+    // Lookup the documents in the now sharded collection through the sharded view.
+    assertAggResultEqInTransaction(
+        lookupColl,
+        [
+            {
+                $lookup:
+                    {from: shardedViewName, localField: "_id", foreignField: "_id", as: "matched"}
+            },
+            {$unwind: "$matched"},
+            {$project: {_id: 1, matchedX: "$matched.x"}}
+        ],
+        [{_id: 1, matchedX: "sharded +1"}, {_id: -1, matchedX: "sharded -1"}]);
+
+    // Find the same documents through the view using $graphLookup.
+    assertAggResultEqInTransaction(lookupColl,
+                                   [
+                                     {
+                                       $graphLookup: {
+                                           from: shardedViewName,
+                                           startWith: "$_id",
+                                           connectFromField: "_id",
+                                           connectToField: "_id",
+                                           as: "matched"
+                                       }
+                                     },
+                                     {$unwind: "$matched"},
+                                     {$project: {_id: 1, matchedX: "$matched.x"}}
+                                   ],
+                                   [{_id: 1, matchedX: "sharded +1"}, {_id: -1, matchedX: "sharded -1"}]);
+}
 st.stop();
-})();

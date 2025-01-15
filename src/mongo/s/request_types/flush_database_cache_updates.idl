@@ -32,7 +32,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 commands:
     _flushDatabaseCacheUpdates:
@@ -62,3 +62,4 @@ commands:
                 type: bool
                 description: "If true, forces a refresh of the cache entry from the config server before waiting for updates to be persist"
                 default: true
+        reply_type: OkReply

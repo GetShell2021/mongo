@@ -2,20 +2,17 @@
  * Basic tests for _shardsvrGetStatsForBalancing
  *
  * @tags: [
- *    featureFlagOrphanTracking,
  *    requires_fcv_60,
  * ]
  */
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");  // for 'configureFailPoint()'
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const rangeDeleterBatchSize = 128;
 
 const st = new ShardingTest({
     shards: 2,
-    other: {shardOptions: {setParameter: {rangeDeleterBatchSize: rangeDeleterBatchSize}}}
+    other: {rsOptions: {setParameter: {rangeDeleterBatchSize: rangeDeleterBatchSize}}}
 });
 
 function getCollSizeBytes(ns, node, optUUID) {
@@ -116,4 +113,3 @@ for (let i = 0; i < numBatches; i++) {
 beforeDeletionFailpoint.off();
 
 st.stop();
-})();

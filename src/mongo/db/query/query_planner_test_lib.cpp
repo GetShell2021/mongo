@@ -34,23 +34,55 @@
 
 #include "mongo/db/query/query_planner_test_lib.h"
 
-#include <ostream>
+#include <cstddef>
+#include <memory>
+#include <set>
+#include <utility>
+#include <vector>
 
+#include <absl/container/flat_hash_map.h>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/fts/fts_query.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_algo.h"
+#include "mongo/db/matcher/expression_hasher.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/pipeline/document_source_group.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/query/collation/collator_factory_mock.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/interval.h"
+#include "mongo/db/query/projection.h"
+#include "mongo/db/query/projection_ast.h"
 #include "mongo/db/query/projection_ast_util.h"
 #include "mongo/db/query/projection_parser.h"
-#include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/projection_policies.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/stage_types.h"
 #include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -64,7 +96,10 @@ using std::string;
 Status filterMatches(const BSONObj& testFilter,
                      const MatchExpression* trueFilter,
                      std::unique_ptr<CollatorInterface> collator) {
-    std::unique_ptr<MatchExpression> trueFilterClone(trueFilter->shallowClone());
+    if (!trueFilter) {
+        return {ErrorCodes::Error{6298503}, "actual (true) filter was null"};
+    }
+    std::unique_ptr<MatchExpression> trueFilterClone(trueFilter->clone());
     MatchExpression::sortTree(trueFilterClone.get());
 
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -81,13 +116,22 @@ Status filterMatches(const BSONObj& testFilter,
         root = MatchExpression::optimize(std::move(root));
     }
     MatchExpression::sortTree(root.get());
-    if (trueFilterClone->equivalent(root.get())) {
-        return Status::OK();
+    if (!trueFilterClone->equivalent(root.get())) {
+        return {ErrorCodes::Error{5619211},
+                str::stream()
+                    << "Provided filter did not match filter on query solution node. Expected: "
+                    << root->toString() << ". Found: " << trueFilter->toString()};
     }
-    return {
-        ErrorCodes::Error{5619211},
-        str::stream() << "Provided filter did not match filter on query solution node. Expected: "
-                      << root->toString() << ". Found: " << trueFilter->toString()};
+
+    const MatchExpressionHasher hash{};
+    if (hash(trueFilterClone.get()) != hash(root.get())) {
+        return {ErrorCodes::Error{7901821},
+                str::stream() << "Provided filter's hash did not match filter's hash on query "
+                                 "solution node. Expected: "
+                              << root->toString() << ". Found: " << trueFilter->toString()};
+    }
+
+    return Status::OK();
 }
 
 Status nodeHasMatchingFilter(const BSONObj& testFilter,
@@ -150,6 +194,22 @@ Status columnIxScanFiltersByPathMatch(
                                   << ", expected filters: " << expectedFiltersByPath
                                   << "stage. Please specify an object."};
         }
+    }
+    return Status::OK();
+}
+
+Status indexNamesMatch(BSONElement expectedIndexName, std::string actualIndexName) {
+    if (expectedIndexName.type() != BSONType::String) {
+        return {ErrorCodes::Error{5619234},
+                str::stream() << "Provided JSON gave a 'ixscan' with a 'name', but the name "
+                                 "was not an string: "
+                              << expectedIndexName};
+    }
+    if (expectedIndexName.valueStringData() != actualIndexName) {
+        return {ErrorCodes::Error{5619235},
+                str::stream() << "Provided JSON gave a 'column_scan' with an 'indexName' which did "
+                                 "not match. Expected: "
+                              << expectedIndexName << " Found: " << actualIndexName};
     }
     return Status::OK();
 }
@@ -521,20 +581,11 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
             }
         }
 
-        BSONElement name = ixscanObj["name"];
+        auto name = ixscanObj["name"];
         if (!name.eoo()) {
-            if (name.type() != BSONType::String) {
-                return {ErrorCodes::Error{5619234},
-                        str::stream()
-                            << "Provided JSON gave a 'ixscan' with a 'name', but the name "
-                               "was not an string: "
-                            << name};
-            }
-            if (name.valueStringData() != ixn->index.identifier.catalogName) {
-                return {ErrorCodes::Error{5619235},
-                        str::stream() << "Provided JSON gave a 'ixscan' with a 'name' which did "
-                                         "not match. Expected: "
-                                      << name << " Found: " << ixn->index.identifier.catalogName};
+            if (auto nameStatus = indexNamesMatch(name, ixn->index.identifier.catalogName);
+                !nameStatus.isOK()) {
+                return nameStatus;
             }
         }
 
@@ -776,6 +827,62 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
         }
 
         return Status::OK();
+    } else if (StageType::STAGE_DISTINCT_SCAN == trueSoln->getType()) {
+        // {distinct: {key: <...>, indexPattern: <...>, direction: <...>}}
+        const DistinctNode* node = static_cast<const DistinctNode*>(trueSoln);
+        BSONElement el = testSoln["distinct"];
+        if (el.eoo() || !el.isABSONObj()) {
+            return {ErrorCodes::Error{9261601},
+                    "found a distinct stage in the solution but no "
+                    "corresponding 'distinct' object in the provided JSON"};
+        }
+
+        BSONObj distinctObj = el.Obj();
+
+        BSONElement key = distinctObj["key"];
+        if (!key.eoo()) {
+            std::vector<BSONElement> fields;
+            node->index.keyPattern.elems(fields);
+            if (node->fieldNo < 0 || static_cast<size_t>(node->fieldNo) >= fields.size() ||
+                key.String() != fields[node->fieldNo].fieldNameStringData()) {
+                return {ErrorCodes::Error{9261602},
+                        str::stream()
+                            << "Provided JSON gave a 'distinct' stage with a different 'key' field"
+                            << key};
+            }
+        }
+
+        BSONElement indexPattern = distinctObj["indexPattern"];
+        if (!indexPattern.eoo()) {
+            if (!SimpleBSONObjComparator::kInstance.evaluate(indexPattern.Obj() ==
+                                                             node->index.keyPattern)) {
+                return {ErrorCodes::Error{9261603},
+                        str::stream() << "Provided JSON gave a 'distinct' stage with a different "
+                                         "'indexPattern' field"
+                                      << indexPattern};
+            }
+        }
+
+        BSONElement direction = distinctObj["direction"];
+        if (!direction.eoo()) {
+            if (direction.String() != std::to_string(node->direction)) {
+                return {ErrorCodes::Error{9261604},
+                        str::stream() << "Provided JSON gave a 'distinct' stage with a different "
+                                         "'direction' field"
+                                      << direction};
+            }
+        }
+
+        BSONElement isFetching = distinctObj["isFetching"];
+        if (!isFetching.eoo() && isFetching.Bool() != node->isFetching) {
+            return {
+                ErrorCodes::Error{9245904},
+                str::stream()
+                    << "Provided JSON gave a 'distinct' stage with a different 'isFetching' field"
+                    << direction};
+        }
+
+        return Status::OK();
     }
 
     //
@@ -950,7 +1057,7 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
                     "corresponding 'proj' object in the provided JSON"};
         }
         BSONObj projObj = el.Obj();
-        invariant(bsonObjFieldsAreInSet(projObj, {"type", "spec", "node"}));
+        invariant(bsonObjFieldsAreInSet(projObj, {"type", "spec", "node", "isAddition"}));
 
         BSONElement projType = projObj["type"];
         if (!projType.eoo()) {
@@ -996,14 +1103,24 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
                 "JSON"};
         }
 
+        // Extra flag which can be used to indicate whether the projection is an "addition" (adding
+        // fields) or not (excluding/including fields);
+        BSONElement isAdditionElt = projObj["isAddition"];
+        const bool isAddition = isAdditionElt.trueValue();
+
         // Create an empty/dummy expression context without access to the operation context and
         // collator. This should be sufficient to parse a projection.
-        auto expCtx =
-            make_intrusive<ExpressionContext>(nullptr, nullptr, NamespaceString("test.dummy"));
+        auto expCtx = ExpressionContextBuilder{}
+                          .ns(NamespaceString::createNamespaceString_forTest("test.dummy"))
+                          .build();
         auto projection = projection_ast::parseAndAnalyze(
-            expCtx, spec.Obj(), ProjectionPolicies::findProjectionPolicies());
+            expCtx,
+            spec.Obj(),
+            isAddition ? ProjectionPolicies::addFieldsProjectionPolicies()
+                       : ProjectionPolicies::findProjectionPolicies());
         auto specProjObj = projection_ast::astToDebugBSON(projection.root());
         auto solnProjObj = projection_ast::astToDebugBSON(pn->proj.root());
+
         if (!SimpleBSONObjComparator::kInstance.evaluate(specProjObj == solnProjObj)) {
             return {ErrorCodes::Error{5619278},
                     str::stream() << "found a projection stage in the solution with "
@@ -1071,7 +1188,9 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
                     }
                     break;
                 }
-                default: { MONGO_UNREACHABLE; }
+                default: {
+                    MONGO_UNREACHABLE;
+                }
             }
         }
 
@@ -1236,7 +1355,10 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
         }
 
         BSONObjBuilder bob;
-        actualGroupNode->groupByExpression->serialize(true).addToBsonObj(&bob, "_id");
+        actualGroupNode->groupByExpression
+            ->serialize(SerializationOptions{
+                .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)})
+            .addToBsonObj(&bob, "_id");
         auto actualGroupByObj = bob.done();
         if (!SimpleBSONObjComparator::kInstance.evaluate(actualGroupByObj ==
                                                          expectedGroupByElem.Obj())) {
@@ -1249,7 +1371,10 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
         BSONArrayBuilder actualAccs;
         for (auto& acc : actualGroupNode->accumulators) {
             BSONObjBuilder bob;
-            acc.expr.argument->serialize(true).addToBsonObj(&bob, acc.expr.name);
+            acc.expr.argument
+                ->serialize(SerializationOptions{
+                    .verbosity = boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner)})
+                .addToBsonObj(&bob, acc.expr.name);
             actualAccs.append(BSON(acc.fieldName << bob.done()));
         }
         auto expectedAccsObj = expectedGroupObj["accs"].Obj();
@@ -1291,90 +1416,6 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
                                   << testSoln << " Found: " << actualSentinelNode};
         }
         return Status::OK();
-    } else if (STAGE_COLUMN_SCAN == trueSoln->getType()) {
-        const auto* actualColumnIxScanNode = static_cast<const ColumnIndexScanNode*>(trueSoln);
-        auto expectedElem = testSoln["column_scan"];
-        if (expectedElem.eoo() || !expectedElem.isABSONObj()) {
-            return {ErrorCodes::Error{5842490},
-                    "found a 'column_scan' object in the test solution but no corresponding "
-                    "'column_scan' object in the expected JSON"};
-        }
-        auto obj = expectedElem.Obj();
-
-        if (auto outputFields = obj["outputFields"]) {
-            if (auto outputStatus =
-                    stringSetsMatch(outputFields,
-                                    actualColumnIxScanNode->outputFields,
-                                    "mismatching output fields within 'column_scan'");
-                !outputStatus.isOK()) {
-                return outputStatus;
-            }
-        }
-
-        if (auto matchFields = obj["matchFields"]) {
-            if (auto matchStatus = stringSetsMatch(matchFields,
-                                                   actualColumnIxScanNode->matchFields,
-                                                   "mismatching match fields within 'column_scan'");
-                !matchStatus.isOK()) {
-                return matchStatus;
-            }
-        }
-
-        if (!actualColumnIxScanNode->children.empty()) {
-            return {
-                ErrorCodes::Error{5842492},
-                "found a column_scan stage with more than zero children in the actual solution:"};
-        }
-
-        // All QuerySolutionNodes can have a 'filter' option, but the column index stage is special.
-        // Make sure the caller doesn't expect this and that the actual solution doesn't store
-        // anything in that field either.
-        if (auto filter = obj["filter"]) {
-            return {ErrorCodes::Error{6312402},
-                    "do not specify 'filter' to a 'column_scan', specify 'filtersByPath' instead"};
-        }
-        if (actualColumnIxScanNode->filter) {
-            return {ErrorCodes::Error{6312403},
-                    "'column_scan' solution node found with a non-empty 'filter'. We expect this "
-                    "to be null and 'filtersByPath' to be used instead."};
-        }
-
-        if (auto filtersByPath = obj["filtersByPath"]) {
-            if (filtersByPath.type() != BSONType::Object) {
-                return {ErrorCodes::Error{6412404},
-                        str::stream() << "invalid 'filtersByPath' specified to 'column_scan' "
-                                         "stage. Please specify an object. Found: "
-                                      << filtersByPath};
-            }
-
-            const auto expectedFiltersByPath = filtersByPath.Obj();
-            if (auto filtersMatchStatus = columnIxScanFiltersByPathMatch(
-                    expectedFiltersByPath, actualColumnIxScanNode->filtersByPath);
-                !filtersMatchStatus.isOK()) {
-                return filtersMatchStatus.withContext("mismatching filters in 'column_scan' stage");
-            }
-        }
-
-        if (auto postAssemblyFilter = obj["postAssemblyFilter"]) {
-            if (postAssemblyFilter.type() != BSONType::Object) {
-                return {ErrorCodes::Error{6412408},
-                        str::stream() << "invalid 'postAssemblyFilter' specified to 'column_scan' "
-                                         "stage. Please specify an object. Found: "
-                                      << postAssemblyFilter};
-            }
-
-            const auto expectedPostAssemblyFilter = postAssemblyFilter.Obj();
-            if (auto filtersMatchStatus =
-                    filterMatches(expectedPostAssemblyFilter,
-                                  actualColumnIxScanNode->postAssemblyFilter.get(),
-                                  nullptr);
-                !filtersMatchStatus.isOK()) {
-                return filtersMatchStatus.withContext(
-                    "mismatching 'postAssemblyFilter' in 'column_scan' stage");
-            }
-        }
-
-        return Status::OK();
     } else if (STAGE_EQ_LOOKUP == trueSoln->getType()) {
         const auto* actualEqLookupNode = static_cast<const EqLookupNode*>(trueSoln);
         auto expectedElem = testSoln["eq_lookup"];
@@ -1395,13 +1436,14 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
                                   << testSoln.toString()};
         }
 
-        if (expectedForeignCollection.str() != actualEqLookupNode->foreignCollection) {
+        if (expectedForeignCollection.str() !=
+            actualEqLookupNode->foreignCollection.toString_forTest()) {
             return {
                 ErrorCodes::Error{6267502},
                 str::stream() << "Test solution 'foreignCollection' does not match actual; test "
                                  ""
                               << expectedForeignCollection.str() << " != actual "
-                              << actualEqLookupNode->foreignCollection};
+                              << actualEqLookupNode->foreignCollection.toStringForErrorMsg()};
         }
 
         auto expectedLocalField = expectedEqLookupSoln["joinFieldLocal"];
@@ -1484,6 +1526,14 @@ Status QueryPlannerTestLib::solutionMatches(const BSONObj& testSoln,
         }
         return solutionMatches(child.Obj(), actualEqLookupNode->children[0].get(), relaxBoundsCheck)
             .withContext("mismatch below eq_lookup stage");
+    } else if (STAGE_EOF == trueSoln->getType()) {
+        auto eofElement = testSoln["eof"];
+        if (eofElement.eoo()) {
+            return {ErrorCodes::Error{8186300},
+                    "found an 'eof' object in the test solution but no corresponding "
+                    "'eof' object in the expected JSON"};
+        }
+        return Status::OK();
     }
     return {ErrorCodes::Error{5698301},
             str::stream() << "Unknown query solution node found: " << trueSoln->toString()};

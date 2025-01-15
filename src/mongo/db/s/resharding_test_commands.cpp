@@ -28,22 +28,43 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
+#include <boost/smart_ptr.hpp>
+#include <functional>
 #include <memory>
+#include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/s/metrics/sharding_data_transform_instance_metrics.h"
 #include "mongo/db/s/resharding/resharding_collection_cloner.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
+#include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding_test_commands_gen.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -65,18 +86,21 @@ public:
             // the thread from the thread pool. We set up the ThreadPoolTaskExecutor identically to
             // how the recipient's primary-only service is set up.
             ThreadPool::Options threadPoolOptions;
-            threadPoolOptions.maxThreads = 1;
+            if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+                // With reshardingImprovements, we need a larger executor.
+                auto donorShards = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx).size();
+                threadPoolOptions.maxThreads =
+                    1 + 2 * donorShards + resharding::gReshardingCollectionClonerWriteThreadCount;
+            } else {
+                threadPoolOptions.maxThreads = 1;
+            }
             threadPoolOptions.threadNamePrefix = "TestReshardCloneCollection-";
             threadPoolOptions.poolName = "TestReshardCloneCollectionThreadPool";
-            threadPoolOptions.onCreateThread = [](const std::string& threadName) {
-                Client::initThread(threadName.c_str());
+            threadPoolOptions.onCreateThread = [opCtx](const std::string& threadName) {
+                Client::initThread(threadName, opCtx->getService());
                 auto* client = Client::getCurrent();
-                AuthorizationSession::get(*client)->grantInternalAuthorization(client);
-
-                {
-                    stdx::lock_guard<Client> lk(*client);
-                    client->setSystemOperationKillableByStepdown(lk);
-                }
+                AuthorizationSession::get(*client)->grantInternalAuthorization();
             };
 
             auto metrics = ReshardingMetrics::makeInstance(
@@ -91,19 +115,24 @@ public:
             hookList->addHook(
                 std::make_unique<rpc::VectorClockMetadataHook>(opCtx->getServiceContext()));
 
-            auto executor = std::make_shared<executor::ThreadPoolTaskExecutor>(
+            auto executor = executor::ThreadPoolTaskExecutor::create(
                 std::make_unique<ThreadPool>(std::move(threadPoolOptions)),
                 executor::makeNetworkInterface(
                     "TestReshardCloneCollectionNetwork", nullptr, std::move(hookList)));
             executor->startup();
 
+            UUID reshardingUUID =
+                request().getReshardingUUID() ? *request().getReshardingUUID() : UUID::gen();
             ReshardingCollectionCloner cloner(metrics.get(),
+                                              reshardingUUID,
                                               ShardKeyPattern(request().getShardKey()),
                                               ns(),
                                               request().getUuid(),
                                               request().getShardId(),
                                               request().getAtClusterTime(),
-                                              request().getOutputNs());
+                                              request().getOutputNs(),
+                                              true /* storeProgress */,
+                                              request().getRelaxed());
 
             std::shared_ptr<ThreadPool> cancelableOperationContextPool = [] {
                 ThreadPool::Options options;
@@ -156,7 +185,7 @@ public:
         return AllowedOnSecondary::kNever;
     }
 };
-MONGO_REGISTER_TEST_COMMAND(ReshardingCloneCollectionTestCommand);
+MONGO_REGISTER_COMMAND(ReshardingCloneCollectionTestCommand).testOnly().forShard();
 
 }  // namespace
 }  // namespace mongo

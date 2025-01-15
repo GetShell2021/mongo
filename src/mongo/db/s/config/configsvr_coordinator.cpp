@@ -28,13 +28,32 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/cstdint.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <tuple>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
 #include "mongo/db/s/config/configsvr_coordinator.h"
-
 #include "mongo/db/s/config/configsvr_coordinator_gen.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/future_util.h"
+#include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -42,6 +61,7 @@
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(hangBeforeRunningConfigsvrCoordinatorInstance);
+MONGO_FAIL_POINT_DEFINE(hangAndEndBeforeRunningConfigsvrCoordinatorInstance);
 
 namespace {
 
@@ -50,8 +70,8 @@ const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
 }  // namespace
 
 ConfigsvrCoordinatorMetadata extractConfigsvrCoordinatorMetadata(const BSONObj& stateDoc) {
-    return ConfigsvrCoordinatorMetadata::parse(
-        IDLParserErrorContext("ConfigsvrCoordinatorMetadata"), stateDoc);
+    return ConfigsvrCoordinatorMetadata::parse(IDLParserContext("ConfigsvrCoordinatorMetadata"),
+                                               stateDoc);
 }
 
 ConfigsvrCoordinator::ConfigsvrCoordinator(const BSONObj& stateDoc)
@@ -93,7 +113,7 @@ void ConfigsvrCoordinator::interrupt(Status status) noexcept {
                 "reason"_attr = redact(status));
 
     // Resolve any unresolved promises to avoid hanging.
-    stdx::lock_guard<Latch> lg(_mutex);
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
     if (!_completionPromise.getFuture().isReady()) {
         _completionPromise.setError(status);
     }
@@ -101,6 +121,11 @@ void ConfigsvrCoordinator::interrupt(Status status) noexcept {
 
 SemiFuture<void> ConfigsvrCoordinator::run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                            const CancellationToken& token) noexcept {
+    if (hangAndEndBeforeRunningConfigsvrCoordinatorInstance.shouldFail()) {
+        hangAndEndBeforeRunningConfigsvrCoordinatorInstance.pauseWhileSet();
+        _completionPromise.emplaceValue();
+        return Status::OK();
+    }
     return ExecutorFuture<void>(**executor)
         .then([this, executor, token, anchor = shared_from_this()] {
             hangBeforeRunningConfigsvrCoordinatorInstance.pauseWhileSet();
@@ -141,14 +166,14 @@ SemiFuture<void> ConfigsvrCoordinator::run(std::shared_ptr<executor::ScopedTaskE
                               "Failed to remove ConfigsvrCoordinator state document",
                               "error"_attr = redact(ex));
                 ex.addContext("Failed to remove ConfigsvrCoordinator state document"_sd);
-                stdx::lock_guard<Latch> lg(_mutex);
+                stdx::lock_guard<stdx::mutex> lg(_mutex);
                 if (!_completionPromise.getFuture().isReady()) {
                     _completionPromise.setError(ex.toStatus());
                 }
                 throw;
             }
 
-            stdx::lock_guard<Latch> lg(_mutex);
+            stdx::lock_guard<stdx::mutex> lg(_mutex);
             if (!_completionPromise.getFuture().isReady()) {
                 _completionPromise.emplaceValue();
             }

@@ -5,10 +5,11 @@
  *
  * @tags: [requires_fcv_60, uses_transactions, requires_persistence]
  */
-(function() {
-'use strict';
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-load("jstests/libs/fail_point_util.js");
+// This test requires running transactions directly against the shard.
+TestData.replicaSetEndpointIncompatible = true;
 
 const kDbName = "testDb";
 const kCollName = "testColl";
@@ -311,4 +312,3 @@ function testNoPersistenceOfDefaultTxnRetryCounter(
 })();
 
 st.stop();
-})();

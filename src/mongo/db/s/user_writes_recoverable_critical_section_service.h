@@ -29,18 +29,14 @@
 
 #pragma once
 
+#include <string>
+
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/service_context.h"
 
 namespace mongo {
-
-namespace user_writes_recoverable_critical_section_util {
-
-bool inRecoveryMode(OperationContext* opCtx);
-
-}
 
 /**
  * Represents the 'user writes blocking' critical section. The critical section status is persisted
@@ -145,17 +141,27 @@ public:
     void recoverRecoverableCriticalSections(OperationContext* opCtx);
 
 private:
-    void onInitialDataAvailable(OperationContext* opCtx,
-                                bool isMajorityDataAvailable) override final {
+    void onConsistentDataAvailable(OperationContext* opCtx,
+                                   bool isMajority,
+                                   bool isRollback) final {
+        // TODO (SERVER-91505): Determine if we should reload in-memory states on rollback.
+        if (isRollback) {
+            return;
+        }
         recoverRecoverableCriticalSections(opCtx);
     }
 
-    void onStartup(OperationContext* opCtx) override final {}
-    void onShutdown() override final {}
-    void onStepUpBegin(OperationContext* opCtx, long long term) override final {}
-    void onStepUpComplete(OperationContext* opCtx, long long term) override final {}
-    void onStepDown() override final {}
-    void onBecomeArbiter() override final {}
+    void onStartup(OperationContext* opCtx) final {}
+    void onSetCurrentConfig(OperationContext* opCtx) final {}
+    void onShutdown() final {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) final {}
+    void onStepUpComplete(OperationContext* opCtx, long long term) final {}
+    void onStepDown() final {}
+    void onRollbackBegin() final {}
+    void onBecomeArbiter() final {}
+    inline std::string getServiceName() const final {
+        return "UserWritesRecoverableCriticalSectionService";
+    }
 };
 
 }  // namespace mongo

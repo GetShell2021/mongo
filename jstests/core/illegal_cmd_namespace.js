@@ -3,11 +3,18 @@
  * but is rejected by the server.
  *
  * @tags: [
- *   assumes_unsharded_collection,
+ *   assumes_no_implicit_collection_creation_on_get_collection,
  * ]
  */
-(function() {
-"use strict";
+
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+
+// On a sharded cluster we need to create the database to throw the expected error instead of just
+// returning an empty batch.
+if (FixtureHelpers.isMongos(db) || TestData.testingReplicaSetEndpoint) {
+    // Create database
+    assert.commandWorked(db.adminCommand({'enableSharding': db.getName()}));
+}
 
 function testBadNamespace(collName) {
     const coll = db[collName];
@@ -33,4 +40,3 @@ testBadNamespace("$cmd.aggregate");
 testBadNamespace("a$cmdb");
 testBadNamespace("$");
 testBadNamespace("a$b");
-}());

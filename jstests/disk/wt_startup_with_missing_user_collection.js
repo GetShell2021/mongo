@@ -4,10 +4,12 @@
  *
  * @tags: [requires_wiredtiger]
  */
-(function() {
-
-load('jstests/disk/libs/wt_file_helper.js');
-load('jstests/noPassthrough/libs/index_build.js');
+import {
+    getUriForColl,
+    getUriForIndex,
+    startMongodOnExistingPath
+} from "jstests/disk/libs/wt_file_helper.js";
+import {IndexBuildTest} from "jstests/noPassthrough/libs/index_build.js";
 
 // This test triggers an unclean shutdown (an fassert), which may cause inaccurate fast counts.
 TestData.skipEnforceFastCountOnValidate = true;
@@ -38,11 +40,11 @@ IndexBuildTest.waitForIndexBuildToScanCollection(
 assert.commandWorked(testDB.adminCommand({fsync: 1}));
 
 const collUri = getUriForColl(testDB.getCollection("a"));
-const indexIdUri = getUriForIndex(testDB.getCollection("a"), /*indexName=*/"_id_");
-const indexXUri = getUriForIndex(testDB.getCollection("a"), /*indexName=*/"x_1");
+const indexIdUri = getUriForIndex(testDB.getCollection("a"), /*indexName=*/ "_id_");
+const indexXUri = getUriForIndex(testDB.getCollection("a"), /*indexName=*/ "x_1");
 
 MongoRunner.stopMongod(mongod);
-awaitIndexBuild();
+awaitIndexBuild({checkExitSuccess: false});
 
 // Remove data files for collection "a" after shutting down.
 removeFile(dbpath + "/" + collUri + ".wt");
@@ -65,7 +67,7 @@ testDB = mongod.getDB(dbName);
 assert.throws(() => {
     assert.commandWorked(testDB.getCollection("a").insert({}));
 });
-assert.gte(rawMongoProgramOutput().search("Fatal assertion.*50883"), 0);
+assert.gte(rawMongoProgramOutput("Fatal assertion").search("50883"), 0);
 
 // Perform a startup, drop collection "a" and shutdown.
 mongod = startMongodOnExistingPath(dbpath);
@@ -75,4 +77,3 @@ testDB = mongod.getDB(dbName);
 assert(testDB.getCollection("a").drop());
 
 MongoRunner.stopMongod(mongod);
-}());

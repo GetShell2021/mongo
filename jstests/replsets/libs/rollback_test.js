@@ -38,12 +38,12 @@
  * of each stage.
  */
 
-"use strict";
-
-load("jstests/replsets/rslib.js");
-load("jstests/replsets/libs/two_phase_drops.js");
-load("jstests/hooks/validate_collections.js");
-load('jstests/libs/fail_point_util.js');
+import {CollectionValidator} from "jstests/hooks/validate_collections.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {waitForState} from "jstests/replsets/rslib.js";
 
 /**
  *
@@ -67,8 +67,10 @@ load('jstests/libs/fail_point_util.js');
  *
  * @param {string} [optional] name the name of the test being run
  * @param {Object} [optional] replSet the ReplSetTest instance to adopt
+ * @param {Object} [optional] nodeOptions command-line options to apply to all nodes in the replica
+ *     set. Ignored if 'replSet' is provided.
  */
-function RollbackTest(name = "RollbackTest", replSet) {
+export function RollbackTest(name = "RollbackTest", replSet, nodeOptions) {
     const State = {
         kStopped: "kStopped",
         kRollbackOps: "kRollbackOps",
@@ -104,7 +106,31 @@ function RollbackTest(name = "RollbackTest", replSet) {
     let lastRBID;
 
     // Make sure we have a replica set up and running.
-    replSet = (replSet === undefined) ? performStandardSetup() : replSet;
+    replSet = (replSet === undefined) ? performStandardSetup(nodeOptions) : replSet;
+
+    // Runs the passed in cmdObj on db with a security token if multitenancy support is activated.
+    let runWithTenantIfNeeded = (function() {
+        const adminDB = replSet.getPrimary().getDB("admin");
+        const featureFlagRequireTenantID = FeatureFlagUtil.isEnabled(adminDB, "RequireTenantID");
+        const featureFlagSecurityToken = FeatureFlagUtil.isEnabled(adminDB, "SecurityToken");
+        const multitenancyDoc =
+            assert.commandWorked(adminDB.adminCommand({getParameter: 1, multitenancySupport: 1}));
+        if (multitenancyDoc.hasOwnProperty("multitenancySupport") &&
+            multitenancyDoc.multitenancySupport && featureFlagRequireTenantID &&
+            featureFlagSecurityToken) {
+            return function(dbConn, cmdObj) {
+                const tenantId = ObjectId();
+                dbConn.getMongo()._setSecurityToken(_createTenantToken({tenant: tenantId}));
+                assert.commandWorked(dbConn.runCommand(cmdObj));
+                dbConn.getMongo()._setSecurityToken(undefined);
+            };
+        } else {
+            return function(dbConn, cmdObj) {
+                assert.commandWorked(dbConn.runCommand(cmdObj));
+            };
+        }
+    })();
+
     validateAndUseSetup(replSet);
 
     // Majority writes in the initial phase, before transitionToRollbackOperations(), should be
@@ -179,9 +205,12 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // ensure the insert was replicated and written to the on-disk journal of all 3
         // nodes, with the exception of ephemeral and in-memory storage engines where
         // journaling isn't supported.
-        assert.commandWorked(curPrimary.getDB(dbName).ensureSyncSource.insert(
-            {thisDocument: 'is inserted to ensure any node can sync from any other'},
-            {writeConcern: {w: 3, j: config.writeConcernMajorityJournalDefault}}));
+
+        runWithTenantIfNeeded(curPrimary.getDB(dbName), {
+            insert: "ensureSyncSource",
+            documents: [{thisDocument: 'is inserted to ensure any node can sync from any other'}],
+            writeConcern: {w: 3, j: config.writeConcernMajorityJournalDefault}
+        });
     }
 
     /**
@@ -204,12 +233,12 @@ function RollbackTest(name = "RollbackTest", replSet) {
      *
      * Note: One of the secondaries will have a priority of 0.
      */
-    function performStandardSetup() {
-        let nodeOptions = {};
+    function performStandardSetup(nodeOptions) {
+        nodeOptions = nodeOptions || {};
         if (TestData.logComponentVerbosity) {
-            nodeOptions["setParameter"] = {
-                "logComponentVerbosity": tojsononeline(TestData.logComponentVerbosity)
-            };
+            nodeOptions["setParameter"] = nodeOptions["setParameter"] || {};
+            nodeOptions["setParameter"]["logComponentVerbosity"] =
+                tojsononeline(TestData.logComponentVerbosity);
         }
         if (TestData.syncdelay) {
             nodeOptions["syncdelay"] = TestData.syncdelay;
@@ -222,7 +251,7 @@ function RollbackTest(name = "RollbackTest", replSet) {
         let config = replSet.getReplSetConfig();
         config.members[2].priority = 0;
         config.settings = {chainingAllowed: false};
-        replSet.initiateWithHighElectionTimeout(config);
+        replSet.initiate(config);
         // Tiebreaker's replication is paused for most of the test, avoid falling off the oplog.
         replSet.nodes.forEach((node) => {
             assert.commandWorked(node.adminCommand({replSetResizeOplog: 1, minRetentionHours: 2}));
@@ -244,13 +273,11 @@ function RollbackTest(name = "RollbackTest", replSet) {
                   State.kSteadyStateOps,
                   "Not in kSteadyStateOps state, cannot check data consistency");
 
-        // We must wait for collection drops to complete so that we don't get spurious failures
-        // in the consistency checks.
         rst.awaitSecondaryNodes();
-        rst.nodes.forEach(TwoPhaseDropCollectionTest.waitForAllCollectionDropsToComplete);
 
         const name = rst.name;
         rst.checkOplogs(name);
+        rst.checkPreImageCollection(name);
         rst.checkReplicatedDataHashes(name);
         collectionValidator.validateNodes(rst.nodeList());
     };
@@ -294,6 +321,10 @@ function RollbackTest(name = "RollbackTest", replSet) {
         return rst.getPrimary(ReplSetTest.kDefaultTimeoutMS, kRetryIntervalMS);
     }
 
+    this.stepUpNode = function(conn) {
+        stepUp(conn);
+    };
+
     function oplogTop(conn) {
         return conn.getDB("local").oplog.rs.find().limit(1).sort({$natural: -1}).next();
     }
@@ -331,11 +362,6 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // 3. Check if the rollback node is caught up.
         //
         // If any conditions are unmet, retry.
-        //
-        // If {enableMajorityReadConcern:false} is set, it will use the rollbackViaRefetch
-        // algorithm. That can lead to unrecoverable rollbacks, particularly in unclean shutdown
-        // suites, as it is possible in rare cases for the sync source to lose the entry
-        // corresponding to the optime the rollback node chose as its minValid.
         log(`Wait for ${curSecondary.host} to finish rollback`);
         assert.soonNoExcept(
             () => {
@@ -448,10 +474,12 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // ensure that this document is not lost due to unclean shutdowns. Ephemeral and in-memory
         // storage engines are an exception because journaling isn't supported.
         let writeConcern = TestData.rollbackShutdowns ? {w: 1, j: true} : {w: 1};
-        let dbName = "EnsureThereIsAtLeastOneOperationToRollback";
-        assert.commandWorked(curPrimary.getDB(dbName).ensureRollback.insert(
-            {thisDocument: 'is inserted to ensure rollback is not skipped'},
-            {writeConcern: writeConcern}));
+        let dbName = "EnsureThereIsAtLeastOneOpToRollback";
+        runWithTenantIfNeeded(curPrimary.getDB(dbName), {
+            insert: "ensureRollback",
+            documents: [{thisDocument: 'is inserted to ensure rollback is not skipped'}],
+            writeConcern
+        });
 
         log(`Isolating the primary ${curPrimary.host} so it will step down`);
         // We should have already disconnected the primary from the secondary during the first stage
@@ -539,11 +567,11 @@ function RollbackTest(name = "RollbackTest", replSet) {
         return curPrimary;
     };
 
-    this.stop = function(checkDataConsistencyOptions) {
+    this.stop = function(checkDataConsistencyOptions, skipDataConsistencyCheck = false) {
         const start = new Date();
         restartServerReplication(tiebreakerNode);
         rst.awaitReplication();
-        if (!doneConsistencyChecks) {
+        if (!doneConsistencyChecks && !skipDataConsistencyCheck) {
             this.checkDataConsistency(checkDataConsistencyOptions);
         }
         transitionIfAllowed(State.kStopped);

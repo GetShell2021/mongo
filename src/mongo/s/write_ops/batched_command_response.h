@@ -29,13 +29,30 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/rpc/write_concern_error_detail.h"
 #include "mongo/s/write_ops/batched_upsert_detail.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 
@@ -104,10 +121,12 @@ public:
     const std::vector<BatchedUpsertDetail*>& getUpsertDetails() const;
     const BatchedUpsertDetail* getUpsertDetailsAt(std::size_t pos) const;
 
+    // TODO SERVER-87035: Remove lastOp.
     void setLastOp(repl::OpTime lastOp);
     bool isLastOpSet() const;
     repl::OpTime getLastOp() const;
 
+    // TODO SERVER-87035: Remove electionId.
     void setElectionId(const OID& electionId);
     bool isElectionIdSet() const;
     OID getElectionId() const;
@@ -190,7 +209,7 @@ public:
     MultipleErrorsOccurredInfo(BSONArray arr) : _arr(std::move(arr)) {}
 
     static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj);
-    void serialize(BSONObjBuilder* bob) const;
+    void serialize(BSONObjBuilder* bob) const override;
 
 private:
     BSONArray _arr;

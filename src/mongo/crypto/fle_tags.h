@@ -30,32 +30,33 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <vector>
 
 #include "mongo/crypto/fle_crypto.h"
+#include "mongo/crypto/fle_crypto_types.h"
+#include "mongo/db/namespace_string.h"
+
+namespace mongo {
+class FLETagQueryInterface;
+}
 
 namespace mongo::fle {
 
-/**
- * Read a list of binary tags given ESC, ECC, and EDC derived tokens and a specific contention
- * factor.
- */
-std::vector<PrfBlock> readTagsWithContention(const FLEStateCollectionReader& esc,
-                                             const FLEStateCollectionReader& ecc,
-                                             ESCDerivedFromDataToken s,
-                                             ECCDerivedFromDataToken c,
-                                             EDCDerivedFromDataToken d,
-                                             uint64_t contentionFactor,
-                                             size_t memoryLimit,
-                                             std::vector<PrfBlock>&& binaryTags);
+std::vector<std::vector<FLEEdgeCountInfo>> getCountInfoSets(FLETagQueryInterface* queryImpl,
+                                                            const NamespaceString& nssEsc,
+                                                            ESCDerivedFromDataToken s,
+                                                            EDCDerivedFromDataToken d,
+                                                            boost::optional<int64_t> cm);
 
 /**
- * Read a list of binary tags given ESC, ECC, and EDC derived tokens and a maximum contention
+ * Read a list of binary tags given ESC and and EDC derived tokens and a maximum contention
  * factor.
  */
-std::vector<PrfBlock> readTags(const FLEStateCollectionReader& esc,
-                               const FLEStateCollectionReader& ecc,
+std::vector<PrfBlock> readTags(FLETagQueryInterface* queryImpl,
+                               const NamespaceString& nssEsc,
                                ESCDerivedFromDataToken s,
-                               ECCDerivedFromDataToken c,
                                EDCDerivedFromDataToken d,
                                boost::optional<int64_t> cm);
 }  // namespace mongo::fle

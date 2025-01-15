@@ -24,7 +24,7 @@ __wt_import_repair(WT_SESSION_IMPL *session, const char *uri, char **configp)
     WT_DECL_ITEM(checkpoint);
     WT_DECL_RET;
     WT_KEYED_ENCRYPTOR *kencryptor;
-    char *checkpoint_list, *config, *config_tmp, *metadata, fileid[64];
+    char *checkpoint_list, *config, *config_tmp, fileid[64], *metadata;
     const char *cfg[] = {WT_CONFIG_BASE(session, file_meta), NULL, NULL, NULL, NULL, NULL, NULL};
 
     ckptbase = NULL;
@@ -131,13 +131,13 @@ __wt_import_repair(WT_SESSION_IMPL *session, const char *uri, char **configp)
     F_SET(ckpt, WT_CKPT_UPDATE);
     WT_ERR(__wt_buf_set(session, &ckpt->raw, checkpoint->data, checkpoint->size));
     WT_ERR(__wt_meta_ckptlist_update_config(session, ckptbase, config_tmp, &config));
-    __wt_verbose(session, WT_VERB_CHECKPOINT, "import metadata: %s", config);
+    __wt_verbose_info(session, WT_VERB_CHECKPOINT, "import metadata: %s", config);
     *configp = config;
-
+    WT_STAT_CONN_INCR(session, session_table_create_import_repair);
 err:
     F_CLR(session, WT_SESSION_IMPORT_REPAIR);
 
-    __wt_meta_ckptlist_free(session, &ckptbase);
+    __wt_ckptlist_free(session, &ckptbase);
 
     __wt_free(session, checkpoint_list);
     if (ret != 0)

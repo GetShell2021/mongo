@@ -5,10 +5,8 @@
  *  2) Inactive transaction is aborted.
  * @tags: [uses_transactions]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/curop_helpers.js");  // for waitForCurOpByFailPoint().
+import {waitForCurOpByFailPoint} from "jstests/libs/curop_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = "txnsDuringStepDown";
 const dbName = testName;
@@ -16,7 +14,7 @@ const collName = "testcoll";
 
 const rst = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0}}]});
 rst.startSet();
-rst.initiate();
+rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 var primary = rst.getPrimary();
 var db = primary.getDB(dbName);
@@ -49,7 +47,7 @@ function runStepDown() {
     assert.commandWorked(primaryAdmin.runCommand({"replSetStepDown": 30 * 60, "force": true}));
 
     // Wait until the primary transitioned to SECONDARY state.
-    rst.waitForState(primary, ReplSetTest.State.SECONDARY);
+    rst.awaitSecondaryNodes(null, [primary]);
 
     jsTestLog("Validating data.");
     assert.docEq([{_id: 'readOp'}], primaryColl.find().toArray());
@@ -131,4 +129,3 @@ runStepDown();
 assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 
 rst.stopSet();
-})();

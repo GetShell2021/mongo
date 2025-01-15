@@ -28,11 +28,19 @@
  */
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/process_health/fault.h"
 #include "mongo/db/process_health/fault_facet.h"
 #include "mongo/db/process_health/fault_manager_config.h"
+#include "mongo/db/process_health/health_check_status.h"
 #include "mongo/db/process_health/health_monitoring_server_parameters_gen.h"
 #include "mongo/db/process_health/health_observer.h"
 #include "mongo/db/process_health/progress_monitor.h"
@@ -40,7 +48,15 @@
 #include "mongo/db/service_context.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace process_health {
@@ -167,8 +183,7 @@ private:
     // Callback used to crash the server.
     std::function<void(std::string cause)> _crashCb;
 
-    mutable Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(5), "FaultManager::_mutex");
+    mutable stdx::mutex _mutex;
 
     std::shared_ptr<Fault> _fault;
     // This source is canceled before the _taskExecutor shutdown(). It
@@ -179,8 +194,7 @@ private:
     SharedPromise<void> _initialHealthCheckCompletedPromise;
 
     // Protects the state below.
-    mutable Mutex _stateMutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(0), "FaultManager::_stateMutex");
+    mutable stdx::mutex _stateMutex;
 
     bool _initialized = false;
     Date_t _lastTransitionTime;

@@ -5,11 +5,20 @@
  *
  * @tags: [requires_fcv_60, uses_transactions]
  */
-(function() {
-'use strict';
+import {
+    withRetryOnTransientTxnErrorIncrementTxnNum
+} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    getOplogEntriesForTxn,
+    getTxnEntriesForSession,
+    makeCommitTransactionCmdObj,
+    makePrepareTransactionCmdObj,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
-load("jstests/libs/fixture_helpers.js");  // For FixtureHelpers.
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+// This test requires running transactions directly against the shard.
+TestData.replicaSetEndpointIncompatible = true;
 
 const kDbName = "testDb";
 const kCollName = "testColl";
@@ -22,6 +31,8 @@ const mongosTestColl = mongosTestDB.getCollection(kCollName);
 const shard0TestDB = shard0Primary.getDB(kDbName);
 
 assert.commandWorked(mongosTestDB.createCollection(kCollName));
+assert.commandWorked(
+    st.shard0.adminCommand({_flushRoutingTableCacheUpdates: mongosTestColl.getFullName()}));
 
 function makeInsertCmdObj(docs, lsid, txnNumber, stmtId, startTransaction) {
     const cmdObj = {
@@ -46,12 +57,17 @@ function makeInsertCmdObj(docs, lsid, txnNumber, stmtId, startTransaction) {
         const lsid = {id: UUID(), txnNumber: NumberLong(0), txnUUID: UUID()};
         const txnNumber = 0;
         let stmtId = 1;
-        const insertCmdObj0 = makeInsertCmdObj([{x: 0}], lsid, txnNumber, stmtId, true);
-        const commitCmdObj = makeCommitTransactionCmdObj(lsid, txnNumber);
+        let commitRes;
+        withRetryOnTransientTxnErrorIncrementTxnNum(txnNumber, (txnNum) => {
+            const insertCmdObj0 = makeInsertCmdObj([{x: 0}], lsid, txnNum, stmtId, true);
+            const commitCmdObj = makeCommitTransactionCmdObj(lsid, txnNum);
 
-        assert.commandWorked(db.runCommand(insertCmdObj0));
-        assert.commandFailedWithCode(db.runCommand(insertCmdObj0), expectedRetryErrorCode);
-        return db.adminCommand(commitCmdObj);
+            assert.commandWorked(db.runCommand(insertCmdObj0));
+            assert.commandFailedWithCode(db.runCommand(insertCmdObj0), expectedRetryErrorCode);
+            commitRes = db.adminCommand(commitCmdObj);
+        });
+
+        return commitRes;
     };
 
     // For a transaction executed directly against a mongod, the retry will return an error without
@@ -78,15 +94,19 @@ function makeInsertCmdObj(docs, lsid, txnNumber, stmtId, startTransaction) {
         const lsid = {id: UUID(), txnNumber: NumberLong(0), txnUUID: UUID()};
         const txnNumber = 0;
         let stmtId = 1;
-        const insertCmdObj0 =
-            makeInsertCmdObj([{x: 0}], lsid, txnNumber, stmtId++, true /* startTransaction */);
-        const insertCmdObj1 = makeInsertCmdObj([{x: 1}], lsid, txnNumber, stmtId++);
-        const commitCmdObj = makeCommitTransactionCmdObj(lsid, txnNumber);
+        let commitRes;
+        withRetryOnTransientTxnErrorIncrementTxnNum(txnNumber, (txnNum) => {
+            const insertCmdObj0 =
+                makeInsertCmdObj([{x: 0}], lsid, txnNum, stmtId++, true /* startTransaction */);
+            const insertCmdObj1 = makeInsertCmdObj([{x: 1}], lsid, txnNum, stmtId++);
+            const commitCmdObj = makeCommitTransactionCmdObj(lsid, txnNum);
+            assert.commandWorked(db.runCommand(insertCmdObj0));
+            assert.commandWorked(db.runCommand(insertCmdObj1));
+            assert.commandFailedWithCode(db.runCommand(insertCmdObj1), expectedRetryErrorCode);
+            commitRes = db.adminCommand(commitCmdObj);
+        });
 
-        assert.commandWorked(db.runCommand(insertCmdObj0));
-        assert.commandWorked(db.runCommand(insertCmdObj1));
-        assert.commandFailedWithCode(db.runCommand(insertCmdObj1), expectedRetryErrorCode);
-        return db.adminCommand(commitCmdObj);
+        return commitRes;
     };
 
     // For both transactions executed against a mongod and a mongos, the retry will not return an
@@ -107,24 +127,24 @@ function makeInsertCmdObj(docs, lsid, txnNumber, stmtId, startTransaction) {
         const lsid = {id: UUID(), txnNumber: NumberLong(0), txnUUID: UUID()};
         const txnNumber = 0;
         let stmtId = 1;
-        const insertCmdObj0 =
-            makeInsertCmdObj([{x: 0}], lsid, txnNumber, stmtId++, true /* startTransaction */);
-        const insertCmdObj1 = makeInsertCmdObj([{x: 1}], lsid, txnNumber, stmtId++);
-        const commitCmdObj = makeCommitTransactionCmdObj(lsid, txnNumber);
+        withRetryOnTransientTxnErrorIncrementTxnNum(txnNumber, (txnNum) => {
+            const insertCmdObj0 =
+                makeInsertCmdObj([{x: 0}], lsid, txnNum, stmtId++, true /* startTransaction */);
+            const insertCmdObj1 = makeInsertCmdObj([{x: 1}], lsid, txnNum, stmtId++);
+            const commitCmdObj = makeCommitTransactionCmdObj(lsid, txnNum);
 
-        assert.commandWorked(db.runCommand(insertCmdObj0));
-        assert.commandWorked(db.adminCommand(commitCmdObj));
+            assert.commandWorked(db.runCommand(insertCmdObj0));
+            assert.commandWorked(db.adminCommand(commitCmdObj));
 
-        const oplogEntriesBefore = getOplogEntriesForTxn(st.rs0, lsid, txnNumber);
-        const txnEntriesBefore = getTxnEntriesForSession(st.rs0, lsid);
-
-        assert.commandFailedWithCode(db.runCommand(insertCmdObj1), 5875603);
-        assert.commandWorked(db.adminCommand(commitCmdObj));
-
-        const oplogEntriesAfter = getOplogEntriesForTxn(st.rs0, lsid, txnNumber);
-        const txnEntriesAfter = getTxnEntriesForSession(st.rs0, lsid);
-        assert.eq(oplogEntriesBefore, oplogEntriesAfter);
-        assert.eq(txnEntriesBefore, txnEntriesAfter);
+            const oplogEntriesBefore = getOplogEntriesForTxn(st.rs0, lsid, txnNum);
+            const txnEntriesBefore = getTxnEntriesForSession(st.rs0, lsid);
+            assert.commandFailedWithCode(db.runCommand(insertCmdObj1), 5875603);
+            assert.commandWorked(db.adminCommand(commitCmdObj));
+            const oplogEntriesAfter = getOplogEntriesForTxn(st.rs0, lsid, txnNum);
+            const txnEntriesAfter = getTxnEntriesForSession(st.rs0, lsid);
+            assert.eq(oplogEntriesBefore, oplogEntriesAfter);
+            assert.eq(txnEntriesBefore, txnEntriesAfter);
+        });
 
         assert.eq(mongosTestColl.count(), 1);
         assert.commandWorked(mongosTestColl.remove({}));
@@ -185,4 +205,3 @@ function makeInsertCmdObj(docs, lsid, txnNumber, stmtId, startTransaction) {
 }
 
 st.stop();
-})();

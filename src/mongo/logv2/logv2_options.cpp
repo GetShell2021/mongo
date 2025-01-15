@@ -27,14 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/validated_tenancy_scope.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/logv2/log_util.h"
 #include "mongo/logv2/logv2_options_gen.h"
-#include "mongo/util/options_parser/option_section.h"
-#include "mongo/util/options_parser/startup_option_init.h"
-#include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
@@ -42,12 +48,14 @@
 namespace mongo {
 
 void RedactEncryptedFields::append(OperationContext* opCtx,
-                                   BSONObjBuilder& b,
-                                   const std::string& name) {
-    b << name << logv2::shouldRedactBinDataEncrypt();
+                                   BSONObjBuilder* b,
+                                   StringData name,
+                                   const boost::optional<TenantId>&) {
+    *b << name << logv2::shouldRedactBinDataEncrypt();
 }
 
-Status RedactEncryptedFields::set(const BSONElement& newValueElement) {
+Status RedactEncryptedFields::set(const BSONElement& newValueElement,
+                                  const boost::optional<TenantId>&) {
     bool newVal;
     if (!newValueElement.coerce(&newVal)) {
         return {ErrorCodes::BadValue,
@@ -58,7 +66,7 @@ Status RedactEncryptedFields::set(const BSONElement& newValueElement) {
     return Status::OK();
 }
 
-Status RedactEncryptedFields::setFromString(const std::string& str) {
+Status RedactEncryptedFields::setFromString(StringData str, const boost::optional<TenantId>&) {
     if (str == "true" || str == "1") {
         logv2::setShouldRedactBinDataEncrypt(true);
     } else if (str == "false" || str == "0") {

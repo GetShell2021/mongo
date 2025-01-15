@@ -27,9 +27,15 @@
  *    it in the license file.
  */
 
+#include <memory>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -76,13 +82,14 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uasserted(ErrorCodes::Unauthorized, "Unauthorized");
         }
     };
-} coordinateCommitTransactionCmd;
+};
+MONGO_REGISTER_COMMAND(CoordinateCommitTransactionCmd).forRouter();
 
 }  // namespace mongo

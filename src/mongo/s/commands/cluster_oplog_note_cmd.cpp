@@ -28,20 +28,28 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <iosfwd>
+#include <string>
 
-#include "mongo/db/commands.h"
-
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/resource_pattern.h"
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/namespace_string.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/decorable.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -52,19 +60,19 @@ namespace mongo {
 using std::string;
 using std::stringstream;
 
-class AppendOplogNoteCmd : public BasicCommand {
+class ClusterAppendOplogNoteCmd : public BasicCommand {
 public:
-    AppendOplogNoteCmd() : BasicCommand("appendOplogNote") {}
+    ClusterAppendOplogNoteCmd() : BasicCommand("appendOplogNote") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
@@ -72,24 +80,26 @@ public:
         return "Performs a no-op entry on the oplog on each shard";
     }
 
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::appendOplogNote)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forClusterResource(dbName.tenantId()),
+                     ActionType::appendOplogNote)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName& dbName,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
 
         auto shardResponses = scatterGatherUnversionedTargetAllShards(
             opCtx,
-            dbname,
+            dbName,
             applyReadWriteConcern(
                 opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
             ReadPreferenceSetting::get(opCtx),
@@ -99,9 +109,6 @@ public:
         return appendRawResponses(opCtx, &errmsg, &result, shardResponses).responseOK;
     }
 };
-
-MONGO_INITIALIZER(RegisterAppendOpLogNoteCmd)(InitializerContext* context) {
-    new AppendOplogNoteCmd();
-}
+MONGO_REGISTER_COMMAND(ClusterAppendOplogNoteCmd).forRouter();
 
 }  // namespace mongo

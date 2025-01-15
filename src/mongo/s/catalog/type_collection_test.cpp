@@ -27,16 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/s/catalog/type_collection.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
 
-using unittest::assertGet;
 
 TEST(CollectionType, Empty) {
     ASSERT_THROWS(CollectionType(BSONObj()), DBException);
@@ -58,7 +64,7 @@ TEST(CollectionType, Basic) {
                                      << "fr_CA")
                              << CollectionType::kUniqueFieldName << true));
 
-    ASSERT(coll.getNss() == NamespaceString{"db.coll"});
+    ASSERT(coll.getNss() == NamespaceString::createNamespaceString_forTest("db.coll"));
     ASSERT_EQUALS(coll.getEpoch(), oid);
     ASSERT_EQUALS(coll.getUuid(), uuid);
     ASSERT_EQUALS(coll.getTimestamp(), timestamp);
@@ -91,7 +97,7 @@ TEST(CollectionType, AllFieldsPresent) {
         << CollectionType::kUniqueFieldName << true << CollectionType::kUuidFieldName << uuid
         << CollectionType::kReshardingFieldsFieldName << reshardingFields.toBSON()));
 
-    ASSERT(coll.getNss() == NamespaceString{"db.coll"});
+    ASSERT(coll.getNss() == NamespaceString::createNamespaceString_forTest("db.coll"));
     ASSERT_EQUALS(coll.getEpoch(), oid);
     ASSERT_EQUALS(coll.getTimestamp(), timestamp);
     ASSERT_EQUALS(coll.getUpdatedAt(), Date_t::fromMillisSinceEpoch(1));
@@ -146,7 +152,7 @@ TEST(CollectionType, Pre22Format) {
                              << Date_t::fromMillisSinceEpoch(1) << "dropped" << false << "key"
                              << BSON("a" << 1) << "unique" << false));
 
-    ASSERT(coll.getNss() == NamespaceString{"db.coll"});
+    ASSERT(coll.getNss() == NamespaceString::createNamespaceString_forTest("db.coll"));
     ASSERT(!coll.getEpoch().isSet());
     ASSERT_EQUALS(coll.getUpdatedAt(), Date_t::fromMillisSinceEpoch(1));
     ASSERT_BSONOBJ_EQ(coll.getKeyPattern().toBSON(), BSON("a" << 1));

@@ -28,18 +28,37 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/cluster_server_parameter_cmds_gen.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/set_cluster_parameter_invocation.h"
-#include "mongo/db/commands/user_management_commands_gen.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/repl/repl_client_info.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -64,14 +83,14 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName << " can only be run on shard servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
             hangInShardsvrSetClusterParameter.pauseWhileSet();
 
             SetClusterParameter setClusterParameterRequest(request().getCommandParameter());
-            setClusterParameterRequest.setDbName(NamespaceString::kAdminDb);
+            setClusterParameterRequest.setDbName(DatabaseName::kAdmin);
             std::unique_ptr<ServerParameterService> parameterService =
                 std::make_unique<ClusterParameterService>();
             DBDirectClient client(opCtx);
@@ -79,16 +98,18 @@ public:
             SetClusterParameterInvocation invocation{std::move(parameterService), dbService};
             // Use local write concern for setClusterParameter, the idea is that the command is
             // being called with majority write concern, so, we'll wait for majority after checking
-            // out the session.
+            // out the session. Note that we use the force option for invoke -- the config server
+            // should already have checked isEnabled + validate for us.
             bool writePerformed = invocation.invoke(opCtx,
                                                     setClusterParameterRequest,
                                                     request().getClusterParameterTime(),
+                                                    boost::none /* previousTime */,
                                                     kLocalWriteConcern);
             if (!writePerformed) {
                 // Since no write happened on this txnNumber, we need to make a dummy write so
                 // that secondaries can be aware of this txn.
                 DBDirectClient client(opCtx);
-                client.update(NamespaceString::kServerConfigurationNamespace.ns(),
+                client.update(NamespaceString::kServerConfigurationNamespace,
                               BSON("_id"
                                    << "SetClusterParameterStats"),
                               BSON("$inc" << BSON("count" << 1)),
@@ -99,7 +120,7 @@ public:
 
     private:
         NamespaceString ns() const override {
-            return NamespaceString();
+            return NamespaceString::kEmpty;
         }
 
         bool supportsWriteConcern() const override {
@@ -110,8 +131,9 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
 
@@ -131,7 +153,8 @@ public:
     bool supportsRetryableWrite() const final {
         return true;
     }
-} shardsvrSetClusterParameterCmd;
+};
+MONGO_REGISTER_COMMAND(ShardsvrSetClusterParameterCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

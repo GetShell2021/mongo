@@ -28,18 +28,44 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/resharding/coordinator_document_gen.h"
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/request_types/abort_reshard_collection_gen.h"
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -51,8 +77,8 @@ UUID retrieveReshardingUUID(OperationContext* opCtx, const NamespaceString& ns) 
     repl::ReadConcernArgs::get(opCtx) =
         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-    const auto collEntry = catalogClient->getCollection(opCtx, ns);
+    const auto collEntry =
+        ShardingCatalogManager::get(opCtx)->localCatalogClient()->getCollection(opCtx, ns);
 
     uassert(ErrorCodes::NoSuchReshardCollection,
             "Could not find resharding-related metadata that matches the given namespace",
@@ -77,15 +103,27 @@ void assertExistsReshardingDocument(OperationContext* opCtx, UUID reshardingUUID
             !!docOptional);
 }
 
-auto assertGetReshardingMachine(OperationContext* opCtx, UUID reshardingUUID) {
-    auto machine = resharding::tryGetReshardingStateMachine<
+auto assertGetReshardingMachine(OperationContext* opCtx,
+                                UUID reshardingUUID,
+                                boost::optional<mongo::ProvenanceEnum> provenance) {
+    auto machine = resharding::tryGetReshardingStateMachineAndThrowIfShuttingDown<
         ReshardingCoordinatorService,
-        ReshardingCoordinatorService::ReshardingCoordinator,
+        ReshardingCoordinator,
         ReshardingCoordinatorDocument>(opCtx, reshardingUUID);
 
     uassert(ErrorCodes::NoSuchReshardCollection,
             "Could not find in-progress resharding operation to abort",
             machine);
+
+    if (resharding::gFeatureFlagMoveCollection.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) ||
+        resharding::gFeatureFlagUnshardCollection.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        uassert(ErrorCodes::IllegalOperation,
+                "Could not find in-progress resharding operation with matching provenance",
+                provenance && (*machine)->getMetadata().getProvenance() == provenance.get());
+    }
+
     return *machine;
 }
 
@@ -99,16 +137,11 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::CommandNotSupported,
-                    "abortReshardCollection command not enabled",
-                    resharding::gFeatureFlagResharding.isEnabled(
-                        serverGlobalParams.featureCompatibility));
-
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrAbortReshardCollection can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
@@ -116,12 +149,13 @@ public:
 
             LOGV2(5403501,
                   "Aborting resharding operation",
-                  "namespace"_attr = ns(),
+                  logAttrs(ns()),
                   "reshardingUUID"_attr = reshardingUUID);
 
             assertExistsReshardingDocument(opCtx, reshardingUUID);
 
-            auto machine = assertGetReshardingMachine(opCtx, reshardingUUID);
+            auto machine =
+                assertGetReshardingMachine(opCtx, reshardingUUID, request().getProvenance());
             auto future = machine->getCompletionFuture();
             machine->abort();
 
@@ -158,8 +192,9 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
 
@@ -180,7 +215,8 @@ public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
-} configsvrAbortReshardCollectionCmd;
+};
+MONGO_REGISTER_COMMAND(ConfigsvrAbortReshardCollectionCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

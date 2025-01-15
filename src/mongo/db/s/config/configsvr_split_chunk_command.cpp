@@ -28,19 +28,32 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/split_chunk_request_type.h"
-#include "mongo/s/grid.h"
-#include "mongo/util/str.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -61,10 +74,12 @@ using std::string;
  *   max: <BSONObj chunkToSplitMax>,
  *   splitPoints: [<BSONObj key>, ...],
  *   shard: <string shard>,
- *   fromChunkSplitter: <bool>,
  *   writeConcern: <BSONObj>
  * }
  */
+
+constexpr StringData kCollectionVersionField = "collectionVersion"_sd;
+
 class ConfigSvrSplitChunkCommand : public BasicCommand {
 public:
     ConfigSvrSplitChunkCommand() : BasicCommand("_configsvrCommitChunkSplit") {}
@@ -91,27 +106,31 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forClusterResource(dbName.tenantId()),
+                     ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::deserialize(dbName.tenantId(),
+                                                CommandHelpers::parseNsFullyQualified(cmdObj),
+                                                SerializationContext::stateDefault());
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrCommitChunkSplit can only be run on config servers",
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
         // Set the operation context read concern level to local for reads into the config database.
         repl::ReadConcernArgs::get(opCtx) =
@@ -119,20 +138,21 @@ public:
 
         auto parsedRequest = uassertStatusOK(SplitChunkRequest::parseFromConfigCommand(cmdObj));
 
-        auto shardAndCollVers =
-            uassertStatusOK(ShardingCatalogManager::get(opCtx)->commitChunkSplit(
-                opCtx,
-                parsedRequest.getNamespace(),
-                parsedRequest.getEpoch(),
-                parsedRequest.getTimestamp(),
-                parsedRequest.getChunkRange(),
-                parsedRequest.getSplitPoints(),
-                parsedRequest.getShardName(),
-                parsedRequest.isFromChunkSplitter()));
-        result.appendElements(shardAndCollVers);
+        auto shardAndCollVers = uassertStatusOK(
+            ShardingCatalogManager::get(opCtx)->commitChunkSplit(opCtx,
+                                                                 parsedRequest.getNamespace(),
+                                                                 parsedRequest.getEpoch(),
+                                                                 parsedRequest.getTimestamp(),
+                                                                 parsedRequest.getChunkRange(),
+                                                                 parsedRequest.getSplitPoints(),
+                                                                 parsedRequest.getShardName()));
+
+        shardAndCollVers.collectionPlacementVersion.serialize(kCollectionVersionField, &result);
+        shardAndCollVers.shardPlacementVersion.serialize(ChunkVersion::kChunkVersionField, &result);
 
         return true;
     }
-} configsvrSplitChunkCmd;
+};
+MONGO_REGISTER_COMMAND(ConfigSvrSplitChunkCommand).forShard();
 }  // namespace
 }  // namespace mongo

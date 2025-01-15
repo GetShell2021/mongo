@@ -29,13 +29,34 @@
 
 #include "mongo/db/process_health/health_observer.h"
 
+#include <boost/smart_ptr.hpp>
+#include <functional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/process_health/fault.h"
 #include "mongo/db/process_health/fault_manager_test_suite.h"
+#include "mongo/db/process_health/health_observer_base.h"
 #include "mongo/db/process_health/health_observer_mock.h"
 #include "mongo/db/process_health/health_observer_registration.h"
 #include "mongo/db/service_context.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/timer.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source_mock.h"
+#include "mongo/util/future_impl.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -55,25 +76,12 @@ namespace {
 // by the instantiate method below will be greater than expected.
 TEST_F(FaultManagerTest, Registration) {
     registerMockHealthObserver(FaultFacetType::kMock1, [] { return Severity::kOk; });
-    auto allObservers = HealthObserverRegistration::instantiateAllObservers(svcCtx());
+    auto allObservers = HealthObserverRegistration::instantiateAllObservers(getServiceContext());
     ASSERT_EQ(1, allObservers.size());
     ASSERT_EQ(FaultFacetType::kMock1, allObservers[0]->getType());
 }
 
-TEST_F(FaultManagerTest, InitialHealthCheckDoesNotRunIfFeatureFlagNotEnabled) {
-    resetManager();
-    RAIIServerParameterControllerForTest _controller{"featureFlagHealthMonitoring", false};
-
-    registerMockHealthObserver(FaultFacetType::kMock1, [] { return Severity::kOk; });
-    static_cast<void>(manager().schedulePeriodicHealthCheckThreadTest());
-
-    auto currentFault = manager().currentFault();
-    ASSERT_TRUE(!currentFault);  // Is not created.
-    ASSERT_TRUE(manager().getFaultState() == FaultState::kStartupCheck);
-}
-
 TEST_F(FaultManagerTest, Stats) {
-    RAIIServerParameterControllerForTest _controller{"featureFlagHealthMonitoring", true};
     resetManager(std::make_unique<FaultManagerConfig>());
     auto faultFacetType = FaultFacetType::kMock1;
     AtomicWord<Severity> mockResult(Severity::kFailure);
@@ -129,7 +137,6 @@ TEST_F(FaultManagerTest, ProgressMonitorCheck) {
     });
 
     // Health check should get stuck here.
-    RAIIServerParameterControllerForTest _controller{"featureFlagHealthMonitoring", true};
     auto initialHealthCheckFuture = manager().startPeriodicHealthChecks();
     auto observer = manager().getHealthObserversTest()[0];
     manager().healthCheckTest(observer, CancellationToken::uncancelable());
@@ -157,7 +164,6 @@ TEST_F(FaultManagerTest, HealthCheckRunsPeriodically) {
         BSON("values" << BSON_ARRAY(BSON("type"
                                          << "test"
                                          << "interval" << 1)))};
-    RAIIServerParameterControllerForTest _controller{"featureFlagHealthMonitoring", true};
     auto faultFacetType = FaultFacetType::kMock1;
     AtomicWord<Severity> severity{Severity::kOk};
     registerMockHealthObserver(faultFacetType, [&severity] { return severity.load(); });
@@ -174,7 +180,6 @@ TEST_F(FaultManagerTest, HealthCheckRunsPeriodically) {
 
 TEST_F(FaultManagerTest, PeriodicHealthCheckOnErrorMakesBadHealthStatus) {
     resetManager(std::make_unique<FaultManagerConfig>());
-    RAIIServerParameterControllerForTest _controller{"featureFlagHealthMonitoring", true};
     auto faultFacetType = FaultFacetType::kMock1;
 
     registerMockHealthObserver(faultFacetType, [] {
@@ -198,18 +203,18 @@ TEST_F(FaultManagerTest,
         BSON("values" << BSON_ARRAY(BSON("type"
                                          << "test"
                                          << "interval" << 1)))};
-    RAIIServerParameterControllerForTest _flagController{"featureFlagHealthMonitoring", true};
     RAIIServerParameterControllerForTest _serverParamController{"activeFaultDurationSecs", 5};
 
     AtomicWord<bool> shouldBlock{true};
-    registerMockHealthObserver(FaultFacetType::kMock1,
-                               [&shouldBlock] {
-                                   while (shouldBlock.load()) {
-                                       sleepFor(Milliseconds(1));
-                                   }
-                                   return Severity::kOk;
-                               },
-                               Milliseconds(100));
+    registerMockHealthObserver(
+        FaultFacetType::kMock1,
+        [&shouldBlock] {
+            while (shouldBlock.load()) {
+                sleepFor(Milliseconds(1));
+            }
+            return Severity::kOk;
+        },
+        Milliseconds(100));
 
     ASSERT_TRUE(manager().getFaultState() == FaultState::kStartupCheck);
 

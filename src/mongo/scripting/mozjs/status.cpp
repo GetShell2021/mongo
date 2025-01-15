@@ -27,19 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/scripting/mozjs/status.h"
-
+#include <js/CallArgs.h>
+#include <js/ComparisonOperators.h>
 #include <js/Object.h>
+#include <js/PropertyDescriptor.h>
+#include <js/RootingAPI.h>
 #include <js/ValueArray.h>
+#include <jsapi.h>
+#include <memory>
+#include <string>
+#include <utility>
 
+#include <js/TypeDecls.h>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/scripting/jsexception.h"
+#include "mongo/scripting/mozjs/error.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/internedstring.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
+#include "mongo/scripting/mozjs/status.h"
 #include "mongo/scripting/mozjs/valuereader.h"
-#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
+#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace mozjs {
@@ -48,11 +58,11 @@ const char* const MongoStatusInfo::className = "MongoStatus";
 const char* const MongoStatusInfo::inheritFrom = "Error";
 
 Status MongoStatusInfo::toStatus(JSContext* cx, JS::HandleObject object) {
-    return *static_cast<Status*>(JS::GetPrivate(object));
+    return *JS::GetMaybePtrFromReservedSlot<Status>(object, StatusSlot);
 }
 
 Status MongoStatusInfo::toStatus(JSContext* cx, JS::HandleValue value) {
-    return *static_cast<Status*>(JS::GetPrivate(value.toObjectOrNull()));
+    return *JS::GetMaybePtrFromReservedSlot<Status>(value.toObjectOrNull(), StatusSlot);
 }
 
 void MongoStatusInfo::fromStatus(JSContext* cx, Status status, JS::MutableHandleValue value) {
@@ -89,16 +99,17 @@ void MongoStatusInfo::fromStatus(JSContext* cx, Status status, JS::MutableHandle
         smUtils::wrapConstrainedMethod<Functions::stack, false, MongoStatusInfo>,
         nullptr);
 
-    JS::SetPrivate(thisv, scope->trackedNew<Status>(std::move(status)));
+    JS::SetReservedSlot(
+        thisv, StatusSlot, JS::PrivateValue(scope->trackedNew<Status>(std::move(status))));
 
     value.setObjectOrNull(thisv);
 }
 
-void MongoStatusInfo::finalize(JSFreeOp* fop, JSObject* obj) {
-    auto status = static_cast<Status*>(JS::GetPrivate(obj));
+void MongoStatusInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
+    auto status = JS::GetMaybePtrFromReservedSlot<Status>(obj, StatusSlot);
 
     if (status)
-        getScope(fop)->trackedDelete(status);
+        getScope(gcCtx)->trackedDelete(status);
 }
 
 void MongoStatusInfo::Functions::code::call(JSContext* cx, JS::CallArgs args) {
@@ -147,10 +158,10 @@ void MongoStatusInfo::Functions::stack::call(JSContext* cx, JS::CallArgs args) {
 
 void MongoStatusInfo::postInstall(JSContext* cx, JS::HandleObject global, JS::HandleObject proto) {
     auto scope = getScope(cx);
-
-    JS::SetPrivate(
-        proto,
-        scope->trackedNew<Status>(Status(ErrorCodes::UnknownError, "Mongo Status Prototype")));
+    JS::SetReservedSlot(proto,
+                        StatusSlot,
+                        JS::PrivateValue(scope->trackedNew<Status>(
+                            Status(ErrorCodes::UnknownError, "Mongo Status Prototype"))));
 }
 
 }  // namespace mozjs

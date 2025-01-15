@@ -27,11 +27,26 @@
  *    it in the license file.
  */
 
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/client/read_preference.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_cache_noop.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
@@ -39,11 +54,22 @@
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
-#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/random.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -58,21 +84,21 @@ protected:
 
         ConfigServerTestFixture::setUp();
         DBDirectClient client(operationContext());
-        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns());
-        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace.ns(),
+        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace);
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
                              {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
 
-        ReadWriteConcernDefaults::create(getServiceContext(), _lookupMock.getFetchDefaultsFn());
+        ReadWriteConcernDefaults::create(getService(), _lookupMock.getFetchDefaultsFn());
 
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
         TransactionCoordinatorService::get(operationContext())
-            ->onShardingInitialization(operationContext(), true);
+            ->initializeIfNeeded(operationContext(), /* term */ 1);
 
         WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
     }
 
     void tearDown() override {
-        TransactionCoordinatorService::get(operationContext())->onStepDown();
+        TransactionCoordinatorService::get(operationContext())->interrupt();
         WaitForMajorityService::get(getServiceContext()).shutDown();
         ConfigServerTestFixture::tearDown();
     }
@@ -81,7 +107,8 @@ protected:
     ReadWriteConcernDefaultsLookupMock _lookupMock;
 };
 
-const NamespaceString kNamespace("TestDB.TestColl");
+const NamespaceString kNamespace =
+    NamespaceString::createNamespaceString_forTest("TestDB.TestColl");
 const KeyPattern kKeyPattern(BSON("x" << 1));
 
 TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectly) {
@@ -107,9 +134,10 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectly) {
         migratedChunk.setCollectionUUID(collUUID);
         migratedChunk.setVersion(origVersion);
         migratedChunk.setShard(shard0.getName());
-        migratedChunk.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
-        migratedChunk.setMin(BSON("a" << 1));
-        migratedChunk.setMax(BSON("a" << 10));
+        migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
+        migratedChunk.setHistory(
+            {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), shard0.getName())});
+        migratedChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
         origVersion.incMinor();
 
@@ -117,34 +145,36 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectly) {
         controlChunk.setCollectionUUID(collUUID);
         controlChunk.setVersion(origVersion);
         controlChunk.setShard(shard0.getName());
-        controlChunk.setHistory({ChunkHistory(Timestamp(50, 0), shard0.getName())});
-        controlChunk.setMin(BSON("a" << 10));
-        controlChunk.setMax(BSON("a" << 20));
+        controlChunk.setOnCurrentShardSince(Timestamp(50, 0));
+        controlChunk.setHistory(
+            {ChunkHistory(*controlChunk.getOnCurrentShardSince(), shard0.getName())});
+        controlChunk.setRange({BSON("a" << 10), BSON("a" << 20)});
         controlChunk.setJumbo(true);
     }
 
     setupCollection(kNamespace, kKeyPattern, {migratedChunk, controlChunk});
 
-    Timestamp validAfter{101, 0};
-    BSONObj versions = assertGet(ShardingCatalogManager::get(operationContext())
-                                     ->commitChunkMigration(operationContext(),
-                                                            kNamespace,
-                                                            migratedChunk,
-                                                            migratedChunk.getVersion().epoch(),
-                                                            collTimestamp,
-                                                            ShardId(shard0.getName()),
-                                                            ShardId(shard1.getName()),
-                                                            validAfter));
+    const auto currentTime = VectorClock::get(getServiceContext())->getTime();
+    const auto expectedValidAfter = currentTime.clusterTime().asTimestamp();
+
+    auto versions = assertGet(ShardingCatalogManager::get(operationContext())
+                                  ->commitChunkMigration(operationContext(),
+                                                         kNamespace,
+                                                         migratedChunk,
+                                                         migratedChunk.getVersion().epoch(),
+                                                         collTimestamp,
+                                                         ShardId(shard0.getName()),
+                                                         ShardId(shard1.getName())));
 
     // Verify the versions returned match expected values.
-    auto mver = ChunkVersion::parse(versions["shardVersion"]);
+    auto mver = versions.shardPlacementVersion;
     ASSERT_EQ(ChunkVersion(
                   {migratedChunk.getVersion().epoch(), migratedChunk.getVersion().getTimestamp()},
                   {migratedChunk.getVersion().majorVersion() + 1, 1}),
               mver);
 
-    // Verify that a collection version is returned
-    auto cver = ChunkVersion::parse(versions["collectionVersion"]);
+    // Verify that a collection placement version is returned
+    auto cver = versions.collectionPlacementVersion;
     ASSERT_TRUE(mver.isOlderOrEqualThan(cver));
 
     // Verify the chunks ended up in the right shards.
@@ -154,7 +184,8 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectly) {
 
     // The migrated chunk's history should be updated.
     ASSERT_EQ(2UL, chunkDoc0.getHistory().size());
-    ASSERT_EQ(validAfter, chunkDoc0.getHistory().front().getValidAfter());
+    ASSERT_EQ(expectedValidAfter, chunkDoc0.getHistory().front().getValidAfter());
+    ASSERT_EQ(expectedValidAfter, *chunkDoc0.getOnCurrentShardSince());
 
     auto chunkDoc1 = uassertStatusOK(
         getChunkDoc(operationContext(), controlChunk.getMin(), collEpoch, collTimestamp));
@@ -166,6 +197,8 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectly) {
               chunkDoc1.getHistory().front().getValidAfter());
     ASSERT_EQ(controlChunk.getHistory().front().getShard(),
               chunkDoc1.getHistory().front().getShard());
+    ASSERT(chunkDoc1.getOnCurrentShardSince().has_value());
+    ASSERT_EQ(controlChunk.getOnCurrentShardSince(), chunkDoc1.getOnCurrentShardSince());
     ASSERT(chunkDoc1.getJumbo());
 }
 
@@ -192,37 +225,37 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectlyWithoutControlChunk) {
     chunk0.setCollectionUUID(collUUID);
     chunk0.setVersion(origVersion);
     chunk0.setShard(shard0.getName());
-    chunk0.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
+    chunk0.setOnCurrentShardSince(Timestamp(100, 0));
+    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), shard0.getName())});
 
     // apportion
     auto chunkMin = BSON("a" << 1);
-    chunk0.setMin(chunkMin);
     auto chunkMax = BSON("a" << 10);
-    chunk0.setMax(chunkMax);
+    chunk0.setRange({chunkMin, chunkMax});
 
     setupCollection(kNamespace, kKeyPattern, {chunk0});
+    const auto currentTime = VectorClock::get(getServiceContext())->getTime();
+    const auto expectedValidAfter = currentTime.clusterTime().asTimestamp();
 
-    Timestamp validAfter{101, 0};
+    StatusWith<ShardingCatalogManager::ShardAndCollectionPlacementVersions> result =
+        ShardingCatalogManager::get(operationContext())
+            ->commitChunkMigration(operationContext(),
+                                   kNamespace,
+                                   chunk0,
+                                   origVersion.epoch(),
+                                   collTimestamp,
+                                   ShardId(shard0.getName()),
+                                   ShardId(shard1.getName()));
 
-    StatusWith<BSONObj> resultBSON = ShardingCatalogManager::get(operationContext())
-                                         ->commitChunkMigration(operationContext(),
-                                                                kNamespace,
-                                                                chunk0,
-                                                                origVersion.epoch(),
-                                                                collTimestamp,
-                                                                ShardId(shard0.getName()),
-                                                                ShardId(shard1.getName()),
-                                                                validAfter);
-
-    ASSERT_OK(resultBSON.getStatus());
+    ASSERT_OK(result.getStatus());
 
     // Verify the version returned matches expected value.
-    BSONObj versions = resultBSON.getValue();
-    auto mver = ChunkVersion::parse(versions["shardVersion"]);
+    auto versions = result.getValue();
+    auto mver = versions.shardPlacementVersion;
     ASSERT_EQ(ChunkVersion({origVersion.epoch(), origVersion.getTimestamp()}, {0, 0}), mver);
 
-    // Verify that a collection version is returned
-    auto cver = ChunkVersion::parse(versions["collectionVersion"]);
+    // Verify that a collection placement version is returned
+    auto cver = versions.collectionPlacementVersion;
     ASSERT_EQ(ChunkVersion({collEpoch, collTimestamp}, {origMajorVersion + 1, 0}), cver);
 
     // Verify the chunk ended up in the right shard.
@@ -231,7 +264,8 @@ TEST_F(CommitChunkMigrate, ChunksUpdatedCorrectlyWithoutControlChunk) {
     ASSERT_EQ("shard1", chunkDoc0.getShard().toString());
     // The history should be updated.
     ASSERT_EQ(2UL, chunkDoc0.getHistory().size());
-    ASSERT_EQ(validAfter, chunkDoc0.getHistory().front().getValidAfter());
+    ASSERT_EQ(expectedValidAfter, chunkDoc0.getHistory().front().getValidAfter());
+    ASSERT_EQ(expectedValidAfter, *chunkDoc0.getOnCurrentShardSince());
 }
 
 TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandNoCtlTrimHistory) {
@@ -257,34 +291,37 @@ TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandNoCtlTrimHistory) {
     chunk0.setCollectionUUID(collUUID);
     chunk0.setVersion(origVersion);
     chunk0.setShard(shard0.getName());
-    chunk0.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
+    chunk0.setOnCurrentShardSince(Timestamp(100, 0));
+    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), shard0.getName())});
 
     // apportion
     auto chunkMin = BSON("a" << 1);
-    chunk0.setMin(chunkMin);
     auto chunkMax = BSON("a" << 10);
-    chunk0.setMax(chunkMax);
+    chunk0.setRange({chunkMin, chunkMax});
 
     setupCollection(kNamespace, kKeyPattern, {chunk0});
 
     // Make the time distance between the last history element large enough.
-    Timestamp validAfter{200, 0};
+    const auto currentTime = VectorClock::get(getServiceContext())->getTime();
+    const auto currentClusterTime = currentTime.clusterTime().asTimestamp();
+    const auto updatedClusterTime = LogicalTime(currentClusterTime + Timestamp(200.0).asULL());
+    VectorClock::get(getServiceContext())->advanceClusterTime_forTest(updatedClusterTime);
 
-    StatusWith<BSONObj> resultBSON = ShardingCatalogManager::get(operationContext())
-                                         ->commitChunkMigration(operationContext(),
-                                                                kNamespace,
-                                                                chunk0,
-                                                                origVersion.epoch(),
-                                                                collTimestamp,
-                                                                ShardId(shard0.getName()),
-                                                                ShardId(shard1.getName()),
-                                                                validAfter);
+    StatusWith<ShardingCatalogManager::ShardAndCollectionPlacementVersions> result =
+        ShardingCatalogManager::get(operationContext())
+            ->commitChunkMigration(operationContext(),
+                                   kNamespace,
+                                   chunk0,
+                                   origVersion.epoch(),
+                                   collTimestamp,
+                                   ShardId(shard0.getName()),
+                                   ShardId(shard1.getName()));
 
-    ASSERT_OK(resultBSON.getStatus());
+    ASSERT_OK(result.getStatus());
 
     // Verify the version returned matches expected value.
-    BSONObj versions = resultBSON.getValue();
-    auto mver = ChunkVersion::parse(versions["shardVersion"]);
+    auto versions = result.getValue();
+    auto mver = versions.shardPlacementVersion;
     ASSERT_EQ(ChunkVersion({origVersion.epoch(), origVersion.getTimestamp()}, {0, 0}), mver);
 
     // Verify the chunk ended up in the right shard.
@@ -294,7 +331,8 @@ TEST_F(CommitChunkMigrate, CheckCorrectOpsCommandNoCtlTrimHistory) {
 
     // The new history entry should be added, but the old one preserved.
     ASSERT_EQ(2UL, chunkDoc0.getHistory().size());
-    ASSERT_EQ(validAfter, chunkDoc0.getHistory().front().getValidAfter());
+    ASSERT_EQ(updatedClusterTime.asTimestamp(), chunkDoc0.getHistory().front().getValidAfter());
+    ASSERT_EQ(updatedClusterTime.asTimestamp(), *chunkDoc0.getOnCurrentShardSince());
 }
 
 TEST_F(CommitChunkMigrate, RejectOutOfOrderHistory) {
@@ -318,30 +356,31 @@ TEST_F(CommitChunkMigrate, RejectOutOfOrderHistory) {
     chunk0.setCollectionUUID(collUUID);
     chunk0.setVersion(origVersion);
     chunk0.setShard(shard0.getName());
-    chunk0.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
+    chunk0.setOnCurrentShardSince(Timestamp(100, 1));
+    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), shard0.getName())});
 
     // apportion
     auto chunkMin = BSON("a" << 1);
-    chunk0.setMin(chunkMin);
     auto chunkMax = BSON("a" << 10);
-    chunk0.setMax(chunkMax);
+    chunk0.setRange({chunkMin, chunkMax});
 
     setupCollection(kNamespace, kKeyPattern, {chunk0});
 
-    // Make the time before the last change to trigger the failure.
-    Timestamp validAfter{99, 0};
+    // Ensure that the current cluster time is earlier than the timestamp associated to the chunk
+    // being migrated.
+    VectorClock::get(getServiceContext())->resetVectorClock_forTest();
 
-    StatusWith<BSONObj> resultBSON = ShardingCatalogManager::get(operationContext())
-                                         ->commitChunkMigration(operationContext(),
-                                                                kNamespace,
-                                                                chunk0,
-                                                                origVersion.epoch(),
-                                                                origVersion.getTimestamp(),
-                                                                ShardId(shard0.getName()),
-                                                                ShardId(shard1.getName()),
-                                                                validAfter);
+    StatusWith<ShardingCatalogManager::ShardAndCollectionPlacementVersions> result =
+        ShardingCatalogManager::get(operationContext())
+            ->commitChunkMigration(operationContext(),
+                                   kNamespace,
+                                   chunk0,
+                                   origVersion.epoch(),
+                                   origVersion.getTimestamp(),
+                                   ShardId(shard0.getName()),
+                                   ShardId(shard1.getName()));
 
-    ASSERT_EQ(ErrorCodes::IncompatibleShardingMetadata, resultBSON.getStatus());
+    ASSERT_EQ(ErrorCodes::IncompatibleShardingMetadata, result.getStatus());
 }
 
 TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch0) {
@@ -368,9 +407,8 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch0) {
 
     // apportion
     auto chunkMin = BSON("a" << 1);
-    chunk0.setMin(chunkMin);
     auto chunkMax = BSON("a" << 10);
-    chunk0.setMax(chunkMax);
+    chunk0.setRange({chunkMin, chunkMax});
 
     ChunkType chunk1;
     chunk1.setName(OID::gen());
@@ -378,25 +416,22 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch0) {
     chunk1.setVersion(origVersion);
     chunk1.setShard(shard0.getName());
 
-    chunk1.setMin(chunkMax);
     auto chunkMaxax = BSON("a" << 20);
-    chunk1.setMax(chunkMaxax);
+    chunk1.setRange({chunkMax, chunkMaxax});
 
     setupCollection(kNamespace, kKeyPattern, {chunk0, chunk1});
 
-    Timestamp validAfter{1};
+    StatusWith<ShardingCatalogManager::ShardAndCollectionPlacementVersions> result =
+        ShardingCatalogManager::get(operationContext())
+            ->commitChunkMigration(operationContext(),
+                                   kNamespace,
+                                   chunk0,
+                                   OID::gen(),
+                                   Timestamp(52),
+                                   ShardId(shard0.getName()),
+                                   ShardId(shard1.getName()));
 
-    StatusWith<BSONObj> resultBSON = ShardingCatalogManager::get(operationContext())
-                                         ->commitChunkMigration(operationContext(),
-                                                                kNamespace,
-                                                                chunk0,
-                                                                OID::gen(),
-                                                                Timestamp(52),
-                                                                ShardId(shard0.getName()),
-                                                                ShardId(shard1.getName()),
-                                                                validAfter);
-
-    ASSERT_EQ(ErrorCodes::StaleEpoch, resultBSON.getStatus());
+    ASSERT_EQ(ErrorCodes::StaleEpoch, result.getStatus());
 }
 
 TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch1) {
@@ -424,9 +459,8 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch1) {
 
     // apportion
     auto chunkMin = BSON("a" << 1);
-    chunk0.setMin(chunkMin);
     auto chunkMax = BSON("a" << 10);
-    chunk0.setMax(chunkMax);
+    chunk0.setRange({chunkMin, chunkMax});
 
     ChunkType chunk1;
     chunk1.setName(OID::gen());
@@ -434,26 +468,23 @@ TEST_F(CommitChunkMigrate, RejectWrongCollectionEpoch1) {
     chunk1.setVersion(otherVersion);
     chunk1.setShard(shard0.getName());
 
-    chunk1.setMin(chunkMax);
     auto chunkMaxax = BSON("a" << 20);
-    chunk1.setMax(chunkMaxax);
+    chunk1.setRange({chunkMax, chunkMaxax});
 
     // get version from the control chunk this time
     setupCollection(kNamespace, kKeyPattern, {chunk1, chunk0});
 
-    Timestamp validAfter{1};
+    StatusWith<ShardingCatalogManager::ShardAndCollectionPlacementVersions> result =
+        ShardingCatalogManager::get(operationContext())
+            ->commitChunkMigration(operationContext(),
+                                   kNamespace,
+                                   chunk0,
+                                   origVersion.epoch(),
+                                   origVersion.getTimestamp(),
+                                   ShardId(shard0.getName()),
+                                   ShardId(shard1.getName()));
 
-    StatusWith<BSONObj> resultBSON = ShardingCatalogManager::get(operationContext())
-                                         ->commitChunkMigration(operationContext(),
-                                                                kNamespace,
-                                                                chunk0,
-                                                                origVersion.epoch(),
-                                                                origVersion.getTimestamp(),
-                                                                ShardId(shard0.getName()),
-                                                                ShardId(shard1.getName()),
-                                                                validAfter);
-
-    ASSERT_EQ(ErrorCodes::StaleEpoch, resultBSON.getStatus());
+    ASSERT_EQ(ErrorCodes::StaleEpoch, result.getStatus());
 }
 
 TEST_F(CommitChunkMigrate, CommitWithLastChunkOnShardShouldNotAffectOtherChunks) {
@@ -479,13 +510,13 @@ TEST_F(CommitChunkMigrate, CommitWithLastChunkOnShardShouldNotAffectOtherChunks)
     chunk0.setCollectionUUID(collUUID);
     chunk0.setVersion(origVersion);
     chunk0.setShard(shard0.getName());
-    chunk0.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
+    chunk0.setOnCurrentShardSince(Timestamp(100, 0));
+    chunk0.setHistory({ChunkHistory(*chunk0.getOnCurrentShardSince(), shard0.getName())});
 
     // apportion
     auto chunkMin = BSON("a" << 1);
-    chunk0.setMin(chunkMin);
     auto chunkMax = BSON("a" << 10);
-    chunk0.setMax(chunkMax);
+    chunk0.setRange({chunkMin, chunkMax});
 
     ChunkType chunk1;
     chunk1.setName(OID::gen());
@@ -493,31 +524,33 @@ TEST_F(CommitChunkMigrate, CommitWithLastChunkOnShardShouldNotAffectOtherChunks)
     chunk1.setVersion(origVersion);
     chunk1.setShard(shard1.getName());
 
-    chunk1.setMin(chunkMax);
     auto chunkMaxax = BSON("a" << 20);
-    chunk1.setMax(chunkMaxax);
+    chunk1.setRange({chunkMax, chunkMaxax});
 
     Timestamp ctrlChunkValidAfter = Timestamp(50, 0);
-    chunk1.setHistory({ChunkHistory(ctrlChunkValidAfter, shard1.getName())});
+    chunk1.setOnCurrentShardSince(ctrlChunkValidAfter);
+    chunk1.setHistory({ChunkHistory(*chunk1.getOnCurrentShardSince(), shard1.getName())});
 
     setupCollection(kNamespace, kKeyPattern, {chunk0, chunk1});
 
-    Timestamp validAfter{101, 0};
-    StatusWith<BSONObj> resultBSON = ShardingCatalogManager::get(operationContext())
-                                         ->commitChunkMigration(operationContext(),
-                                                                kNamespace,
-                                                                chunk0,
-                                                                origVersion.epoch(),
-                                                                origVersion.getTimestamp(),
-                                                                ShardId(shard0.getName()),
-                                                                ShardId(shard1.getName()),
-                                                                validAfter);
+    const auto currentTime = VectorClock::get(getServiceContext())->getTime();
+    const auto expectedValidAfter = currentTime.clusterTime().asTimestamp();
 
-    ASSERT_OK(resultBSON.getStatus());
+    StatusWith<ShardingCatalogManager::ShardAndCollectionPlacementVersions> result =
+        ShardingCatalogManager::get(operationContext())
+            ->commitChunkMigration(operationContext(),
+                                   kNamespace,
+                                   chunk0,
+                                   origVersion.epoch(),
+                                   origVersion.getTimestamp(),
+                                   ShardId(shard0.getName()),
+                                   ShardId(shard1.getName()));
+
+    ASSERT_OK(result.getStatus());
 
     // Verify the versions returned match expected values.
-    BSONObj versions = resultBSON.getValue();
-    auto mver = ChunkVersion::parse(versions["shardVersion"]);
+    auto versions = result.getValue();
+    auto mver = versions.shardPlacementVersion;
     ASSERT_EQ(ChunkVersion({origVersion.epoch(), origVersion.getTimestamp()}, {0, 0}), mver);
 
     // Verify the chunks ended up in the right shards.
@@ -527,7 +560,9 @@ TEST_F(CommitChunkMigrate, CommitWithLastChunkOnShardShouldNotAffectOtherChunks)
 
     // The migrated chunk's history should be updated.
     ASSERT_EQ(2UL, chunkDoc0.getHistory().size());
-    ASSERT_EQ(validAfter, chunkDoc0.getHistory().front().getValidAfter());
+    ASSERT_EQ(chunkDoc0.getHistory().front().getValidAfter(), *chunkDoc0.getOnCurrentShardSince());
+    ASSERT_EQ(expectedValidAfter, chunkDoc0.getHistory().front().getValidAfter());
+    ASSERT_EQ(expectedValidAfter, *chunkDoc0.getOnCurrentShardSince());
 
     auto chunkDoc1 =
         uassertStatusOK(getChunkDoc(operationContext(), chunkMax, collEpoch, collTimestamp));
@@ -537,6 +572,7 @@ TEST_F(CommitChunkMigrate, CommitWithLastChunkOnShardShouldNotAffectOtherChunks)
     // The control chunk's history should be unchanged.
     ASSERT_EQ(1UL, chunkDoc1.getHistory().size());
     ASSERT_EQ(ctrlChunkValidAfter, chunkDoc1.getHistory().front().getValidAfter());
+    ASSERT_EQ(ctrlChunkValidAfter, *chunkDoc1.getOnCurrentShardSince());
 }
 
 TEST_F(CommitChunkMigrate, RejectMissingChunkVersion) {
@@ -559,22 +595,23 @@ TEST_F(CommitChunkMigrate, RejectMissingChunkVersion) {
     migratedChunk.setName(OID::gen());
     migratedChunk.setCollectionUUID(collUUID);
     migratedChunk.setShard(shard0.getName());
-    migratedChunk.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
-    migratedChunk.setMin(BSON("a" << 1));
-    migratedChunk.setMax(BSON("a" << 10));
+    migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
+    migratedChunk.setHistory(
+        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), shard0.getName())});
+    migratedChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     ChunkType currentChunk;
     currentChunk.setName(OID::gen());
     currentChunk.setCollectionUUID(collUUID);
     currentChunk.setVersion(origVersion);
     currentChunk.setShard(shard0.getName());
-    currentChunk.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
-    currentChunk.setMin(BSON("a" << 1));
-    currentChunk.setMax(BSON("a" << 10));
+    currentChunk.setOnCurrentShardSince(Timestamp(100, 0));
+    currentChunk.setHistory(
+        {ChunkHistory(*currentChunk.getOnCurrentShardSince(), shard0.getName())});
+    currentChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     setupCollection(kNamespace, kKeyPattern, {currentChunk});
 
-    Timestamp validAfter{101, 0};
     ASSERT_THROWS_CODE(ShardingCatalogManager::get(operationContext())
                            ->commitChunkMigration(operationContext(),
                                                   kNamespace,
@@ -582,8 +619,7 @@ TEST_F(CommitChunkMigrate, RejectMissingChunkVersion) {
                                                   origVersion.epoch(),
                                                   origVersion.getTimestamp(),
                                                   ShardId(shard0.getName()),
-                                                  ShardId(shard1.getName()),
-                                                  validAfter),
+                                                  ShardId(shard1.getName())),
                        DBException,
                        4683300);
 }
@@ -609,9 +645,10 @@ TEST_F(CommitChunkMigrate, RejectOlderChunkVersion) {
     migratedChunk.setCollectionUUID(collUUID);
     migratedChunk.setVersion(origVersion);
     migratedChunk.setShard(shard0.getName());
-    migratedChunk.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
-    migratedChunk.setMin(BSON("a" << 1));
-    migratedChunk.setMax(BSON("a" << 10));
+    migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
+    migratedChunk.setHistory(
+        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), shard0.getName())});
+    migratedChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     ChunkVersion currentChunkVersion({epoch, Timestamp(42)}, {14, 7});
 
@@ -620,13 +657,13 @@ TEST_F(CommitChunkMigrate, RejectOlderChunkVersion) {
     currentChunk.setCollectionUUID(collUUID);
     currentChunk.setVersion(currentChunkVersion);
     currentChunk.setShard(shard0.getName());
-    currentChunk.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
-    currentChunk.setMin(BSON("a" << 1));
-    currentChunk.setMax(BSON("a" << 10));
+    currentChunk.setOnCurrentShardSince(Timestamp(100, 0));
+    currentChunk.setHistory(
+        {ChunkHistory(*currentChunk.getOnCurrentShardSince(), shard0.getName())});
+    currentChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     setupCollection(kNamespace, kKeyPattern, {currentChunk});
 
-    Timestamp validAfter{101, 0};
     auto result = ShardingCatalogManager::get(operationContext())
                       ->commitChunkMigration(operationContext(),
                                              kNamespace,
@@ -634,11 +671,10 @@ TEST_F(CommitChunkMigrate, RejectOlderChunkVersion) {
                                              origVersion.epoch(),
                                              origVersion.getTimestamp(),
                                              ShardId(shard0.getName()),
-                                             ShardId(shard1.getName()),
-                                             validAfter);
+                                             ShardId(shard1.getName()));
 
-    ASSERT_NOT_OK(result);
-    ASSERT_EQ(result, ErrorCodes::ConflictingOperationInProgress);
+    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_EQ(result.getStatus(), ErrorCodes::ConflictingOperationInProgress);
 }
 
 TEST_F(CommitChunkMigrate, RejectMismatchedEpoch) {
@@ -661,9 +697,10 @@ TEST_F(CommitChunkMigrate, RejectMismatchedEpoch) {
     migratedChunk.setCollectionUUID(collUUID);
     migratedChunk.setVersion(origVersion);
     migratedChunk.setShard(shard0.getName());
-    migratedChunk.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
-    migratedChunk.setMin(BSON("a" << 1));
-    migratedChunk.setMax(BSON("a" << 10));
+    migratedChunk.setOnCurrentShardSince(Timestamp(100, 0));
+    migratedChunk.setHistory(
+        {ChunkHistory(*migratedChunk.getOnCurrentShardSince(), shard0.getName())});
+    migratedChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     ChunkVersion currentChunkVersion({OID::gen(), Timestamp(42)}, {12, 7});
 
@@ -672,13 +709,13 @@ TEST_F(CommitChunkMigrate, RejectMismatchedEpoch) {
     currentChunk.setCollectionUUID(collUUID);
     currentChunk.setVersion(currentChunkVersion);
     currentChunk.setShard(shard0.getName());
-    currentChunk.setHistory({ChunkHistory(Timestamp(100, 0), shard0.getName())});
-    currentChunk.setMin(BSON("a" << 1));
-    currentChunk.setMax(BSON("a" << 10));
+    currentChunk.setOnCurrentShardSince(Timestamp(100, 0));
+    currentChunk.setHistory(
+        {ChunkHistory(*currentChunk.getOnCurrentShardSince(), shard0.getName())});
+    currentChunk.setRange({BSON("a" << 1), BSON("a" << 10)});
 
     setupCollection(kNamespace, kKeyPattern, {currentChunk});
 
-    Timestamp validAfter{101, 0};
     auto result = ShardingCatalogManager::get(operationContext())
                       ->commitChunkMigration(operationContext(),
                                              kNamespace,
@@ -686,11 +723,10 @@ TEST_F(CommitChunkMigrate, RejectMismatchedEpoch) {
                                              origVersion.epoch(),
                                              origVersion.getTimestamp(),
                                              ShardId(shard0.getName()),
-                                             ShardId(shard1.getName()),
-                                             validAfter);
+                                             ShardId(shard1.getName()));
 
-    ASSERT_NOT_OK(result);
-    ASSERT_EQ(result, ErrorCodes::StaleEpoch);
+    ASSERT_NOT_OK(result.getStatus());
+    ASSERT_EQ(result.getStatus(), ErrorCodes::StaleEpoch);
 }
 
 class CommitMoveRangeTest : public CommitChunkMigrate {
@@ -710,14 +746,16 @@ public:
         chunk.setVersion(version);
         chunk.setShard(shardID);
         chunk.setHistory(history);
-        chunk.setMin(min);
-        chunk.setMax(max);
+        if (!history.empty())
+            chunk.setOnCurrentShardSince(history.front().getValidAfter());
+        chunk.setRange({min, max});
 
         return chunk;
     }
 
     /*
-     * Setup the collection with `numberOfChunks` contiguous chunks covering all the shard key space
+     * Setup the collection with `numberOfChunks` contiguous chunks covering all the shard key
+     space
      */
     void setupCollectionWithNChunks(int numberOfChunks) {
         invariant(numberOfChunks > 0);
@@ -725,7 +763,6 @@ public:
         uint32_t currentMajorVersion = 1;
         int historyTimestampSecond = 100;
 
-        std::vector<ChunkHistory> history;
         std::vector<BSONObj> chunksMin = {kKeyPattern.globalMin()};
         for (int i = 10; i < numberOfChunks * 10; i += 10) {
             chunksMin.push_back(BSON("x" << i));
@@ -738,8 +775,8 @@ public:
             const auto shardId = _shardIds.at(i % 2);  // Shard owning the chunk
             ChunkVersion version =
                 ChunkVersion({_collEpoch, _collTimestamp}, {currentMajorVersion++, 0});
-            history.insert(history.begin(),
-                           {ChunkHistory(Timestamp(historyTimestampSecond++, 0), shardId)});
+            std::vector<ChunkHistory> history{
+                ChunkHistory(Timestamp(historyTimestampSecond++, 0), shardId)};
             ChunkType chunk = createChunk(_collUUID, min, max, version, shardId, history);
             chunks.push_back(chunk);
         }
@@ -758,25 +795,23 @@ public:
                                const ChunkType& migratedChunk,
                                const bool expectLeftSplit,
                                const bool expectRightSplit) {
-        Timestamp validAfter = [&]() {
-            auto currValidAfter = migratedChunk.getHistory().at(0).getValidAfter();
-            return Timestamp(currValidAfter.getSecs() + 100, 0);
-        }();
-
         const auto donor = migratedChunk.getShard();
         const auto recipient =
             migratedChunk.getShard() == _shardIds.at(0) ? _shardIds.at(1) : _shardIds.at(0);
 
-        auto collVersionBefore = [&]() {
+        auto collPlacementVersionBefore = [&]() {
             const auto chunkDoc = uassertStatusOK(
                 findOneOnConfigCollection(operationContext(),
-                                          ChunkType::ConfigNS,
+                                          NamespaceString::kConfigsvrChunksNamespace,
                                           BSON(ChunkType::collectionUUID << _collUUID),
                                           BSON(ChunkType::lastmod << -1)));
             auto chunk = uassertStatusOK(
                 ChunkType::parseFromConfigBSON(chunkDoc, _collEpoch, _collTimestamp));
             return chunk.getVersion();
         }();
+
+        const auto currentTime = VectorClock::get(getServiceContext())->getTime();
+        const auto expectedValidAfter = currentTime.clusterTime().asTimestamp();
 
         uassertStatusOK(ShardingCatalogManager::get(operationContext())
                             ->commitChunkMigration(operationContext(),
@@ -785,8 +820,7 @@ public:
                                                    migratedChunk.getVersion().epoch(),
                                                    migratedChunk.getVersion().getTimestamp(),
                                                    donor,
-                                                   recipient,
-                                                   validAfter));
+                                                   recipient));
 
         // Verify the new chunk is on the recipient shard
         {
@@ -799,12 +833,14 @@ public:
             ASSERT(migratedChunk.getMax().woCompare(newChunk.getMax()) == 0);
 
             // The migrated chunk's version must have been bumped
-            ASSERT_EQ(newChunk.getVersion().majorVersion(), collVersionBefore.majorVersion() + 1);
+            ASSERT_EQ(newChunk.getVersion().majorVersion(),
+                      collPlacementVersionBefore.majorVersion() + 1);
             ASSERT_EQ(0, newChunk.getVersion().minorVersion());
 
             // The migrated chunk's history should have been updated with a new `validAfter` entry
             ASSERT_EQ(origChunk.getHistory().size() + 1, newChunk.getHistory().size());
-            ASSERT_EQ(validAfter, newChunk.getHistory().front().getValidAfter());
+            ASSERT_EQ(expectedValidAfter, newChunk.getHistory().front().getValidAfter());
+            ASSERT_EQ(expectedValidAfter, *newChunk.getOnCurrentShardSince());
 
             // The migrated chunk's history must inherit the previous chunk's history
             assertSameHistories(std::vector<ChunkHistory>(newChunk.getHistory().begin() + 1,
@@ -821,6 +857,7 @@ public:
                                             migratedChunk.getVersion().epoch(),
                                             migratedChunk.getVersion().getTimestamp()));
             ASSERT_EQ(donor, leftSplitChunk.getShard());
+            ASSERT_EQ(origChunk.getOnCurrentShardSince(), leftSplitChunk.getOnCurrentShardSince());
 
             // The min of the split chunk must be the min of the original chunk
             ASSERT(leftSplitChunk.getMin().woCompare(origChunk.getMin()) == 0);
@@ -829,7 +866,7 @@ public:
             ASSERT(leftSplitChunk.getMax().woCompare(migratedChunk.getMin()) == 0);
 
             // The major and minor versions of the left split chunk must have been bumped
-            ASSERT_EQ(collVersionBefore.majorVersion() + 1,
+            ASSERT_EQ(collPlacementVersionBefore.majorVersion() + 1,
                       leftSplitChunk.getVersion().majorVersion());
             ASSERT_EQ(expectedMinVersion++, leftSplitChunk.getVersion().minorVersion());
 
@@ -845,6 +882,7 @@ public:
                                             migratedChunk.getVersion().epoch(),
                                             migratedChunk.getVersion().getTimestamp()));
             ASSERT_EQ(donor, rightSplitChunk.getShard());
+            ASSERT_EQ(origChunk.getOnCurrentShardSince(), rightSplitChunk.getOnCurrentShardSince());
 
             // The min of the right split chunk must fit the max of the new chunk
             ASSERT(rightSplitChunk.getMin().woCompare(migratedChunk.getMax()) == 0);
@@ -853,7 +891,7 @@ public:
             ASSERT(rightSplitChunk.getMax().woCompare(origChunk.getMax()) == 0);
 
             // The major and minor versions of the right split chunk must have been bumped
-            ASSERT_EQ(collVersionBefore.majorVersion() + 1,
+            ASSERT_EQ(collPlacementVersionBefore.majorVersion() + 1,
                       rightSplitChunk.getVersion().majorVersion());
             ASSERT_EQ(expectedMinVersion++, rightSplitChunk.getVersion().minorVersion());
 
@@ -916,7 +954,7 @@ TEST_F(CommitMoveRangeTest, MoveRangeSplitChunkLeftSide) {
 
     const ChunkType origChunk = chunks.at(0);
     ChunkType migratedChunk = origChunk;
-    migratedChunk.setMin(BSON("x" << 10));
+    migratedChunk.setRange({BSON("x" << 10), migratedChunk.getMax()});
 
     runMoveRangeAndVerify(
         origChunk, migratedChunk, true /* expectLeftSplit */, false /* expectRightSplit */);
@@ -935,7 +973,7 @@ TEST_F(CommitMoveRangeTest, MoveRangeSplitChunkRightSide) {
 
     const ChunkType origChunk = chunks.at(0);
     ChunkType migratedChunk = origChunk;
-    migratedChunk.setMax(BSON("x" << 10));
+    migratedChunk.setRange({migratedChunk.getMin(), BSON("x" << 10)});
 
     runMoveRangeAndVerify(
         origChunk, migratedChunk, false /* expectLeftSplit */, true /* expectRightSplit */);
@@ -954,8 +992,7 @@ TEST_F(CommitMoveRangeTest, MoveRangeSplitChunkLeftRightSide) {
 
     const ChunkType origChunk = chunks.at(0);
     ChunkType migratedChunk = origChunk;
-    migratedChunk.setMin(BSON("x" << 1));
-    migratedChunk.setMax(BSON("x" << 10));
+    migratedChunk.setRange({BSON("x" << 1), BSON("x" << 10)});
 
     runMoveRangeAndVerify(
         origChunk, migratedChunk, true /* expectLeftSplit */, true /* expectRightSplit */);
@@ -975,7 +1012,7 @@ TEST_F(CommitMoveRangeTest, MoveRangeRandom) {
     bool expectLeftSplit = [&]() {
         if (origChunkIndex > 0 && random.nextInt32(2)) {
             const auto newMin = origChunk.getMin().getIntField("x") + 2;
-            migratedChunk.setMin(BSON("x" << newMin));
+            migratedChunk.setRange({BSON("x" << newMin), migratedChunk.getMax()});
             return true;
         }
         return false;
@@ -984,7 +1021,7 @@ TEST_F(CommitMoveRangeTest, MoveRangeRandom) {
     bool expectRightSplit = [&]() {
         if (origChunkIndex < nChunks - 1 && random.nextInt32(2)) {
             const auto newMax = origChunk.getMax().getIntField("x") - 2;
-            migratedChunk.setMax(BSON("x" << newMax));
+            migratedChunk.setRange({migratedChunk.getMin(), BSON("x" << newMax)});
             return true;
         }
         return false;

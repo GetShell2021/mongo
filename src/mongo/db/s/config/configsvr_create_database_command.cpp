@@ -27,23 +27,33 @@
  *    it in the license file.
  */
 
+#include <string>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
 
-#include <set>
-
+#include "mongo/base/error_codes.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/s/grid.h"
+#include "mongo/db/s/create_database_coordinator.h"
+#include "mongo/db/s/create_database_coordinator_document_gen.h"
+#include "mongo/db/s/create_database_util.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -72,23 +82,64 @@ public:
         Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCreateDatabase can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
+            opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             // Set the operation context read concern level to local for reads into the config
             // database.
             repl::ReadConcernArgs::get(opCtx) =
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-            auto dbname = request().getCommandParameter();
+            const auto dbNameStr = request().getCommandParameter();
+            const auto dbName = DatabaseNameUtil::deserialize(
+                boost::none, dbNameStr, request().getSerializationContext());
 
-            audit::logEnableSharding(opCtx->getClient(), dbname);
+            audit::logEnableSharding(opCtx->getClient(), dbNameStr);
 
-            auto dbt = ShardingCatalogManager::get(opCtx)->createDatabase(
-                opCtx, dbname, request().getPrimaryShardId());
+            // Checks for restricted and invalid namespaces.
+            if (const auto configDatabaseOpt =
+                    create_database_util::checkDbNameConstraints(dbName)) {
+                return configDatabaseOpt->getVersion();
+            }
+            const auto optResolvedPrimaryShard =
+                create_database_util::resolvePrimaryShard(opCtx, request().getPrimaryShardId());
 
-            return {dbt.getVersion()};
+            std::function<Response()> getCreateDatabaseResponse;
+            {
+                FixedFCVRegion fixedFcvRegion{opCtx};
+                bool createDatabaseDDLCoordinatorFeatureFlagEnabled =
+                    feature_flags::gCreateDatabaseDDLCoordinator.isEnabled(
+                        (*fixedFcvRegion).acquireFCVSnapshot());
+
+                if (!createDatabaseDDLCoordinatorFeatureFlagEnabled) {
+                    getCreateDatabaseResponse = [&]() {
+                        auto dbt = ShardingCatalogManager::get(opCtx)->createDatabase(
+                            opCtx,
+                            dbName,
+                            optResolvedPrimaryShard,
+                            request().getSerializationContext());
+
+                        return Response(dbt.getVersion());
+                    };
+                } else {
+                    CreateDatabaseCoordinatorDocument coordinatorDoc;
+                    coordinatorDoc.setShardingDDLCoordinatorMetadata(
+                        {{NamespaceString(dbName), DDLCoordinatorTypeEnum::kCreateDatabase}});
+                    coordinatorDoc.setPrimaryShard(optResolvedPrimaryShard);
+                    coordinatorDoc.setUserSelectedPrimary(optResolvedPrimaryShard.is_initialized());
+                    auto service = ShardingDDLCoordinatorService::getService(opCtx);
+                    auto createDatabaseCoordinator =
+                        checked_pointer_cast<CreateDatabaseCoordinator>(
+                            service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+                    getCreateDatabaseResponse = [opCtx,
+                                                 coord = std::move(createDatabaseCoordinator)]() {
+                        return coord->getResult(opCtx);
+                    };
+                }
+            }
+            return getCreateDatabaseResponse();
         }
 
     private:
@@ -104,8 +155,9 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
 
@@ -122,7 +174,8 @@ private:
     bool adminOnly() const override {
         return true;
     }
-} configsvrCreateDatabaseCmd;
+};
+MONGO_REGISTER_COMMAND(ConfigSvrCreateDatabaseCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

@@ -28,6 +28,10 @@
  */
 
 #include "mongo/s/initialize_tenant_to_shard_cache.h"
+
+#include <utility>
+
+
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
 
@@ -35,7 +39,8 @@ namespace mongo {
 namespace {
 bool initSet = false;
 std::function<void(ServiceContext* service)> tenantToShardCacheInitializer =
-    [](ServiceContext* service) {};
+    [](ServiceContext* service) {
+    };
 }  // namespace
 }  // namespace mongo
 

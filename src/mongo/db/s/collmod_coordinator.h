@@ -29,9 +29,31 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/coll_mod_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops.h"
 #include "mongo/db/s/collmod_coordinator_document_gen.h"
+#include "mongo/db/s/sharded_collmod_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/future.h"
 
 namespace mongo {
 
@@ -60,6 +82,7 @@ public:
 
 private:
     struct CollectionInfo {
+        bool isTracked;
         bool isSharded;
         boost::optional<TimeseriesOptions> timeSeriesOptions;
         // The targeting namespace can be different from the original namespace in some cases, like
@@ -70,8 +93,14 @@ private:
     struct ShardingInfo {
         // The primary shard for the collection, only set if the collection is sharded.
         ShardId primaryShard;
-        // The shards owning chunks for the collection, only set if the collection is sharded.
-        std::vector<ShardId> shardsOwningChunks;
+        // Flag that tells if the primary db shard has chunks for the collection.
+        bool isPrimaryOwningChunks;
+        // The participant shards owning chunks for the collection, only set if the collection is
+        // sharded.
+        std::vector<ShardId> participantsOwningChunks;
+        // The participant shards not owning chunks for the collection, only set if the collection
+        // is sharded.
+        std::vector<ShardId> participantsNotOwningChunks;
     };
 
     StringData serializePhase(const Phase& phase) const override {
@@ -87,6 +116,18 @@ private:
     void _saveCollectionInfoOnCoordinatorIfNecessary(OperationContext* opCtx);
 
     void _saveShardingInfoOnCoordinatorIfNecessary(OperationContext* opCtx);
+
+    std::vector<AsyncRequestsSender::Response> _sendCollModToPrimaryShard(
+        OperationContext* opCtx,
+        ShardsvrCollModParticipant& request,
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& token);
+
+    std::vector<AsyncRequestsSender::Response> _sendCollModToParticipantShards(
+        OperationContext* opCtx,
+        ShardsvrCollModParticipant& request,
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& token);
 
     const mongo::CollModRequest _request;
 

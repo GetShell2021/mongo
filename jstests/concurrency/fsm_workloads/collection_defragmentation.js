@@ -1,11 +1,17 @@
-'use strict';
-
 /**
  * collection_defragmentation.js
  *
  * Runs defragmentation on collections with concurrent operations.
  *
- * @tags: [requires_sharding, assumes_balancer_on, antithesis_incompatible]
+ * @tags: [
+ *  requires_sharding,
+ *  assumes_balancer_on,
+ *  antithesis_incompatible,
+ *  # This test configure the 'balancerShouldReturnRandomMigrations' failpoint
+ *  # that will be reset to its default value if a node is killed and restarted.
+ *  does_not_support_stepdowns,
+ *  assumes_stable_shard_list,
+ * ]
  */
 
 const dbPrefix = jsTestName() + '_DB_';
@@ -14,9 +20,9 @@ const collPrefix = 'sharded_coll_';
 const collCount = 2;
 const maxChunkSizeMB = 10;
 
-load('jstests/sharding/libs/defragmentation_util.js');
-load('jstests/sharding/libs/find_chunks_util.js');
-load('jstests/concurrency/fsm_workload_helpers/chunks.js');
+import {defragmentationUtil} from "jstests/sharding/libs/defragmentation_util.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {ChunkHelper} from "jstests/concurrency/fsm_workload_helpers/chunks.js";
 
 function getRandomDb(db) {
     return db.getSiblingDB(dbPrefix + Random.randInt(dbCount));
@@ -51,7 +57,7 @@ function getAllChunks(configDB, ns, keyPattern) {
     return chunkArray;
 }
 
-var $config = (function() {
+export const $config = (function() {
     var states = {
         init: function init(db, collName, connCache) {
             // Initialize defragmentation
@@ -59,7 +65,7 @@ var $config = (function() {
                 const dbName = dbPrefix + i;
                 for (let j = 0; j < collCount; j++) {
                     const fullNs = dbName + "." + collPrefix + j;
-                    assertWhenOwnColl.commandWorked(connCache.mongos[0].adminCommand({
+                    assert.commandWorked(connCache.mongos[0].adminCommand({
                         configureCollectionBalancing: fullNs,
                         defragmentCollection: true,
                         chunkSize: maxChunkSizeMB,
@@ -121,11 +127,8 @@ var $config = (function() {
 
             // Choose a random starting point to look for mergeable chunks to make it less likely
             // that each thread tries to move the same chunk.
-            let index = Random.randInt(chunks.length);
-            for (let i = 0; i < chunks.length; i++) {
-                if (index === chunks.length - 1) {
-                    index = 0;
-                }
+            let index = Random.randInt(chunks.length - 1);
+            for (let i = 0; i < chunks.length - 1; i++) {
                 if (chunks[index].shard === chunks[index + 1].shard &&
                     defragmentationUtil.getZoneForRange(connCache.mongos[0],
                                                         randomColl.getFullName(),
@@ -145,6 +148,10 @@ var $config = (function() {
                     }
                     return;
                 }
+                index++;
+                if (index >= chunks.length - 1) {
+                    index = 0;
+                }
             }
         },
 
@@ -158,7 +165,7 @@ var $config = (function() {
                 configDB.chunks.aggregate([{$match: chunksJoinClause}, {$sample: {size: 1}}])
                     .toArray()[0];
             try {
-                assertAlways.commandWorked(
+                assert.commandWorked(
                     db.adminCommand({split: randomColl.getFullName(), find: randomChunk.min}));
                 jsTest.log("Manual split chunk of chunk " + tojson(randomChunk));
             } catch (e) {
@@ -173,8 +180,8 @@ var $config = (function() {
             const extendedShardKey =
                 getExtendedCollectionShardKey(configDB, randomColl.getFullName());
             try {
-                assertWhenOwnColl.commandWorked(randomColl.createIndex(extendedShardKey));
-                assertWhenOwnColl.commandWorked(randomDB.adminCommand(
+                assert.commandWorked(randomColl.createIndex(extendedShardKey));
+                assert.commandWorked(randomDB.adminCommand(
                     {refineCollectionShardKey: randomColl.getFullName(), key: extendedShardKey}));
                 jsTest.log("Manual refine shard key for collection " + randomColl.getFullName() +
                            " to " + tojson(extendedShardKey));
@@ -193,26 +200,44 @@ var $config = (function() {
     };
 
     let defaultChunkDefragmentationThrottlingMS;
+    let defaultBalancerShouldReturnRandomMigrations;
 
     function setup(db, collName, cluster) {
+        cluster.executeOnConfigNodes((db) => {
+            defaultBalancerShouldReturnRandomMigrations =
+                assert
+                    .commandWorked(db.adminCommand({
+                        getParameter: 1,
+                        'failpoint.balancerShouldReturnRandomMigrations': 1
+                    }))['failpoint.balancerShouldReturnRandomMigrations']
+                    .mode;
+
+            // If the failpoint is enabled on this suite, disable it because this test relies on the
+            // balancer taking correct decisions.
+            if (defaultBalancerShouldReturnRandomMigrations === 1) {
+                assert.commandWorked(db.adminCommand(
+                    {configureFailPoint: 'balancerShouldReturnRandomMigrations', mode: 'off'}));
+            }
+        });
+
         const mongos = cluster.getDB('config').getMongo();
         // Create all fragmented collections
         for (let i = 0; i < dbCount; i++) {
             const dbName = dbPrefix + i;
             const newDb = db.getSiblingDB(dbName);
-            assertAlways.commandWorked(newDb.adminCommand({enablesharding: dbName}));
+            assert.commandWorked(newDb.adminCommand({enablesharding: dbName}));
             for (let j = 0; j < collCount; j++) {
                 const fullNs = dbName + "." + collPrefix + j;
                 const numChunks = Random.randInt(30);
                 const numZones = Random.randInt(numChunks / 2);
-                const docSizeBytes = Random.randInt(1024 * 1024) + 50;
+                const docSizeBytesRange = [50, 1024 * 1024];
                 defragmentationUtil.createFragmentedCollection(
                     mongos,
                     fullNs,
                     numChunks,
                     5 /* maxChunkFillMB */,
                     numZones,
-                    docSizeBytes,
+                    docSizeBytesRange,
                     1000 /* chunkSpacing */,
                     true /* disableCollectionBalancing*/);
             }
@@ -227,6 +252,18 @@ var $config = (function() {
 
     function teardown(db, collName, cluster) {
         const mongos = cluster.getDB('config').getMongo();
+
+        let defaultBalancerMigrationsThrottling;
+        cluster.executeOnConfigNodes((db) => {
+            defaultBalancerMigrationsThrottling = assert.commandWorked(db.adminCommand({
+                getParameter: 1,
+                'balancerMigrationsThrottlingMs': 1
+            }))['balancerMigrationsThrottlingMs'];
+
+            assert.commandWorked(
+                db.adminCommand({setParameter: 1, balancerMigrationsThrottlingMs: 100}));
+        });
+
         for (let i = 0; i < dbCount; i++) {
             const dbName = dbPrefix + i;
             for (let j = 0; j < collCount; j++) {
@@ -234,15 +271,14 @@ var $config = (function() {
                 // Wait for defragmentation to complete
                 defragmentationUtil.waitForEndOfDefragmentation(mongos, fullNs);
                 // Enable balancing and wait for balanced
-                assertAlways.commandWorked(mongos.getDB('config').collections.update(
+                assert.commandWorked(mongos.getDB('config').collections.update(
                     {_id: fullNs}, {$set: {"noBalance": false}}));
-                assertAlways.soon(function() {
-                    let res = mongos.adminCommand({balancerCollectionStatus: fullNs});
-                    assertAlways.commandWorked(res);
-                    return res.balancerCompliant;
-                });
+                sh.awaitCollectionBalance(mongos.getCollection(fullNs), 300000 /* 5 minutes */);
+                // Re-disable balancing
+                assert.commandWorked(mongos.getDB('config').collections.update(
+                    {_id: fullNs}, {$set: {"noBalance": true}}));
                 // Begin defragmentation again
-                assertAlways.commandWorked(mongos.adminCommand({
+                assert.commandWorked(mongos.adminCommand({
                     configureCollectionBalancing: fullNs,
                     defragmentCollection: true,
                     chunkSize: maxChunkSizeMB,
@@ -260,11 +296,29 @@ var $config = (function() {
                 });
             }
         }
+
+        cluster.executeOnConfigNodes((db) => {
+            // Reset the failpoint to its original value.
+            if (defaultBalancerShouldReturnRandomMigrations === 1) {
+                defaultBalancerShouldReturnRandomMigrations =
+                    assert
+                        .commandWorked(db.adminCommand({
+                            configureFailPoint: 'balancerShouldReturnRandomMigrations',
+                            mode: 'alwaysOn'
+                        }))
+                        .was;
+            }
+
+            assert.commandWorked(db.adminCommand({
+                setParameter: 1,
+                balancerMigrationsThrottlingMs: defaultBalancerMigrationsThrottling
+            }));
+        });
     }
 
     return {
         threadCount: 5,
-        iterations: 10,
+        iterations: 25,
         states: states,
         transitions: transitions,
         setup: setup,

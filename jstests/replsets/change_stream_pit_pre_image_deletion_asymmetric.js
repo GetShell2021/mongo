@@ -5,15 +5,11 @@
  *
  * @tags: [
  * requires_fcv_60,
- * featureFlagChangeStreamPreAndPostImages,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/change_stream_util.js");  // For getPreImages().
-load("jstests/libs/fail_point_util.js");
-load('jstests/replsets/rslib.js');  // For getLatestOp, getFirstOplogEntry.
+import {getPreImages} from "jstests/libs/query/change_stream_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {getFirstOplogEntry, getLatestOp} from "jstests/replsets/rslib.js";
 
 const oplogSizeMB = 1;
 const replTest = new ReplSetTest({
@@ -45,7 +41,8 @@ assert.commandWorked(coll.insert({_id: 1, v: 1}, {writeConcern: {w: 2}}));
 // data situation during oplog application.
 const initialSyncNode = replTest.add({
     rsConfig: {priority: 0},
-    setParameter: {'failpoint.initialSyncHangBeforeCopyingDatabases': tojson({mode: 'alwaysOn'})}
+    setParameter: {'failpoint.initialSyncHangBeforeCopyingDatabases': tojson({mode: 'alwaysOn'})},
+    oplogSize: oplogSizeMB
 });
 
 // Wait until the new node starts and pauses on the fail point.
@@ -65,7 +62,7 @@ assert.commandWorked(initialSyncNode.adminCommand(
 
 // Wait until the initial sync process is complete and the new node becomes a fully
 // functioning secondary.
-replTest.waitForState(initialSyncNode, ReplSetTest.State.SECONDARY);
+replTest.awaitSecondaryNodes(null, [initialSyncNode]);
 
 // Verify that pre-images were not written during the logical initial sync. At this point the
 // pre-image collections in the nodes of the replica set are out of sync.
@@ -88,6 +85,10 @@ function oplogIsRolledOver() {
 }
 
 while (!oplogIsRolledOver()) {
+    // Reducing the number of documents inserted to prevent using too much memory.
+    // The oplog rollover depends on timestamp, sleeping between inserts can significantly reduce
+    // the total number of documents.
+    sleep(20);
     // Insert a large document with a write concern that ensures that before proceeding the
     // operation gets replicated to all 3 nodes in the replica set, since, otherwise, the node that
     // is being initial synced may not be able to catchup due to a small size of the oplog.
@@ -104,4 +105,3 @@ assert.soon(() => {
 // Verify that all nodes get in sync and do not crash.
 replTest.awaitReplication();
 replTest.stopSet();
-})();

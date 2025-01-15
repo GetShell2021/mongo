@@ -30,11 +30,23 @@
 
 #include "mongo/db/timeseries/timeseries_collmod.h"
 
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/catalog/coll_mod.h"
+#include "mongo/db/catalog/collection_uuid_mismatch.h"
 #include "mongo/db/timeseries/catalog_helper.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/timeseries/timeseries_options.h"
 #include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
@@ -42,35 +54,24 @@
 namespace mongo {
 namespace timeseries {
 
-std::unique_ptr<CollMod> makeTimeseriesBucketsCollModCommand(OperationContext* opCtx,
+std::unique_ptr<CollMod> makeTimeseriesBucketsCollModCommand(TimeseriesOptions& timeseriesOptions,
                                                              const CollMod& origCmd) {
     const auto& origNs = origCmd.getNamespace();
-
-    auto isCommandOnTimeseriesBucketNamespace =
-        origCmd.getIsTimeseriesNamespace() && *origCmd.getIsTimeseriesNamespace();
-    auto timeseriesOptions =
-        timeseries::getTimeseriesOptions(opCtx, origNs, !isCommandOnTimeseriesBucketNamespace);
-
-    // Return early with null if we are not working with a time-series collection.
-    if (!timeseriesOptions) {
-        return {};
-    }
 
     auto index = origCmd.getIndex();
     if (index && index->getKeyPattern()) {
         auto bucketsIndexSpecWithStatus = timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(
-            *timeseriesOptions, *index->getKeyPattern());
+            timeseriesOptions, *index->getKeyPattern());
 
         uassert(ErrorCodes::IndexNotFound,
                 str::stream() << bucketsIndexSpecWithStatus.getStatus().toString()
-                              << " Command request: " << redact(origCmd.toBSON({})),
+                              << " Command request: " << redact(origCmd.toBSON()),
                 bucketsIndexSpecWithStatus.isOK());
 
         index->setKeyPattern(std::move(bucketsIndexSpecWithStatus.getValue()));
     }
 
-    auto ns =
-        isCommandOnTimeseriesBucketNamespace ? origNs : origNs.makeTimeseriesBucketsNamespace();
+    auto ns = origNs.makeTimeseriesBucketsNamespace();
     CollModRequest request;
     request.setIndex(index);
     request.setValidator(origCmd.getValidator());
@@ -78,33 +79,24 @@ std::unique_ptr<CollMod> makeTimeseriesBucketsCollModCommand(OperationContext* o
     request.setValidationAction(origCmd.getValidationAction());
     request.setViewOn(origCmd.getViewOn());
     request.setPipeline(origCmd.getPipeline());
-    request.setRecordPreImages(origCmd.getRecordPreImages());
     request.setChangeStreamPreAndPostImages(origCmd.getChangeStreamPreAndPostImages());
     request.setExpireAfterSeconds(origCmd.getExpireAfterSeconds());
     request.setTimeseries(origCmd.getTimeseries());
+    request.setTimeseriesBucketsMayHaveMixedSchemaData(
+        origCmd.getTimeseriesBucketsMayHaveMixedSchemaData());
     request.setDryRun(origCmd.getDryRun());
     auto cmd = std::make_unique<CollMod>(ns);
     cmd->setCollModRequest(request);
     return cmd;
 }
 
-std::unique_ptr<CollMod> makeTimeseriesViewCollModCommand(OperationContext* opCtx,
+std::unique_ptr<CollMod> makeTimeseriesViewCollModCommand(TimeseriesOptions& timeseriesOptions,
                                                           const CollMod& origCmd) {
     const auto& ns = origCmd.getNamespace();
 
-    auto isCommandOnTimeseriesBucketNamespace =
-        origCmd.getIsTimeseriesNamespace() && *origCmd.getIsTimeseriesNamespace();
-    auto timeseriesOptions =
-        timeseries::getTimeseriesOptions(opCtx, ns, !isCommandOnTimeseriesBucketNamespace);
-
-    // Return early with null if we are not working with a time-series collection.
-    if (!timeseriesOptions) {
-        return {};
-    }
-
     auto& tsMod = origCmd.getTimeseries();
     if (tsMod) {
-        auto res = timeseries::applyTimeseriesOptionsModifications(*timeseriesOptions, *tsMod);
+        auto res = timeseries::applyTimeseriesOptionsModifications(timeseriesOptions, *tsMod);
         if (res.isOK()) {
             auto& [newOptions, changed] = res.getValue();
             if (changed) {
@@ -128,39 +120,41 @@ Status processCollModCommandWithTimeSeriesTranslation(OperationContext* opCtx,
                                                       const CollMod& cmd,
                                                       bool performViewChange,
                                                       BSONObjBuilder* result) {
-    const auto* mainCmd = &cmd;
-    // If the target namespace refers to a time-series collection, we will redirect the
-    // collection modification request to the underlying bucket collection.
-    // Aliasing collMod on a time-series collection in this manner has a few advantages:
-    // - It supports modifying the expireAfterSeconds setting (which is also a collection
-    //   creation option).
-    // - It avoids any accidental changes to critical view-specific properties of the
-    //   time-series collection, which are important for maintaining the view-bucket
-    //   relationship.
-    //
-    // 'timeseriesBucketsCmd' is null if the request namespace does not refer to a time-series
-    // collection. Otherwise, transforms the user time-series collMod request to one on the
-    // underlying bucket collection.
-    auto timeseriesBucketsCmd = makeTimeseriesBucketsCollModCommand(opCtx, cmd);
-    if (timeseriesBucketsCmd) {
-        // We additionally create a special, limited collMod command for the view definition
-        // itself if the pipeline needs to be updated to reflect changed timeseries options.
-        // This operation is completed first. In the case that we get a partial update where
-        // only one of the two collMod operations fully completes (e.g. replication rollback),
-        // having the view pipeline update without updating the timeseries options on the
-        // buckets collection will result in sub-optimal performance, but correct behavior.
-        // If the timeseries options were updated without updating the view pipeline, we could
-        // end up with incorrect query behavior (namely data missing from some queries).
-        auto timeseriesViewCmd = makeTimeseriesViewCollModCommand(opCtx, cmd);
-        if (timeseriesViewCmd && performViewChange) {
-            auto status = processCollModCommand(opCtx, nss, *timeseriesViewCmd, result);
-            if (!status.isOK()) {
-                return status;
-            }
-        }
-        mainCmd = timeseriesBucketsCmd.get();
+    auto timeseriesOptions = timeseries::getTimeseriesOptions(opCtx, cmd.getNamespace(), true);
+
+    if (!timeseriesOptions) {
+        return processCollModCommand(opCtx, cmd.getNamespace(), cmd, nullptr, result);
     }
-    return processCollModCommand(opCtx, mainCmd->getNamespace(), *mainCmd, result);
+
+    // If there the expected collection UUID is provided, always fail because the user-facing
+    // time-series doesn't have a UUID.
+    checkCollectionUUIDMismatch(opCtx, cmd.getNamespace(), nullptr, cmd.getCollectionUUID());
+
+    // Aliasing collMod on a time-series collection in this manner has a few advantages:
+    // - It supports modifying the expireAfterSeconds setting (which is also a collection creation
+    //   option).
+    // - It avoids any accidental changes to critical view-specific properties of thetime-series
+    //   collection, which are important for maintaining the view-bucket relationship.
+    auto timeseriesBucketsCmd = makeTimeseriesBucketsCollModCommand(*timeseriesOptions, cmd);
+
+    // We additionally create a special, limited collMod command for the view definition itself if
+    // the pipeline needs to be updated to reflect changed timeseries options. This operation is
+    // completed first. In the case that we get a partial update where only one of the two collMod
+    // operations fully completes (e.g. replication rollback), having the view pipeline update
+    // without updating the timeseries options on the buckets collection will result in sub-optimal
+    // performance, but correct behavior. If the timeseries options were updated without updating
+    // the view pipeline, we could end up with incorrect query behavior (namely data missing from
+    // some queries).
+    auto timeseriesViewCmd = makeTimeseriesViewCollModCommand(*timeseriesOptions, cmd);
+    if (timeseriesViewCmd && performViewChange) {
+        auto status = processCollModCommand(opCtx, nss, *timeseriesViewCmd, nullptr, result);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    return processCollModCommand(
+        opCtx, timeseriesBucketsCmd->getNamespace(), *timeseriesBucketsCmd, nullptr, result);
 }
 
 }  // namespace timeseries

@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/base/status_with.h"
+#include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
@@ -42,7 +43,6 @@
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/net/hostandport.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -125,7 +125,7 @@ public:
         ReplicationConsistencyMarkers* consistencyMarkers,
         StorageInterface* storageInterface,
         const OplogApplier::Options& options,
-        ThreadPool* writerPool) = 0;
+        ThreadPool* workerPool) = 0;
 
     /**
      * Returns the current in-memory replica set config if there is one, or an error why there
@@ -142,6 +142,12 @@ public:
      * Stores the replica set config document in local storage, or returns an error.
      */
     virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) = 0;
+
+    /**
+     * Returns the current stored replica set "last vote" if there is one, or an error why there
+     * isn't.
+     */
+    virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx) const = 0;
 
     /**
      * Returns the replication journal listener.

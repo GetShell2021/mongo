@@ -20,8 +20,8 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 
-import sys
 import os
+import sys
 
 import SCons
 
@@ -47,7 +47,11 @@ if __name__ == "__main__":
     archive_type = sys.argv[1]
     archive_name = sys.argv[2]
     root_dir = sys.argv[3]
-    files = sys.argv[4:]
+    file_list = sys.argv[4]
+
+    files = []
+    with open(file_list) as f:
+        files = f.read().splitlines()
 
     if archive_type not in ("zip", "tar"):
         print("unsupported archive_type", archive_type)
@@ -119,7 +123,7 @@ def collect_transitive_files(env, entry):
 
     # Now we will call the scanner to find the transtive files of any files that
     # we found from the component DAG.
-
+    bazel_installed = set()
     while stack:
         s = stack.pop()
         if s in cache:
@@ -132,14 +136,33 @@ def collect_transitive_files(env, entry):
         # anyway.
         stack.extend(env.GetTransitivelyInstalledFiles(s))
 
+        # if the current file is a bazel target we need to find its bazel deps
+        # and add them to the archive.
+        if env.GetOption("ninja") == "disabled" and env.GetOption("link-model") == "dynamic":
+            env.BazelAutoArchive(s, bazel_installed, stack)
+            real_node = getattr(s.attributes, "AIB_INSTALL_FROM", s)
+            # usually you might use scons .children call but we know we only care about
+            # direct libdeps in this case as they may be transition nodes that are between
+            # scons and bazels graph.
+            for child in getattr(real_node.attributes, "libdeps_direct_sorted", []):
+                try:
+                    bazel_libdep = env.File(f"#/{env['SCONS2BAZEL_TARGETS'].bazel_output(child)}")
+                    install_file = env.GetAutoInstalledFiles(bazel_libdep)
+                    if not install_file:
+                        shlib_suffix = env.subst("$SHLIBSUFFIX")
+                        env.BazelAutoInstall(bazel_libdep, shlib_suffix)
+                        install_file = env.GetAutoInstalledFiles(bazel_libdep)
+                    env.BazelAutoArchive(install_file[0], bazel_installed, stack)
+                except KeyError:
+                    pass
+
     # Setting the AIB_NO_ARCHIVE attribute to True prevents outputs from an
     # AutoInstall builder from being included into archives produced by this
     # tool
     # Usage:
     # node = env.AutoInstall(...)
     # setattr(node[0].attributes, 'AIB_NO_ARCHIVE', True)
-    # TODO SERVER-61013 Update documentation once AutoInstall is a real builder
-    return sorted(f for f in files if not getattr(f.attributes, 'AIB_NO_ARCHIVE', False))
+    return sorted(f for f in files if not getattr(f.attributes, "AIB_NO_ARCHIVE", False))
 
 
 def auto_archive_gen(first_env, make_archive_script, pkg_fmt):
@@ -198,27 +221,42 @@ def archive_builder(source, target, env, for_signature):
 
     archive_type = env["__AUTO_ARCHIVE_TYPE"]
     make_archive_script = source[0]
+    compression_flags = ""
+
     tar_cmd = env.WhereIs("tar")
     if archive_type == "tar" and tar_cmd:
-        command_prefix = "{tar} -C {common_ancestor} -czf {archive_name}"
+        pigz_cmd = env.WhereIs("pigz")
+        if pigz_cmd:
+            # pigz is the parallel implementation of gizp,
+            # it uses all available cores on the machine.
+            # if available we use it to speedup compression.
+            compression_flags = "--use-compress-program='{pigz_cmd}'".format(pigz_cmd=pigz_cmd)
+        else:
+            compression_flags = "-z"
+
+        command_prefix = (
+            "{tar} -vc {compression_flags} -C {common_ancestor} -T {file_list} -f {archive_name}"
+        )
     else:
-        command_prefix = "{python} {make_archive_script} {archive_type} {archive_name} {common_ancestor}"
+        command_prefix = "{python} {make_archive_script} {archive_type} {archive_name} {common_ancestor} {file_list}"
 
     archive_name = env.File(target[0])
-    command_prefix = command_prefix.format(
+    command_sig = command_prefix.format(
         tar=tar_cmd,
+        compression_flags=compression_flags,
         python=sys.executable,
         archive_type=archive_type,
         archive_name=archive_name,
         make_archive_script=make_archive_script,
         common_ancestor=common_ancestor,
+        file_list="",
     )
 
     # If we are just being invoked for our signature, we can omit the indirect dependencies
     # found by expanding the transitive dependencies, since we really only have a hard dependency
     # on our direct dependencies.
     if for_signature:
-        return command_prefix
+        return command_sig
 
     component = env["AIB_COMPONENT"]
     role = env["AIB_ROLE"]
@@ -237,24 +275,45 @@ def archive_builder(source, target, env, for_signature):
     if not transitive_files:
         return []
 
-    # The env["ESCAPE"] function is used by scons to make arguments
-    # valid for the platform that we're running on. For instance it
-    # will properly quote paths that have spaces in them on Posix
-    # platforms and handle \ / on Windows.
-    escape_func = env.get("ESCAPE", lambda x: x)
-
     # TODO: relpath is costly, and we do it for every file in the archive here.
     # We should find a way to avoid the repeated relpath invocation, probably by
     # bucketing by directory.
     relative_files = [
-        escape_func(os.path.relpath(file.get_abspath(), common_ancestor.get_abspath()))
+        os.path.relpath(file.get_abspath(), common_ancestor.get_abspath())
         for file in transitive_files
     ]
 
-    return "{prefix} {files}".format(
-        prefix=command_prefix,
-        files=" ".join(relative_files),
+    # This is not great for ninja, essentially we are doing realtime operations here, which is
+    # not terrible for scons CommandActionGenerators, because the generation happens right before
+    # executing the command. However, this means for ninja that the realtime things happen during
+    # ninja generation, and are far removed from ninja execution. Even if we split this into a
+    # separate action for ninja's sake, there would still be issues because the reason to make
+    # such a filelist is to prevent creating command lines which are too long, and actions must
+    # be converted to command lines for ninja. When the ninja tool is able to process scons
+    # callbacks in order and not via aggregation then this could be moved to a simple Textfile call.
+    file_list = str(target[0].abspath) + ".filelist"
+    os.makedirs(os.path.dirname(file_list), exist_ok=True)
+    with open(file_list, "w") as f:
+        for file in relative_files:
+            f.write(file + "\n")
+
+    cmd = command_prefix.format(
+        tar=tar_cmd,
+        compression_flags=compression_flags,
+        python=sys.executable,
+        archive_type=archive_type,
+        archive_name=archive_name,
+        make_archive_script=make_archive_script,
+        common_ancestor=common_ancestor,
+        file_list=file_list,
     )
+    if env.GetOption("ninja") != "disabled":
+        if env.TargetOSIs("windows"):
+            cmd = 'echo "archive not supported with ninja, use scons only." & exit /b 1'
+        else:
+            cmd = 'echo "archive not supported with ninja, use scons only."; exit 1'
+
+    return cmd
 
 
 def exists(env):
@@ -268,8 +327,11 @@ def generate(env):
     bld = SCons.Builder.Builder(
         action=SCons.Action.CommandGeneratorAction(
             archive_builder,
-            {"cmdstr": "Building package ${TARGETS[0]} from ${SOURCES[1:]}"},
-        ))
+            {"cmdstr": "Building package ${TARGETS[0]} from ${SOURCES[1:]}"}
+            if not env.Verbose()
+            else {"cmdstr": ""},
+        )
+    )
     env.Append(BUILDERS={"AutoArchive": bld})
     env["AUTO_ARCHIVE_TARBALL_SUFFIX"] = env.get(
         "AUTO_ARCHIVE_TARBALL_SUFFIX",
@@ -292,4 +354,5 @@ def generate(env):
             "tar": (auto_archive_gen(env, make_archive_script, "tar"), False),
             "zip": (auto_archive_gen(env, make_archive_script, "zip"), False),
             "archive": (auto_archive_gen(env, make_archive_script, "auto"), False),
-        })
+        }
+    )

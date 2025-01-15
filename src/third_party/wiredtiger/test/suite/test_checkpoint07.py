@@ -32,6 +32,7 @@
 import wttest
 from wiredtiger import stat
 
+@wttest.skip_for_hook("tiered", "tiered checkpoints override clean checkpoint timer behavior")
 class test_checkpoint07(wttest.WiredTigerTestCase):
     conn_config = 'cache_size=50MB,statistics=(all)'
 
@@ -43,12 +44,9 @@ class test_checkpoint07(wttest.WiredTigerTestCase):
         return val
 
     def test_checkpoint07(self):
-        self.uri1 = 'table:ckpt05.1'
-        self.file1 = 'file:ckpt05.1.wt'
-        self.uri2 = 'table:ckpt05.2'
-        self.file2 = 'file:ckpt05.2.wt'
-        self.uri3 = 'table:ckpt05.3'
-        self.file3 = 'file:ckpt05.3.wt'
+        self.uri1 = 'table:ckpt07.1'
+        self.uri2 = 'table:ckpt07.2'
+        self.uri3 = 'table:ckpt07.3'
         self.session.create(self.uri1, 'key_format=i,value_format=i')
         self.session.create(self.uri2, 'key_format=i,value_format=i')
         self.session.create(self.uri3, 'key_format=i,value_format=i')
@@ -65,11 +63,11 @@ class test_checkpoint07(wttest.WiredTigerTestCase):
         self.session.checkpoint(None)
         c1[2] = 2
         self.session.checkpoint(None)
-        val1 = self.get_stat(self.file1)
+        val1 = self.get_stat(self.uri1)
         self.assertEqual(val1, 0)
-        val2 = self.get_stat(self.file2)
+        val2 = self.get_stat(self.uri2)
         self.assertNotEqual(val2, 0)
-        val3 = self.get_stat(self.file3)
+        val3 = self.get_stat(self.uri3)
         self.assertNotEqual(val3, 0)
         # It is possible that we could span the second timer when processing table
         # two and table three during the checkpoint. If they're different check
@@ -119,7 +117,7 @@ class test_checkpoint07(wttest.WiredTigerTestCase):
         self.assertNotEqual(val3, 0)
         self.assertLess(val1, val3)
         # Save the old forever value from table 3.
-        oldval3 = val3
+        foreverValue = val3
 
         # Force a checkpoint while the backup cursor is open. Then write again
         # to table 2. Since table 1 and table 3 are clean again, this should
@@ -138,7 +136,7 @@ class test_checkpoint07(wttest.WiredTigerTestCase):
         val3 = self.get_stat(self.uri3)
         self.assertNotEqual(val1, 0)
         self.assertNotEqual(val3, 0)
-        self.assertLess(val3, oldval3)
+        self.assertLess(val3, foreverValue)
         # It is possible that we could span the second timer when processing table
         # two and table three during the checkpoint. If they're different check
         # they are within 1 second of each other.
@@ -160,18 +158,7 @@ class test_checkpoint07(wttest.WiredTigerTestCase):
         val2 = self.get_stat(self.uri2)
         self.assertEqual(val2, 0)
 
-        val1 = self.get_stat(self.uri1)
         val3 = self.get_stat(self.uri3)
-        self.assertNotEqual(val1, 0)
-        self.assertNotEqual(val3, 0)
-        # It is possible that we could span the second timer when processing table
-        # two and table three during the checkpoint. If they're different check
-        # they are within 1 second of each other.
-        if val1 != val3:
-            self.assertTrue(val1 == val3 - 1 or val3 == val1 - 1)
-        self.assertEqual(val3, oldval3)
+        self.assertEqual(val3, foreverValue)
 
         self.session.close()
-
-if __name__ == '__main__':
-    wttest.run()

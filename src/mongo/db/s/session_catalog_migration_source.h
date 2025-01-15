@@ -29,17 +29,29 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <list>
 #include <memory>
+#include <utility>
+#include <vector>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_history_iterator.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/concurrency/with_lock.h"
 
@@ -93,6 +105,13 @@ public:
                                   NamespaceString ns,
                                   ChunkRange chunk,
                                   KeyPattern shardKey);
+
+    /**
+     * Gets the session oplog entries to be sent to the destination. The initialization is separated
+     * from the constructor to allow the member functions of the SessionCatalogMigrationSource to be
+     * called before the initialization step is finished.
+     */
+    void init(OperationContext* opCtx, const LogicalSessionId& migrationLsid);
 
     /**
      * Returns true if there are more oplog entries to fetch at this moment. Note that new writes
@@ -171,6 +190,30 @@ public:
                                      const ShardKeyPattern& shardKeyPattern,
                                      const ChunkRange& chunkRange);
 
+    long long getSessionOplogEntriesToBeMigratedSoFar();
+    long long getSessionOplogEntriesSkippedSoFarLowerBound();
+
+    /**
+     * Given an Oplog entry, extracts the shard key corresponding to the key pattern for insert,
+     * update, and delete op types. If the op type is not a CRUD operation, an empty BSONObj()
+     * will be returned.
+     *
+     * For update and delete operations, the Oplog entry will contain an object with the document
+     * key.
+     *
+     * For insert operations, the Oplog entry will contain the original document from which the
+     * document key must be extracted
+     *
+     * Examples:
+     *  For KeyPattern {'a.b': 1}
+     *   If the oplog entries contains field op='i'
+     *     oplog contains: { a : { b : "1" } }
+     *   If the oplog entries contains field op='u' or op='d'
+     *     oplog contains: { 'a.b': "1" }
+     */
+    static BSONObj extractShardKeyFromOplogEntry(const ShardKeyPattern& shardKeyPattern,
+                                                 const repl::OplogEntry& entry);
+
 private:
     /**
      * An iterator for extracting session write oplogs that need to be cloned during migration.
@@ -241,8 +284,18 @@ private:
     bool _hasNewWrites(WithLock);
 
     /**
-     * Attempts to fetch the next oplog entry from the new writes that was saved by saveNewWriteTS.
-     * Returns true if there were documents that were retrieved.
+     * Can only be invoked when '_unprocessedNewWriteOplogBuffer' is empty but '_newWriteOpTimeList'
+     * is not. Fetches the oplog entry for the next opTime in '_newWriteOpTimeList'. If the oplog
+     * entry corresponds to a write against the chunk range being migrated, adds the oplog entry or
+     * its inner oplog entries (for applyOps) to '_unprocessedNewWriteOplogBuffer'.
+     */
+    void _tryFetchNextNewWriteOplog(stdx::unique_lock<stdx::mutex>& lk, OperationContext* opCtx);
+
+    /**
+     * If there is no stashed '_lastFetchedOplog', looks for the next opTime in
+     * '_newWriteOpTimeList' that corresponds to a write against this chunk range, fetches its oplog
+     * entry and stashes it onto '_lastFetchedOplog' (and '_lastFetchedOplogImage' if applicable).
+     * Returns true if such an oplog entry was found and fetched.
      */
     bool _fetchNextNewWriteOplog(OperationContext* opCtx);
 
@@ -255,13 +308,13 @@ private:
 
     /*
      * Derives retryable write oplog entries from the given retryable internal transaction applyOps
-     * oplog entry, and adds the ones that are related to the migration the given oplog buffer. Must
-     * be called while holding the mutex that protects the buffer.
+     * oplog entry, or retryable write applyOps entry (with multiOpType() ==
+     * kApplyOpsAppliedSeparately), and adds the ones that are related to the migration the given
+     * oplog buffer. Must be called while holding the mutex that protects the buffer.
      */
-    void _extractOplogEntriesForInternalTransactionForRetryableWrite(
-        WithLock,
-        const repl::OplogEntry& applyOplogEntry,
-        std::vector<repl::OplogEntry>* oplogBuffer);
+    void _extractOplogEntriesForRetryableApplyOps(WithLock,
+                                                  const repl::OplogEntry& applyOplogEntry,
+                                                  std::vector<repl::OplogEntry>* oplogBuffer);
 
     // Namespace for which the migration is happening
     const NamespaceString _ns;
@@ -275,8 +328,7 @@ private:
 
     // Protects _sessionOplogIterators, _currentOplogIterator, _lastFetchedOplog,
     // _lastFetchedOplogImage and _unprocessedOplogBuffer.
-    Mutex _sessionCloneMutex =
-        MONGO_MAKE_LATCH("SessionCatalogMigrationSource::_sessionCloneMutex");
+    stdx::mutex _sessionCloneMutex;
 
     // List of remaining session records that needs to be cloned.
     std::vector<std::unique_ptr<SessionOplogIterator>> _sessionOplogIterators;
@@ -298,10 +350,10 @@ private:
 
     // Protects _newWriteOpTimeList, _lastFetchedNewWriteOplog, _lastFetchedNewWriteOplogImage,
     // _unprocessedNewWriteOplogBuffer, _state, _newOplogNotification.
-    Mutex _newOplogMutex = MONGO_MAKE_LATCH("SessionCatalogMigrationSource::_newOplogMutex");
+    stdx::mutex _newOplogMutex;
 
     // The average size of documents in config.transactions.
-    uint64_t _averageSessionDocSize;
+    uint64_t _averageSessionDocSize{0};
 
     // Stores oplog opTime of new writes that are coming in.
     std::list<std::pair<repl::OpTime, EntryAtOpTimeType>> _newWriteOpTimeList;
@@ -324,6 +376,16 @@ private:
     // Sets to true if there is no need to fetch an oplog anymore (for example, because migration
     // aborted).
     std::shared_ptr<Notification<bool>> _newOplogNotification;
+
+    // The number of session oplog entries that need to be migrated
+    // from the source to the destination
+    AtomicWord<long long> _sessionOplogEntriesToBeMigratedSoFar{0};
+
+    // There are optimizations so that we do not send all of the oplog
+    // entries to the destination. This stat provides a lower bound on the number of session oplog
+    // entries that we did not send to the destination. It is a lower bound because some of the
+    // optimizations do not allow us to know the exact number of oplog entries we skipped.
+    AtomicWord<long long> _sessionOplogEntriesSkippedSoFarLowerBound{0};
 };
 
 }  // namespace mongo

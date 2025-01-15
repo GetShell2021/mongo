@@ -28,18 +28,35 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <utility>
 
-#include "mongo/db/repl/session_update_tracker.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/write_ops/write_ops_retryability.h"
 #include "mongo/db/repl/oplog_entry.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/session.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_participant_gen.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/session_update_tracker.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/update/document_diff_serialization.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
@@ -56,11 +73,11 @@ OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
                                                      const BSONObj& o2Field,
                                                      Date_t wallClockTime) {
     return {repl::DurableOplogEntry(opTime,
-                                    boost::none,  // hash
                                     repl::OpTypeEnum::kUpdate,
                                     NamespaceString::kSessionTransactionsTableNamespace,
                                     boost::none,  // uuid
                                     false,        // fromMigrate
+                                    boost::none,  // checkExistenceForDiffInsert
                                     repl::OplogEntry::kOplogVersion,
                                     updateBSON,
                                     o2Field,
@@ -77,7 +94,7 @@ OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
 }
 
 /**
- * Constructs a new oplog entry if the given entry has transaction state embedded within in. The new
+ * Constructs a new oplog entry if the given entry has transaction state embedded within it. The new
  * oplog entry will contain the operation needed to replicate the transaction table.
  *
  * Returns boost::none if the given oplog doesn't have any transaction state or does not support
@@ -114,50 +131,10 @@ boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
         entry.getWallClockTime());
 }
 
-/**
- * A tenant migrations transaction entry will:
- *
- * 1) Have the 'fromTenantMigration' field set
- * 2) Be a no-op entry
- * 3) Have sessionId and txnNumber
- */
-bool isTransactionEntryFromTenantMigrations(const OplogEntry& entry) {
-    if (!entry.getFromTenantMigration()) {
-        return false;
-    }
-
-    if (entry.getFromMigrate()) {
-        // Retryable writes have fromMigrate set.
-        return false;
-    }
-
-    if (entry.getOpType() != repl::OpTypeEnum::kNoop) {
-        return false;
-    }
-
-    if (!entry.getSessionId() || !entry.getTxnNumber()) {
-        return false;
-    }
-
-    return true;
-}
-
 }  // namespace
 
 bool SessionUpdateTracker::isTransactionEntry(const OplogEntry& entry) {
-    if (isTransactionEntryFromTenantMigrations(entry)) {
-        return true;
-    }
-
-    auto sessionInfo = entry.getOperationSessionInfo();
-    if (!sessionInfo.getTxnNumber()) {
-        return false;
-    }
-
-    return entry.isPartialTransaction() ||
-        entry.getCommandType() == repl::OplogEntry::CommandType::kAbortTransaction ||
-        entry.getCommandType() == repl::OplogEntry::CommandType::kCommitTransaction ||
-        entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps;
+    return entry.isInTransaction();
 }
 
 boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::_updateOrFlush(
@@ -211,7 +188,8 @@ boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::_updateSessionInf
             return {};
         }
 
-        if (!entry.getObject2()) {
+        if (!entry.getObject2() ||
+            (entry.getObject2()->isEmpty() && !isWouldChangeOwningShardSentinelOplogEntry(entry))) {
             return {};
         }
     }
@@ -286,7 +264,7 @@ std::vector<OplogEntry> SessionUpdateTracker::flushAll() {
 std::vector<OplogEntry> SessionUpdateTracker::_flushForQueryPredicate(
     const BSONObj& queryPredicate) {
     auto idField = queryPredicate["_id"].Obj();
-    auto lsid = LogicalSessionId::parse(IDLParserErrorContext("lsidInOplogQuery"), idField);
+    auto lsid = LogicalSessionId::parse(IDLParserContext("lsidInOplogQuery"), idField);
     auto iter = _sessionsToUpdate.find(lsid);
 
     if (iter == _sessionsToUpdate.end()) {
@@ -324,7 +302,7 @@ boost::optional<OplogEntry> SessionUpdateTracker::_createTransactionTableUpdateF
         newTxnRecord.setLastWriteOpTime(entry.getOpTime());
         newTxnRecord.setLastWriteDate(entry.getWallClockTime());
 
-        if (entry.getFromTenantMigration() && entry.getOpType() == OpTypeEnum::kNoop) {
+        if (entry.getOpType() == OpTypeEnum::kNoop) {
             newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
             return newTxnRecord.toBSON();
         }
@@ -343,9 +321,10 @@ boost::optional<OplogEntry> SessionUpdateTracker::_createTransactionTableUpdateF
                         // The prepare oplog entry is the first operation of the transaction.
                         newTxnRecord.setStartOpTime(entry.getOpTime());
                     } else {
-                        // Update the transaction record using $set to avoid overwriting the
-                        // startOpTime.
-                        return BSON("$set" << newTxnRecord.toBSON());
+                        // Update the transaction record using a delta oplog entry to avoid
+                        // overwriting the startOpTime.
+                        return update_oplog_entry::makeDeltaOplogEntry(
+                            BSON(doc_diff::kUpdateSectionFieldName << newTxnRecord.toBSON()));
                     }
                 } else {
                     newTxnRecord.setState(DurableTxnStateEnum::kCommitted);

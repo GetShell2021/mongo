@@ -8,16 +8,16 @@
  *    change_stream_does_not_expect_txns,
  *    assumes_unsharded_collection,
  *    assumes_read_preference_unchanged,
- *    featureFlagChangeStreamsVisibility
  * ]
  */
 
-(function() {
-"use strict";
+import {assertDropCollection} from "jstests/libs/collection_drop_recreate.js";
+import {
+    assertChangeStreamEventEq,
+    ChangeStreamTest
+} from "jstests/libs/query/change_stream_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-load("jstests/libs/collection_drop_recreate.js");  // For assertDropCollection.
-load('jstests/libs/change_stream_util.js');        // For 'ChangeStreamTest' and
-                                                   // 'assertChangeStreamEventEq'.
 const dbName = jsTestName();
 const collName = "test";
 const collNS = dbName + "." + collName;
@@ -128,8 +128,7 @@ function validateExpectedEventAndConfirmResumability(collParam, expectedOutput) 
     });
 }
 
-assert.commandWorked(db.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(db.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 // Test the behaviour of migrateLastChunkFromShard for a single-collection stream
 validateExpectedEventAndConfirmResumability(collName, {
@@ -153,4 +152,3 @@ validateExpectedEventAndConfirmResumability(1, {
 validateShowSystemEventsFalse();
 
 st.stop();
-}());

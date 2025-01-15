@@ -4,7 +4,6 @@
  *
  *  @tags: [
  *    requires_fcv_60,
- *    featureFlagChangeStreamPreAndPostImages,
  *    requires_sharding,
  *    uses_change_streams,
  *    change_stream_does_not_expect_txns,
@@ -12,12 +11,15 @@
  *    assumes_read_preference_unchanged,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");  // For assertDropAndRecreateCollection.
-load("jstests/libs/chunk_manipulation_util.js");   // For pauseMigrateAtStep, waitForMigrateStep and
-                                                   // unpauseMigrateAtStep.
+import {
+    migrateStepNames,
+    moveChunkParallel,
+    pauseMigrateAtStep,
+    unpauseMigrateAtStep,
+    waitForMigrateStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({
     shards: 2,
@@ -32,12 +34,12 @@ const db = mongosConn.getDB(dbName);
 const donor = st.shard0;
 const recipient = st.shard1;
 
+assert.commandWorked(st.s.adminCommand({enableSharding: dbName, primaryShard: donor.shardName}));
+
 // Creates a sharded collection and enables recording of pre-images for it. Returns the sharded
 // collection.
 const coll = (() => {
     assertDropAndRecreateCollection(db, collName);
-
-    st.ensurePrimaryShard(dbName, donor.shardName);
 
     const coll = db.getCollection(collName);
 
@@ -54,12 +56,38 @@ const coll = (() => {
     return coll;
 })();
 
+// Events may be batched in an applyOps when featureFlagReplicateVectoredInsertsTransactionally
+// is enabled; expand them here, and filter the expanded events by docId.
+function _expandAndFilterEvents(oplogEvents, docId) {
+    let expandedEvents = Array();
+    for (let idx = 0; idx < oplogEvents.length; idx++) {
+        const event = oplogEvents[idx];
+        if (event.o.hasOwnProperty("applyOps")) {
+            for (let applyOpsIdx = 0; applyOpsIdx < event.o.applyOps.length; applyOpsIdx++) {
+                const innerEvent = event.o.applyOps[applyOpsIdx];
+                if (innerEvent.o._id == docId) {
+                    expandedEvents.push(innerEvent);
+                }
+            }
+        } else {
+            expandedEvents.push(event);
+        }
+    }
+    return expandedEvents;
+}
+
 // Verifies that expected 'fromMigrate' events are observed in the oplog for the specified shard.
 function verifyFromMigrateOplogEvents(shard, docId, ops) {
-    const oplogEvents = shard.getDB("local")
-                            .getCollection("oplog.rs")
-                            .find({"fromMigrate": true, "o._id": docId})
-                            .toArray();
+    let oplogEvents = shard.getDB("local")
+                          .getCollection("oplog.rs")
+                          .find({
+                              "$or": [
+                                  {"fromMigrate": true, "o._id": docId},
+                                  {"fromMigrate": true, "o.applyOps": {$exists: true}}
+                              ]
+                          })
+                          .toArray();
+    oplogEvents = _expandAndFilterEvents(oplogEvents, docId);
     assert.eq(oplogEvents.length, ops.length, oplogEvents);
 
     for (let idx = 0; idx < oplogEvents.length; idx++) {
@@ -231,4 +259,3 @@ function verifyChangeStreamEvents(csCursor, events) {
 })();
 
 st.stop();
-}());

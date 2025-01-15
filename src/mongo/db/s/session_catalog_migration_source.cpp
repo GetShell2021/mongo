@@ -27,39 +27,70 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/s/session_catalog_migration_source.h"
-
+#include <boost/cstdint.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <tuple>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
 #include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
-#include "mongo/db/ops/write_ops_retryability.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/repl/apply_ops_command_info.h"
 #include "mongo/db/repl/image_collection_entry_gen.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/optime_base_gen.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/s/session_catalog_migration.h"
-#include "mongo/db/session.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_history_iterator.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/s/session_catalog_migration_source.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/platform/random.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace {
-
-PseudoRandom hashGenerator(SecureRandom().nextInt64());
 
 struct LastTxnSession {
     LogicalSessionId sessionId;
@@ -78,7 +109,7 @@ boost::optional<repl::OplogEntry> forgeNoopEntryFromImageCollection(
         return boost::none;
     }
 
-    auto image = repl::ImageEntry::parse(IDLParserErrorContext("image entry"), imageObj);
+    auto image = repl::ImageEntry::parse(IDLParserContext("image entry"), imageObj);
     if (image.getTxnNumber() != retryableFindAndModifyOplogEntry.getTxnNumber()) {
         // In our snapshot, fetch the current transaction number for a session. If that transaction
         // number doesn't match what's found on the image lookup, it implies that the image is not
@@ -142,7 +173,6 @@ boost::optional<repl::OplogEntry> fetchPrePostImageOplog(OperationContext* opCtx
  * Creates an OplogEntry using the given field values
  */
 repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
-                                long long hash,
                                 repl::OpTypeEnum opType,
                                 const BSONObj& oField,
                                 const boost::optional<BSONObj>& o2Field,
@@ -151,11 +181,11 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 const std::vector<StmtId>& statementIds) {
     return {
         repl::DurableOplogEntry(opTime,                           // optime
-                                hash,                             // hash
                                 opType,                           // op type
                                 {},                               // namespace
                                 boost::none,                      // uuid
                                 boost::none,                      // fromMigrate
+                                boost::none,                      // checkExistenceForDiffInsert
                                 repl::OplogEntry::kOplogVersion,  // version
                                 oField,                           // o
                                 o2Field,                          // o2
@@ -182,7 +212,6 @@ repl::OplogEntry makeSentinelOplogEntry(const LogicalSessionId& lsid,
     sessionInfo.setTxnNumber(txnNumber);
 
     return makeOplogEntry({},                                        // optime
-                          hashGenerator.nextInt64(),                 // hash
                           repl::OpTypeEnum::kNoop,                   // op type
                           {},                                        // o
                           TransactionParticipant::kDeadEndSentinel,  // o2
@@ -218,7 +247,39 @@ SessionCatalogMigrationSource::SessionCatalogMigrationSource(OperationContext* o
     : _ns(std::move(ns)),
       _rollbackIdAtInit(repl::ReplicationProcess::get(opCtx)->getRollbackID()),
       _chunkRange(std::move(chunk)),
-      _keyPattern(shardKey) {
+      _keyPattern(shardKey) {}
+
+void SessionCatalogMigrationSource::init(OperationContext* opCtx,
+                                         const LogicalSessionId& migrationLsid) {
+    const auto migrationLsidWithoutTxnNumber = castToParentSessionId(migrationLsid);
+
+    // Create a list of all sessions that we should not consider for migration.
+    // These will be sessions that do not have _ns in their affectedNamespaces and that are safe to
+    // ignore.
+    absl::flat_hash_set<LogicalSessionId, LogicalSessionIdHash> sessionsToIgnore;
+
+    const auto sessionCatalog = SessionCatalog::get(opCtx);
+    SessionKiller::Matcher matcherAllSessions(
+        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+    sessionCatalog->scanSessions(matcherAllSessions, [&](const ObservableSession& session) {
+        auto txnParticipant = TransactionParticipant::get(session);
+
+        // We only want to potentially ignore sessions that we know are safe to ignore.
+        // We can only be confident if the state is valid and we have a complete history to check
+        // against.
+        if (txnParticipant.isValid() && !txnParticipant.hasIncompleteHistory()) {
+            const auto& namespaces = txnParticipant.affectedNamespaces();
+            // If a txn doesn't modify the collection at source shard, affected namespaces would be
+            // empty. We still need to migrate such sessions to handle retryable WCOS writes. This
+            // means transactions which did no writes on this shard will unnecessarily migrate a
+            // $incompleteOplogHistory dead sentinel to the recipient shard. These other
+            // transactions cannot be distinguished by their config.transactions or oplog entries
+            // from the retryable WCOS writes which occurred in a transaction.
+            if (!namespaces.empty() && !namespaces.contains(_ns)) {
+                sessionsToIgnore.emplace(session.getSessionId());
+            }
+        }
+    });
 
     DBDirectClient client(opCtx);
     FindCommandRequest findRequest{NamespaceString::kSessionTransactionsTableNamespace};
@@ -243,10 +304,16 @@ SessionCatalogMigrationSource::SessionCatalogMigrationSource(OperationContext* o
 
     boost::optional<LastTxnSession> lastTxnSession;
     while (cursor->more()) {
-        const auto txnRecord = SessionTxnRecord::parse(
-            IDLParserErrorContext("Session migration cloning"), cursor->next());
+        auto txnRecord =
+            SessionTxnRecord::parse(IDLParserContext("Session migration cloning"), cursor->next());
 
         const auto sessionId = txnRecord.getSessionId();
+
+        if (sessionsToIgnore.contains(sessionId)) {
+            // Skip sessions we know do not have _ns in their oplog chains.
+            continue;
+        }
+
         const auto parentSessionId = castToParentSessionId(sessionId);
         const auto parentTxnNumber =
             sessionId.getTxnNumber() ? *sessionId.getTxnNumber() : txnRecord.getTxnNum();
@@ -257,6 +324,16 @@ SessionCatalogMigrationSource::SessionCatalogMigrationSource(OperationContext* o
             // txnNumber.
             continue;
         }
+
+        if (parentSessionId == migrationLsidWithoutTxnNumber) {
+            // Skip session id matching the migration lsid as they are only for used for rejecting
+            // old migration source from initiating range deleter on the destination. Sending
+            // these sessions to the other side has a potential to deadlock as the destination
+            // will also try to checkout the same session for almost the entire duration of
+            // the migration.
+            continue;
+        }
+
         lastTxnSession = LastTxnSession{parentSessionId, parentTxnNumber};
 
         if (!txnRecord.getLastWriteOpTime().isNull()) {
@@ -266,13 +343,15 @@ SessionCatalogMigrationSource::SessionCatalogMigrationSource(OperationContext* o
     }
 
     {
-        AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+        AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
         writeConflictRetry(
             opCtx,
             "session migration initialization majority commit barrier",
-            NamespaceString::kRsOplogNamespace.ns(),
+            NamespaceString::kRsOplogNamespace,
             [&] {
-                const auto message = BSON("sessionMigrateCloneStart" << _ns.ns());
+                const auto message =
+                    BSON("sessionMigrateCloneStart" << NamespaceStringUtil::serialize(
+                             _ns, SerializationContext::stateDefault()));
 
                 WriteUnitOfWork wuow(opCtx);
                 opCtx->getClient()->getServiceContext()->getOpObserver()->onInternalOpMessage(
@@ -310,7 +389,7 @@ bool SessionCatalogMigrationSource::hasMoreOplog() {
         return true;
     }
 
-    stdx::lock_guard<Latch> lk(_newOplogMutex);
+    stdx::lock_guard<stdx::mutex> lk(_newOplogMutex);
     return _hasNewWrites(lk);
 }
 
@@ -320,11 +399,13 @@ bool SessionCatalogMigrationSource::inCatchupPhase() {
 
 int64_t SessionCatalogMigrationSource::untransferredCatchUpDataSize() {
     invariant(inCatchupPhase());
+
+    stdx::lock_guard<stdx::mutex> _lk(_newOplogMutex);
     return _newWriteOpTimeList.size() * _averageSessionDocSize;
 }
 
 void SessionCatalogMigrationSource::onCommitCloneStarted() {
-    stdx::lock_guard<Latch> _lk(_newOplogMutex);
+    stdx::lock_guard<stdx::mutex> _lk(_newOplogMutex);
 
     _state = State::kCommitStarted;
     if (_newOplogNotification) {
@@ -334,7 +415,7 @@ void SessionCatalogMigrationSource::onCommitCloneStarted() {
 }
 
 void SessionCatalogMigrationSource::onCloneCleanup() {
-    stdx::lock_guard<Latch> _lk(_newOplogMutex);
+    stdx::lock_guard<stdx::mutex> _lk(_newOplogMutex);
 
     _state = State::kCleanup;
     if (_newOplogNotification) {
@@ -345,7 +426,7 @@ void SessionCatalogMigrationSource::onCloneCleanup() {
 
 SessionCatalogMigrationSource::OplogResult SessionCatalogMigrationSource::getLastFetchedOplog() {
     {
-        stdx::lock_guard<Latch> _lk(_sessionCloneMutex);
+        stdx::lock_guard<stdx::mutex> _lk(_sessionCloneMutex);
         if (_lastFetchedOplogImage) {
             return OplogResult(_lastFetchedOplogImage, false);
         } else if (_lastFetchedOplog) {
@@ -354,7 +435,7 @@ SessionCatalogMigrationSource::OplogResult SessionCatalogMigrationSource::getLas
     }
 
     {
-        stdx::lock_guard<Latch> _lk(_newOplogMutex);
+        stdx::lock_guard<stdx::mutex> _lk(_newOplogMutex);
         if (_lastFetchedNewWriteOplogImage) {
             return OplogResult(_lastFetchedNewWriteOplogImage, false);
         }
@@ -373,7 +454,7 @@ bool SessionCatalogMigrationSource::fetchNextOplog(OperationContext* opCtx) {
 std::shared_ptr<Notification<bool>> SessionCatalogMigrationSource::getNotificationForNewOplog() {
     invariant(!_hasMoreOplogFromSessionCatalog());
 
-    stdx::lock_guard<Latch> lk(_newOplogMutex);
+    stdx::lock_guard<stdx::mutex> lk(_newOplogMutex);
 
     if (_newOplogNotification) {
         return _newOplogNotification;
@@ -399,7 +480,7 @@ bool SessionCatalogMigrationSource::shouldSkipOplogEntry(const mongo::repl::Oplo
                                                          const ShardKeyPattern& shardKeyPattern,
                                                          const ChunkRange& chunkRange) {
     if (oplogEntry.isCrudOpType()) {
-        auto shardKey = shardKeyPattern.extractShardKeyFromOplogEntry(oplogEntry);
+        auto shardKey = extractShardKeyFromOplogEntry(shardKeyPattern, oplogEntry);
         return !chunkRange.containsKey(shardKey);
     }
 
@@ -420,28 +501,58 @@ bool SessionCatalogMigrationSource::shouldSkipOplogEntry(const mongo::repl::Oplo
             // prevent a multi-statement transaction from being retried as a retryable write.
             return false;
         }
-        auto shardKey = shardKeyPattern.extractShardKeyFromOplogEntry(object2.get());
+        auto shardKey = extractShardKeyFromOplogEntry(shardKeyPattern, object2.value());
         return !chunkRange.containsKey(shardKey);
     }
 
     return false;
 }
 
-void SessionCatalogMigrationSource::_extractOplogEntriesForInternalTransactionForRetryableWrite(
+long long SessionCatalogMigrationSource::getSessionOplogEntriesToBeMigratedSoFar() {
+    return _sessionOplogEntriesToBeMigratedSoFar.load();
+}
+
+long long SessionCatalogMigrationSource::getSessionOplogEntriesSkippedSoFarLowerBound() {
+    return _sessionOplogEntriesSkippedSoFarLowerBound.load();
+}
+
+BSONObj SessionCatalogMigrationSource::extractShardKeyFromOplogEntry(
+    const ShardKeyPattern& shardKeyPattern, const repl::OplogEntry& entry) {
+    if (!entry.isCrudOpType()) {
+        return BSONObj();
+    }
+
+    auto objWithDocumentKey = entry.getObjectContainingDocumentKey();
+
+    if (!entry.isUpdateOrDelete()) {
+        return shardKeyPattern.extractShardKeyFromDoc(objWithDocumentKey);
+    }
+
+    return shardKeyPattern.extractShardKeyFromDocumentKey(objWithDocumentKey);
+}
+
+void SessionCatalogMigrationSource::_extractOplogEntriesForRetryableApplyOps(
     WithLock,
     const repl::OplogEntry& applyOpsOplogEntry,
     std::vector<repl::OplogEntry>* oplogBuffer) {
-    invariant(isInternalSessionForRetryableWrite(*applyOpsOplogEntry.getSessionId()));
+    invariant(isInternalSessionForRetryableWrite(*applyOpsOplogEntry.getSessionId()) ||
+              applyOpsOplogEntry.getMultiOpType() ==
+                  repl::MultiOplogEntryType::kApplyOpsAppliedSeparately);
     invariant(applyOpsOplogEntry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps);
 
     auto applyOpsInfo = repl::ApplyOpsCommandInfo::parse(applyOpsOplogEntry.getObject());
     auto unrolledOp =
         uassertStatusOK(repl::MutableOplogEntry::parse(applyOpsOplogEntry.getEntry().toBSON()));
+    unrolledOp.setMultiOpType(boost::none);
 
     for (const auto& innerOp : applyOpsInfo.getOperations()) {
         auto replOp = repl::ReplOperation::parse(
-            {"SessionOplogIterator::_extractOplogEntriesForInternalTransactionForRetryableWrite"},
+            IDLParserContext{"SessionOplogIterator::_"
+                             "extractOplogEntriesForInternalTransactionForRetryableWrite"},
             innerOp);
+
+        ScopeGuard skippedEntryTracker(
+            [this] { _sessionOplogEntriesSkippedSoFarLowerBound.addAndFetch(1); });
 
         if (replOp.getStatementIds().empty()) {
             // Skip this operation since it is not retryable.
@@ -461,6 +572,9 @@ void SessionCatalogMigrationSource::_extractOplogEntriesForInternalTransactionFo
         }
 
         oplogBuffer->emplace_back(unrolledOplogEntry);
+
+        skippedEntryTracker.dismiss();
+        _sessionOplogEntriesToBeMigratedSoFar.addAndFetch(1);
     }
 }
 
@@ -478,13 +592,26 @@ bool SessionCatalogMigrationSource::_handleWriteHistory(WithLock lk, OperationCo
 
             // Determine if this oplog entry should be migrated. If so, add the oplog entry or the
             // oplog entries derived from it to the oplog buffer.
+            if (isInternalSessionForRetryableWrite(*nextOplog->getSessionId()) ||
+                nextOplog->getMultiOpType() ==
+                    repl::MultiOplogEntryType::kApplyOpsAppliedSeparately) {
+                if (nextOplog->getCommandType() == repl::OplogEntry::CommandType::kApplyOps) {
+                    // Derive retryable write oplog entries from this retryable internal transaction
+                    // or retryable write applyOps oplog entry, and add them to the oplog buffer.
+                    _extractOplogEntriesForRetryableApplyOps(
+                        lk, *nextOplog, &_unprocessedOplogBuffer);
+                } else {
+                    tassert(7393800,
+                            str::stream() << "Found an oplog entry for a retrayble internal "
+                                             "transaction with an unexpected type"
+                                          << redact(nextOplog->toBSONForLogging()),
+                            nextOplog->getOpType() == repl::OpTypeEnum::kNoop);
+                    if (!nextOplog->getStatementIds().empty() &&
+                        !shouldSkipOplogEntry(nextOplog.value(), _keyPattern, _chunkRange)) {
+                        _unprocessedOplogBuffer.emplace_back(*nextOplog);
+                    }
+                }
 
-            if (isInternalSessionForRetryableWrite(*nextOplog->getSessionId())) {
-                invariant(nextOplog->getCommandType() == repl::OplogEntry::CommandType::kApplyOps);
-                // Derive retryable write oplog entries from this retryable internal transaction
-                // applyOps oplog entry, and add them to the oplog buffer.
-                _extractOplogEntriesForInternalTransactionForRetryableWrite(
-                    lk, *nextOplog, &_unprocessedOplogBuffer);
                 continue;
             }
 
@@ -496,21 +623,25 @@ bool SessionCatalogMigrationSource::_handleWriteHistory(WithLock lk, OperationCo
             auto nextStmtIds = nextOplog->getStatementIds();
             invariant(!nextStmtIds.empty());
 
-            // Skip the rest of the chain for this session since the ns is unrelated with the
-            // current one being migrated. It is ok to not check the rest of the chain because
-            // retryable writes doesn't allow touching different namespaces.
+            ScopeGuard skippedEntryTracker(
+                [this] { _sessionOplogEntriesSkippedSoFarLowerBound.addAndFetch(1); });
+
+            // We only want to oplog entries for our target namespace. BulkWrite can cause multiple
+            // namespaces to be affected by the same retryable write chain so we must continue to
+            // iterate this chain to check for entries.
             if (nextStmtIds.front() != kIncompleteHistoryStmtId && nextOplog->getNss() != _ns) {
-                _currentOplogIterator.reset();
-                return false;
+                continue;
             }
 
             // Skipping an entry here will also result in the pre/post images to also not be
             // sent in the migration as they're handled by 'fetchPrePostImageOplog' below.
-            if (shouldSkipOplogEntry(nextOplog.get(), _keyPattern, _chunkRange)) {
+            if (shouldSkipOplogEntry(nextOplog.value(), _keyPattern, _chunkRange)) {
                 continue;
             }
 
             _unprocessedOplogBuffer.emplace_back(*nextOplog);
+            skippedEntryTracker.dismiss();
+            _sessionOplogEntriesToBeMigratedSoFar.addAndFetch(1);
         }
 
         // Peek the next oplog entry in the buffer and process it. We cannot pop the oplog
@@ -522,6 +653,7 @@ bool SessionCatalogMigrationSource::_handleWriteHistory(WithLock lk, OperationCo
         invariant(!_lastFetchedOplog);
         if (nextImageOplog) {
             _lastFetchedOplogImage = downConvertSessionInfoIfNeeded(*nextImageOplog);
+            _sessionOplogEntriesToBeMigratedSoFar.addAndFetch(1);
         }
         _lastFetchedOplog = downConvertSessionInfoIfNeeded(nextOplog);
         _unprocessedOplogBuffer.pop_back();
@@ -532,13 +664,13 @@ bool SessionCatalogMigrationSource::_handleWriteHistory(WithLock lk, OperationCo
 }
 
 bool SessionCatalogMigrationSource::_hasMoreOplogFromSessionCatalog() {
-    stdx::lock_guard<Latch> _lk(_sessionCloneMutex);
+    stdx::lock_guard<stdx::mutex> _lk(_sessionCloneMutex);
     return _lastFetchedOplog || !_unprocessedOplogBuffer.empty() ||
         !_sessionOplogIterators.empty() || _currentOplogIterator;
 }
 
 bool SessionCatalogMigrationSource::_fetchNextOplogFromSessionCatalog(OperationContext* opCtx) {
-    stdx::unique_lock<Latch> lk(_sessionCloneMutex);
+    stdx::unique_lock<stdx::mutex> lk(_sessionCloneMutex);
 
     if (_lastFetchedOplogImage) {
         // When `_lastFetchedOplogImage` is set, it means we found an oplog entry with a pre/post
@@ -573,122 +705,156 @@ bool SessionCatalogMigrationSource::_hasNewWrites(WithLock) {
         !_unprocessedNewWriteOplogBuffer.empty();
 }
 
-bool SessionCatalogMigrationSource::_fetchNextNewWriteOplog(OperationContext* opCtx) {
-    boost::optional<repl::OplogEntry> nextNewWriteOplog;
+void SessionCatalogMigrationSource::_tryFetchNextNewWriteOplog(stdx::unique_lock<stdx::mutex>& lk,
+                                                               OperationContext* opCtx) {
+    invariant(_unprocessedNewWriteOplogBuffer.empty());
+    invariant(!_newWriteOpTimeList.empty());
 
-    {
-        stdx::unique_lock<Latch> lk(_newOplogMutex);
+    // The oplog buffer is empty. Peek the next opTime and fetch its oplog entry while not
+    // holding the mutex. We cannot dequeue the opTime upfront since the the read can fail
+    // with a WriteConflictException error.
+    repl::OpTime opTimeToFetch;
+    EntryAtOpTimeType entryAtOpTimeType;
+    std::tie(opTimeToFetch, entryAtOpTimeType) = _newWriteOpTimeList.front();
 
-        if (_lastFetchedNewWriteOplogImage) {
-            // When `_lastFetchedNewWriteOplogImage` is set, it means we found an oplog entry with
-            // a pre/post image. At this step, we've already returned the image oplog entry, but we
-            // have yet to return the original oplog entry stored in `_lastFetchedNewWriteOplog`. We
-            // will unset this value and return such that the next call to `getLastFetchedOplog`
-            // will return `_lastFetchedNewWriteOplog`.
-            _lastFetchedNewWriteOplogImage.reset();
-            return true;
-        }
+    lk.unlock();
+    DBDirectClient client(opCtx);
+    const auto& nextNewWriteOplogDoc =
+        client.findOne(NamespaceString::kRsOplogNamespace, opTimeToFetch.asQuery());
+    uassert(40620,
+            str::stream() << "Unable to fetch oplog entry with opTime: " << opTimeToFetch.toBSON(),
+            !nextNewWriteOplogDoc.isEmpty());
+    auto nextNewWriteOplog = uassertStatusOK(repl::OplogEntry::parse(nextNewWriteOplogDoc));
+    lk.lock();
 
-        _lastFetchedNewWriteOplog.reset();
+    // Determine how this oplog entry should be migrated. Either add the oplog entry or the
+    // oplog entries derived from it to the oplog buffer. Finally, dequeue the opTime.
 
-        if (_unprocessedNewWriteOplogBuffer.empty() && _newWriteOpTimeList.empty()) {
-            return false;
-        }
+    auto handleRetryableApplyOps = [&]() {
+        // Derive retryable write oplog entries from this retryable internal
+        // transaction or retryable write applyOps oplog entry, and add them to the
+        // oplog buffer.
+        _extractOplogEntriesForRetryableApplyOps(
+            lk, nextNewWriteOplog, &_unprocessedNewWriteOplogBuffer);
+        _newWriteOpTimeList.pop_front();
 
-        if (_unprocessedNewWriteOplogBuffer.empty()) {
-            // The oplog buffer is empty. Peek the next opTime and fetch its oplog entry while not
-            // holding the mutex. We cannot dequeue the opTime upfront since the the read can fail
-            // with a WriteConflictException error.
-            repl::OpTime opTimeToFetch;
-            EntryAtOpTimeType entryAtOpTimeType;
-            std::tie(opTimeToFetch, entryAtOpTimeType) = _newWriteOpTimeList.front();
-
-            lk.unlock();
-            DBDirectClient client(opCtx);
-            const auto& nextNewWriteOplogDoc =
-                client.findOne(NamespaceString::kRsOplogNamespace, opTimeToFetch.asQuery());
-            uassert(40620,
-                    str::stream() << "Unable to fetch oplog entry with opTime: "
-                                  << opTimeToFetch.toBSON(),
-                    !nextNewWriteOplogDoc.isEmpty());
-            auto nextNewWriteOplog = uassertStatusOK(repl::OplogEntry::parse(nextNewWriteOplogDoc));
-            lk.lock();
-
-            // Determine how this oplog entry should be migrated. Either add the oplog entry or the
-            // oplog entries derived from it to the oplog buffer. Finally, dequeue the opTime.
-
-            if (entryAtOpTimeType == EntryAtOpTimeType::kRetryableWrite) {
-                _unprocessedNewWriteOplogBuffer.emplace_back(nextNewWriteOplog);
-                _newWriteOpTimeList.pop_front();
-            } else if (entryAtOpTimeType == EntryAtOpTimeType::kTransaction) {
-                invariant(nextNewWriteOplog.getCommandType() ==
-                          repl::OplogEntry::CommandType::kApplyOps);
-                const auto sessionId = *nextNewWriteOplog.getSessionId();
-
-                // The opTimes for transactions inside internal sessions for non-retryable writes
-                // should never get added to the opTime queue since those transactions are not
-                // retryable so there is no need to transfer their write history to the
-                // recipient.
-                invariant(!isInternalSessionForNonRetryableWrite(sessionId),
-                          "Cannot add op time for a non-retryable internal transaction to the "
-                          "session migration op time queue");
-
-                if (isInternalSessionForRetryableWrite(sessionId)) {
-                    // Derive retryable write oplog entries from this retryable internal
-                    // transaction applyOps oplog entry, and add them to the oplog buffer.
-                    _extractOplogEntriesForInternalTransactionForRetryableWrite(
-                        lk, nextNewWriteOplog, &_unprocessedNewWriteOplogBuffer);
-                    _newWriteOpTimeList.pop_front();
-
-                    if (auto prevOpTime = nextNewWriteOplog.getPrevWriteOpTimeInTransaction();
-                        prevOpTime && !prevOpTime->isNull()) {
-                        // Add the opTime for the previous applyOps oplog entry in the transaction
-                        // to the queue.
-                        _notifyNewWriteOpTime(lk, *prevOpTime, EntryAtOpTimeType::kTransaction);
-                    }
-
-                    lk.unlock();
-                    return _fetchNextNewWriteOplog(opCtx);
-                }
-
-                // This applyOps oplog entry corresponds to non-internal transaction prepare/commit,
-                // replace it with a dead-end sentinel oplog entry.
-                auto sentinelOplogEntry =
-                    makeSentinelOplogEntry(sessionId,
-                                           *nextNewWriteOplog.getTxnNumber(),
-                                           opCtx->getServiceContext()->getFastClockSource()->now());
-                _unprocessedNewWriteOplogBuffer.emplace_back(sentinelOplogEntry);
-                _newWriteOpTimeList.pop_front();
-            } else {
-                MONGO_UNREACHABLE;
+        // There's no need to follow the prevOpTime chain for retryable writes because we
+        // should have already added all optimes using the op observer.
+        if (entryAtOpTimeType == EntryAtOpTimeType::kTransaction) {
+            if (auto prevOpTime = nextNewWriteOplog.getPrevWriteOpTimeInTransaction();
+                prevOpTime && !prevOpTime->isNull()) {
+                // Add the opTime for the previous applyOps oplog entry in the transaction
+                // to the queue.
+                _notifyNewWriteOpTime(lk, *prevOpTime, EntryAtOpTimeType::kTransaction);
             }
         }
+    };
 
-        // Peek the next oplog entry in the buffer and process it below. We cannot pop the oplog
-        // entry upfront since it may require fetching/forging a pre or post image and the reads
-        // done as part of that can fail with a WriteConflictException error.
-        nextNewWriteOplog = _unprocessedNewWriteOplogBuffer.back();
-    }
-
-    auto nextNewWriteImageOplog = fetchPrePostImageOplog(opCtx, &(*nextNewWriteOplog));
-    {
-        stdx::lock_guard<Latch> lk(_newOplogMutex);
-        invariant(!_lastFetchedNewWriteOplogImage);
-        invariant(!_lastFetchedNewWriteOplog);
-        if (nextNewWriteImageOplog) {
-            _lastFetchedNewWriteOplogImage =
-                downConvertSessionInfoIfNeeded(*nextNewWriteImageOplog);
+    if (entryAtOpTimeType == EntryAtOpTimeType::kRetryableWrite) {
+        if (nextNewWriteOplog.getMultiOpType() ==
+            repl::MultiOplogEntryType::kApplyOpsAppliedSeparately) {
+            invariant(nextNewWriteOplog.getCommandType() ==
+                      repl::OplogEntry::CommandType::kApplyOps);
+            handleRetryableApplyOps();
+            return;
         }
-        _lastFetchedNewWriteOplog = downConvertSessionInfoIfNeeded(*nextNewWriteOplog);
-        _unprocessedNewWriteOplogBuffer.pop_back();
+
+        // If a non-retryable write is executed using the same opCtx as a retryable
+        // write/txn, the MigrationChunkClonerSource will notify the
+        // SessionCatalogMigrationSource of the op's opTime, because the
+        // MigrationChunkClonerSource decides which oplog entries need to have their session
+        // info migrated using state on the opCtx. If this oplog entry does not have any
+        // session info, we should skip migrating it here.
+        if (!nextNewWriteOplog.getSessionId()) {
+            _newWriteOpTimeList.pop_front();
+            return;
+        }
+
+        _unprocessedNewWriteOplogBuffer.emplace_back(nextNewWriteOplog);
+        _newWriteOpTimeList.pop_front();
+        _sessionOplogEntriesToBeMigratedSoFar.addAndFetch(1);
+        return;
+    } else if (entryAtOpTimeType == EntryAtOpTimeType::kTransaction) {
+        invariant(nextNewWriteOplog.getCommandType() == repl::OplogEntry::CommandType::kApplyOps);
+        const auto sessionId = *nextNewWriteOplog.getSessionId();
+
+        if (isInternalSessionForNonRetryableWrite(sessionId)) {
+            dassert(0,
+                    str::stream() << "Cannot add op time for a non-retryable "
+                                     "internal transaction to the "
+                                     "session migration op time queue - "
+                                  << "session id:" << sessionId << " oplog entry: "
+                                  << redact(nextNewWriteOplog.toBSONForLogging()));
+
+            // Transactions inside internal sessions for non-retryable writes are not
+            // retryable so there is no need to transfer their write history to the
+            // recipient.
+            _newWriteOpTimeList.pop_front();
+            return;
+        }
+
+        if (isInternalSessionForRetryableWrite(sessionId)) {
+            handleRetryableApplyOps();
+            return;
+        }
+
+        // This applyOps oplog entry corresponds to non-internal transaction prepare/commit,
+        // replace it with a dead-end sentinel oplog entry.
+        auto sentinelOplogEntry =
+            makeSentinelOplogEntry(sessionId,
+                                   *nextNewWriteOplog.getTxnNumber(),
+                                   opCtx->getServiceContext()->getFastClockSource()->now());
+        _unprocessedNewWriteOplogBuffer.emplace_back(sentinelOplogEntry);
+        _newWriteOpTimeList.pop_front();
+        _sessionOplogEntriesToBeMigratedSoFar.addAndFetch(1);
+        return;
+    } else {
+        MONGO_UNREACHABLE;
     }
+}
+
+bool SessionCatalogMigrationSource::_fetchNextNewWriteOplog(OperationContext* opCtx) {
+    stdx::unique_lock<stdx::mutex> lk(_newOplogMutex);
+
+    if (_lastFetchedNewWriteOplogImage) {
+        // When `_lastFetchedNewWriteOplogImage` is set, it means we found an oplog entry with
+        // a pre/post image. At this step, we've already returned the image oplog entry, but we
+        // have yet to return the original oplog entry stored in `_lastFetchedNewWriteOplog`. We
+        // will unset this value and return such that the next call to `getLastFetchedOplog`
+        // will return `_lastFetchedNewWriteOplog`.
+        _lastFetchedNewWriteOplogImage.reset();
+        return true;
+    }
+
+    _lastFetchedNewWriteOplog.reset();
+
+    while (_unprocessedNewWriteOplogBuffer.empty()) {
+        if (_newWriteOpTimeList.empty()) {
+            return false;
+        }
+        _tryFetchNextNewWriteOplog(lk, opCtx);
+    }
+
+    auto nextNewWriteOplog = _unprocessedNewWriteOplogBuffer.back();
+    lk.unlock();
+    auto nextNewWriteImageOplog = fetchPrePostImageOplog(opCtx, &(nextNewWriteOplog));
+    lk.lock();
+
+    invariant(!_lastFetchedNewWriteOplogImage);
+    invariant(!_lastFetchedNewWriteOplog);
+    if (nextNewWriteImageOplog) {
+        _sessionOplogEntriesToBeMigratedSoFar.addAndFetch(1);
+        _lastFetchedNewWriteOplogImage = downConvertSessionInfoIfNeeded(*nextNewWriteImageOplog);
+    }
+    _lastFetchedNewWriteOplog = downConvertSessionInfoIfNeeded(nextNewWriteOplog);
+    _unprocessedNewWriteOplogBuffer.pop_back();
 
     return true;
 }
 
 void SessionCatalogMigrationSource::notifyNewWriteOpTime(repl::OpTime opTime,
                                                          EntryAtOpTimeType entryAtOpTimeType) {
-    stdx::lock_guard<Latch> lk(_newOplogMutex);
+    stdx::lock_guard<stdx::mutex> lk(_newOplogMutex);
     _notifyNewWriteOpTime(lk, opTime, entryAtOpTimeType);
 }
 
@@ -770,8 +936,8 @@ boost::optional<repl::OplogEntry> SessionCatalogMigrationSource::SessionOplogIte
             // Otherwise, skip the record by returning boost::none.
             auto result = [&]() -> boost::optional<repl::OplogEntry> {
                 if (!_record.getState() ||
-                    _record.getState().get() == DurableTxnStateEnum::kCommitted ||
-                    _record.getState().get() == DurableTxnStateEnum::kPrepared) {
+                    _record.getState().value() == DurableTxnStateEnum::kCommitted ||
+                    _record.getState().value() == DurableTxnStateEnum::kPrepared) {
                     return makeSentinelOplogEntry(
                         _record.getSessionId(),
                         _record.getTxnNum(),

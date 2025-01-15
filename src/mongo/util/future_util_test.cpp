@@ -27,14 +27,25 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/util/cancellation.h"
 #include <algorithm>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <fmt/format.h>
+#include <functional>
 #include <random>
+#include <ratio>
+#include <tuple>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/unittest/thread_assertion_monitor.h"
 #include "mongo/util/future_util.h"
 
@@ -47,7 +58,7 @@ public:
         auto network = std::make_unique<executor::NetworkInterfaceMock>();
         _network = network.get();
 
-        _executor = makeSharedThreadPoolTestExecutor(std::move(network));
+        _executor = makeThreadPoolTestExecutor(std::move(network));
         _executor->startup();
     }
 
@@ -88,9 +99,11 @@ using AsyncTryUntilTest = FutureUtilTest;
 
 TEST_F(AsyncTryUntilTest, LoopExecutesOnceWithAlwaysTrueCondition) {
     auto i = 0;
-    auto resultFut = AsyncTry([&] { ++i; })
-                         .until([](Status s) { return true; })
-                         .on(executor(), CancellationToken::uncancelable());
+    auto resultFut = AsyncTry([&] {
+                         ++i;
+                     }).until([](Status s) {
+                           return true;
+                       }).on(executor(), CancellationToken::uncancelable());
     resultFut.wait();
 
     ASSERT_EQ(i, 1);
@@ -100,9 +113,11 @@ TEST_F(AsyncTryUntilTest, LoopDoesNotExecuteIfExecutorAlreadyShutdown) {
     executor()->shutdown();
 
     auto i = 0;
-    auto resultFut = AsyncTry([&] { ++i; })
-                         .until([](Status s) { return true; })
-                         .on(executor(), CancellationToken::uncancelable());
+    auto resultFut = AsyncTry([&] {
+                         ++i;
+                     }).until([](Status s) {
+                           return true;
+                       }).on(executor(), CancellationToken::uncancelable());
 
     ASSERT_THROWS_CODE(resultFut.get(), DBException, ErrorCodes::ShutdownInProgress);
 
@@ -115,9 +130,9 @@ TEST_F(AsyncTryUntilTest, LoopDoesNotReturnBrokenPromiseIfExecutorShutdownWhileL
     auto resultFut = AsyncTry([&] {
                          barrierBeforeShutdown.countDownAndWait();
                          barrierAfterShutdown.countDownAndWait();
-                     })
-                         .until([](Status) { return false; })
-                         .on(executor(), CancellationToken::uncancelable());
+                     }).until([](Status) {
+                           return false;
+                       }).on(executor(), CancellationToken::uncancelable());
     barrierBeforeShutdown.countDownAndWait();
     executor()->shutdown();
     barrierAfterShutdown.countDownAndWait();
@@ -163,9 +178,9 @@ TEST_F(AsyncTryUntilTest, LoopExecutesUntilConditionIsTrue) {
     auto resultFut = AsyncTry([&] {
                          ++i;
                          return i;
-                     })
-                         .until([&](StatusWith<int> swInt) { return swInt.getValue() == numLoops; })
-                         .on(executor(), CancellationToken::uncancelable());
+                     }).until([&](StatusWith<int> swInt) {
+                           return swInt.getValue() == numLoops;
+                       }).on(executor(), CancellationToken::uncancelable());
     resultFut.wait();
 
     ASSERT_EQ(i, numLoops);
@@ -177,9 +192,9 @@ TEST_F(AsyncTryUntilTest, LoopExecutesUntilConditionIsTrueWithFutureReturnType) 
     auto resultFut = AsyncTry([&] {
                          ++i;
                          return Future<int>::makeReady(i);
-                     })
-                         .until([&](StatusWith<int> swInt) { return swInt.getValue() == numLoops; })
-                         .on(executor(), CancellationToken::uncancelable());
+                     }).until([&](StatusWith<int> swInt) {
+                           return swInt.getValue() == numLoops;
+                       }).on(executor(), CancellationToken::uncancelable());
     resultFut.wait();
 
     ASSERT_EQ(i, numLoops);
@@ -191,9 +206,9 @@ TEST_F(AsyncTryUntilTest, LoopExecutesUntilConditionIsTrueWithSemiFutureReturnTy
     auto resultFut = AsyncTry([&] {
                          ++i;
                          return SemiFuture<int>::makeReady(i);
-                     })
-                         .until([&](StatusWith<int> swInt) { return swInt.getValue() == numLoops; })
-                         .on(executor(), CancellationToken::uncancelable());
+                     }).until([&](StatusWith<int> swInt) {
+                           return swInt.getValue() == numLoops;
+                       }).on(executor(), CancellationToken::uncancelable());
     resultFut.wait();
 
     ASSERT_EQ(i, numLoops);
@@ -205,9 +220,9 @@ TEST_F(AsyncTryUntilTest, LoopExecutesUntilConditionIsTrueWithExecutorFutureRetu
     auto resultFut = AsyncTry([&] {
                          ++i;
                          return ExecutorFuture<int>(executor(), i);
-                     })
-                         .until([&](StatusWith<int> swInt) { return swInt.getValue() == numLoops; })
-                         .on(executor(), CancellationToken::uncancelable());
+                     }).until([&](StatusWith<int> swInt) {
+                           return swInt.getValue() == numLoops;
+                       }).on(executor(), CancellationToken::uncancelable());
     resultFut.wait();
 
     ASSERT_EQ(i, numLoops);
@@ -324,9 +339,9 @@ TEST_F(AsyncTryUntilTest, LoopBodyPropagatesValueOfLastIterationToCaller) {
     auto resultFut = AsyncTry([&] {
                          ++i;
                          return i;
-                     })
-                         .until([&](StatusWith<int> swInt) { return i == expectedResult; })
-                         .on(executor(), CancellationToken::uncancelable());
+                     }).until([&](StatusWith<int> swInt) {
+                           return i == expectedResult;
+                       }).on(executor(), CancellationToken::uncancelable());
 
     ASSERT_EQ(resultFut.get(), expectedResult);
 }
@@ -337,9 +352,9 @@ TEST_F(AsyncTryUntilTest, FutureReturningLoopBodyPropagatesValueOfLastIterationT
     auto resultFut = AsyncTry([&] {
                          ++i;
                          return Future<int>::makeReady(i);
-                     })
-                         .until([&](StatusWith<int> swInt) { return i == expectedResult; })
-                         .on(executor(), CancellationToken::uncancelable());
+                     }).until([&](StatusWith<int> swInt) {
+                           return i == expectedResult;
+                       }).on(executor(), CancellationToken::uncancelable());
 
     ASSERT_EQ(resultFut.get(), expectedResult);
 }
@@ -350,9 +365,9 @@ TEST_F(AsyncTryUntilTest, SemiFutureReturningLoopBodyPropagatesValueOfLastIterat
     auto resultFut = AsyncTry([&] {
                          ++i;
                          return SemiFuture<int>::makeReady(i);
-                     })
-                         .until([&](StatusWith<int> swInt) { return i == expectedResult; })
-                         .on(executor(), CancellationToken::uncancelable());
+                     }).until([&](StatusWith<int> swInt) {
+                           return i == expectedResult;
+                       }).on(executor(), CancellationToken::uncancelable());
 
     ASSERT_EQ(resultFut.get(), expectedResult);
 }
@@ -363,18 +378,18 @@ TEST_F(AsyncTryUntilTest, ExecutorFutureReturningLoopBodyPropagatesValueOfLastIt
     auto resultFut = AsyncTry([&] {
                          ++i;
                          return ExecutorFuture<int>(executor(), i);
-                     })
-                         .until([&](StatusWith<int> swInt) { return i == expectedResult; })
-                         .on(executor(), CancellationToken::uncancelable());
+                     }).until([&](StatusWith<int> swInt) {
+                           return i == expectedResult;
+                       }).on(executor(), CancellationToken::uncancelable());
 
     ASSERT_EQ(resultFut.get(), expectedResult);
 }
 
-TEST_F(AsyncTryUntilTest, LoopBodyPropagatesErrorToConditionAndCaller) {
+void doTestWithError(auto&& executor, const auto& bodyReturn) {
     unittest::threadAssertionMonitoredTest([&](auto& assertionMonitor) {
-        auto resultFut = AsyncTry<std::function<void()>>([&] {
+        auto resultFut = AsyncTry([&] {
                              uasserted(ErrorCodes::InternalError, "test error");
-                             return 3;
+                             return bodyReturn();
                          })
                              .until([&](StatusWith<int> swInt) {
                                  assertionMonitor.exec([&] {
@@ -383,67 +398,26 @@ TEST_F(AsyncTryUntilTest, LoopBodyPropagatesErrorToConditionAndCaller) {
                                  });
                                  return true;
                              })
-                             .on(executor(), CancellationToken::uncancelable());
+                             .on(executor, CancellationToken::uncancelable());
 
         ASSERT_EQ(resultFut.getNoThrow(), ErrorCodes::InternalError);
     });
+}
+
+TEST_F(AsyncTryUntilTest, LoopBodyPropagatesErrorToConditionAndCaller) {
+    doTestWithError(executor(), [] { return 3; });
 }
 
 TEST_F(AsyncTryUntilTest, FutureReturningLoopBodyPropagatesErrorToConditionAndCaller) {
-    unittest::threadAssertionMonitoredTest([&](auto& assertionMonitor) {
-        auto resultFut = AsyncTry<std::function<void()>>([&] {
-                             uasserted(ErrorCodes::InternalError, "test error");
-                             return Future<int>::makeReady(3);
-                         })
-                             .until([&](StatusWith<int> swInt) {
-                                 assertionMonitor.exec([&] {
-                                     ASSERT_NOT_OK(swInt);
-                                     ASSERT_EQ(swInt.getStatus().code(), ErrorCodes::InternalError);
-                                 });
-                                 return true;
-                             })
-                             .on(executor(), CancellationToken::uncancelable());
-
-        ASSERT_EQ(resultFut.getNoThrow(), ErrorCodes::InternalError);
-    });
+    doTestWithError(executor(), [] { return Future<int>::makeReady(3); });
 }
 
 TEST_F(AsyncTryUntilTest, SemiFutureReturningLoopBodyPropagatesErrorToConditionAndCaller) {
-    unittest::threadAssertionMonitoredTest([&](auto& assertionMonitor) {
-        auto resultFut = AsyncTry<std::function<void()>>([&] {
-                             uasserted(ErrorCodes::InternalError, "test error");
-                             return SemiFuture<int>::makeReady(3);
-                         })
-                             .until([&](StatusWith<int> swInt) {
-                                 assertionMonitor.exec([&] {
-                                     ASSERT_NOT_OK(swInt);
-                                     ASSERT_EQ(swInt.getStatus().code(), ErrorCodes::InternalError);
-                                 });
-                                 return true;
-                             })
-                             .on(executor(), CancellationToken::uncancelable());
-
-        ASSERT_EQ(resultFut.getNoThrow(), ErrorCodes::InternalError);
-    });
+    doTestWithError(executor(), [] { return SemiFuture<int>::makeReady(3); });
 }
 
 TEST_F(AsyncTryUntilTest, ExecutorFutureReturningLoopBodyPropagatesErrorToConditionAndCaller) {
-    unittest::threadAssertionMonitoredTest([&](auto& assertionMonitor) {
-        auto resultFut = AsyncTry<std::function<void()>>([&] {
-                             uasserted(ErrorCodes::InternalError, "test error");
-                             return ExecutorFuture<int>(executor(), 3);
-                         })
-                             .until([&](StatusWith<int> swInt) {
-                                 assertionMonitor.exec([&] {
-                                     ASSERT_NOT_OK(swInt);
-                                     ASSERT_EQ(swInt.getStatus().code(), ErrorCodes::InternalError);
-                                 });
-                                 return true;
-                             })
-                             .on(executor(), CancellationToken::uncancelable());
-
-        ASSERT_EQ(resultFut.getNoThrow(), ErrorCodes::InternalError);
-    });
+    doTestWithError(executor(), [&] { return ExecutorFuture<int>(executor(), 3); });
 }
 
 static const Status kCanceledStatus = {ErrorCodes::CallbackCanceled, "AsyncTry::until canceled"};
@@ -541,9 +515,11 @@ TEST_F(AsyncTryUntilTest, CanceledTryUntilLoopDoesNotExecuteIfAlreadyCanceled) {
     CancellationSource cancelSource;
     auto canceledToken = cancelSource.token();
     cancelSource.cancel();
-    auto resultFut = AsyncTry([&] { ++counter; })
-                         .until([](Status) { return false; })
-                         .on(executor(), canceledToken);
+    auto resultFut = AsyncTry([&] {
+                         ++counter;
+                     }).until([](Status) {
+                           return false;
+                       }).on(executor(), canceledToken);
     ASSERT_EQ(resultFut.getNoThrow(), kCanceledStatus);
     ASSERT_EQ(counter, 0);
 }
@@ -576,9 +552,10 @@ TEST_F(AsyncTryUntilTest, CanceledTryUntilLoopWithBackoffDoesNotExecuteIfAlready
 
 TEST_F(AsyncTryUntilTest, UntilBodyPropagatesErrorToCaller) {
     const auto error = Status(ErrorCodes::InternalError, "Some error");
-    auto resultFut = AsyncTry([] {})
-                         .until([&](Status status) -> bool { iasserted(error); })
-                         .on(executor(), CancellationToken::uncancelable());
+    auto resultFut = AsyncTry([] {
+                     }).until([&](Status status) -> bool {
+                           iasserted(error);
+                       }).on(executor(), CancellationToken::uncancelable());
     ASSERT_EQ(resultFut.getNoThrow(), error);
 }
 
@@ -589,6 +566,20 @@ TEST_F(AsyncTryUntilTest, UntilWithDelayBodyPropagatesErrorToCaller) {
                          .withDelayBetweenIterations(Seconds(10))
                          .on(executor(), CancellationToken::uncancelable());
     ASSERT_EQ(resultFut.getNoThrow(), error);
+}
+
+TEST_F(AsyncTryUntilTest, MoveOnlyType) {
+    using MoveOnly = std::unique_ptr<int>;
+
+    AsyncTry([this] { return ExecutorFuture(executor(), MoveOnly{}); })
+        .until([](const StatusWith<MoveOnly>& swResult) {
+            // Access the move-only result via a const reference.
+            return swResult.isOK();
+        })
+        .on(executor(), CancellationToken::uncancelable())
+        .getAsync([](StatusWith<MoveOnly>) {
+            // Consume the (move-only) result.
+        });
 }
 
 template <typename T>

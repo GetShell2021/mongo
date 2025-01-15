@@ -1,6 +1,8 @@
 """Interface for customizing the behavior of a test fixture."""
 
 import sys
+import threading
+from typing import Optional
 
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib.testing.testcases import interface as testcase
@@ -36,13 +38,14 @@ class Hook(object, metaclass=registry.make_registry_metaclass(_HOOKS)):  # pylin
 
         if self.IS_BACKGROUND is None:
             raise ValueError(
-                "Concrete Hook subclasses must override the IS_BACKGROUND class property")
+                "Concrete Hook subclasses must override the IS_BACKGROUND class property"
+            )
 
     def before_suite(self, test_report):
         """Test runner calls this exactly once before they start running the suite."""
         pass
 
-    def after_suite(self, test_report, teardown_flag=None):
+    def after_suite(self, test_report, teardown_flag: Optional[threading.Event] = None):
         """Invoke by test runner calls this exactly once after all tests have finished executing.
 
         Be sure to reset the behavior back to its original state so that it can be run again.
@@ -62,8 +65,7 @@ class Hook(object, metaclass=registry.make_registry_metaclass(_HOOKS)):  # pylin
 class DynamicTestCase(testcase.TestCase):  # pylint: disable=abstract-method
     """DynamicTestCase class."""
 
-    def __init__(  # pylint: disable=too-many-arguments
-            self, logger, test_name, description, base_test_name, hook):
+    def __init__(self, logger, test_name, description, base_test_name, hook):
         """Initialize DynamicTestCase."""
         testcase.TestCase.__init__(self, logger, "Hook", test_name, dynamic=True)
         self.description = description

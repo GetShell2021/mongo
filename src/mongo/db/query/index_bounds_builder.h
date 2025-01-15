@@ -29,11 +29,21 @@
 
 #pragma once
 
+#include <string>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/index_entry.h"
+#include "mongo/db/query/interval.h"
 #include "mongo/db/query/interval_evaluation_tree.h"
 
 namespace mongo {
@@ -67,16 +77,28 @@ public:
      * increasing tightness. These values are used when we need to do comparison between two
      * BoundsTightness values. Such comparisons can answer questions such as "Does predicate
      * X have tighter or looser bounds than predicate Y?".
+     *
+     * These enum values are ordered from loosest to tightest.
      */
     enum BoundsTightness {
         // Index bounds are inexact, and a fetch is required.
         INEXACT_FETCH = 0,
 
-        // Index bounds are inexact, but no fetch is required
-        INEXACT_COVERED = 1,
+        // Index bounds are inexact, and a fetch may be required depending on the projection.
+        // For example, a count $in query on null + a regex can be covered, but a find query with
+        // the same filter and no projection cannot.
+        INEXACT_MAYBE_COVERED = 1,
+
+        // Index bounds are exact, but a fetch may be required depending on the projection.
+        // For example, a find query on null may be covered, depending on which fields we project
+        // out.
+        EXACT_MAYBE_COVERED = 2,
+
+        // Index bounds are inexact, but no fetch is required.
+        INEXACT_COVERED = 3,
 
         // Index bounds are exact.
-        EXACT = 2
+        EXACT = 4
     };
 
     /**
@@ -211,7 +233,15 @@ public:
                                OrderedIntervalList* oil,
                                BoundsTightness* tightnessOut);
 
-    static void translateEquality(const BSONElement& data,
+
+    /**
+     * Convert the value at 'data' to an Interval. Populate the out-params, 'oil' and 'tightnessOut'
+     * accordingly. If 'holder' is specified, use that BSONObj as the '_intervalData' for the
+     * construted Interval, otherwise construct a new BSONObj from 'data'.
+     */
+    static void translateEquality(const PathMatchExpression* matchExpr,
+                                  const BSONElement& data,
+                                  boost::optional<BSONObj> holder,
                                   const IndexEntry& index,
                                   bool isHashed,
                                   OrderedIntervalList* oil,
@@ -248,18 +278,6 @@ public:
                                  bool* startKeyInclusive,
                                  BSONObj* endKey,
                                  bool* endKeyInclusive);
-
-    /**
-     * Returns 'true' if the ordered intervals 'oil' represent a strict null equality predicate.
-     * Returns 'false' otherwise.
-     */
-    static bool isNullInterval(const OrderedIntervalList& oil);
-
-    /**
-     * Returns 'true' if the ordered intervals 'oil' represent a strict equality predicate matching
-     * null and the empty list. Returns 'false' otherwise.
-     */
-    static bool isNullAndEmptyArrayInterval(const OrderedIntervalList& oil);
 
     /**
      * Appends the startKey and endKey of the given "all values" 'interval' (which is either
@@ -301,6 +319,11 @@ private:
                                     OrderedIntervalList* oilOut,
                                     BoundsTightness* tightnessOut,
                                     interval_evaluation_tree::Builder* ietBuilder);
+
+    /**
+     * Helper method for merging interval tightness for $in expressions.
+     */
+    static void _mergeTightness(const BoundsTightness& tightness, BoundsTightness& tightnessOut);
 };
 
 }  // namespace mongo

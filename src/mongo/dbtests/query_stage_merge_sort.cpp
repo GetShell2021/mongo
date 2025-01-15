@@ -27,38 +27,62 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/client/dbclient_cursor.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/merge_sort.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/json.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_planner_params.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 /**
  * This file tests db/exec/merge_sort.cpp
  */
 
+namespace mongo {
 namespace QueryStageMergeSortTests {
-
-using std::make_unique;
-using std::set;
-using std::string;
-using std::unique_ptr;
 
 class QueryStageMergeSortTestBase {
 public:
@@ -66,7 +90,7 @@ public:
 
     virtual ~QueryStageMergeSortTestBase() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
-        _client.dropCollection(ns());
+        _client.dropCollection(nss());
     }
 
     void addIndex(const BSONObj& obj) {
@@ -93,18 +117,18 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(ns(), obj);
+        _client.insert(nss(), obj);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(ns(), obj);
+        _client.remove(nss(), obj);
     }
 
     void update(const BSONObj& predicate, const BSONObj& update) {
-        _client.update(ns(), predicate, update);
+        _client.update(nss(), predicate, update);
     }
 
-    void getRecordIds(set<RecordId>* out, const CollectionPtr& coll) {
+    void getRecordIds(std::set<RecordId>* out, const CollectionPtr& coll) {
         auto cursor = coll->getCursor(&_opCtx);
         while (auto record = cursor->next()) {
             out->insert(record->id);
@@ -130,7 +154,7 @@ public:
     }
 
     static NamespaceString nss() {
-        return NamespaceString(ns());
+        return NamespaceString::createNamespaceString_forTest(ns());
     }
 
 protected:
@@ -138,7 +162,7 @@ protected:
     OperationContext& _opCtx = *_txnPtr;
 
     boost::intrusive_ptr<ExpressionContext> _expCtx =
-        make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss());
+        ExpressionContextBuilder{}.opCtx(&_opCtx).ns(nss()).build();
 
 private:
     DBDirectClient _client;
@@ -171,7 +195,7 @@ public:
         addIndex(secondIndex);
         CollectionPtr coll = ctx.getCollection();
 
-        unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
+        std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
         // Sort by c:1
         MergeSortStageParams msparams;
         msparams.pattern = BSON("c" << 1);
@@ -179,21 +203,21 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, coll, getIndex(secondIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
 
-        unique_ptr<FetchStage> fetchStage =
-            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
+        std::unique_ptr<FetchStage> fetchStage =
+            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, &coll);
         // Must fetch if we want to easily pull out an obj.
         auto statusWithPlanExecutor =
             plan_executor_factory::make(_expCtx,
                                         std::move(ws),
                                         std::move(fetchStage),
                                         &coll,
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -240,7 +264,7 @@ public:
         addIndex(secondIndex);
         auto coll = ctx.getCollection();
 
-        unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
+        std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
         // Sort by c:1
         MergeSortStageParams msparams;
         msparams.pattern = BSON("c" << 1);
@@ -248,20 +272,20 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, coll, getIndex(secondIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
-        unique_ptr<FetchStage> fetchStage =
-            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
+        std::unique_ptr<FetchStage> fetchStage =
+            std::make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, &coll);
 
         auto statusWithPlanExecutor =
             plan_executor_factory::make(_expCtx,
                                         std::move(ws),
                                         std::move(fetchStage),
                                         &coll,
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -307,7 +331,7 @@ public:
         addIndex(secondIndex);
         auto coll = ctx.getCollection();
 
-        unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
+        std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
         // Sort by c:1
         MergeSortStageParams msparams;
         msparams.dedup = false;
@@ -316,20 +340,20 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, coll, getIndex(secondIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
-        unique_ptr<FetchStage> fetchStage =
-            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
+        std::unique_ptr<FetchStage> fetchStage =
+            std::make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, &coll);
 
         auto statusWithPlanExecutor =
             plan_executor_factory::make(_expCtx,
                                         std::move(ws),
                                         std::move(fetchStage),
                                         &coll,
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -378,7 +402,7 @@ public:
         addIndex(secondIndex);
         auto coll = ctx.getCollection();
 
-        unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
+        std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
         // Sort by c:-1
         MergeSortStageParams msparams;
         msparams.pattern = BSON("c" << -1);
@@ -388,22 +412,22 @@ public:
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(firstIndex, coll));
         params.bounds.startKey = objWithMaxKey(1);
         params.bounds.endKey = objWithMinKey(1);
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, coll, getIndex(secondIndex, coll));
         params.bounds.startKey = objWithMaxKey(1);
         params.bounds.endKey = objWithMinKey(1);
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
-        unique_ptr<FetchStage> fetchStage =
-            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
+        std::unique_ptr<FetchStage> fetchStage =
+            std::make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, &coll);
 
         auto statusWithPlanExecutor =
             plan_executor_factory::make(_expCtx,
                                         std::move(ws),
                                         std::move(fetchStage),
                                         &coll,
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -450,7 +474,7 @@ public:
         addIndex(secondIndex);
         auto coll = ctx.getCollection();
 
-        unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
+        std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
         // Sort by c:1
         MergeSortStageParams msparams;
         msparams.pattern = BSON("c" << 1);
@@ -458,22 +482,22 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
 
         // b:51 (EOF)
         params = makeIndexScanParams(&_opCtx, coll, getIndex(secondIndex, coll));
         params.bounds.startKey = BSON("" << 51 << "" << MinKey);
         params.bounds.endKey = BSON("" << 51 << "" << MaxKey);
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
-        unique_ptr<FetchStage> fetchStage =
-            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
+        std::unique_ptr<FetchStage> fetchStage =
+            std::make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, &coll);
 
         auto statusWithPlanExecutor =
             plan_executor_factory::make(_expCtx,
                                         std::move(ws),
                                         std::move(fetchStage),
                                         &coll,
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -503,35 +527,38 @@ public:
             wuow.commit();
         }
 
-        unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
+        std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
         // Sort by foo:1
         MergeSortStageParams msparams;
         msparams.pattern = BSON("foo" << 1);
         auto ms = std::make_unique<MergeSortStage>(_expCtx.get(), msparams, ws.get());
 
-        int numIndices = 20;
+        const int numIndices = 20;
+        BSONObj indexSpec[numIndices];
+
         for (int i = 0; i < numIndices; ++i) {
             // 'a', 'b', ...
-            string index(1, 'a' + i);
+            std::string index(1, 'a' + i);
             insert(BSON(index << 1 << "foo" << i));
 
-            BSONObj indexSpec = BSON(index << 1 << "foo" << 1);
-            addIndex(indexSpec);
-            auto params = makeIndexScanParams(
-                &_opCtx, ctx.getCollection(), getIndex(indexSpec, ctx.getCollection()));
-            ms->addChild(std::make_unique<IndexScan>(
-                _expCtx.get(), ctx.getCollection(), params, ws.get(), nullptr));
+            indexSpec[i] = BSON(index << 1 << "foo" << 1);
+            addIndex(indexSpec[i]);
         }
-        auto coll = ctx.getCollection();
-        unique_ptr<FetchStage> fetchStage =
-            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
+        const auto& coll = ctx.getCollection();
+        for (int i = 0; i < numIndices; ++i) {
+            auto params = makeIndexScanParams(&_opCtx, coll, getIndex(indexSpec[i], coll));
+            ms->addChild(
+                std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
+        }
+        std::unique_ptr<FetchStage> fetchStage =
+            std::make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, &coll);
 
         auto statusWithPlanExecutor =
             plan_executor_factory::make(_expCtx,
                                         std::move(ws),
                                         std::move(fetchStage),
                                         &coll,
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -540,7 +567,7 @@ public:
             BSONObj obj;
             ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
             ASSERT_EQUALS(i, obj["foo"].numberInt());
-            string index(1, 'a' + i);
+            std::string index(1, 'a' + i);
             ASSERT_EQUALS(1, obj[index].numberInt());
         }
 
@@ -565,28 +592,31 @@ public:
         // Sort by foo:1
         MergeSortStageParams msparams;
         msparams.pattern = BSON("foo" << 1);
-        auto ms = make_unique<MergeSortStage>(_expCtx.get(), msparams, &ws);
+        auto ms = std::make_unique<MergeSortStage>(_expCtx.get(), msparams, &ws);
 
         // Index 'a'+i has foo equal to 'i'.
 
-        int numIndices = 20;
+        const int numIndices = 20;
+        BSONObj indexSpec[numIndices];
         for (int i = 0; i < numIndices; ++i) {
             // 'a', 'b', ...
-            string index(1, 'a' + i);
+            std::string index(1, 'a' + i);
             insert(BSON(index << 1 << "foo" << i));
 
-            BSONObj indexSpec = BSON(index << 1 << "foo" << 1);
-            addIndex(indexSpec);
-            auto params = makeIndexScanParams(
-                &_opCtx, ctx.getCollection(), getIndex(indexSpec, ctx.getCollection()));
-            ms->addChild(std::make_unique<IndexScan>(
-                _expCtx.get(), ctx.getCollection(), params, &ws, nullptr));
+            indexSpec[i] = BSON(index << 1 << "foo" << 1);
+            addIndex(indexSpec[i]);
+        }
+        const auto& coll = ctx.getCollection();
+        for (int i = 0; i < numIndices; ++i) {
+            auto params =
+                makeIndexScanParams(&_opCtx, coll, getIndex(indexSpec[i], ctx.getCollection()));
+            ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr));
         }
 
-        set<RecordId> recordIds;
-        getRecordIds(&recordIds, ctx.getCollection());
+        std::set<RecordId> recordIds;
+        getRecordIds(&recordIds, coll);
 
-        set<RecordId>::iterator it = recordIds.begin();
+        std::set<RecordId>::iterator it = recordIds.begin();
 
         // Get 10 results.  Should be getting results in order of 'recordIds'.
         int count = 0;
@@ -600,7 +630,7 @@ public:
             WorkingSetMember* member = ws.get(id);
             ASSERT_EQUALS(member->recordId, *it);
             BSONElement elt;
-            string index(1, 'a' + count);
+            std::string index(1, 'a' + count);
             ASSERT(member->getFieldDotted(index, &elt));
             ASSERT_EQUALS(1, elt.numberInt());
             ASSERT(member->getFieldDotted("foo", &elt));
@@ -613,7 +643,6 @@ public:
         // stage, and therefore should still be returned.
         ms->saveState();
         remove(BSON(std::string(1u, 'a' + count) << 1));
-        auto coll = ctx.getCollection();
         ms->restoreState(&coll);
 
         // Make sure recordIds[11] is returned as expected. We expect the corresponding working set
@@ -630,7 +659,7 @@ public:
             ASSERT_EQ(member->getState(), WorkingSetMember::RID_AND_IDX);
             ASSERT(member->hasRecordId());
             ASSERT(!member->hasObj());
-            string index(1, 'a' + count);
+            std::string index(1, 'a' + count);
             BSONElement elt;
             ASSERT_TRUE(member->getFieldDotted(index, &elt));
             ASSERT_EQUALS(1, elt.numberInt());
@@ -639,7 +668,7 @@ public:
 
             // An attempt to fetch the WSM should show that the key is no longer present in the
             // index.
-            NamespaceString fakeNS("test", "coll");
+            NamespaceString fakeNS = NamespaceString::createNamespaceString_forTest("test", "coll");
             ASSERT_FALSE(WorkingSetCommon::fetch(
                 &_opCtx, &ws, id, coll->getCursor(&_opCtx).get(), coll, fakeNS));
 
@@ -658,7 +687,7 @@ public:
             WorkingSetMember* member = ws.get(id);
             ASSERT_EQUALS(member->recordId, *it);
             BSONElement elt;
-            string index(1, 'a' + count);
+            std::string index(1, 'a' + count);
             ASSERT_TRUE(member->getFieldDotted(index, &elt));
             ASSERT_EQUALS(1, elt.numberInt());
             ASSERT(member->getFieldDotted("foo", &elt));
@@ -691,7 +720,7 @@ public:
 
         std::set<RecordId> rids;
         getRecordIds(&rids, coll);
-        set<RecordId>::iterator it = rids.begin();
+        std::set<RecordId>::iterator it = rids.begin();
 
         WorkingSet ws;
         WorkingSetMember* member;
@@ -707,9 +736,9 @@ public:
             auto fetchStage = std::make_unique<FetchStage>(
                 _expCtx.get(),
                 &ws,
-                std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr),
+                std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr),
                 nullptr,
-                coll);
+                &coll);
             ms->addChild(std::move(fetchStage));
         }
 
@@ -721,9 +750,9 @@ public:
             auto fetchStage = std::make_unique<FetchStage>(
                 _expCtx.get(),
                 &ws,
-                std::make_unique<IndexScan>(_expCtx.get(), coll, params, &ws, nullptr),
+                std::make_unique<IndexScan>(_expCtx.get(), &coll, params, &ws, nullptr),
                 nullptr,
-                coll);
+                &coll);
             ms->addChild(std::move(fetchStage));
         }
 
@@ -798,7 +827,7 @@ public:
         addIndex(secondIndex);
         auto coll = ctx.getCollection();
 
-        unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
+        std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
         // Sort by c:1, d:1
         MergeSortStageParams msparams;
         msparams.pattern = BSON("c" << 1 << "d" << 1);
@@ -807,21 +836,21 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(firstIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, coll, getIndex(secondIndex, coll));
-        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr));
+        ms->addChild(std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr));
 
         auto fetchStage =
-            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, coll);
+            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ms), nullptr, &coll);
         // Must fetch if we want to easily pull out an obj.
         auto statusWithPlanExecutor =
             plan_executor_factory::make(_expCtx,
                                         std::move(ws),
                                         std::move(fetchStage),
                                         &coll,
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -869,7 +898,7 @@ public:
         addIndex(secondIndex);
         auto coll = ctx.getCollection();
 
-        unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
+        std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
         // Sort by c:1, d:1
         MergeSortStageParams msparams;
         msparams.pattern = BSON("c" << 1 << "d" << 1);
@@ -879,26 +908,26 @@ public:
 
         // a:1
         auto params = makeIndexScanParams(&_opCtx, coll, getIndex(firstIndex, coll));
-        auto idxScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr);
+        auto idxScan = std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr);
 
         // Wrap 'idxScan' with a FETCH stage so a document is fetched and MERGE_SORT is forced to
         // use the provided collator 'collator'. Also, this permits easier retrieval of result
         // objects in the result verification code.
         ms->addChild(
-            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(idxScan), nullptr, coll));
+            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(idxScan), nullptr, &coll));
 
         // b:1
         params = makeIndexScanParams(&_opCtx, coll, getIndex(secondIndex, coll));
-        idxScan = std::make_unique<IndexScan>(_expCtx.get(), coll, params, ws.get(), nullptr);
+        idxScan = std::make_unique<IndexScan>(_expCtx.get(), &coll, params, ws.get(), nullptr);
         ms->addChild(
-            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(idxScan), nullptr, coll));
+            make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(idxScan), nullptr, &coll));
 
         auto statusWithPlanExecutor =
             plan_executor_factory::make(_expCtx,
                                         std::move(ws),
                                         std::move(ms),
                                         &coll,
-                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                         QueryPlannerParams::DEFAULT);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -920,11 +949,11 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query_stage_merge_sort_test") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageMergeSortPrefixIndex>();
         add<QueryStageMergeSortDups>();
         add<QueryStageMergeSortDupsNoDedup>();
@@ -938,6 +967,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> queryStageMergeSortTest;
+unittest::OldStyleSuiteInitializer<All> queryStageMergeSortTest;
 
 }  // namespace QueryStageMergeSortTests
+}  // namespace mongo

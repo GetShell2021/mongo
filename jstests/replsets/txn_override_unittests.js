@@ -25,12 +25,9 @@
  * us to keep more tests running now. That said, these should ideally all throw so we do not rely on
  * the test itself calling assert.commandWorked.
  *
- * @tags: [requires_replication, uses_transactions]
+ * @tags: [requires_replication, uses_transactions, requires_scripting]
  */
-(function() {
-"use strict";
-load("jstests/libs/transactions_util.js");
-load('jstests/libs/write_concern_util.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Commands not to override since they can log excessively.
 const runCommandOverrideDenylistedCommands =
@@ -317,6 +314,43 @@ function runTest(testSuite, testCase) {
 
 const retryOnNetworkErrorTests = [
     {
+        name: "retry the explain command when it fails with the Interupted error code",
+        test: function() {
+            assert.commandWorked(testDB.createCollection(collName1));
+            assert.commandWorked(coll1.insert({_id: 1}));
+
+            // Mock the explain response, when the command got interrupted.
+            setCommandMockResponse("explain", {
+                "ok": 1,
+                "executionStats": {
+                    "executionSuccess": false,
+                    "errorMessage": "operation was interrupted",
+                    "errorCode": ErrorCodes.Interrupted,
+                    "nReturned": 0,
+                    "executionTimeMillis": 2,
+                    "totalKeysExamined": 0,
+                    "totalDocsExamined": 0,
+                    "executionStages": {
+                        "isCached": false,
+                        "stage": "EXPRESS_UPDATE",
+                        "keyPattern": "{ _id: 1 }",
+                        "indexName": "_id_",
+                        "keysExamined": 0,
+                        "docsExamined": 0,
+                        "nReturned": 0,
+                        "nWouldModify": 0,
+                        "nWouldUpsert": 0,
+                        "nWouldDelete": 0
+                    }
+                }
+            });
+            const explain = assert.commandWorked(testDB.runCommand(
+                {explain: {findAndModify: collName1, update: {$inc: {i: 1}}, query: {_id: 1}}}));
+            assert.eq(explain.executionStats.nReturned, 1, explain);
+            assert.eq(explain.executionStats.executionSuccess, true, explain);
+        }
+    },
+    {
         name: "update with network error after success",
         test: function() {
             assert.commandWorked(testDB.createCollection(collName1));
@@ -365,10 +399,10 @@ const retryOnNetworkErrorTests = [
             let obj2 = {_id: 2, x: 5};
             assert.commandWorked(coll1.insert(obj1));
             assert.commandWorked(coll1.insert(obj2));
-            assert.docEq(coll1.find().toArray(), [{_id: 1, x: 5}, {_id: 2, x: 5}]);
+            assert.docEq([{_id: 1, x: 5}, {_id: 2, x: 5}], coll1.find().toArray());
             obj1.x = 7;
             assert.commandWorked(coll1.update({_id: 2}, {$set: {x: 8}}));
-            assert.docEq(coll1.find().toArray(), [{_id: 1, x: 5}, {_id: 2, x: 8}]);
+            assert.docEq([{_id: 1, x: 5}, {_id: 2, x: 8}], coll1.find().toArray());
         }
     },
     {
@@ -1349,6 +1383,7 @@ const txnOverridePlusRetryOnNetworkErrorTests = [
             failCommandWithFailPoint(["insert"], {errorCode: ErrorCodes.NotWritablePrimary});
 
             assert.commandWorked(coll1.insert({a: 2, b: {c: 7, d: "d is good"}}));
+            /* eslint-disable */
             const cursor = coll1.find({
                 $where: function() {
                     assert.eq(3, Object.keySet(obj).length);
@@ -1358,6 +1393,7 @@ const txnOverridePlusRetryOnNetworkErrorTests = [
                     return true;
                 }
             });
+            /* eslint-enable */
             assert.eq(1, cursor.toArray().length);
         }
     },
@@ -1398,13 +1434,13 @@ const txnOverridePlusRetryOnNetworkErrorTests = [
             let obj2 = {_id: 2, x: 5};
             assert.commandWorked(coll1.insert(obj1));
             assert.commandWorked(coll1.insert(obj2));
-            assert.docEq(coll1.find().toArray(), [{_id: 1, x: 5}, {_id: 2, x: 5}]);
+            assert.docEq([{_id: 1, x: 5}, {_id: 2, x: 5}], coll1.find().toArray());
             obj1.x = 7;
             assert.commandWorked(coll1.update({_id: 2}, {$set: {x: 8}}));
-            assert.docEq(coll1.find().toArray(), [{_id: 1, x: 5}, {_id: 2, x: 8}]);
+            assert.docEq([{_id: 1, x: 5}, {_id: 2, x: 8}], coll1.find().toArray());
 
             endCurrentTransactionIfOpen();
-            assert.docEq(coll1.find().toArray(), [{_id: 1, x: 5}, {_id: 2, x: 8}]);
+            assert.docEq([{_id: 1, x: 5}, {_id: 2, x: 8}], coll1.find().toArray());
         }
     },
     {
@@ -1878,7 +1914,7 @@ TestData.overrideRetryAttempts = 3;
 let session = conn.startSession(TestData.sessionOptions);
 let testDB = session.getDatabase(dbName);
 
-load("jstests/libs/override_methods/network_error_and_txn_override.js");
+await import("jstests/libs/override_methods/network_error_and_txn_override.js");
 
 jsTestLog("=-=-=-=-=-= Testing with 'retry on network error' by itself. =-=-=-=-=-=");
 TestData.sessionOptions = new SessionOptions({retryWrites: true});
@@ -1966,4 +2002,3 @@ doNotRetryReadErrorWithOutBackgroundReconfigTest.forEach(
     (testCase) => runTest("doNotRetryReadErrorWithOutBackgroundReconfigTest", testCase));
 
 rst.stopSet();
-})();

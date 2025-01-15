@@ -27,20 +27,18 @@
  *    it in the license file.
  */
 
+#include "mongo/bson/bsonobjbuilder.h"
 
-#include "mongo/db/jsobj.h"
-
-#include <boost/lexical_cast.hpp>
+#include <string>
 
 #include "mongo/bson/timestamp.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-
 namespace mongo {
-
-using std::string;
 
 template <class Derived, class B>
 Derived& BSONObjBuilderBase<Derived, B>::appendMinForType(StringData fieldName, int t) {
@@ -184,7 +182,7 @@ Derived& BSONObjBuilderBase<Derived, B>::appendMaxForType(StringData fieldName, 
 template <class Derived, class B>
 Derived& BSONObjBuilderBase<Derived, B>::appendDate(StringData fieldName, Date_t dt) {
     _b.appendNum((char)Date);
-    _b.appendStr(fieldName);
+    _b.appendCStr(fieldName);
     _b.appendNum(dt.toMillisSinceEpoch());
     return static_cast<Derived&>(*this);
 }
@@ -237,7 +235,15 @@ bool BSONObjBuilderBase<Derived, B>::hasField(StringData name) const {
 // Explicit instantiations
 template class BSONObjBuilderBase<BSONObjBuilder, BufBuilder>;
 template class BSONObjBuilderBase<UniqueBSONObjBuilder, UniqueBufBuilder>;
+template class BSONObjBuilderBase<allocator_aware::BSONObjBuilder<std::allocator<void>>,
+                                  allocator_aware::BufBuilder<std::allocator<void>>>;
+template class BSONObjBuilderBase<allocator_aware::BSONObjBuilder<tracking::Allocator<void>>,
+                                  allocator_aware::BufBuilder<tracking::Allocator<void>>>;
 template class BSONArrayBuilderBase<BSONArrayBuilder, BSONObjBuilder>;
+template class BSONArrayBuilderBase<allocator_aware::BSONArrayBuilder<std::allocator<void>>,
+                                    allocator_aware::BSONObjBuilder<std::allocator<void>>>;
+template class BSONArrayBuilderBase<allocator_aware::BSONArrayBuilder<tracking::Allocator<void>>,
+                                    allocator_aware::BSONObjBuilder<tracking::Allocator<void>>>;
 template class BSONArrayBuilderBase<UniqueBSONArrayBuilder, UniqueBSONObjBuilder>;
 
 }  // namespace mongo

@@ -7,11 +7,12 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/replsets/rslib.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    assertVoteCount,
+    waitForNewlyAddedRemovalForNodeToBeCommitted
+} from "jstests/replsets/rslib.js";
 
 const testName = jsTestName();
 const dbName = "testdb";
@@ -20,7 +21,7 @@ const collName = "testcoll";
 const rst = new ReplSetTest(
     {name: testName, nodes: 1, settings: {chainingAllowed: false}, useBridge: true});
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const primary = rst.getPrimary();
 const primaryDb = primary.getDB(dbName);
@@ -37,7 +38,7 @@ const secondary = rst.add({
     }
 });
 rst.reInitiate();
-rst.waitForState(secondary, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [secondary]);
 
 jsTestLog("Checking that the primary has initiated the removal of 'newlyAdded'");
 hangBeforeNewlyAddedRemovalFP.wait();
@@ -89,4 +90,3 @@ assert.eq(2,
           () => [tojson(configBeforeTermBump), tojson(configAfterTermBump)]);
 
 rst.stopSet();
-})();

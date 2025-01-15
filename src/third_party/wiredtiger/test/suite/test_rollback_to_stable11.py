@@ -27,7 +27,7 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 from helper import simulate_crash_restart
-from test_rollback_to_stable01 import test_rollback_to_stable_base
+from rollback_to_stable_util import test_rollback_to_stable_base
 from wiredtiger import stat
 from wtdataset import SimpleDataSet
 from wtscenario import make_scenarios
@@ -50,7 +50,7 @@ class test_rollback_to_stable11(test_rollback_to_stable_base):
     scenarios = make_scenarios(format_values, prepare_values)
 
     def conn_config(self):
-        config = 'cache_size=1MB,statistics=(all)'
+        config = 'cache_size=1MB,statistics=(all),verbose=(rts:5)'
         return config
 
     def test_rollback_to_stable(self):
@@ -138,6 +138,3 @@ class test_rollback_to_stable11(test_rollback_to_stable_base):
         self.assertGreater(pages_visited, 0)
         self.assertEqual(hs_removed, 4)
         self.assertEqual(hs_sweep, 0)
-
-if __name__ == '__main__':
-    wttest.run()

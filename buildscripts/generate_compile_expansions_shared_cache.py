@@ -8,8 +8,9 @@ $ python generate_compile_expansions.py --out compile_expansions.yml
 
 import argparse
 import os
-import sys
 import shlex
+import sys
+
 import yaml
 
 VERSION_JSON = "version.json"
@@ -59,18 +60,27 @@ def generate_scons_cache_expansions():
     # Global shared cache using EFS
     if os.getenv("SCONS_CACHE_SCOPE") == "shared":
         if sys.platform.startswith("win"):
-            shared_mount_root = 'X:\\'
+            shared_mount_root = "X:\\"
         else:
-            shared_mount_root = '/efs'
-        default_cache_path = os.path.join(shared_mount_root, system_uuid, "scons-cache")
+            shared_mount_root = "/efs/scons"
+
+        scons_cache_dir = os.getenv("SCONS_CACHE_DIR")
+        if scons_cache_dir:
+            default_cache_path = os.path.join(
+                shared_mount_root, system_uuid, "per_variant_caches", scons_cache_dir, "scons-cache"
+            )
+        else:
+            default_cache_path = os.path.join(shared_mount_root, system_uuid, "scons-cache")
+
         expansions["scons_cache_path"] = default_cache_path
-        expansions[
-            "scons_cache_args"] = "--cache={0} --cache-signature-mode=validate --cache-dir={1}".format(
-                scons_cache_mode, shlex.quote(default_cache_path))
+        expansions["scons_cache_args"] = (
+            "--cache=nolinked --cache-signature-mode=validate --cache-dir={0} --cache-show".format(
+                shlex.quote(default_cache_path)
+            )
+        )
 
     # Local shared cache - host-based
     elif os.getenv("SCONS_CACHE_SCOPE") == "local":
-
         if sys.platform.startswith("win"):
             default_cache_path_base = r"z:\data\scons-cache"
         else:
@@ -78,9 +88,11 @@ def generate_scons_cache_expansions():
 
         default_cache_path = os.path.join(default_cache_path_base, system_uuid)
         expansions["scons_cache_path"] = default_cache_path
-        expansions[
-            "scons_cache_args"] = "--cache={0} --cache-signature-mode=validate --cache-dir={1}".format(
-                scons_cache_mode, shlex.quote(default_cache_path))
+        expansions["scons_cache_args"] = (
+            "--cache={0} --cache-signature-mode=validate --cache-dir={1} --cache-show".format(
+                scons_cache_mode, shlex.quote(default_cache_path)
+            )
+        )
     # No cache
     else:
         # Anything else is 'none'

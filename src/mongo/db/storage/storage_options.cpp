@@ -27,12 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/server_parameter.h"
 #include "mongo/db/storage/storage_options.h"
-
 #include "mongo/db/storage/storage_parameters_gen.h"
-#include "mongo/platform/compiler.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -47,10 +51,9 @@ void StorageGlobalParams::reset() {
     dbpath = kDefaultDbPath;
     upgrade = false;
     repair = false;
+    validate = false;
     restore = false;
-
-    // The intention here is to enable the journal by default if we are running on a 64 bit system.
-    dur = (sizeof(void*) == 8);
+    magicRestore = false;
 
     noTableScan.store(false);
     directoryperdb = false;
@@ -60,20 +63,21 @@ void StorageGlobalParams::reset() {
     oplogMinRetentionHours.store(0.0);
     allowOplogTruncation = true;
     disableLockFreeReads = false;
-    checkpointDelaySecs = 0;
+    forceDisableTableLogging = false;
 }
 
 StorageGlobalParams storageGlobalParams;
 
-Status StorageDirectoryPerDbParameter::setFromString(const std::string&) {
+Status StorageDirectoryPerDbParameter::setFromString(StringData, const boost::optional<TenantId>&) {
     return {ErrorCodes::IllegalOperation,
             str::stream() << name() << " cannot be set via setParameter"};
 };
 
 void StorageDirectoryPerDbParameter::append(OperationContext* opCtx,
-                                            BSONObjBuilder& builder,
-                                            const std::string& name) {
-    builder.append(name, storageGlobalParams.directoryperdb);
+                                            BSONObjBuilder* builder,
+                                            StringData name,
+                                            const boost::optional<TenantId>&) {
+    builder->append(name, storageGlobalParams.directoryperdb);
 }
 
 

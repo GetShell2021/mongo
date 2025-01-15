@@ -27,54 +27,80 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/sort_pattern.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
 
 namespace mongo {
+
+namespace {
+
+static const StringDataSet kValidMetaSorts{"textScore"_sd,
+                                           "randVal"_sd,
+                                           "geoNearDistance"_sd,
+                                           "searchScore"_sd,
+                                           "vectorSearchScore"_sd,
+                                           "score"_sd};
+
+bool isSupportedMetaSort(const boost::intrusive_ptr<ExpressionContext>& expCtx, StringData name) {
+    if (name == "searchScore"_sd || name == "vectorSearchScore"_sd || name == "score"_sd) {
+        expCtx->throwIfFeatureFlagIsNotEnabledOnFCV(
+            "sorting by searchScore, vectorSearchScore, or score",
+            feature_flags::gFeatureFlagRankFusionFull);
+    }
+    return kValidMetaSorts.contains(name);
+}
+
+boost::intrusive_ptr<ExpressionMeta> parseMetaExpression(
+    const BSONObj& metaDoc, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    BSONElement metaElem = metaDoc.firstElement();
+    // This restriction is due to needing to figure out sort direction. We assume for scored results
+    // that users want the most relevant results first.
+    uassert(17312,
+            "$meta is the only expression supported by $sort right now",
+            metaElem.fieldNameStringData() == "$meta");
+
+    uassert(ErrorCodes::FailedToParse,
+            "Cannot have additional keys in a $meta sort specification",
+            metaDoc.nFields() == 1);
+
+    const auto metaName = metaElem.valueStringDataSafe();
+
+    if (!isSupportedMetaSort(expCtx, metaName)) {
+        uasserted(31138, str::stream() << "Illegal $meta sort: " << metaElem);
+    }
+
+    VariablesParseState vps = expCtx->variablesParseState;
+    return static_cast<ExpressionMeta*>(ExpressionMeta::parse(expCtx.get(), metaElem, vps).get());
+}
+}  // namespace
+
 SortPattern::SortPattern(const BSONObj& obj,
-                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx) {
+                         const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     for (auto&& keyField : obj) {
         auto fieldName = keyField.fieldNameStringData();
 
         SortPatternPart patternPart;
 
-        if (keyField.type() == Object) {
-            BSONObj metaDoc = keyField.Obj();
-            // this restriction is due to needing to figure out sort direction
-            uassert(17312,
-                    "$meta is the only expression supported by $sort right now",
-                    metaDoc.firstElement().fieldNameStringData() == "$meta");
-
-            uassert(ErrorCodes::FailedToParse,
-                    "Cannot have additional keys in a $meta sort specification",
-                    metaDoc.nFields() == 1);
-
-            VariablesParseState vps = pExpCtx->variablesParseState;
-            BSONElement metaElem = metaDoc.firstElement();
-
-            if (metaElem.valueStringDataSafe() == "textScore"_sd) {
-                // Valid meta sort. Just fall through.
-            } else if (metaElem.valueStringDataSafe() == "randVal"_sd) {
-                // Valid meta sort. Just fall through.
-            } else if (metaElem.valueStringDataSafe() == "geoNearDistance"_sd) {
-                if (!feature_flags::gTimeseriesMetricIndexes.isEnabled(
-                        serverGlobalParams.featureCompatibility)) {
-                    uasserted(5917100,
-                              "$meta sort by 'geoNearDistance' is allowed only with "
-                              "featureFlagTimeseriesMetricIndexes flag");
-                }
-                // Valid meta sort if the flag is enabled. Just fall through.
-            } else if (metaElem.valueStringDataSafe() == "searchScore"_sd) {
-                uasserted(31218, "$meta sort by 'searchScore' metadata is not supported");
-            } else if (metaElem.valueStringDataSafe() == "searchHighlights"_sd) {
-                uasserted(31219, "$meta sort by 'searchHighlights' metadata is not supported");
-            } else {
-                uasserted(31138, str::stream() << "Illegal $meta sort: " << metaElem);
-            }
-            patternPart.expression = static_cast<ExpressionMeta*>(
-                ExpressionMeta::parse(pExpCtx.get(), metaElem, vps).get());
+        if (keyField.type() == BSONType::Object) {
+            patternPart.expression = parseMetaExpression(keyField.Obj(), expCtx);
 
             // If sorting by textScore, sort highest scores first. If sorting by randVal, order
             // doesn't matter, so just always use descending.
@@ -96,7 +122,13 @@ SortPattern::SortPattern(const BSONObj& obj,
 
         patternPart.fieldPath = FieldPath{fieldName};
         patternPart.isAscending = (direction > 0);
-        _paths.insert(patternPart.fieldPath->fullPath());
+
+        const auto [_, inserted] = _paths.insert(patternPart.fieldPath->fullPath());
+        uassert(7472500,
+                str::stream() << "$sort key must not contain duplicate keys (duplicate: '"
+                              << patternPart.fieldPath->fullPath() << "')",
+                inserted);
+
         _sortPattern.push_back(std::move(patternPart));
     }
 }
@@ -105,20 +137,20 @@ QueryMetadataBitSet SortPattern::metadataDeps(QueryMetadataBitSet unavailableMet
     DepsTracker depsTracker{unavailableMetadata};
     for (auto&& part : _sortPattern) {
         if (part.expression) {
-            part.expression->addDependencies(&depsTracker);
+            expression::addDependencies(part.expression.get(), &depsTracker);
         }
     }
 
     return depsTracker.metadataDeps();
 }
 
-Document SortPattern::serialize(SortKeySerialization serializationMode) const {
+Document SortPattern::serialize(SortKeySerialization serializationMode,
+                                const SerializationOptions& options) const {
     MutableDocument keyObj;
     const size_t n = _sortPattern.size();
     for (size_t i = 0; i < n; ++i) {
         if (_sortPattern[i].fieldPath) {
-            // Append a named integer based on whether the sort is ascending/descending.
-            keyObj.setField(_sortPattern[i].fieldPath->fullPath(),
+            keyObj.setField(options.serializeFieldPath(*_sortPattern[i].fieldPath),
                             Value(_sortPattern[i].isAscending ? 1 : -1));
         } else {
             // Sorting by an expression, use a made up field name.
@@ -127,7 +159,12 @@ Document SortPattern::serialize(SortKeySerialization serializationMode) const {
                 case SortKeySerialization::kForExplain:
                 case SortKeySerialization::kForPipelineSerialization: {
                     const bool isExplain = (serializationMode == SortKeySerialization::kForExplain);
-                    keyObj[computedFieldName] = _sortPattern[i].expression->serialize(isExplain);
+                    auto opts = SerializationOptions{};
+                    if (isExplain) {
+                        opts.verbosity =
+                            boost::make_optional(ExplainOptions::Verbosity::kQueryPlanner);
+                    }
+                    keyObj[computedFieldName] = _sortPattern[i].expression->serialize(opts);
                     break;
                 }
                 case SortKeySerialization::kForSortKeyMerging: {
@@ -145,7 +182,7 @@ Document SortPattern::serialize(SortKeySerialization serializationMode) const {
 void SortPattern::addDependencies(DepsTracker* deps) const {
     for (auto&& keyPart : _sortPattern) {
         if (keyPart.expression) {
-            keyPart.expression->addDependencies(deps);
+            expression::addDependencies(keyPart.expression.get(), deps);
         } else {
             deps->fields.insert(keyPart.fieldPath->fullPath());
         }
@@ -164,5 +201,32 @@ bool SortPattern::isExtensionOf(const SortPattern& other) const {
         }
     }
     return true;
+}
+
+bool isSortOnSingleMetaField(const SortPattern& sortPattern,
+                             QueryMetadataBitSet metadataToConsider) {
+    // Exactly 1 expression in the sort pattern is needed.
+    if (sortPattern.begin() == sortPattern.end() ||
+        std::next(sortPattern.begin()) != sortPattern.end()) {
+        // 0 parts, or more than 1 part.
+        return false;
+    }
+    const auto& firstAndOnlyPart = *sortPattern.begin();
+    if (auto* expr = firstAndOnlyPart.expression.get()) {
+        if (auto metaExpr = dynamic_cast<ExpressionMeta*>(expr)) {
+            if (metadataToConsider.none()) {
+                // Any metadata field.
+                return true;
+            }
+            for (std::size_t i = 1; i < DocumentMetadataFields::kNumFields; ++i) {
+                if (metadataToConsider[i] &&
+                    metaExpr->getMetaType() == static_cast<DocumentMetadataFields::MetaType>(i)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    return false;
 }
 }  // namespace mongo

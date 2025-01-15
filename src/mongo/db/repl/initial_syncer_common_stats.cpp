@@ -28,8 +28,12 @@
  */
 
 #include "mongo/db/repl/initial_syncer_common_stats.h"
+
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
@@ -38,23 +42,15 @@ namespace mongo {
 namespace repl {
 namespace initial_sync_common_stats {
 
-Counter64 initialSyncFailedAttempts;
-Counter64 initialSyncFailures;
-Counter64 initialSyncCompletes;
-
-ServerStatusMetricField<Counter64> displaySSInitialSyncFailedAttempts(
-    "repl.initialSync.failedAttempts", &initialSyncFailedAttempts);
-ServerStatusMetricField<Counter64> displaySSInitialSyncFailures("repl.initialSync.failures",
-                                                                &initialSyncFailures);
-ServerStatusMetricField<Counter64> displaySSInitialSyncCompleted("repl.initialSync.completed",
-                                                                 &initialSyncCompletes);
+Counter64& initialSyncFailedAttempts = *MetricBuilder<Counter64>{"repl.initialSync.failedAttempts"};
+Counter64& initialSyncFailures = *MetricBuilder<Counter64>{"repl.initialSync.failures"};
+Counter64& initialSyncCompletes = *MetricBuilder<Counter64>{"repl.initialSync.completed"};
 
 void LogInitialSyncAttemptStats(const StatusWith<OpTimeAndWallTime>& attemptResult,
                                 bool hasRetries,
                                 const BSONObj& stats) {
     // Don't remove or change this log id as it is ingested to Atlas.
     LOGV2(21192,
-          "Initial sync status: {status}, initial sync attempt statistics: {statistics}",
           "Initial sync status and statistics",
           "status"_attr =
               attemptResult.isOK() ? "successful" : (hasRetries ? "in_progress" : "failed"),

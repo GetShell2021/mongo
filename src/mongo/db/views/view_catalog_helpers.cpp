@@ -29,6 +29,23 @@
 
 #include "mongo/db/views/view_catalog_helpers.h"
 
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
+#include <iterator>
+#include <list>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
@@ -37,7 +54,20 @@
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/db/views/view_graph.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/uuid.h"
+#include "mongo/util/version/releases.h"
 
 namespace mongo {
 namespace view_catalog_helpers {
@@ -45,7 +75,6 @@ namespace view_catalog_helpers {
 StatusWith<stdx::unordered_set<NamespaceString>> validatePipeline(OperationContext* opCtx,
                                                                   const ViewDefinition& viewDef) {
     const LiteParsedPipeline liteParsedPipeline(viewDef.viewOn(), viewDef.pipeline());
-    const auto involvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
 
     // The API version pipeline validation should be skipped for time-series view because of
     // following reasons:
@@ -60,35 +89,35 @@ StatusWith<stdx::unordered_set<NamespaceString>> validatePipeline(OperationConte
     // correctly. In order to parse a pipeline we need to resolve any namespaces involved to a
     // collection and a pipeline, but in this case we don't need this map to be accurate since
     // we will not be evaluating the pipeline.
-    StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
-    for (auto&& nss : involvedNamespaces) {
+    StringMap<ResolvedNamespace> resolvedNamespaces;
+
+    // Create copy of involved namespaces, as these can be moved into the result.
+    for (const auto& nss : liteParsedPipeline.getInvolvedNamespaces()) {
         resolvedNamespaces[nss.coll()] = {nss, {}};
     }
-    boost::intrusive_ptr<ExpressionContext> expCtx =
-        new ExpressionContext(opCtx,
-                              AggregateCommandRequest(viewDef.viewOn(), viewDef.pipeline()),
-                              CollatorInterface::cloneCollator(viewDef.defaultCollator()),
-                              // We can use a stub MongoProcessInterface because we are only parsing
-                              // the Pipeline for validation here. We won't do anything with the
-                              // pipeline that will require a real implementation.
-                              std::make_shared<StubMongoProcessInterface>(),
-                              std::move(resolvedNamespaces),
-                              boost::none);
-
+    AggregateCommandRequest aggregateRequest(viewDef.viewOn(), viewDef.pipeline());
+    // We can use a stub MongoProcessInterface because we are only
+    // parsing the Pipeline for validation here. We won't do anything
+    // with the pipeline that will require a real implementation.
+    auto expCtx = ExpressionContextBuilder{}
+                      .fromRequest(opCtx, aggregateRequest)
+                      .collator(CollatorInterface::cloneCollator(viewDef.defaultCollator()))
+                      .resolvedNamespace(std::move(resolvedNamespaces))
+                      .mayDbProfile(true)
+                      // The pipeline parser needs to know that we're parsing a pipeline for a view
+                      // definition to apply some additional checks.
+                      .isParsingViewDefinition(true)
+                      .build();
     // If the feature compatibility version is not kLatest, and we are validating features as
     // primary, ban the use of new agg features introduced in kLatest to prevent them from being
     // persisted in the catalog.
     // (Generic FCV reference): This FCV check should exist across LTS binary versions.
     multiversion::FeatureCompatibilityVersion fcv;
     if (serverGlobalParams.validateFeaturesAsPrimary.load() &&
-        serverGlobalParams.featureCompatibility.isLessThan(multiversion::GenericFCV::kLatest,
-                                                           &fcv)) {
-        expCtx->maxFeatureCompatibilityVersion = fcv;
+        serverGlobalParams.featureCompatibility.acquireFCVSnapshot().isLessThan(
+            multiversion::GenericFCV::kLatest, &fcv)) {
+        expCtx->setMaxFeatureCompatibilityVersion(fcv);
     }
-
-    // The pipeline parser needs to know that we're parsing a pipeline for a view definition
-    // to apply some additional checks.
-    expCtx->isParsingViewDefinition = true;
 
     try {
         auto pipeline =
@@ -106,7 +135,7 @@ StatusWith<stdx::unordered_set<NamespaceString>> validatePipeline(OperationConte
                             << firstPersistentStage->get()->getSourceName() << " in location "
                             << std::distance(sources.begin(), firstPersistentStage)
                             << " of the pipeline cannot be used in the view definition of "
-                            << viewDef.name().ns() << " because it writes to disk",
+                            << viewDef.name().toStringForErrorMsg() << " because it writes to disk",
                         firstPersistentStage == sources.end());
 
                 uassert(ErrorCodes::OptionNotSupportedOnView,
@@ -124,8 +153,28 @@ StatusWith<stdx::unordered_set<NamespaceString>> validatePipeline(OperationConte
         return ex.toStatus();
     }
 
-    return std::move(involvedNamespaces);
+    return liteParsedPipeline.getInvolvedNamespaces();
 }
+
+NamespaceString findSourceCollectionNamespace(OperationContext* opCtx,
+                                              std::shared_ptr<const CollectionCatalog> catalog,
+                                              const NamespaceString& nss) {
+
+    // Points to the name of the most resolved namespace.
+    const NamespaceString* resolvedNss = &nss;
+
+    int depth = 0;
+    for (; depth < ViewGraph::kMaxViewDepth; depth++) {
+        auto view = catalog->lookupView(opCtx, *resolvedNss);
+        if (!view) {
+            return NamespaceString({*resolvedNss});
+        }
+        resolvedNss = &view->viewOn();
+    }
+
+    MONGO_UNREACHABLE;
+}
+
 
 StatusWith<ResolvedView> resolveView(OperationContext* opCtx,
                                      std::shared_ptr<const CollectionCatalog> catalog,
@@ -150,13 +199,15 @@ StatusWith<ResolvedView> resolveView(OperationContext* opCtx,
     int depth = 0;
     boost::optional<bool> mixedData = boost::none;
     boost::optional<TimeseriesOptions> tsOptions = boost::none;
+    boost::optional<bool> hasExtendedRange = boost::none;
+    boost::optional<bool> fixedBuckets = boost::none;
 
     for (; depth < ViewGraph::kMaxViewDepth; depth++) {
         auto view = catalog->lookupView(opCtx, *resolvedNss);
         if (!view) {
             // Return error status if pipeline is too large.
             int pipelineSize = 0;
-            for (auto obj : resolvedPipeline) {
+            for (const auto& obj : resolvedPipeline) {
                 pipelineSize += obj.objsize();
             }
             if (pipelineSize > ViewGraph::kMaxViewPipelineSizeBytes) {
@@ -171,9 +222,11 @@ StatusWith<ResolvedView> resolveView(OperationContext* opCtx,
             return StatusWith<ResolvedView>(
                 {*resolvedNss,
                  std::move(resolvedPipeline),
-                 collation ? std::move(collation.get()) : CollationSpec::kSimpleSpec,
+                 collation ? std::move(collation.value()) : CollationSpec::kSimpleSpec,
                  tsOptions,
-                 mixedData});
+                 mixedData,
+                 hasExtendedRange,
+                 fixedBuckets});
         }
 
         resolvedNss = &view->viewOn();
@@ -187,13 +240,13 @@ StatusWith<ResolvedView> resolveView(OperationContext* opCtx,
         if (view->timeseries()) {
             auto tsCollection = catalog->lookupCollectionByNamespace(opCtx, *resolvedNss);
             uassert(6067201,
-                    str::stream() << "expected time-series buckets collection " << *resolvedNss
-                                  << " to exist",
+                    str::stream() << "expected time-series buckets collection "
+                                  << (*resolvedNss).toStringForErrorMsg() << " to exist",
                     tsCollection);
-            if (tsCollection) {
-                mixedData = tsCollection->getTimeseriesBucketsMayHaveMixedSchemaData();
-                tsOptions = tsCollection->getTimeseriesOptions();
-            }
+            mixedData = tsCollection->getTimeseriesBucketsMayHaveMixedSchemaData();
+            tsOptions = tsCollection->getTimeseriesOptions();
+            hasExtendedRange = tsCollection->getRequiresTimeseriesExtendedRangeSupport();
+            fixedBuckets = tsCollection->areTimeseriesBucketsFixed();
         }
 
         dependencyChain.push_back(*resolvedNss);
@@ -216,7 +269,7 @@ StatusWith<ResolvedView> resolveView(OperationContext* opCtx,
             curOp->debug().addResolvedViews(dependencyChain, resolvedPipeline);
 
             return StatusWith<ResolvedView>(
-                {*resolvedNss, std::move(resolvedPipeline), std::move(collation.get())});
+                {*resolvedNss, std::move(resolvedPipeline), std::move(collation.value())});
         }
     }
 

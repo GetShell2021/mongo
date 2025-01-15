@@ -27,8 +27,7 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <arpa/inet.h>
 #include <cstddef>
 #include <curl/curl.h>
 #include <curl/easy.h>
@@ -47,21 +46,25 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/executor/connection_pool.h"
 #include "mongo/executor/connection_pool_stats.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/logv2/log.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/alarm.h"
 #include "mongo/util/alarm_runner_background_thread.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/http_client.h"
+#include "mongo/util/net/http_client_options.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/strong_weak_finish_line.h"
 #include "mongo/util/system_clock_source.h"
 #include "mongo/util/timer.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 namespace mongo {
 
@@ -159,18 +162,38 @@ size_t WriteMemoryCallback(void* ptr, size_t size, size_t nmemb, void* data) {
  */
 size_t ReadMemoryCallback(char* buffer, size_t size, size_t nitems, void* instream) {
 
-    auto* cdrc = reinterpret_cast<ConstDataRangeCursor*>(instream);
+    auto* bufReader = reinterpret_cast<BufReader*>(instream);
 
     size_t ret = 0;
 
-    if (cdrc->length() > 0) {
-        size_t readSize = std::min(size * nitems, cdrc->length());
-        memcpy(buffer, cdrc->data(), readSize);
-        invariant(cdrc->advanceNoThrow(readSize).isOK());
+    if (bufReader->remaining() > 0) {
+        size_t readSize =
+            std::min(size * nitems, static_cast<unsigned long>(bufReader->remaining()));
+        auto buf = bufReader->readBytes(readSize);
+        memcpy(buffer, buf.rawData(), readSize);
         ret = readSize;
     }
 
     return ret;
+}
+
+/**
+ * Seek into for data to the remote side
+ */
+size_t SeekMemoryCallback(void* clientp, curl_off_t offset, int origin) {
+
+    // Curl will call this in readrewind but only to reset the stream to the beginning
+    // In other protocols (like FTP, SSH) or HTTP resumption they may ask for partial buffers which
+    // we do not support.
+    if (offset != 0 || origin != SEEK_SET) {
+        return CURL_SEEKFUNC_CANTSEEK;
+    }
+
+    auto* bufReader = reinterpret_cast<BufReader*>(clientp);
+
+    bufReader->rewindToStart();
+
+    return CURL_SEEKFUNC_OK;
 }
 
 struct CurlEasyCleanup {
@@ -194,6 +217,47 @@ using CurlSlist = std::unique_ptr<curl_slist, CurlSlistFreeAll>;
 
 long longSeconds(Seconds tm) {
     return static_cast<long>(durationCount<Seconds>(tm));
+}
+
+
+StringData enumToString(curl_infotype type) {
+    switch (type) {
+        case CURLINFO_TEXT:
+            return "TEXT"_sd;
+        case CURLINFO_HEADER_IN:
+            return "HEADER_IN"_sd;
+        case CURLINFO_HEADER_OUT:
+            return "HEADER_OUT"_sd;
+        case CURLINFO_DATA_IN:
+            return "DATA_IN"_sd;
+        case CURLINFO_DATA_OUT:
+            return "DATA_OUT"_sd;
+        case CURLINFO_SSL_DATA_IN:
+            return "SSL_DATA_IN"_sd;
+        case CURLINFO_SSL_DATA_OUT:
+            return "SSL_DATA_OUT"_sd;
+        default:
+            return "unknown"_sd;
+    }
+}
+
+int curlDebugCallback(CURL* handle, curl_infotype type, char* data, size_t size, void* clientp) {
+    switch (type) {
+        case CURLINFO_TEXT:
+        case CURLINFO_HEADER_IN:
+        case CURLINFO_HEADER_OUT:
+        case CURLINFO_DATA_IN:
+        case CURLINFO_DATA_OUT:
+            LOGV2_DEBUG(7661901,
+                        1,
+                        "Curl",
+                        "type"_attr = enumToString(type),
+                        "message"_attr = StringData(data, size));
+            [[fallthrough]];
+
+        default:
+            return 0;
+    }
 }
 
 CurlEasyHandle createCurlEasyHandle(Protocols protocol) {
@@ -226,9 +290,10 @@ CurlEasyHandle createCurlEasyHandle(Protocols protocol) {
     }
 
     // TODO: CURLOPT_EXPECT_100_TIMEOUT_MS?
-    // TODO: consider making this configurable, defaults to stderr
-    // curl_easy_setopt(handle.get(), CURLOPT_VERBOSE, 1);
-    // curl_easy_setopt(_handle.get(), CURLOPT_DEBUGFUNCTION , ???);
+    if (httpClientOptions.verboseLogging.loadRelaxed()) {
+        curl_easy_setopt(handle.get(), CURLOPT_VERBOSE, 1);
+        curl_easy_setopt(handle.get(), CURLOPT_DEBUGFUNCTION, curlDebugCallback);
+    }
 
     return handle;
 }
@@ -250,7 +315,7 @@ public:
     explicit CurlHandleTimer(ClockSource* clockSource, std::shared_ptr<AlarmScheduler> scheduler)
         : _clockSource(clockSource), _scheduler(std::move(scheduler)), _handle(nullptr) {}
 
-    virtual ~CurlHandleTimer() {
+    ~CurlHandleTimer() override {
         if (_handle) {
             _handle->cancel().ignore();
         }
@@ -379,7 +444,7 @@ public:
           _protocol(protocol) {}
 
 
-    virtual ~PooledCurlHandle() = default;
+    ~PooledCurlHandle() override = default;
 
     const HostAndPort& getHostAndPort() const final {
         return _target;
@@ -593,6 +658,9 @@ class CurlHttpClient final : public HttpClient {
 public:
     CurlHttpClient(HttpConnectionPool pool) : _pool(pool) {}
 
+    CurlHttpClient(const std::vector<CIDR>& cidrDenyList)
+        : _pool(HttpConnectionPool::kUse), _cidrDenyList(cidrDenyList) {}
+
     void allowInsecureHTTP(bool allow) final {
         _allowInsecure = allow;
     }
@@ -634,38 +702,107 @@ public:
     }
 
 private:
+    static curl_socket_t staticBlockCidrDenyList(void* clientp,
+                                                 curlsocktype purpose,
+                                                 struct curl_sockaddr* address) {
+        CurlHttpClient* client = static_cast<CurlHttpClient*>(clientp);
+        return client->blockCidrDenyList(address);
+    }
+
+    curl_socket_t blockCidrDenyList(struct curl_sockaddr* address) {
+        std::vector<char> ipAddress(address->addrlen);
+
+        switch (address->addr.sa_family) {
+            case AF_INET: {
+                struct sockaddr_in* ipv4 = reinterpret_cast<struct sockaddr_in*>(&address->addr);
+                auto result =
+                    inet_ntop(AF_INET, &(ipv4->sin_addr), ipAddress.data(), address->addrlen);
+                if (!result) {
+                    return CURL_SOCKET_BAD;
+                }
+                break;
+            }
+            case AF_INET6: {
+                struct sockaddr_in6* ipv6 = reinterpret_cast<struct sockaddr_in6*>(&address->addr);
+                auto result =
+                    inet_ntop(AF_INET6, &(ipv6->sin6_addr), ipAddress.data(), address->addrlen);
+                if (!result) {
+                    return CURL_SOCKET_BAD;
+                }
+                break;
+            }
+            default:
+                return CURL_SOCKET_BAD;
+        }
+
+        auto destinationAsCIDR = CIDR::parse(ipAddress.data());
+        if (!destinationAsCIDR.isOK()) {
+            return CURL_SOCKET_BAD;
+        }
+        for (const CIDR& cidr : _cidrDenyList) {
+            if (cidr.contains(destinationAsCIDR.getValue())) {
+                return CURL_SOCKET_BAD;
+            }
+        }
+        return socket(address->family, address->socktype, address->protocol);
+    }
+
+    void updateHandleForBufferData(CURL* handle, BufReader* bufReader) const {
+        curl_easy_setopt(handle, CURLOPT_READFUNCTION, ReadMemoryCallback);
+        curl_easy_setopt(handle, CURLOPT_READDATA, bufReader);
+
+        curl_easy_setopt(handle, CURLOPT_SEEKFUNCTION, SeekMemoryCallback);
+        curl_easy_setopt(handle, CURLOPT_SEEKDATA, bufReader);
+    }
+
     HttpReply request(CURL* handle, HttpMethod method, StringData url, ConstDataRange cdr) const {
         uassert(ErrorCodes::InternalError, "Curl initialization failed", handle);
+
+        if (!_cidrDenyList.empty()) {
+            curl_easy_setopt(
+                handle, CURLOPT_OPENSOCKETFUNCTION, &CurlHttpClient::staticBlockCidrDenyList);
+            curl_easy_setopt(handle, CURLOPT_OPENSOCKETDATA, this);
+        }
 
         curl_easy_setopt(handle, CURLOPT_TIMEOUT, longSeconds(_timeout));
 
         curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT, longSeconds(_connectTimeout));
 
-        ConstDataRangeCursor cdrc(cdr);
+        BufReader bufReader(cdr.data(), cdr.length());
         switch (method) {
             case HttpMethod::kGET:
                 uassert(ErrorCodes::BadValue,
                         "Request body not permitted with GET requests",
                         cdr.length() == 0);
-                // Per https://curl.se/libcurl/c/CURLOPT_POST.html
-                // We need to reset the type of request we want to make when reusing the request
+                // Per https://curl.se/libcurl/c/CURLOPT_CUSTOMREQUEST.html
+                // We need to explicitly unset CURLOPT_CUSTOMREQUEST when reusing the request
+                curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, NULL);
                 curl_easy_setopt(handle, CURLOPT_HTTPGET, 1);
                 break;
             case HttpMethod::kPOST:
-                curl_easy_setopt(handle, CURLOPT_PUT, 0);
+                curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, NULL);
                 curl_easy_setopt(handle, CURLOPT_POST, 1);
-
-                curl_easy_setopt(handle, CURLOPT_READFUNCTION, ReadMemoryCallback);
-                curl_easy_setopt(handle, CURLOPT_READDATA, &cdrc);
-                curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, (long)cdrc.length());
+                updateHandleForBufferData(handle, &bufReader);
+                curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, (long)bufReader.remaining());
                 break;
             case HttpMethod::kPUT:
-                curl_easy_setopt(handle, CURLOPT_POST, 0);
+                curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, NULL);
                 curl_easy_setopt(handle, CURLOPT_PUT, 1);
-
-                curl_easy_setopt(handle, CURLOPT_READFUNCTION, ReadMemoryCallback);
-                curl_easy_setopt(handle, CURLOPT_READDATA, &cdrc);
-                curl_easy_setopt(handle, CURLOPT_INFILESIZE_LARGE, (long)cdrc.length());
+                updateHandleForBufferData(handle, &bufReader);
+                curl_easy_setopt(handle, CURLOPT_UPLOAD, 1L);
+                curl_easy_setopt(handle, CURLOPT_INFILESIZE_LARGE, (long)bufReader.remaining());
+                break;
+            case HttpMethod::kPATCH:
+                curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, "PATCH");
+                updateHandleForBufferData(handle, &bufReader);
+                curl_easy_setopt(handle, CURLOPT_UPLOAD, 1L);
+                curl_easy_setopt(handle, CURLOPT_INFILESIZE_LARGE, (long)bufReader.remaining());
+                break;
+            case HttpMethod::kDELETE:
+                uassert(ErrorCodes::BadValue,
+                        "Request body not permitted with DELETE requests",
+                        cdr.length() == 0);
+                curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, "DELETE");
                 break;
             default:
                 MONGO_UNREACHABLE;
@@ -708,6 +845,8 @@ private:
     HttpConnectionPool _pool;
 
     bool _allowInsecure{false};
+
+    std::vector<CIDR> _cidrDenyList;
 };
 
 class HttpClientProviderImpl : public HttpClientProvider {
@@ -724,6 +863,11 @@ public:
     std::unique_ptr<HttpClient> createWithoutConnectionPool() final {
         invariant(curlLibraryManager.isInitialized());
         return std::make_unique<CurlHttpClient>(HttpConnectionPool::kDoNotUse);
+    }
+
+    std::unique_ptr<HttpClient> createWithFirewall(const std::vector<CIDR>& cidrDenyList) final {
+        invariant(curlLibraryManager.isInitialized());
+        return std::make_unique<CurlHttpClient>(cidrDenyList);
     }
 
     BSONObj getServerStatus() final {

@@ -28,9 +28,15 @@
  */
 #pragma once
 
+#include <functional>
 #include <memory>
+#include <vector>
 
+#include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/client/sdam/topology_manager.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/future.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo::sdam {
 
@@ -49,7 +55,7 @@ public:
         override;
 
 private:
-    mutable mongo::Mutex _mutex = MONGO_MAKE_LATCH("MockTopologyManager");
+    mutable mongo::stdx::mutex _mutex;
     TopologyDescriptionPtr _topologyDescription;
 };
 

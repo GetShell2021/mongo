@@ -29,7 +29,19 @@
 
 #pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream_check_resumability.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
 
 namespace mongo {
 /**
@@ -39,7 +51,8 @@ namespace mongo {
 class DocumentSourceChangeStreamEnsureResumeTokenPresent final
     : public DocumentSourceChangeStreamCheckResumability {
 public:
-    static constexpr StringData kStageName = "$_internalChangeStreamEnsureResumeTokenPresent"_sd;
+    static constexpr StringData kStageName =
+        change_stream_constants::stage_names::kEnsureResumeTokenPresent;
 
     const char* getSourceName() const final;
 
@@ -47,14 +60,14 @@ public:
 
     GetModPathsReturn getModifiedPaths() const final {
         // This stage neither modifies nor renames any field.
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {}};
     }
 
     static boost::intrusive_ptr<DocumentSourceChangeStreamEnsureResumeTokenPresent> create(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const DocumentSourceChangeStreamSpec& spec);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value doSerialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
 private:
     /**

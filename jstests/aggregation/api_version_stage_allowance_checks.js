@@ -9,11 +9,9 @@
  *   assumes_unsharded_collection,
  *   do_not_wrap_aggregations_in_facets,
  *   uses_api_parameters,
+ *   requires_fcv_81,
  * ]
  */
-(function() {
-"use strict";
-
 const dbName = jsTestName();
 const testDB = db.getSiblingDB(dbName);
 testDB.dropDatabase();
@@ -43,11 +41,11 @@ let result = curDB.runCommand({
             remotes: [],
             nss: "test.mergeCursors",
             allowPartialResults: false,
-            recordRemoteOpWaitTime: false
         }
     }],
     cursor: {},
     writeConcern: {w: "majority"},
+    readConcern: {},
     apiVersion: "1",
     apiStrict: true
 });
@@ -64,7 +62,6 @@ result = testDB.runCommand({
             remotes: [],
             nss: "test.mergeCursors",
             allowPartialResults: false,
-            recordRemoteOpWaitTime: false
         }
     }],
     cursor: {},
@@ -85,7 +82,6 @@ result = testDB.runCommand({
             remotes: [],
             nss: "test.mergeCursors",
             allowPartialResults: false,
-            recordRemoteOpWaitTime: false
         }
     }],
     cursor: {},
@@ -107,7 +103,7 @@ result = testDB.runCommand({
 });
 assert.commandFailedWithCode(result, ErrorCodes.APIStrictError);
 
-// Tests that the 'fromMongos' option cannot be specified by external client with 'apiStrict' set to
+// Tests that the 'fromRouter' option cannot be specified by external client with 'apiStrict' set to
 // true.
 result = testDB.runCommand({
     aggregate: collName,
@@ -116,40 +112,29 @@ result = testDB.runCommand({
     writeConcern: {w: "majority"},
     apiVersion: "1",
     apiStrict: true,
-    fromMongos: true
+    fromRouter: true
 });
 assert.commandFailedWithCode(result, ErrorCodes.APIStrictError);
 
-// Tests that the 'fromMongos' option should not fail by internal client with 'apiStrict' set to
+// Tests that the 'fromRouter' option should not fail by internal client with 'apiStrict' set to
 // true.
 result = curDB.runCommand({
     aggregate: collName,
     pipeline: [{$project: {_id: 0}}],
     cursor: {},
     writeConcern: {w: "majority"},
+    readConcern: {},
     apiVersion: "1",
     apiStrict: true
 });
 assert.commandWorked(result);
 
-// Tests that the 'fromMongos' option should not fail by external client without 'apiStrict'.
+// Tests that the 'fromRouter' option should not fail by external client without 'apiStrict'.
 result = testDB.runCommand({
     aggregate: collName,
     pipeline: [{$project: {_id: 0}}],
     cursor: {},
     writeConcern: {w: "majority"},
-    apiVersion: "1",
-    apiStrict: true
-});
-assert.commandWorked(result);
-
-// Tests that the internal '$_generateV2ResumeTokens' option does not fail with 'apiStrict: true'.
-result = testDB.runCommand({
-    aggregate: collName,
-    pipeline: [{$project: {_id: 0}}],
-    cursor: {},
-    writeConcern: {w: "majority"},
-    $_generateV2ResumeTokens: false,
     apiVersion: "1",
     apiStrict: true
 });
@@ -178,5 +163,4 @@ assert.commandWorked(result);
     const plans = [coll.find().explain(), coll.explain().aggregate([{$match: {}}])];
     assert(plans.every(
         plan => plan.stages.map(x => Object.keys(x)[0]).includes("$_internalUnpackBucket")));
-})();
 })();

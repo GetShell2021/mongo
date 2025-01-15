@@ -29,10 +29,20 @@
 
 #pragma once
 
+#include <cstdint>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -56,15 +66,6 @@ inline Status validateDefaultWriteConcernHasMember(const WriteConcernOptions& de
 
     return Status::OK();
 }
-
-inline Status validateReplSetNameNonEmpty(StringData replSetName) {
-    if (replSetName.empty()) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "Replica set configuration must have non-empty _id field");
-    }
-    return Status::OK();
-}
-
 
 Status validateReplicaSetIdNotNull(OID replicaSetId);
 

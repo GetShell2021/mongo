@@ -28,11 +28,31 @@
  */
 
 
+#include <memory>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -68,23 +88,24 @@ public:
             const auto nss = ns();
             const auto& req = request();
 
-            // TODO SERVER-64926 do not assume min always present
-            uassert(ErrorCodes::InvalidOptions, "Missing required parameter 'min'", req.getMin());
+            uassert(ErrorCodes::InvalidOptions,
+                    "Missing required parameter 'min' or 'max'",
+                    req.getMin() || req.getMax());
 
             ConfigsvrMoveRange configsvrRequest(nss);
-            configsvrRequest.setDbName(NamespaceString::kAdminDb);
+            configsvrRequest.setDbName(DatabaseName::kAdmin);
             configsvrRequest.setMoveRangeRequestBase(req.getMoveRangeRequestBase());
             configsvrRequest.setForceJumbo(request().getForceJumbo() ? ForceJumbo::kForceManual
                                                                      : ForceJumbo::kDoNotForce);
+            configsvrRequest.setWriteConcern(opCtx->getWriteConcern());
 
             auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-            const auto commandResponse = uassertStatusOK(configShard->runCommand(
-                opCtx,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                NamespaceString::kAdminDb.toString(),
-                configsvrRequest.toBSON(BSON(WriteConcernOptions::kWriteConcernField
-                                             << opCtx->getWriteConcern().toBSON())),
-                Shard::RetryPolicy::kIdempotent));
+            const auto commandResponse = uassertStatusOK(
+                configShard->runCommand(opCtx,
+                                        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                        DatabaseName::kAdmin,
+                                        configsvrRequest.toBSON(),
+                                        Shard::RetryPolicy::kIdempotent));
 
             uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(commandResponse));
         }
@@ -102,11 +123,12 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                        ->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns()),
                                                            ActionType::moveChunk));
         }
     };
-} moveRange;
+};
+MONGO_REGISTER_COMMAND(ClusterMoveRangeCommand).forRouter();
 
 }  // namespace
 }  // namespace mongo

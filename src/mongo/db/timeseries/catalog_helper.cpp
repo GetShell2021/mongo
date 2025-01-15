@@ -27,11 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
 
-#include "mongo/db/timeseries/catalog_helper.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/timeseries/catalog_helper.h"
 
 namespace mongo {
 
@@ -41,8 +44,9 @@ boost::optional<TimeseriesOptions> getTimeseriesOptions(OperationContext* opCtx,
                                                         const NamespaceString& nss,
                                                         bool convertToBucketsNamespace) {
     auto bucketsNs = convertToBucketsNamespace ? nss.makeTimeseriesBucketsNamespace() : nss;
-    auto bucketsColl =
-        CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForRead(opCtx, bucketsNs);
+    // Hold reference to the catalog for collection lookup without locks to be safe.
+    auto catalog = CollectionCatalog::get(opCtx);
+    auto bucketsColl = catalog->lookupCollectionByNamespace(opCtx, bucketsNs);
     if (!bucketsColl) {
         return boost::none;
     }

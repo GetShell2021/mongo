@@ -5,17 +5,23 @@
  * @tags: [requires_wiredtiger, requires_replication]
  */
 
-(function() {
-
-load('jstests/disk/libs/wt_file_helper.js');
-load('jstests/noPassthrough/libs/index_build.js');
+import {
+    assertErrorOnStartupWhenStartingAsReplSet,
+    assertRepairSucceeds,
+    assertStartInReplSet,
+    corruptFile,
+    getUriForColl,
+    startMongodOnExistingPath,
+} from "jstests/disk/libs/wt_file_helper.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {IndexBuildTest} from "jstests/noPassthrough/libs/index_build.js";
 
 const dbName = "repair_unfinished_indexes";
 const collName = "test";
 
 const replSet = new ReplSetTest({nodes: 2});
 replSet.startSet();
-replSet.initiate();
+replSet.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 const primary = replSet.getPrimary();
 const primaryDB = primary.getDB(dbName);
@@ -92,4 +98,3 @@ assertErrorOnStartupWhenStartingAsReplSet(
 })();
 
 replSet.stopSet();
-})();

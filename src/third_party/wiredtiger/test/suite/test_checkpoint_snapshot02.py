@@ -162,13 +162,13 @@ class test_checkpoint_snapshot02(wttest.WiredTigerTestCase):
         try:
             ckpt.start()
 
-            # Wait for checkpoint to start before committing.
-            ckpt_started = 0
-            while not ckpt_started:
-                stat_cursor = self.session.open_cursor('statistics:', None, None)
-                ckpt_started = stat_cursor[stat.conn.txn_checkpoint_running][2]
-                stat_cursor.close()
+            # Wait for checkpoint to start and acquire its snapshot before committing.
+            ckpt_snapshot = 0
+            while not ckpt_snapshot:
                 time.sleep(1)
+                stat_cursor = self.session.open_cursor('statistics:', None, None)
+                ckpt_snapshot = stat_cursor[stat.conn.checkpoint_snapshot_acquired][2]
+                stat_cursor.close()
 
             session1.commit_transaction()
 
@@ -223,13 +223,13 @@ class test_checkpoint_snapshot02(wttest.WiredTigerTestCase):
         try:
             ckpt.start()
 
-            # Wait for checkpoint to start before committing.
-            ckpt_started = 0
-            while not ckpt_started:
-                stat_cursor = self.session.open_cursor('statistics:', None, None)
-                ckpt_started = stat_cursor[stat.conn.txn_checkpoint_running][2]
-                stat_cursor.close()
+            # Wait for checkpoint to start and acquire its snapshot before committing.
+            ckpt_snapshot = 0
+            while not ckpt_snapshot:
                 time.sleep(1)
+                stat_cursor = self.session.open_cursor('statistics:', None, None)
+                ckpt_snapshot = stat_cursor[stat.conn.checkpoint_snapshot_acquired][2]
+                stat_cursor.close()
 
             session1.commit_transaction()
 
@@ -250,6 +250,7 @@ class test_checkpoint_snapshot02(wttest.WiredTigerTestCase):
         self.assertGreater(inconsistent_ckpt, 0)
         self.assertGreaterEqual(keys_removed, 0)
 
+    @wttest.skip_for_hook("tiered", "Fails with tiered storage")
     def test_checkpoint_snapshot_with_txnid_and_timestamp(self):
         self.moresetup()
 
@@ -286,14 +287,14 @@ class test_checkpoint_snapshot02(wttest.WiredTigerTestCase):
         ckpt = checkpoint_thread(self.conn, done)
         try:
             ckpt.start()
-            
-            # Wait for checkpoint to start before committing.
-            ckpt_started = 0
-            while not ckpt_started:
-                stat_cursor = self.session.open_cursor('statistics:', None, None)
-                ckpt_started = stat_cursor[stat.conn.txn_checkpoint_running][2]
-                stat_cursor.close()
+
+            # Wait for checkpoint to start and acquire its snapshot before committing.
+            ckpt_snapshot = 0
+            while not ckpt_snapshot:
                 time.sleep(1)
+                stat_cursor = self.session.open_cursor('statistics:', None, None)
+                ckpt_snapshot = stat_cursor[stat.conn.checkpoint_snapshot_acquired][2]
+                stat_cursor.close()
 
             session2.commit_transaction()
 
@@ -328,6 +329,3 @@ class test_checkpoint_snapshot02(wttest.WiredTigerTestCase):
 
         self.assertGreaterEqual(inconsistent_ckpt, 0)
         self.assertEqual(keys_removed, 0)
-
-if __name__ == '__main__':
-    wttest.run()

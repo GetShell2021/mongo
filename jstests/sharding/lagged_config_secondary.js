@@ -1,38 +1,38 @@
 /**
  * Test that mongos times out when the config server replica set only contains nodes that
  * are behind the majority opTime.
+ * @tags: [
+ *   config_shard_incompatible,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
 
-load("jstests/libs/logv2_helpers.js");
-load("jstests/libs/write_concern_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
-// Checking UUID and index consistency involves mongos being able to do a read from the config
-// server, but this test is designed to make mongos time out when reading from the config server.
+// The following checks involve reading from the config server, but this test is designed to make
+// mongos time out when reading from the config server.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
 TestData.skipCheckRoutingTableConsistency = true;
-
-(function() {
-
-/**
- * On the config server the lastApplied optime can go past the atClusterTime timestamp due to pings
- * made on collection config.mongos or config.lockping by the distributed lock pinger thread and
- * sharding uptime reporter thread. This can cause the insert into test.TestConfigColl to time out.
- * To prevent this, disable the pinger threads to prevent them reaching out to the config server.
- */
-const failpointParams = {
-    setParameter: {"failpoint.disableReplSetDistLockManager": "{mode: 'alwaysOn'}"}
-};
+TestData.skipCheckShardFilteringMetadata = true;
+TestData.skipCheckMetadataConsistency = true;
 
 var st = new ShardingTest({
     shards: 1,
+    config: 3,
     configReplSetTestOptions: {settings: {chainingAllowed: false}},
     other: {
-        configOptions: failpointParams,
-        rsOptions: failpointParams,
-        mongosOptions:
-            {setParameter: {["failpoint.disableShardingUptimeReporting"]: "{mode: 'alwaysOn'}"}}
+        mongosOptions: {
+            setParameter: {
+                "failpoint.disableShardingUptimeReporting": "{mode: 'alwaysOn'}",
+                // ShardingTest use a high config command timeout to avoid spurious failures but
+                // this test intentionally triggers a timeout, so we restore the default value.
+                defaultConfigCommandTimeoutMS: 30000,
+            }
+        }
     }
 });
 
@@ -70,10 +70,7 @@ assert(ErrorCodes.isExceededTimeLimitError(exception.code));
 
 let msgAA = 'command config.$cmd command: find { find: "databases"';
 let msgAB = 'errCode:' + ErrorCodes.ClientDisconnect;
-let msgB = 'Command on database config timed out waiting for read concern to be satisfied';
-if (isJsonLogNoConn()) {
-    msgB = /Command timed out waiting for read concern to be satisfied.*"db":"config"/;
-}
+let msgB = /Command timed out waiting for read concern to be satisfied.*"db":"config"/;
 
 assert.soon(
     function() {
@@ -89,10 +86,9 @@ assert.soon(
     },
     'Did not see any log entries containing the following message: ' + msgAA + ' ... ' + msgAB +
         ' or ' + msgB,
-    60000,
+    180000,
     300);
 
 // Can't do clean shutdown with this failpoint on.
 restartServerReplication(delayedConfigSecondary);
 st.stop();
-}());

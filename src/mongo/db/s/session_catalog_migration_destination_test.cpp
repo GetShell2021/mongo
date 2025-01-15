@@ -27,37 +27,72 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <fmt/format.h>
 #include <memory>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/initialize_operation_session_info.h"
-#include "mongo/db/logical_session_cache_noop.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/ops/write_ops_exec.h"
-#include "mongo/db/ops/write_ops_gen.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops_exec.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/optime_with.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
-#include "mongo/db/server_options.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_history_iterator.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/executor/remote_command_request.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace {
@@ -74,7 +109,7 @@ const ConnectionString kConfigConnStr =
 const ConnectionString kDonorConnStr =
     ConnectionString::forReplicaSet("donor", {HostAndPort("donor:1")});
 const ShardId kFromShard("donor");
-const NamespaceString kNs("a.b");
+const NamespaceString kNs = NamespaceString::createNamespaceString_forTest("a.b");
 
 /**
  * Creates an OplogEntry with given parameters and preset defaults for this test suite.
@@ -92,11 +127,11 @@ repl::OplogEntry makeOplogEntry(
     boost::optional<repl::RetryImageEnum> needsRetryImage = boost::none) {
     return {
         repl::DurableOplogEntry(opTime,          // optime
-                                0,               // hash
                                 opType,          // opType
                                 kNs,             // namespace
                                 boost::none,     // uuid
                                 boost::none,     // fromMigrate
+                                boost::none,     // checkExistenceForDiffInsert
                                 0,               // version
                                 object,          // o
                                 object2,         // o2
@@ -138,7 +173,8 @@ public:
         // onStepUp() relies on the storage interface to create the config.transactions table.
         repl::StorageInterface::set(getServiceContext(),
                                     std::make_unique<repl::StorageInterfaceImpl>());
-        MongoDSessionCatalog::onStepUp(operationContext());
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(operationContext());
+        mongoDSessionCatalog->onStepUp(operationContext());
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
 
         setUnshardedFilteringMetadata(kNs);
@@ -178,10 +214,13 @@ public:
                              const TxnNumber& txnNum) {
         opCtx->setLogicalSessionId(sessionId);
         opCtx->setTxnNumber(txnNum);
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNum}, boost::none /* autocommit */, boost::none /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNum},
+                                       boost::none /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kNone);
     }
 
     void checkOplog(const repl::OplogEntry& originalOplog, const repl::OplogEntry& oplogToCheck) {
@@ -207,16 +246,15 @@ public:
 
     void checkStatementExecuted(OperationContext* opCtx, TxnNumber txnNumber, StmtId stmtId) {
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        auto oplog = txnParticipant.checkStatementExecuted(opCtx, stmtId);
-        ASSERT_TRUE(oplog);
+        ASSERT(txnParticipant.checkStatementExecuted(opCtx, stmtId));
     }
 
-    void checkStatementExecuted(OperationContext* opCtx,
-                                TxnNumber txnNumber,
-                                StmtId stmtId,
-                                const repl::OplogEntry& expectedOplog) {
+    void checkStatementExecutedAndCheckOplogEntry(OperationContext* opCtx,
+                                                  TxnNumber txnNumber,
+                                                  StmtId stmtId,
+                                                  const repl::OplogEntry& expectedOplog) {
         const auto txnParticipant = TransactionParticipant::get(opCtx);
-        auto oplog = txnParticipant.checkStatementExecuted(opCtx, stmtId);
+        auto oplog = txnParticipant.checkStatementExecutedAndFetchOplogEntry(opCtx, stmtId);
         ASSERT_TRUE(oplog);
         checkOplogWithNestedOplog(expectedOplog, *oplog);
     }
@@ -239,19 +277,32 @@ public:
             insertRequest.setWriteCommandRequestBase(cmdBase);
 
             BSONObjBuilder insertBuilder;
-            insertRequest.serialize({}, &insertBuilder);
+            insertRequest.serialize(&insertBuilder);
             sessionInfo.serialize(&insertBuilder);
 
-            Client::initThread("test-insert-thread");
+            Client::initThread("test-insert-thread", getGlobalServiceContext()->getService());
             auto innerOpCtx = Client::getCurrent()->makeOperationContext();
 
-            initializeOperationSessionInfo(innerOpCtx.get(), insertBuilder.obj(), true, true, true);
-            MongoDOperationContextSession sessionTxnState(innerOpCtx.get());
+            auto opMsgRequest = OpMsgRequestBuilder::create(
+                auth::ValidatedTenancyScope::kNotRequired,
+                DatabaseName::createDatabaseName_forTest(boost::none, "test_unused_dbname"),
+                insertBuilder.obj(),
+                BSONObj());
+            auto osi = OperationSessionInfoFromClient::parse(
+                IDLParserContext{"OperationSessionInfo"}, opMsgRequest.body);
+            initializeOperationSessionInfo(innerOpCtx.get(),
+                                           opMsgRequest.getValidatedTenantId(),
+                                           osi,
+                                           true /* requiresAuth */,
+                                           true /* attachToOpCtx */,
+                                           true /* isReplSetMemberOrMongos */);
+            auto mongoDSessionCatalog = MongoDSessionCatalog::get(innerOpCtx.get());
+            auto sessionTxnState = mongoDSessionCatalog->checkOutSession(innerOpCtx.get());
             auto txnParticipant = TransactionParticipant::get(innerOpCtx.get());
             txnParticipant.beginOrContinue(innerOpCtx.get(),
                                            {*sessionInfo.getTxnNumber()},
                                            boost::none /* autocommit */,
-                                           boost::none /* startTransaction */);
+                                           TransactionParticipant::TransactionActions::kNone);
 
             const auto reply = write_ops_exec::performInserts(innerOpCtx.get(), insertRequest);
             ASSERT(reply.results.size() == 1);
@@ -274,9 +325,10 @@ public:
     }
 
     void setUnshardedFilteringMetadata(const NamespaceString& nss) {
-        AutoGetDb autoDb(operationContext(), nss.db(), MODE_IX);
+        AutoGetDb autoDb(operationContext(), nss.dbName(), MODE_IX);
         Lock::CollectionLock collLock(operationContext(), nss, MODE_IX);
-        CollectionShardingRuntime::get(operationContext(), nss)
+        CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(operationContext(),
+                                                                             nss)
             ->setFilteringMetadata(operationContext(), CollectionMetadata());
     }
 
@@ -289,7 +341,9 @@ private:
             StaticCatalogClient() = default;
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
-                OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
+                OperationContext* opCtx,
+                repl::ReadConcernLevel readConcern,
+                bool excludeDraining) override {
 
                 ShardType donorShard;
                 donorShard.setName(kDonorConnStr.getSetName());
@@ -334,6 +388,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldJoinProperlyWhenNothingToTr
 
     sessionMigration.start(getServiceContext());
     finishSessionExpectSuccess(&sessionMigration);
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 0);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxn) {
@@ -375,8 +430,10 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxn) {
 
     finishSessionExpectSuccess(&sessionMigration);
     auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 3);
     setUpSessionWithTxn(opCtx, sessionId, 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
@@ -392,9 +449,9 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxn) {
 
     ASSERT_FALSE(historyIter.hasNext());
 
-    checkStatementExecuted(opCtx, 2, 23, oplog1);
-    checkStatementExecuted(opCtx, 2, 45, oplog2);
-    checkStatementExecuted(opCtx, 2, 5, oplog3);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 23, oplog1);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 45, oplog2);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 5, oplog3);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithMultiStmtIds) {
@@ -436,8 +493,10 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithMultiStmtIds) {
 
     finishSessionExpectSuccess(&sessionMigration);
     auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 3);
     setUpSessionWithTxn(opCtx, sessionId, 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
@@ -453,12 +512,12 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithMultiStmtIds) {
 
     ASSERT_FALSE(historyIter.hasNext());
 
-    checkStatementExecuted(opCtx, 2, 23, oplog1);
-    checkStatementExecuted(opCtx, 2, 24, oplog1);
-    checkStatementExecuted(opCtx, 2, 45, oplog2);
-    checkStatementExecuted(opCtx, 2, 46, oplog2);
-    checkStatementExecuted(opCtx, 2, 5, oplog3);
-    checkStatementExecuted(opCtx, 2, 6, oplog3);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 23, oplog1);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 24, oplog1);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 45, oplog2);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 46, oplog2);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 5, oplog3);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 6, oplog3);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldOnlyStoreHistoryOfLatestTxn) {
@@ -505,7 +564,9 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldOnlyStoreHistoryOfLatestTxn
 
     auto opCtx = operationContext();
     setUpSessionWithTxn(opCtx, sessionId, txnNum);
-    MongoDOperationContextSession ocs(opCtx);
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 3);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
@@ -514,7 +575,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldOnlyStoreHistoryOfLatestTxn
     checkOplogWithNestedOplog(oplog3, historyIter.next(opCtx));
     ASSERT_FALSE(historyIter.hasNext());
 
-    checkStatementExecuted(opCtx, txnNum, 5, oplog3);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, txnNum, 5, oplog3);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxnInSeparateBatches) {
@@ -559,8 +620,10 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxnInSeparate
     finishSessionExpectSuccess(&sessionMigration);
 
     auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 3);
     setUpSessionWithTxn(opCtx, sessionId, 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
@@ -576,9 +639,9 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithSameTxnInSeparate
 
     ASSERT_FALSE(historyIter.hasNext());
 
-    checkStatementExecuted(opCtx, 2, 23, oplog1);
-    checkStatementExecuted(opCtx, 2, 45, oplog2);
-    checkStatementExecuted(opCtx, 2, 5, oplog3);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 23, oplog1);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 45, oplog2);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 5, oplog3);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithDifferentSession) {
@@ -624,14 +687,16 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithDifferentSession)
     returnOplog({oplog1, oplog2, oplog3});
 
     finishSessionExpectSuccess(&sessionMigration);
+    auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 3);
 
     ASSERT_TRUE(SessionCatalogMigrationDestination::State::Done == sessionMigration.getState());
 
-    auto opCtx = operationContext();
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
 
     {
         setUpSessionWithTxn(opCtx, sessionId1, 2);
-        MongoDOperationContextSession ocs(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
 
         TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
@@ -639,16 +704,16 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithDifferentSession)
         checkOplogWithNestedOplog(oplog1, historyIter.next(opCtx));
         ASSERT_FALSE(historyIter.hasNext());
 
-        checkStatementExecuted(opCtx, 2, 23, oplog1);
+        checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 23, oplog1);
     }
 
     {
         // XXX TODO USE A DIFFERENT OPERATION CONTEXT!
-        auto client2 = getServiceContext()->makeClient("client2");
+        auto client2 = getServiceContext()->getService()->makeClient("client2");
         AlternativeClientRegion acr(client2);
         auto opCtx2 = cc().makeOperationContext();
         setUpSessionWithTxn(opCtx2.get(), sessionId2, 42);
-        MongoDOperationContextSession ocs(opCtx2.get());
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx2.get());
         auto txnParticipant = TransactionParticipant::get(opCtx2.get());
 
 
@@ -661,8 +726,8 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithDifferentSession)
 
         ASSERT_FALSE(historyIter.hasNext());
 
-        checkStatementExecuted(opCtx2.get(), 42, 45, oplog2);
-        checkStatementExecuted(opCtx2.get(), 42, 5, oplog3);
+        checkStatementExecutedAndCheckOplogEntry(opCtx2.get(), 42, 45, oplog2);
+        checkStatementExecutedAndCheckOplogEntry(opCtx2.get(), 42, 5, oplog3);
     }
 }
 
@@ -712,10 +777,12 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldNotNestAlreadyNestedOplog) 
     returnOplog({oplog1, oplog2});
 
     finishSessionExpectSuccess(&sessionMigration);
-
     auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 2);
+
     setUpSessionWithTxn(opCtx, sessionId, 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
@@ -765,10 +832,12 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePreImageFindA
     returnOplog({preImageOplog, updateOplog});
 
     finishSessionExpectSuccess(&sessionMigration);
-
     auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 2);
+
     setUpSessionWithTxn(opCtx, sessionId, 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
 
@@ -822,7 +891,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePreImageFindA
     ASSERT_TRUE(newPreImageOplog.getObject2());
     ASSERT_TRUE(newPreImageOplog.getObject2().value().isEmpty());
 
-    checkStatementExecuted(opCtx, 2, 45, updateOplog);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 45, updateOplog);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleForgedPreImageFindAndModify) {
@@ -860,10 +929,12 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleForgedPreImag
     returnOplog({preImageOplog, updateOplog});
 
     finishSessionExpectSuccess(&sessionMigration);
-
     auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 2);
+
     setUpSessionWithTxn(opCtx, sessionId, 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
 
@@ -917,7 +988,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleForgedPreImag
     ASSERT_TRUE(newPreImageOplog.getObject2());
     ASSERT_TRUE(newPreImageOplog.getObject2().value().isEmpty());
 
-    checkStatementExecuted(opCtx, 2, 45, updateOplog);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 45, updateOplog);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePostImageFindAndModify) {
@@ -952,10 +1023,12 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePostImageFind
     returnOplog({postImageOplog, updateOplog});
 
     finishSessionExpectSuccess(&sessionMigration);
-
     auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 2);
+
     setUpSessionWithTxn(opCtx, sessionId, 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
@@ -1008,7 +1081,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandlePostImageFind
     ASSERT_TRUE(newPostImageOplog.getObject2());
     ASSERT_TRUE(newPostImageOplog.getObject2().value().isEmpty());
 
-    checkStatementExecuted(opCtx, 2, 45, updateOplog);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 45, updateOplog);
 }
 
 
@@ -1045,10 +1118,12 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleForgedPostIma
     returnOplog({postImageOplog, updateOplog});
 
     finishSessionExpectSuccess(&sessionMigration);
-
     auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 2);
+
     setUpSessionWithTxn(opCtx, sessionId, 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
 
@@ -1102,7 +1177,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleForgedPostIma
     ASSERT_TRUE(newPostImageOplog.getObject2());
     ASSERT_TRUE(newPostImageOplog.getObject2().value().isEmpty());
 
-    checkStatementExecuted(opCtx, 2, 45, updateOplog);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 45, updateOplog);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleFindAndModifySplitIn2Batches) {
@@ -1138,12 +1213,14 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleFindAndModify
     returnOplog({updateOplog});
 
     finishSessionExpectSuccess(&sessionMigration);
+    auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 2);
 
     ASSERT_TRUE(SessionCatalogMigrationDestination::State::Done == sessionMigration.getState());
 
-    auto opCtx = operationContext();
     setUpSessionWithTxn(opCtx, sessionId, 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
 
@@ -1197,7 +1274,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldBeAbleToHandleFindAndModify
     ASSERT_TRUE(newPreImageOplog.getObject2());
     ASSERT_TRUE(newPreImageOplog.getObject2().value().isEmpty());
 
-    checkStatementExecuted(opCtx, 2, 45, updateOplog);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 45, updateOplog);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, OlderTxnShouldBeIgnored) {
@@ -1242,11 +1319,13 @@ TEST_F(SessionCatalogMigrationDestinationTest, OlderTxnShouldBeIgnored) {
     returnOplog({oplog1, oplog2});
 
     finishSessionExpectSuccess(&sessionMigration);
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 2);
 
     ASSERT_TRUE(SessionCatalogMigrationDestination::State::Done == sessionMigration.getState());
 
     setUpSessionWithTxn(opCtx, sessionId, 20);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
 
@@ -1311,7 +1390,8 @@ TEST_F(SessionCatalogMigrationDestinationTest, NewerTxnWriteShouldNotBeOverwritt
     finishSessionExpectSuccess(&sessionMigration);
 
     setUpSessionWithTxn(opCtx, sessionId, 20);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
@@ -1497,9 +1577,11 @@ TEST_F(SessionCatalogMigrationDestinationTest,
     returnOplog({oplog2});
 
     finishSessionExpectSuccess(&sessionMigration);
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 2);
 
     setUpSessionWithTxn(opCtx, sessionId, 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
 
@@ -1518,8 +1600,8 @@ TEST_F(SessionCatalogMigrationDestinationTest,
     ASSERT_FALSE(historyIter.hasNext());
 
     checkStatementExecuted(opCtx, 2, 0);
-    checkStatementExecuted(opCtx, 2, 23, oplog1);
-    checkStatementExecuted(opCtx, 2, 45, oplog2);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 23, oplog1);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 2, 45, oplog2);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, ShouldErrorForConsecutivePreImageOplog) {
@@ -1810,9 +1892,11 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldIgnoreAlreadyExecutedStatem
     returnOplog({oplog1, oplog2, oplog3});
 
     finishSessionExpectSuccess(&sessionMigration);
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 3);
 
     setUpSessionWithTxn(opCtx, sessionId, 19);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
@@ -1830,9 +1914,9 @@ TEST_F(SessionCatalogMigrationDestinationTest, ShouldIgnoreAlreadyExecutedStatem
     ASSERT_EQ(1, firstInsertOplog.getStatementIds().size());
     ASSERT_EQ(30, firstInsertOplog.getStatementIds().front());
 
-    checkStatementExecuted(opCtx, 19, 23, oplog1);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 19, 23, oplog1);
     checkStatementExecuted(opCtx, 19, 30);
-    checkStatementExecuted(opCtx, 19, 45, oplog3);
+    checkStatementExecutedAndCheckOplogEntry(opCtx, 19, 45, oplog3);
 }
 
 TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithIncompleteHistory) {
@@ -1879,8 +1963,10 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithIncompleteHistory
     ASSERT_TRUE(SessionCatalogMigrationDestination::State::Done == sessionMigration.getState());
 
     auto opCtx = operationContext();
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 3);
     setUpSessionWithTxn(opCtx, *sessionInfo.getSessionId(), 2);
-    MongoDOperationContextSession ocs(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
 
     TransactionHistoryIterator historyIter(txnParticipant.getLastWriteOpTime());
@@ -1897,6 +1983,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, OplogEntriesWithIncompleteHistory
 TEST_F(SessionCatalogMigrationDestinationTest,
        OplogEntriesWithOldTransactionFollowedByUpToDateEntries) {
     auto opCtx = operationContext();
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
 
     OperationSessionInfo sessionInfo1;
     sessionInfo1.setSessionId(makeLogicalSessionIdForTest());
@@ -1906,12 +1993,14 @@ TEST_F(SessionCatalogMigrationDestinationTest,
         // in TransactionTooOld. This should not preclude the entries for session 2 from getting
         // applied.
         setUpSessionWithTxn(opCtx, *sessionInfo1.getSessionId(), *sessionInfo1.getTxnNumber());
-        MongoDOperationContextSession ocs(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
 
         txnParticipant.refreshFromStorageIfNeeded(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {3}, boost::none /* autocommit */, boost::none /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {3},
+                                       boost::none /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kNone);
     }
 
     OperationSessionInfo sessionInfo2;
@@ -1958,27 +2047,28 @@ TEST_F(SessionCatalogMigrationDestinationTest,
     sessionMigration.join();
 
     ASSERT_TRUE(SessionCatalogMigrationDestination::State::Done == sessionMigration.getState());
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 3);
 
     // Check nothing was written for session 1
     {
-        auto c1 = getServiceContext()->makeClient("c1");
+        auto c1 = getServiceContext()->getService()->makeClient("c1");
         AlternativeClientRegion acr(c1);
         auto opCtx1 = cc().makeOperationContext();
         auto opCtx = opCtx1.get();
         setUpSessionWithTxn(opCtx, *sessionInfo1.getSessionId(), 3);
-        MongoDOperationContextSession ocs(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant1 = TransactionParticipant::get(opCtx);
         ASSERT(txnParticipant1.getLastWriteOpTime().isNull());
     }
 
     // Check session 2 was correctly updated
     {
-        auto c2 = getServiceContext()->makeClient("c2");
+        auto c2 = getServiceContext()->getService()->makeClient("c2");
         AlternativeClientRegion acr(c2);
         auto opCtx2 = cc().makeOperationContext();
         auto opCtx = opCtx2.get();
         setUpSessionWithTxn(opCtx, *sessionInfo2.getSessionId(), 15);
-        MongoDOperationContextSession ocs(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant2 = TransactionParticipant::get(opCtx);
 
         TransactionHistoryIterator historyIter(txnParticipant2.getLastWriteOpTime());
@@ -1990,8 +2080,8 @@ TEST_F(SessionCatalogMigrationDestinationTest,
 
         ASSERT_FALSE(historyIter.hasNext());
 
-        checkStatementExecuted(opCtx, 15, 56, oplogEntries[1]);
-        checkStatementExecuted(opCtx, 15, 55, oplogEntries[2]);
+        checkStatementExecutedAndCheckOplogEntry(opCtx, 15, 56, oplogEntries[1]);
+        checkStatementExecutedAndCheckOplogEntry(opCtx, 15, 55, oplogEntries[2]);
     }
 }
 
@@ -2004,12 +2094,14 @@ TEST_F(SessionCatalogMigrationDestinationTest, MigratingKnownStmtWhileOplogTrunc
 
     insertDocWithSessionInfo(sessionInfo, kNs, BSON("_id" << 46), kStmtId);
 
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(getServiceContext());
+
     auto getLastWriteOpTime = [&]() {
-        auto c1 = getServiceContext()->makeClient("c1");
+        auto c1 = getServiceContext()->getService()->makeClient("c1");
         AlternativeClientRegion acr(c1);
         auto innerOpCtx = cc().makeOperationContext();
         setUpSessionWithTxn(innerOpCtx.get(), *sessionInfo.getSessionId(), 19);
-        MongoDOperationContextSession ocs(innerOpCtx.get());
+        auto ocs = mongoDSessionCatalog->checkOutSession(innerOpCtx.get());
         auto txnParticipant = TransactionParticipant::get(innerOpCtx.get());
         return txnParticipant.getLastWriteOpTime();
     };
@@ -2053,6 +2145,7 @@ TEST_F(SessionCatalogMigrationDestinationTest, MigratingKnownStmtWhileOplogTrunc
     sessionMigration.join();
 
     ASSERT_TRUE(SessionCatalogMigrationDestination::State::Done == sessionMigration.getState());
+    ASSERT_EQ(sessionMigration.getSessionOplogEntriesMigrated(), 1);
 
     ASSERT_EQ(lastOpTimeBeforeMigrate, getLastWriteOpTime());
 }

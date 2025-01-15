@@ -27,19 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
 #include "mongo/db/catalog/uncommitted_multikey.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 namespace {
 
-const auto getUncommittedMultikey = RecoveryUnit::declareDecoration<UncommittedMultikey>();
+const auto getUncommittedMultikey =
+    RecoveryUnit::Snapshot::declareDecoration<UncommittedMultikey>();
 }  // namespace
 
 UncommittedMultikey& UncommittedMultikey::get(OperationContext* opCtx) {
-    return getUncommittedMultikey(opCtx->recoveryUnit());
+    return getUncommittedMultikey(shard_role_details::getRecoveryUnit(opCtx)->getSnapshot());
 }
 
 }  // namespace mongo

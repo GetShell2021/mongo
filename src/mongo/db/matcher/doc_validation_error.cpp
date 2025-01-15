@@ -27,26 +27,45 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/matcher/doc_validation_error.h"
-
+#include <cstddef>
+#include <set>
 #include <stack>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
-#include "mongo/base/init.h"
+#include <absl/container/flat_hash_set.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <s2cellid.h>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/geo/geoparser.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/geo/geometry_container.h"
+#include "mongo/db/matcher/doc_validation_error.h"
 #include "mongo/db/matcher/doc_validation_util.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_expr.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_path.h"
 #include "mongo/db/matcher/expression_tree.h"
 #include "mongo/db/matcher/expression_type.h"
 #include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/matcher/match_expression_util.h"
 #include "mongo/db/matcher/match_expression_walker.h"
+#include "mongo/db/matcher/matchable.h"
+#include "mongo/db/matcher/path.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_all_elem_match_from_index.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_cond.h"
@@ -58,11 +77,19 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_min_items.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_min_length.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_min_properties.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_num_array_items.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_object_match.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_str_length.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_unique_items.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
 #include "mongo/db/matcher/schema/json_schema_parser.h"
+#include "mongo/db/query/tree_walker.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/pcre.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo::doc_validation_error {
 namespace {
@@ -309,7 +336,7 @@ struct ValidationErrorContext {
     }
 
     bool haveLatestCompleteError() {
-        return !stdx::holds_alternative<std::monostate>(latestCompleteError);
+        return !holds_alternative<std::monostate>(latestCompleteError);
     }
 
     /**
@@ -317,35 +344,37 @@ struct ValidationErrorContext {
      */
     void appendLatestCompleteError(BSONObjBuilder* builder) {
         const static std::string kDetailsString = "details";
-        stdx::visit(
-            visit_helper::Overloaded{[&](const auto& details) -> void {
-                                         verifySizeAndAppend(details, kDetailsString, builder);
-                                     },
-                                     [&](const std::monostate& state) -> void { MONGO_UNREACHABLE },
-                                     [&](const std::string& str) -> void { MONGO_UNREACHABLE }},
-            latestCompleteError);
+        visit(OverloadedVisitor{[&](const auto& details) -> void {
+                                    verifySizeAndAppend(details, kDetailsString, builder);
+                                },
+                                [&](const std::monostate& state) -> void { MONGO_UNREACHABLE },
+                                [&](const std::string& str) -> void {
+                                    MONGO_UNREACHABLE
+                                }},
+              latestCompleteError);
     }
     /**
      * Appends the latest complete error to 'builder'. This should only be called by nodes which
      * construct an array as part of their error.
      */
     void appendLatestCompleteError(BSONArrayBuilder* builder) {
-        stdx::visit(
-            visit_helper::Overloaded{
-                [&](const BSONObj& obj) -> void { verifySizeAndAppend(obj, builder); },
-                [&](const std::string& str) -> void { builder->append(str); },
-                [&](const BSONArray& arr) -> void {
-                    // The '$_internalSchemaAllowedProperties' match expression represents two
-                    // JSONSchema keywords: 'additionalProperties' and 'patternProperties'. As
-                    // such, if both keywords produce an error, their errors will be packaged
-                    // into an array which the parent expression must absorb when constructing
-                    // its array of error details.
-                    for (auto&& elem : arr) {
-                        verifySizeAndAppend(elem, builder);
-                    }
-                },
-                [&](const std::monostate& state) -> void { MONGO_UNREACHABLE }},
-            latestCompleteError);
+        visit(OverloadedVisitor{
+                  [&](const BSONObj& obj) -> void { verifySizeAndAppend(obj, builder); },
+                  [&](const std::string& str) -> void { builder->append(str); },
+                  [&](const BSONArray& arr) -> void {
+                      // The '$_internalSchemaAllowedProperties' match expression represents
+                      // two JSONSchema keywords: 'additionalProperties' and
+                      // 'patternProperties'. As such, if both keywords produce an error,
+                      // their errors will be packaged into an array which the parent
+                      // expression must absorb when constructing its array of error details.
+                      for (auto&& elem : arr) {
+                          verifySizeAndAppend(elem, builder);
+                      }
+                  },
+                  [&](const std::monostate& state) -> void {
+                      MONGO_UNREACHABLE
+                  }},
+              latestCompleteError);
     }
 
     /**
@@ -353,11 +382,11 @@ struct ValidationErrorContext {
      * caller expects an object.
      */
     BSONObj getLatestCompleteErrorObject() const {
-        return stdx::get<BSONObj>(latestCompleteError);
+        return get<BSONObj>(latestCompleteError);
     }
 
     BSONArray getLatestCompleteErrorArray() const {
-        return stdx::get<BSONArray>(latestCompleteError);
+        return get<BSONArray>(latestCompleteError);
     }
 
     /**
@@ -424,7 +453,7 @@ struct ValidationErrorContext {
     // in an array and passed to the parent expression.
     // - Finally, BSONObj indicates the most common case of an error: a detailed object which
     // describes the reasons for failure. The final error will be of this type.
-    stdx::variant<std::monostate, std::string, BSONObj, BSONArray> latestCompleteError =
+    std::variant<std::monostate, std::string, BSONObj, BSONArray> latestCompleteError =
         std::monostate();
     // Document which failed to match against the collection's validator.
     const BSONObj& rootDoc;
@@ -821,6 +850,7 @@ public:
     void visit(const InternalExprGTEMatchExpression* expr) final {}
     void visit(const InternalExprLTMatchExpression* expr) final {}
     void visit(const InternalExprLTEMatchExpression* expr) final {}
+    void visit(const InternalEqHashedKey* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {
         switch (toItemsKeywordType(*expr)) {
             case ItemsKeywordType::kItems: {
@@ -1840,6 +1870,7 @@ public:
     void visit(const InternalExprGTEMatchExpression* expr) final {}
     void visit(const InternalExprLTMatchExpression* expr) final {}
     void visit(const InternalExprLTEMatchExpression* expr) final {}
+    void visit(const InternalEqHashedKey* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {}
     void visit(const InternalSchemaAllowedPropertiesMatchExpression* expr) final {
         if (_context->shouldGenerateError(*expr)) {
@@ -2055,6 +2086,7 @@ public:
     void visit(const InternalExprGTEMatchExpression* expr) final {}
     void visit(const InternalExprLTMatchExpression* expr) final {}
     void visit(const InternalExprLTEMatchExpression* expr) final {}
+    void visit(const InternalEqHashedKey* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {
         switch (toItemsKeywordType(*expr)) {
             case ItemsKeywordType::kItems:
@@ -2280,8 +2312,8 @@ void assertHasErrorAnnotations(const MatchExpression& validatorExpr) {
  * Appends the object id of 'doc' to 'builder' under the 'failingDocumentId' field.
  */
 void appendDocumentId(const BSONObj& doc, BSONObjBuilder* builder) {
-    BSONElement objectIdElement;
-    invariant(doc.getObjectID(objectIdElement));
+    BSONElement objectIdElement = doc["_id"];
+    invariant(objectIdElement);
     builder->appendAs(objectIdElement, "failingDocumentId"_sd);
 }
 

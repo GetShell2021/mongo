@@ -28,20 +28,46 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/rwc_defaults_commands_gen.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/read_write_concern_defaults.h"
-#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/read_write_concern_defaults_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/rpc/unique_message.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -69,8 +95,8 @@ void updatePersistedDefaultRWConcernDocument(OperationContext* opCtx, const RWCo
             entry.setUpsert(true);
             return entry;
         }()});
-        return updateOp.serialize(
-            BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON()));
+        updateOp.setWriteConcern(opCtx->getWriteConcern());
+        return updateOp.serialize();
     }());
     uassertStatusOK(getStatusFromWriteCommandReply(commandResponse->getCommandReply()));
 }
@@ -79,11 +105,12 @@ void assertNotStandaloneOrShardServer(OperationContext* opCtx, StringData cmdNam
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     uassert(51300,
             str::stream() << "'" << cmdName << "' is not supported on standalone nodes.",
-            replCoord->isReplEnabled());
+            replCoord->getSettings().isReplSet());
 
     uassert(51301,
             str::stream() << "'" << cmdName << "' is not supported on shard nodes.",
-            serverGlobalParams.clusterRole != ClusterRole::ShardServer);
+            serverGlobalParams.clusterRole.has(ClusterRole::None) ||
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 }
 
 auto makeResponse(const ReadWriteConcernDefaults::RWConcernDefaultAndTime& rwcDefault,
@@ -130,22 +157,19 @@ public:
 
             hangWhileSettingDefaultRWC.pauseWhileSet();
 
-            auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx->getServiceContext());
+            auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx);
             auto newDefaults = rwcDefaults.generateNewCWRWCToBeSavedOnDisk(
                 opCtx, request().getDefaultReadConcern(), request().getDefaultWriteConcern());
             // We don't want to check if the custom write concern exists on the config servers
             // because it only has to exist on the actual shards in order to be valid.
-            if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
+            if (!serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
                 if (auto optWC = newDefaults.getDefaultWriteConcern()) {
                     uassertStatusOK(replCoord->validateWriteConcern(*optWC));
                 }
             }
 
             updatePersistedDefaultRWConcernDocument(opCtx, newDefaults);
-            LOGV2(20498,
-                  "Successfully set RWC defaults to {value}",
-                  "Successfully set RWC defaults",
-                  "value"_attr = newDefaults);
+            LOGV2(20498, "Successfully set RWC defaults", "value"_attr = newDefaults);
 
             // Refresh to populate the cache with the latest defaults.
             rwcDefaults.refreshIfNecessary(opCtx);
@@ -161,15 +185,17 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForPrivilege(Privilege{ResourcePattern::forClusterResource(),
-                                                             ActionType::setDefaultRWConcern}));
+                        ->isAuthorizedForPrivilege(Privilege{
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::setDefaultRWConcern}));
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
-} setDefaultRWConcernCommand;
+};
+MONGO_REGISTER_COMMAND(SetDefaultRWConcernCommand).forShard();
 
 class GetDefaultRWConcernCommand : public TypedCommand<GetDefaultRWConcernCommand> {
 public:
@@ -193,7 +219,7 @@ public:
         auto typedRun(OperationContext* opCtx) {
             assertNotStandaloneOrShardServer(opCtx, GetDefaultRWConcern::kCommandName);
 
-            auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx->getServiceContext());
+            auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx);
             const bool inMemory = request().getInMemory().value_or(false);
             if (!inMemory) {
                 // If not asking for the in-memory values, force a refresh to find the most recent
@@ -213,15 +239,17 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForPrivilege(Privilege{ResourcePattern::forClusterResource(),
-                                                             ActionType::getDefaultRWConcern}));
+                        ->isAuthorizedForPrivilege(Privilege{
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::getDefaultRWConcern}));
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
-} getDefaultRWConcernCommand;
+};
+MONGO_REGISTER_COMMAND(GetDefaultRWConcernCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

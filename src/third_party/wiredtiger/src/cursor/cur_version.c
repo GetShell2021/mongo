@@ -36,7 +36,7 @@ __curversion_set_key(WT_CURSOR *cursor, ...)
     /* Pass on the raw flag. */
     if (F_ISSET(cursor, WT_CURSTD_RAW))
         LF_SET(WT_CURSTD_RAW);
-    if ((ret = __wt_cursor_set_keyv(file_cursor, flags, ap)) != 0)
+    if ((ret = __wti_cursor_set_keyv(file_cursor, flags, ap)) != 0)
         WT_IGNORE_RET(__wt_panic(session, ret, "failed to set key"));
     va_end(ap);
 }
@@ -61,7 +61,7 @@ __curversion_get_key(WT_CURSOR *cursor, ...)
     /* Pass on the raw flag. */
     if (F_ISSET(cursor, WT_CURSTD_RAW))
         flags |= WT_CURSTD_RAW;
-    WT_ERR(__wt_cursor_get_keyv(file_cursor, flags, ap));
+    WT_ERR(__wti_cursor_get_keyv(file_cursor, flags, ap));
 
 err:
     va_end(ap);
@@ -83,14 +83,14 @@ __curversion_get_value(WT_CURSOR *cursor, ...)
     WT_DECL_RET;
     WT_PACK pack;
     WT_SESSION_IMPL *session;
-    const uint8_t *p, *end;
+    const uint8_t *end, *p;
     va_list ap;
 
     version_cursor = (WT_CURSOR_VERSION *)cursor;
     file_cursor = version_cursor->file_cursor;
     va_start(ap, cursor);
 
-    CURSOR_API_CALL(cursor, session, get_value, NULL);
+    CURSOR_API_CALL(cursor, session, ret, get_value, NULL);
     WT_ERR(__cursor_checkvalue(cursor));
     WT_ERR(__cursor_checkvalue(file_cursor));
 
@@ -119,7 +119,7 @@ __curversion_get_value(WT_CURSOR *cursor, ...)
         WT_ERR_NOTFOUND_OK(ret, false);
 
         WT_ASSERT(session, p <= end);
-        WT_ERR(__wt_cursor_get_valuev(file_cursor, ap));
+        WT_ERR(__wti_cursor_get_valuev(file_cursor, ap));
     }
 
 err:
@@ -138,7 +138,7 @@ __curversion_set_value_with_format(WT_CURSOR *cursor, const char *fmt, ...)
     va_list ap;
 
     va_start(ap, fmt);
-    ret = __wt_cursor_set_valuev(cursor, fmt, ap);
+    ret = __wti_cursor_set_valuev(cursor, fmt, ap);
     va_end(ap);
 
     return (ret);
@@ -151,7 +151,7 @@ __curversion_set_value_with_format(WT_CURSOR *cursor, const char *fmt, ...)
 static int
 __curversion_next_int(WT_CURSOR *cursor)
 {
-    WT_CURSOR *hs_cursor, *file_cursor;
+    WT_CURSOR *file_cursor, *hs_cursor;
     WT_CURSOR_BTREE *cbt;
     WT_CURSOR_VERSION *version_cursor;
     WT_DECL_ITEM(hs_value);
@@ -160,21 +160,23 @@ __curversion_next_int(WT_CURSOR *cursor)
     WT_PAGE *page;
     WT_SESSION_IMPL *session;
     WT_TIME_WINDOW *twp;
-    WT_UPDATE *first, *next_upd, *upd, *tombstone;
+    WT_UPDATE *first, *next_upd, *upd;
     wt_timestamp_t durable_start_ts, durable_stop_ts, stop_ts;
-    uint64_t stop_txn, hs_upd_type, raw;
+    size_t max_memsize;
+    uint64_t hs_upd_type, raw, stop_txn;
     uint8_t *p, version_prepare_state;
     bool upd_found;
 
     session = CUR2S(cursor);
     version_cursor = (WT_CURSOR_VERSION *)cursor;
-    hs_cursor = version_cursor->hs_cursor;
     file_cursor = version_cursor->file_cursor;
+    hs_cursor = version_cursor->hs_cursor;
     cbt = (WT_CURSOR_BTREE *)file_cursor;
     page = cbt->ref->page;
     twp = NULL;
     upd_found = false;
-    first = upd = tombstone = NULL;
+    first = upd = NULL;
+    version_prepare_state = 0;
 
     /* Temporarily clear the raw flag. We need to pack the data according to the format. */
     raw = F_MASK(cursor, WT_CURSTD_RAW);
@@ -193,8 +195,6 @@ __curversion_next_int(WT_CURSOR *cursor)
             F_SET(version_cursor, WT_CURVERSION_UPDATE_EXHAUSTED);
         } else {
             if (upd->type == WT_UPDATE_TOMBSTONE) {
-                tombstone = upd;
-
                 /*
                  * If the update is a tombstone, we still want to record the stop information but we
                  * also need traverse to the next update to get the full value. If the tombstone was
@@ -203,6 +203,10 @@ __curversion_next_int(WT_CURSOR *cursor)
                 version_cursor->upd_stop_txnid = upd->txnid;
                 version_cursor->upd_durable_stop_ts = upd->durable_ts;
                 version_cursor->upd_stop_ts = upd->start_ts;
+
+                if (upd->prepare_state == WT_PREPARE_INPROGRESS ||
+                  upd->prepare_state == WT_PREPARE_LOCKED)
+                    version_prepare_state = 1;
 
                 /* No need to check the next update if the tombstone is globally visible. */
                 if (__wt_txn_upd_visible_all(session, upd))
@@ -222,8 +226,6 @@ __curversion_next_int(WT_CURSOR *cursor)
                 if (upd->prepare_state == WT_PREPARE_INPROGRESS ||
                   upd->prepare_state == WT_PREPARE_LOCKED)
                     version_prepare_state = 1;
-                else
-                    version_prepare_state = 0;
 
                 /*
                  * Copy the update value into the version cursor as we don't know the value format.
@@ -232,8 +234,8 @@ __curversion_next_int(WT_CURSOR *cursor)
                 if (upd->type != WT_UPDATE_MODIFY)
                     __wt_upd_value_assign(cbt->upd_value, upd);
                 else
-                    WT_ERR(
-                      __wt_modify_reconstruct_from_upd_list(session, cbt, upd, cbt->upd_value));
+                    WT_ERR(__wt_modify_reconstruct_from_upd_list(
+                      session, cbt, upd, cbt->upd_value, WT_OPCTX_TRANSACTION));
 
                 /*
                  * Set the version cursor's value, which also contains all the record metadata for
@@ -307,32 +309,42 @@ __curversion_next_int(WT_CURSOR *cursor)
             WT_ERR(__wt_illegal_value(session, page->type));
         }
 
-        /* Get the ondisk value. */
-        WT_ERR(__wt_value_return_buf(cbt, cbt->ref, &cbt->upd_value->buf, &cbt->upd_value->tw));
+        /*
+         * Get the ondisk value. It is possible to see an overflow removed value if checkpoint has
+         * visited this page and freed the underlying overflow blocks. In this case, checkpoint
+         * reconciliation must have also appended the value to the update chain and moved it to the
+         * history store if it is not obsolete. Therefore, we should have either already returned it
+         * when walking the update chain if we are not racing with checkpoint removing the overflow
+         * value concurrently or we shall return it later when we scan the history store if we do
+         * race with checkpoint. If it is already obsolete, there is no need for us to return it as
+         * the version cursor only ensures to return values that are not obsolete. We can safely
+         * ignore the overflow removed value here.
+         */
+        WT_ERR_ERROR_OK(
+          __wt_value_return_buf(cbt, cbt->ref, &cbt->upd_value->buf, &cbt->upd_value->tw),
+          WT_RESTART, true);
+        if (ret == 0) {
+            if (!WT_TIME_WINDOW_HAS_STOP(&cbt->upd_value->tw)) {
+                durable_stop_ts = version_cursor->upd_durable_stop_ts;
+                stop_ts = version_cursor->upd_stop_ts;
+                stop_txn = version_cursor->upd_stop_txnid;
+            } else {
+                durable_stop_ts = cbt->upd_value->tw.durable_stop_ts;
+                stop_ts = cbt->upd_value->tw.stop_ts;
+                stop_txn = cbt->upd_value->tw.stop_txn;
+            }
 
-        if (!WT_TIME_WINDOW_HAS_STOP(&cbt->upd_value->tw)) {
-            durable_stop_ts = version_cursor->upd_durable_stop_ts;
-            stop_ts = version_cursor->upd_stop_ts;
-            stop_txn = version_cursor->upd_stop_txnid;
-        } else {
-            durable_stop_ts = cbt->upd_value->tw.durable_stop_ts;
-            stop_ts = cbt->upd_value->tw.stop_ts;
-            stop_txn = cbt->upd_value->tw.stop_txn;
-        }
+            if (version_prepare_state == 0)
+                version_prepare_state = cbt->upd_value->tw.prepare;
 
-        if (tombstone != NULL &&
-          (tombstone->prepare_state == WT_PREPARE_INPROGRESS ||
-            tombstone->prepare_state == WT_PREPARE_LOCKED))
-            version_prepare_state = 1;
-        else
-            version_prepare_state = cbt->upd_value->tw.prepare;
+            WT_ERR(__curversion_set_value_with_format(cursor, WT_CURVERSION_METADATA_FORMAT,
+              cbt->upd_value->tw.start_txn, cbt->upd_value->tw.start_ts,
+              cbt->upd_value->tw.durable_start_ts, stop_txn, stop_ts, durable_stop_ts,
+              WT_UPDATE_STANDARD, version_prepare_state, 0, WT_CURVERSION_DISK_IMAGE));
 
-        WT_ERR(__curversion_set_value_with_format(cursor, WT_CURVERSION_METADATA_FORMAT,
-          cbt->upd_value->tw.start_txn, cbt->upd_value->tw.start_ts,
-          cbt->upd_value->tw.durable_start_ts, stop_txn, stop_ts, durable_stop_ts,
-          WT_UPDATE_STANDARD, version_prepare_state, 0, WT_CURVERSION_DISK_IMAGE));
-
-        upd_found = true;
+            upd_found = true;
+        } else
+            ret = 0;
         F_SET(version_cursor, WT_CURVERSION_ON_DISK_EXHAUSTED);
     }
 
@@ -379,6 +391,10 @@ __curversion_next_int(WT_CURSOR *cursor)
          * value.
          */
         if (hs_upd_type == WT_UPDATE_MODIFY) {
+            __wt_modify_max_memsize_format(
+              hs_value->data, file_cursor->value_format, cbt->upd_value->buf.size, &max_memsize);
+            WT_ERR(__wt_buf_set_and_grow(session, &cbt->upd_value->buf, cbt->upd_value->buf.data,
+              cbt->upd_value->buf.size, max_memsize));
             WT_ERR(__wt_modify_apply_item(
               session, file_cursor->value_format, &cbt->upd_value->buf, hs_value->data));
         } else {
@@ -418,7 +434,7 @@ __curversion_next(WT_CURSOR *cursor)
 
     version_cursor = (WT_CURSOR_VERSION *)cursor;
 
-    CURSOR_API_CALL(cursor, session, next, CUR2BT(version_cursor->file_cursor));
+    CURSOR_API_CALL(cursor, session, ret, next, CUR2BT(version_cursor->file_cursor));
     WT_ERR(__curversion_next_int(cursor));
 
 err:
@@ -434,7 +450,7 @@ err:
 static int
 __curversion_reset(WT_CURSOR *cursor)
 {
-    WT_CURSOR *hs_cursor, *file_cursor;
+    WT_CURSOR *file_cursor, *hs_cursor;
     WT_CURSOR_VERSION *version_cursor;
     WT_DECL_RET;
     WT_SESSION_IMPL *session;
@@ -442,7 +458,7 @@ __curversion_reset(WT_CURSOR *cursor)
     version_cursor = (WT_CURSOR_VERSION *)cursor;
     hs_cursor = version_cursor->hs_cursor;
     file_cursor = version_cursor->file_cursor;
-    CURSOR_API_CALL(cursor, session, reset, NULL);
+    CURSOR_API_CALL(cursor, session, ret, reset, NULL);
 
     if (file_cursor != NULL)
         WT_TRET(file_cursor->reset(file_cursor));
@@ -482,7 +498,7 @@ __curversion_search(WT_CURSOR *cursor)
     file_cursor = version_cursor->file_cursor;
     cbt = (WT_CURSOR_BTREE *)file_cursor;
 
-    CURSOR_API_CALL(cursor, session, search, CUR2BT(cbt));
+    CURSOR_API_CALL(cursor, session, ret, search, CUR2BT(cbt));
     txn = session->txn;
 
     /*
@@ -550,7 +566,7 @@ err:
 static int
 __curversion_close(WT_CURSOR *cursor)
 {
-    WT_CURSOR *hs_cursor, *file_cursor;
+    WT_CURSOR *file_cursor, *hs_cursor;
     WT_CURSOR_VERSION *version_cursor;
     WT_DECL_RET;
     WT_SESSION_IMPL *session;
@@ -558,7 +574,7 @@ __curversion_close(WT_CURSOR *cursor)
     version_cursor = (WT_CURSOR_VERSION *)cursor;
     hs_cursor = version_cursor->hs_cursor;
     file_cursor = version_cursor->file_cursor;
-    CURSOR_API_CALL(cursor, session, close, NULL);
+    CURSOR_API_CALL(cursor, session, ret, close, NULL);
 
 err:
     version_cursor->next_upd = NULL;
@@ -587,10 +603,11 @@ __wt_curversion_open(WT_SESSION_IMPL *session, const char *uri, WT_CURSOR *owner
 {
     WT_CURSOR_STATIC_INIT(iface, __curversion_get_key, /* get-key */
       __curversion_get_value,                          /* get-value */
+      __wti_cursor_get_raw_key_value_notsup,           /* get-raw-key-value */
       __curversion_set_key,                            /* set-key */
-      __wt_cursor_set_value_notsup,                    /* set-value */
-      __wt_cursor_compare_notsup,                      /* compare */
-      __wt_cursor_equals_notsup,                       /* equals */
+      __wti_cursor_set_value_notsup,                   /* set-value */
+      __wti_cursor_compare_notsup,                     /* compare */
+      __wti_cursor_equals_notsup,                      /* equals */
       __curversion_next,                               /* next */
       __wt_cursor_notsup,                              /* prev */
       __curversion_reset,                              /* reset */

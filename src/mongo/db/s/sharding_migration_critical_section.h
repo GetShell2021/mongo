@@ -29,10 +29,14 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <utility>
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 
 namespace mongo {
 
@@ -72,7 +76,7 @@ public:
 
     /**
      * Leaves the critical section without doing error-checking. Only meant to be used when
-     * recovering the critical sections in the RecoverableCriticalSectionService.
+     * recovering the critical sections in the ShardingRecoveryService.
      */
     void exitCriticalSectionNoChecks();
 

@@ -27,49 +27,48 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/stats/counters.h"
 
 #include <fmt/format.h>
+#include <tuple>
 
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/client/authenticate.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/commands/server_status.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/static_immortal.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
-
 namespace mongo {
 
-namespace {
 using namespace fmt::literals;
+
+void OpCounters::_reset() {
+    _insert->store(0);
+    _query->store(0);
+    _update->store(0);
+    _delete->store(0);
+    _getmore->store(0);
+    _command->store(0);
+    _nestedAggregate->store(0);
+
+    _queryDeprecated->store(0);
+
+    _insertOnExistingDoc->store(0);
+    _updateOnMissingDoc->store(0);
+    _deleteWasEmpty->store(0);
+    _deleteFromMissingNamespace->store(0);
+    _acceptableErrorInCommand->store(0);
 }
 
 void OpCounters::_checkWrap(CacheExclusive<AtomicWord<long long>> OpCounters::*counter, int n) {
     static constexpr auto maxCount = 1LL << 60;
     auto oldValue = (this->*counter)->fetchAndAddRelaxed(n);
     if (oldValue > maxCount) {
-        _insert->store(0);
-        _query->store(0);
-        _update->store(0);
-        _delete->store(0);
-        _getmore->store(0);
-        _command->store(0);
-
-        _insertDeprecated->store(0);
-        _queryDeprecated->store(0);
-        _updateDeprecated->store(0);
-        _deleteDeprecated->store(0);
-        _getmoreDeprecated->store(0);
-        _killcursorsDeprecated->store(0);
-
-        _insertOnExistingDoc->store(0);
-        _updateOnMissingDoc->store(0);
-        _deleteWasEmpty->store(0);
-        _deleteFromMissingNamespace->store(0);
-        _acceptableErrorInCommand->store(0);
+        _reset();
     }
 }
 
@@ -83,23 +82,9 @@ BSONObj OpCounters::getObj() const {
     b.append("command", _command->loadRelaxed());
 
     auto queryDep = _queryDeprecated->loadRelaxed();
-    auto getmoreDep = _getmoreDeprecated->loadRelaxed();
-    auto killcursorsDep = _killcursorsDeprecated->loadRelaxed();
-    auto updateDep = _updateDeprecated->loadRelaxed();
-    auto deleteDep = _deleteDeprecated->loadRelaxed();
-    auto insertDep = _insertDeprecated->loadRelaxed();
-    auto totalDep = queryDep + getmoreDep + killcursorsDep + updateDep + deleteDep + insertDep;
-
-    if (totalDep > 0) {
+    if (queryDep > 0) {
         BSONObjBuilder d(b.subobjStart("deprecated"));
-
-        d.append("total", totalDep);
-        d.append("insert", insertDep);
         d.append("query", queryDep);
-        d.append("update", updateDep);
-        d.append("delete", deleteDep);
-        d.append("getmore", getmoreDep);
-        d.append("killcursors", killcursorsDep);
     }
 
     // Append counters for constraint relaxations, only if they exist.
@@ -238,6 +223,10 @@ void AuthCounter::incSaslSupportedMechanismsReceived() {
     _saslSupportedMechanismsReceived.fetchAndAddRelaxed(1);
 }
 
+void AuthCounter::incAuthenticationCumulativeTime(long long micros) {
+    _authenticationCumulativeMicros.fetchAndAddRelaxed(micros);
+}
+
 void AuthCounter::MechanismCounterHandle::incSpeculativeAuthenticateReceived() {
     _data->speculativeAuthenticate.received.fetchAndAddRelaxed(1);
 }
@@ -329,19 +318,65 @@ void AuthCounter::append(BSONObjBuilder* b) {
     }
 
     mechsBuilder.done();
+
+    const auto totalAuthenticationTimeMicros = _authenticationCumulativeMicros.load();
+    b->append("totalAuthenticationTimeMicros", totalAuthenticationTimeMicros);
 }
 
-OpCounters globalOpCounters;
+OpCounterServerStatusSection::OpCounterServerStatusSection(const std::string& sectionName,
+                                                           ClusterRole role,
+                                                           OpCounters* counters)
+    : ServerStatusSection(sectionName, role), _counters(counters) {}
+
+BSONObj OpCounterServerStatusSection::generateSection(OperationContext* opCtx,
+                                                      const BSONElement& configElement) const {
+    return _counters->getObj();
+}
+
+OpCounters& serviceOpCounters(ClusterRole role) {
+    static StaticImmortal<OpCounters> routerOpCounters;
+    static StaticImmortal<OpCounters> shardOpCounters;
+    if (role.hasExclusively(ClusterRole::RouterServer)) {
+        return *routerOpCounters;
+    }
+    if (role.hasExclusively(ClusterRole::ShardServer)) {
+        return *shardOpCounters;
+    }
+    MONGO_UNREACHABLE;
+}
+
 OpCounters replOpCounters;
 NetworkCounter networkCounter;
 AuthCounter authCounter;
-AggStageCounters aggStageCounters;
+AggStageCounters aggStageCounters{"aggStageCounters."};
 DotsAndDollarsFieldsCounters dotsAndDollarsFieldsCounters;
-QueryEngineCounters queryEngineCounters;
+QueryFrameworkCounters queryFrameworkCounters;
+LookupPushdownCounters lookupPushdownCounters;
+SortCounters sortCounters;
+ValidatorCounters validatorCounters;
+GroupCounters groupCounters;
+SetWindowFieldsCounters setWindowFieldsCounters;
+PlanCacheCounters planCacheCounters;
+FastPathQueryCounters fastPathQueryCounters;
 
 OperatorCounters operatorCountersAggExpressions{"operatorCounters.expressions."};
 OperatorCounters operatorCountersMatchExpressions{"operatorCounters.match."};
 OperatorCounters operatorCountersGroupAccumulatorExpressions{"operatorCounters.groupAccumulators."};
 OperatorCounters operatorCountersWindowAccumulatorExpressions{
     "operatorCounters.windowAccumulators."};
+
+namespace {
+template <ClusterRole::Value role>
+QueryCounters queryCounterSingleton{role};
+}  // namespace
+
+QueryCounters& getQueryCounters(OperationContext* opCtx) {
+    auto role = opCtx->getService()->role();
+    if (role.hasExclusively(ClusterRole::ShardServer))
+        return queryCounterSingleton<ClusterRole::ShardServer>;
+    if (role.hasExclusively(ClusterRole::RouterServer))
+        return queryCounterSingleton<ClusterRole::RouterServer>;
+    MONGO_UNREACHABLE;
+}
+
 }  // namespace mongo

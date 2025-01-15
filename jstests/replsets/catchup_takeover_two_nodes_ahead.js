@@ -9,12 +9,12 @@
 // Now the primary is most-up-to-date and another node is more up-to-date than others.
 // Make a lagged node the next primary.
 // Confirm that the most up-to-date node becomes primary.
-
-(function() {
-'use strict';
-
-load('jstests/replsets/rslib.js');
-load('jstests/replsets/libs/election_metrics.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {
+    verifyCatchUpConclusionReason,
+    verifyServerStatusElectionReasonCounterChange,
+} from "jstests/replsets/libs/election_metrics.js";
 
 var name = 'catchup_takeover_two_nodes_ahead';
 var replSet = new ReplSetTest({name: name, nodes: 5});
@@ -24,19 +24,19 @@ var config = replSet.getReplSetConfig();
 config.settings = {
     chainingAllowed: false
 };
-replSet.initiateWithHighElectionTimeout(config);
+replSet.initiate(config);
 replSet.awaitReplication();
 
 // Write something so that nodes 0 and 1 are ahead.
 stopServerReplication(nodes.slice(2, 5));
 const primary = replSet.getPrimary();
-var writeConcern = {writeConcern: {w: 2, wtimeout: replSet.kDefaultTimeoutMS}};
+var writeConcern = {writeConcern: {w: 2, wtimeout: replSet.timeoutMS}};
 assert.commandWorked(primary.getDB(name).bar.insert({x: 100}, writeConcern));
 
 // Write something so that node 0 is ahead of node 1.
 stopServerReplication(nodes[1]);
 writeConcern = {
-    writeConcern: {w: 1, wtimeout: replSet.kDefaultTimeoutMS}
+    writeConcern: {w: 1, wtimeout: replSet.timeoutMS}
 };
 assert.commandWorked(primary.getDB(name).bar.insert({y: 100}, writeConcern));
 
@@ -66,7 +66,7 @@ verifyServerStatusElectionReasonCounterChange(
     initialPrimaryStatus.electionMetrics, newPrimaryStatus.electionMetrics, "catchUpTakeover", 1);
 
 // Wait until the old primary steps down.
-replSet.waitForState(2, ReplSetTest.State.SECONDARY, replSet.kDefaultTimeoutMS);
+replSet.awaitSecondaryNodes(replSet.timeoutMS, [nodes[2]]);
 
 // Check that the 'numCatchUpsFailedWithNewTerm' field has been incremented in serverStatus, and
 // that none of the other reasons for catchup concluding has been incremented.
@@ -78,4 +78,3 @@ verifyCatchUpConclusionReason(initialNode2Status.electionMetrics,
 // Let the nodes catchup.
 restartServerReplication(nodes.slice(1, 5));
 replSet.stopSet();
-})();

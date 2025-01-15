@@ -3,7 +3,6 @@
 // specifially for the newly added events that are behind the 'showExpandedEvents' flag.
 //
 // @tags: [
-//   featureFlagChangeStreamsVisibility,
 //   requires_fcv_60,
 //   requires_pipeline_optimization,
 //   requires_sharding,
@@ -12,11 +11,12 @@
 //   assumes_unsharded_collection,
 //   assumes_read_preference_unchanged
 // ]
-(function() {
-"use strict";
-
-load("jstests/libs/change_stream_rewrite_util.js");  // For rewrite helpers.
-load("jstests/libs/fixture_helpers.js");             // For FixtureHelpers.
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {
+    createShardedCollection,
+    verifyChangeStreamOnWholeCluster
+} from "jstests/libs/query/change_stream_rewrite_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "change_stream_match_pushdown_and_rewrite";
 const shard0Only = "shard0Only";
@@ -33,10 +33,10 @@ const st = new ShardingTest({
 
 const mongosConn = st.s;
 
-assert.commandWorked(st.s.adminCommand({enableSharding: shard0Only}));
-st.ensurePrimaryShard(shard0Only, st.shard0.shardName);
-assert.commandWorked(st.s.adminCommand({enableSharding: shard1Only}));
-st.ensurePrimaryShard(shard1Only, st.shard1.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: shard0Only, primaryShard: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: shard1Only, primaryShard: st.shard1.shardName}));
 
 const db = mongosConn.getDB(dbName);
 
@@ -726,11 +726,8 @@ verifyOnWholeCluster(resumeAfterToken,
 db.dropDatabase();
 db.getSiblingDB(otherDbName).dropDatabase();
 
-st.adminCommand({enablesharding: dbName});
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
-
-st.adminCommand({enablesharding: otherDbName});
-st.ensurePrimaryShard(otherDbName, st.shard1.shardName);
+st.adminCommand({enablesharding: dbName, primaryShard: st.shard0.shardName});
+st.adminCommand({enablesharding: otherDbName, primaryShard: st.shard1.shardName});
 
 // Open a change stream and store the resume token. This resume token will be used to replay the
 // stream after this point.
@@ -817,5 +814,47 @@ verifyOnWholeCluster(
     },
     [9, 3] /* expectedOplogRetDocsForEachShard */);
 
+// Create a new change stream and resume token for replaying the stream after this point.
+const thirdResumeAfterToken =
+    db.getSiblingDB("admin").watch([], {allChangesForCluster: true}).getResumeToken();
+
+// The test cases below verify the behavior of regex matches with escaped characters on collections
+// with special names (e.g. containing dots). This exercises the fix for SERVER-67715.
+const collWithDot =
+    createShardedCollection(st, "_id" /* shardKey */, dbName, "foo.bar", 2 /*splitAt */);
+assert.commandWorked(collWithDot.createIndex({x: 1}));
+assert.commandWorked(collWithDot.insert({_id: 1}));
+assert.commandWorked(collWithDot.insert({_id: 3}));
+assert.commandWorked(
+    collWithDot.runCommand({collMod: "foo.bar", index: {keyPattern: {x: 1}, hidden: true}}));
+assert.commandWorked(collWithDot.runCommand({dropIndexes: "foo.bar", index: {x: 1}}));
+
+const collWithUnderscore =
+    createShardedCollection(st, "_id" /* shardKey */, dbName, "foo_bar", 2 /*splitAt */);
+assert.commandWorked(collWithUnderscore.createIndex({x: 1}));
+assert.commandWorked(collWithUnderscore.insert({_id: 1}));
+assert.commandWorked(collWithUnderscore.insert({_id: 3}));
+assert.commandWorked(
+    collWithUnderscore.runCommand({collMod: "foo_bar", index: {keyPattern: {x: 1}, hidden: true}}));
+assert.commandWorked(collWithUnderscore.runCommand({dropIndexes: "foo_bar", index: {x: 1}}));
+
+// Ensure that a regex match properly respects escaped characters (here, testing that the escaped
+// "." character is treated as a literal dot). Note that we expect 5 extra oplog entries on shard0:
+//  - 1 from the "create" event (which only appears on shard0)
+//  - 4 no-op entries from sharding the two collections that are not affected by the filter pushdown
+//    (2 "shardCollection" + 2 "migrateChunkToNewShard")
+verifyOnWholeCluster(thirdResumeAfterToken,
+                     {$match: {"ns.coll": {$nin: [/^foo\./]}}},
+                     {
+                         "foo_bar": {
+                             create: ["foo_bar"],
+                             shardCollection: ["foo_bar"],
+                             createIndexes: ["foo_bar", "foo_bar"],
+                             insert: [1, 3],
+                             modify: ["foo_bar", "foo_bar"],
+                             dropIndexes: ["foo_bar", "foo_bar"]
+                         }
+                     },
+                     [9, 4] /* expectedOplogRetDocsForEachShard */);
+
 st.stop();
-})();

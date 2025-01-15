@@ -27,55 +27,198 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
-#include <vector>
-
 #include "mongo/db/s/resharding/resharding_oplog_fetcher.h"
 
+#include <absl/container/node_hash_map.h>
+#include <boost/cstdint.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
 #include <fmt/format.h>
+#include <mutex>
+#include <tuple>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/client/dbclient_connection.h"
-#include "mongo/client/remote_command_targeter.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
+#include "mongo/db/s/resharding/resharding_oplog_fetcher_progress_gen.h"
+#include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding/resharding_util.h"
-#include "mongo/db/s/sharding_data_transform_cumulative_metrics.h"
+#include "mongo/db/shard_role.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
-#include "mongo/stdx/mutex.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/timer.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
-
 
 namespace mongo {
 namespace {
 boost::intrusive_ptr<ExpressionContext> _makeExpressionContext(OperationContext* opCtx) {
-    StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
+    StringMap<ResolvedNamespace> resolvedNamespaces;
     resolvedNamespaces[NamespaceString::kRsOplogNamespace.coll()] = {
         NamespaceString::kRsOplogNamespace, std::vector<BSONObj>()};
-    return make_intrusive<ExpressionContext>(opCtx,
-                                             boost::none, /* explain */
-                                             false,       /* fromMongos */
-                                             false,       /* needsMerge */
-                                             true,        /* allowDiskUse */
-                                             true,        /* bypassDocumentValidation */
-                                             false,       /* isMapReduceCommand */
-                                             NamespaceString::kRsOplogNamespace,
-                                             boost::none, /* runtimeConstants */
-                                             nullptr,     /* collator */
-                                             MongoProcessInterface::create(opCtx),
-                                             std::move(resolvedNamespaces),
-                                             boost::none); /* collUUID */
+    return ExpressionContextBuilder{}
+        .opCtx(opCtx)
+        .mongoProcessInterface(MongoProcessInterface::create(opCtx))
+        .ns(NamespaceString::kRsOplogNamespace)
+        .resolvedNamespace(std::move(resolvedNamespaces))
+        .allowDiskUse(true)
+        .bypassDocumentValidation(true)
+        .build();
+}
+
+struct OplogInsertBatch {
+    std::vector<InsertStatement> statements;
+    ReshardingDonorOplogId startAt;
+    bool moreToCome = true;
+};
+
+/**
+ * Packs the oplog entries in 'aggregateBatch' into insert batches based on the configured maximum
+ * insert batch count and bytes while preserving the original oplog order. If there is an oplog
+ * entry whose size exceeds the max batch bytes, packs it into its own batch instead of throwing.
+ */
+std::vector<OplogInsertBatch> getOplogInsertBatches(const std::vector<BSONObj>& aggregateBatch) {
+    size_t maxOperations = resharding::gReshardingOplogFetcherInsertBatchLimitOperations.load();
+    auto maxBytes = resharding::gReshardingOplogFetcherInsertBatchLimitBytes.load();
+
+    std::vector<OplogInsertBatch> insertBatches;
+    size_t totalOperations = 0;
+
+    size_t currentIndex = 0;
+    while (currentIndex < aggregateBatch.size()) {
+        OplogInsertBatch insertBatch;
+        auto totalBytes = 0;
+
+        while (currentIndex < aggregateBatch.size() &&
+               insertBatch.statements.size() < maxOperations) {
+            const auto& currentDoc = aggregateBatch[currentIndex];
+            const auto currentBytes = currentDoc.objsize();
+
+            if (totalBytes == 0 && currentBytes > maxBytes) {
+                LOGV2_WARNING(9656101,
+                              "Found a fetched oplog entry with size greater than the oplog "
+                              "fetcher insert batch size limit. Ignoring the limit.",
+                              "currentBytes"_attr = currentBytes,
+                              "maxBytes"_attr = maxBytes);
+            } else if (totalBytes + currentBytes > maxBytes) {
+                break;
+            }
+            insertBatch.statements.emplace_back(currentDoc);
+            totalBytes += currentBytes;
+            ++currentIndex;
+
+            const auto currentOplogEntry = uassertStatusOK(repl::OplogEntry::parse(currentDoc));
+            insertBatch.startAt =
+                ReshardingDonorOplogId::parse(IDLParserContext{"OplogFetcherParsing"},
+                                              currentOplogEntry.get_id()->getDocument().toBson());
+            if (resharding::isFinalOplog(currentOplogEntry)) {
+                insertBatch.moreToCome = false;
+                break;
+            }
+        }
+
+        invariant(!insertBatch.statements.empty());
+        totalOperations += insertBatch.statements.size();
+        const bool moreToCome = insertBatch.moreToCome;
+        insertBatches.push_back(std::move(insertBatch));
+
+        if (!moreToCome) {
+            break;
+        }
+    }
+
+    invariant(totalOperations == currentIndex,
+              str::stream() << "Packed " << totalOperations << " after iterating upto index "
+                            << currentIndex);
+    return insertBatches;
+}
+
+/**
+ * Inserts the oplog entries in 'oplogBatch' into the oplog buffer collection atomically (in a
+ * single write unit of work).
+ */
+void insertOplogBatch(OperationContext* opCtx,
+                      const CollectionPtr& oplogBufferColl,
+                      CollectionAcquisition& oplogFetcherProgressColl,
+                      const UUID& reshardingUUID,
+                      const ShardId& donorShard,
+                      const std::vector<InsertStatement>& oplogBatch,
+                      bool storeProgress) {
+    WriteUnitOfWork wuow(opCtx, WriteUnitOfWork::kGroupForTransaction);
+
+    uassertStatusOK(collection_internal::insertDocuments(
+        opCtx, oplogBufferColl, oplogBatch.begin(), oplogBatch.end(), nullptr));
+
+
+    if (storeProgress) {
+        // Update the progress doc.
+        auto filter = BSON(ReshardingOplogApplierProgress::kOplogSourceIdFieldName
+                           << (ReshardingSourceId{reshardingUUID, donorShard}).toBSON());
+        auto updateMod =
+            BSON("$inc" << BSON(ReshardingOplogFetcherProgress::kNumEntriesFetchedFieldName
+                                << static_cast<long long>(oplogBatch.size())));
+        auto updateResult = Helpers::upsert(
+            opCtx, oplogFetcherProgressColl, filter, updateMod, false /* fromMigrate */);
+        invariant(updateResult.numDocsModified == 1 || !updateResult.upsertedId.isEmpty());
+    }
+
+    wuow.commit();
 }
 }  // namespace
 
@@ -88,14 +231,16 @@ ReshardingOplogFetcher::ReshardingOplogFetcher(std::unique_ptr<Env> env,
                                                ReshardingDonorOplogId startAt,
                                                ShardId donorShard,
                                                ShardId recipientShard,
-                                               NamespaceString toWriteInto)
+                                               NamespaceString oplogBufferNss,
+                                               bool storeProgress)
     : _env(std::move(env)),
       _reshardingUUID(reshardingUUID),
       _collUUID(collUUID),
       _startAt(startAt),
       _donorShard(donorShard),
       _recipientShard(recipientShard),
-      _toWriteInto(toWriteInto) {
+      _oplogBufferNss(oplogBufferNss),
+      _storeProgress(storeProgress) {
     auto [p, f] = makePromiseFuture<void>();
     stdx::lock_guard lk(_mutex);
     _onInsertPromise = std::move(p);
@@ -149,7 +294,7 @@ ExecutorFuture<void> ReshardingOplogFetcher::schedule(
     }
 
     return ExecutorFuture(executor)
-        .then([this, executor, cancelToken, factory] {
+        .then([this, executor, cancelToken, factory]() mutable {
             return _reschedule(std::move(executor), cancelToken, factory);
         })
         .onError([](Status status) {
@@ -164,10 +309,12 @@ ExecutorFuture<void> ReshardingOplogFetcher::_reschedule(
     CancelableOperationContextFactory factory) {
     return ExecutorFuture(executor)
         .then([this, executor, cancelToken, factory] {
+            // TODO(SERVER-74658): Please revisit if this thread could be made killable.
             ThreadClient client(fmt::format("OplogFetcher-{}-{}",
                                             _reshardingUUID.toString(),
                                             _donorShard.toString()),
-                                _service());
+                                _service()->getService(ClusterRole::ShardServer),
+                                ClientOperationKillableByStepdown{false});
             return iterate(client.get(), factory);
         })
         .then([executor, cancelToken](bool moreToCome) {
@@ -178,7 +325,7 @@ ExecutorFuture<void> ReshardingOplogFetcher::_reschedule(
                 return moreToCome;
             });
         })
-        .then([this, executor, cancelToken, factory](bool moreToCome) {
+        .then([this, executor, cancelToken, factory](bool moreToCome) mutable {
             if (!moreToCome) {
                 LOGV2_INFO(6077401,
                            "Resharding oplog fetcher done fetching",
@@ -189,7 +336,7 @@ ExecutorFuture<void> ReshardingOplogFetcher::_reschedule(
 
             if (cancelToken.isCanceled()) {
                 return ExecutorFuture<void>(
-                    executor,
+                    std::move(executor),
                     Status{ErrorCodes::CallbackCanceled,
                            "Resharding oplog fetcher canceled due to abort or stepdown"});
             }
@@ -198,30 +345,23 @@ ExecutorFuture<void> ReshardingOplogFetcher::_reschedule(
 }
 
 bool ReshardingOplogFetcher::iterate(Client* client, CancelableOperationContextFactory factory) {
-    std::shared_ptr<Shard> targetShard;
-    {
-        auto opCtxRaii = factory.makeOperationContext(client);
-        opCtxRaii->checkForInterrupt();
-
-        StatusWith<std::shared_ptr<Shard>> swDonor =
-            Grid::get(opCtxRaii.get())->shardRegistry()->getShard(opCtxRaii.get(), _donorShard);
-        if (!swDonor.isOK()) {
-            LOGV2_WARNING(5127203,
-                          "Error finding shard in registry, retrying.",
-                          "error"_attr = swDonor.getStatus());
-            return true;
-        }
-        targetShard = swDonor.getValue();
-    }
-
     try {
+        std::shared_ptr<Shard> targetShard;
+        {
+            auto opCtxRaii = factory.makeOperationContext(client);
+            opCtxRaii->checkForInterrupt();
+
+            StatusWith<std::shared_ptr<Shard>> swDonor =
+                Grid::get(opCtxRaii.get())->shardRegistry()->getShard(opCtxRaii.get(), _donorShard);
+            if (!swDonor.isOK()) {
+                LOGV2_WARNING(5127203,
+                              "Error finding shard in registry, retrying.",
+                              "error"_attr = swDonor.getStatus());
+                return true;
+            }
+            targetShard = swDonor.getValue();
+        }
         return consume(client, factory, targetShard.get());
-    } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-        // Defer to the cancellation token for whether the Interruption exception should be retried
-        // upon or not. It is possible the error came as the response from the remote donor shard.
-        // It is also possible that the error is from a stray killOp command being run on this
-        // recipient shard.
-        return true;
     } catch (const ExceptionFor<ErrorCodes::OplogQueryMinTsMissing>&) {
         LOGV2_ERROR(
             5192103, "Fatal resharding error while fetching.", "error"_attr = exceptionToStatus());
@@ -242,18 +382,18 @@ void ReshardingOplogFetcher::_ensureCollection(Client* client,
                                                const NamespaceString nss) {
     auto opCtxRaii = factory.makeOperationContext(client);
     auto opCtx = opCtxRaii.get();
-    invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(!shard_role_details::getLocker(opCtx)->inAWriteUnitOfWork());
 
     // Create the destination collection if necessary.
-    writeConflictRetry(opCtx, "createReshardingLocalOplogBuffer", nss.toString(), [&] {
-        const CollectionPtr coll =
+    writeConflictRetry(opCtx, "createReshardingLocalOplogBuffer", nss, [&] {
+        const Collection* coll =
             CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
         if (coll) {
             return;
         }
 
         WriteUnitOfWork wuow(opCtx);
-        AutoGetDb autoDb(opCtx, nss.db(), LockMode::MODE_IX);
+        AutoGetDb autoDb(opCtx, nss.dbName(), LockMode::MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
         auto db = autoDb.ensureDbExists(opCtx);
 
@@ -287,7 +427,7 @@ AggregateCommandRequest ReshardingOplogFetcher::_makeAggregateCommandRequest(
         auto readConcernArgs = repl::ReadConcernArgs(
             boost::optional<LogicalTime>(_startAt.getClusterTime()),
             boost::optional<repl::ReadConcernLevel>(repl::ReadConcernLevel::kMajorityReadConcern));
-        aggRequest.setReadConcern(readConcernArgs.toBSONInner());
+        aggRequest.setReadConcern(readConcernArgs);
     }
 
     ReadPreferenceSetting readPref(ReadPreference::Nearest,
@@ -310,7 +450,7 @@ AggregateCommandRequest ReshardingOplogFetcher::_makeAggregateCommandRequest(
 bool ReshardingOplogFetcher::consume(Client* client,
                                      CancelableOperationContextFactory factory,
                                      Shard* shard) {
-    _ensureCollection(client, factory, _toWriteInto);
+    _ensureCollection(client, factory, _oplogBufferNss);
 
     auto aggRequest = _makeAggregateCommandRequest(client, factory);
 
@@ -324,51 +464,68 @@ bool ReshardingOplogFetcher::consume(Client* client,
         opCtxRaii.get(),
         aggRequest,
         [this, &batchesProcessed, &moreToCome, &opCtxRaii, &batchFetchTimer, factory](
-            const std::vector<BSONObj>& batch,
+            const std::vector<BSONObj>& aggregateBatch,
             const boost::optional<BSONObj>& postBatchResumeToken) {
-            _env->metrics()->onOplogEntriesFetched(batch.size(),
-                                                   Milliseconds(batchFetchTimer.millis()));
+            _env->metrics()->onBatchRetrievedDuringOplogFetching(
+                Milliseconds(batchFetchTimer.millis()));
 
+            // TODO(SERVER-74658): Please revisit if this thread could be made killable.
             ThreadClient client(fmt::format("ReshardingFetcher-{}-{}",
                                             _reshardingUUID.toString(),
                                             _donorShard.toString()),
-                                _service(),
-                                nullptr);
+                                _service()->getService(ClusterRole::ShardServer),
+                                ClientOperationKillableByStepdown{false});
             auto opCtxRaii = factory.makeOperationContext(client.get());
             auto opCtx = opCtxRaii.get();
 
             // Noting some possible optimizations:
             //
-            // * Batch more inserts into larger storage transactions.
             // * Parallize writing documents across multiple threads.
-            // * Doing either of the above while still using the underlying message buffer of bson
-            //   objects.
-            AutoGetCollection toWriteTo(opCtx, _toWriteInto, LockMode::MODE_IX);
-            for (const BSONObj& doc : batch) {
-                WriteUnitOfWork wuow(opCtx);
-                auto nextOplog = uassertStatusOK(repl::OplogEntry::parse(doc));
+            // * Doing the above while still using the underlying message buffer of bson objects.
+            const auto oplogBufferColl =
+                acquireCollection(opCtx,
+                                  CollectionAcquisitionRequest(
+                                      _oplogBufferNss,
+                                      PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                      repl::ReadConcernArgs::get(opCtx),
+                                      AcquisitionPrerequisites::kWrite),
+                                  MODE_IX);
+            auto oplogFetcherProgressColl =
+                acquireCollection(opCtx,
+                                  CollectionAcquisitionRequest(
+                                      NamespaceString::kReshardingFetcherProgressNamespace,
+                                      PlacementConcern{boost::none, ShardVersion::UNSHARDED()},
+                                      repl::ReadConcernArgs::get(opCtx),
+                                      AcquisitionPrerequisites::kWrite),
+                                  MODE_IX);
 
-                auto startAt = ReshardingDonorOplogId::parse(
-                    {"OplogFetcherParsing"}, nextOplog.get_id()->getDocument().toBson());
+            const auto insertBatches = getOplogInsertBatches(aggregateBatch);
+            for (const auto& insertBatch : insertBatches) {
                 Timer insertTimer;
-                uassertStatusOK(toWriteTo->insertDocument(opCtx, InsertStatement{doc}, nullptr));
-                wuow.commit();
+
+                insertOplogBatch(opCtx,
+                                 oplogBufferColl.getCollectionPtr(),
+                                 oplogFetcherProgressColl,
+                                 _reshardingUUID,
+                                 _donorShard,
+                                 insertBatch.statements,
+                                 _storeProgress);
 
                 _env->metrics()->onLocalInsertDuringOplogFetching(
                     Milliseconds(insertTimer.millis()));
-
-                ++_numOplogEntriesCopied;
+                _env->metrics()->onOplogEntriesFetched(insertBatch.statements.size());
+                _numOplogEntriesCopied += insertBatch.statements.size();
 
                 auto [p, f] = makePromiseFuture<void>();
                 {
                     stdx::lock_guard lk(_mutex);
-                    _startAt = startAt;
+                    _startAt = insertBatch.startAt;
                     _onInsertPromise.emplaceValue();
                     _onInsertPromise = std::move(p);
                     _onInsertFuture = std::move(f);
                 }
 
-                if (resharding::isFinalOplog(nextOplog, _reshardingUUID)) {
+                if (!insertBatch.moreToCome) {
                     moreToCome = false;
                     return false;
                 }
@@ -381,36 +538,48 @@ bool ReshardingOplogFetcher::consume(Client* client,
                 // wasteful.
                 try {
                     auto lastOplogTs = postBatchResumeToken->getField("ts").timestamp();
-                    auto startAt = ReshardingDonorOplogId(lastOplogTs, lastOplogTs);
+                    auto newStartAt = ReshardingDonorOplogId(lastOplogTs, lastOplogTs);
 
-                    WriteUnitOfWork wuow(opCtx);
+                    // If newStartAt == _startAt then inserting a reshardProgressMark is not needed.
+                    // This is because:
+                    //   1. There is already an oplog with timestamp == newStartAt in the
+                    //      oplogBufferColl collection from which the fetcher knows to resume from.
+                    //   2. Or newStartAt equals the initial value for _startAt (typically the
+                    //      minFetchTimestamp) in which case, the fetcher is going to resume from
+                    //      there anyways.
+                    if (newStartAt != _startAt) {
+                        repl::MutableOplogEntry oplog;
+                        oplog.setNss(_oplogBufferNss);
+                        oplog.setOpType(repl::OpTypeEnum::kNoop);
+                        oplog.setUuid(_collUUID);
+                        oplog.set_id(Value(newStartAt.toBSON()));
+                        oplog.setObject(BSON("msg"
+                                             << "Latest oplog ts from donor's cursor response"));
+                        oplog.setObject2(BSON("type" << resharding::kReshardProgressMark));
+                        oplog.setOpTime(OplogSlot());
+                        oplog.setWallClockTime(
+                            opCtx->getServiceContext()->getFastClockSource()->now());
 
-                    repl::MutableOplogEntry oplog;
-                    oplog.setNss(_toWriteInto);
-                    oplog.setOpType(repl::OpTypeEnum::kNoop);
-                    oplog.setUuid(_collUUID);
-                    oplog.set_id(Value(startAt.toBSON()));
-                    oplog.setObject(BSON("msg"
-                                         << "Latest oplog ts from donor's cursor response"));
-                    oplog.setObject2(BSON("type" << resharding::kReshardProgressMark));
-                    oplog.setOpTime(OplogSlot());
-                    oplog.setWallClockTime(opCtx->getServiceContext()->getFastClockSource()->now());
+                        insertOplogBatch(opCtx,
+                                         oplogBufferColl.getCollectionPtr(),
+                                         oplogFetcherProgressColl,
+                                         _reshardingUUID,
+                                         _donorShard,
+                                         {InsertStatement{oplog.toBSON()}},
+                                         _storeProgress);
+                        // Also include synthetic oplog in the fetched count
+                        // so it can match up with the total oplog applied
+                        // count in the end.
+                        _env->metrics()->onOplogEntriesFetched(1);
 
-                    uassertStatusOK(
-                        toWriteTo->insertDocument(opCtx, InsertStatement{oplog.toBSON()}, nullptr));
-                    wuow.commit();
-
-                    // Also include synthetic oplog in the fetched count so it can match up with the
-                    // total oplog applied count in the end.
-                    _env->metrics()->onOplogEntriesFetched(1, Milliseconds(0));
-
-                    auto [p, f] = makePromiseFuture<void>();
-                    {
-                        stdx::lock_guard lk(_mutex);
-                        _startAt = startAt;
-                        _onInsertPromise.emplaceValue();
-                        _onInsertPromise = std::move(p);
-                        _onInsertFuture = std::move(f);
+                        auto [p, f] = makePromiseFuture<void>();
+                        {
+                            stdx::lock_guard lk(_mutex);
+                            _startAt = newStartAt;
+                            _onInsertPromise.emplaceValue();
+                            _onInsertPromise = std::move(p);
+                            _onInsertFuture = std::move(f);
+                        }
                     }
                 } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
                     // It's possible that the donor shard has not generated new oplog entries since

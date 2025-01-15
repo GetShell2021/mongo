@@ -1,12 +1,14 @@
-// Cannot implicitly shard accessed collections because the "dataSize" command returns an
-// "keyPattern must equal shard key" error response.
-// @tags: [assumes_unsharded_collection, requires_fcv_53]
-
-//
 // Test argument validation for dataSize command
 //
+// @tags: [
+//   # The test runs commands that are not allowed with security token: dataSize.
+//   not_allowed_with_signed_security_token,
+//   # Cannot implicitly shard accessed collections because the "dataSize" command returns an
+//   # "keyPattern must equal shard key" error response.
+//   assumes_unsharded_collection,
+//   requires_fcv_53
+// ]
 
-(function() {
 let coll = db.datasize_validation;
 coll.drop();
 coll.insertOne({_id: 1});
@@ -50,4 +52,3 @@ assert.eq(result.size,
 assert.eq(result.numObjects,
           resultWithKey.numObjects,
           "numObjects should be equal after keyPattern properly inferred from min/max bounds.");
-})();

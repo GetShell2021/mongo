@@ -41,7 +41,6 @@ class test_tiered15(TieredConfigMixin, wttest.WiredTigerTestCase):
         ('tiered', dict(type='tiered', tiered_err=True, non_tiered_err=True, non_tiered_errmsg="/Invalid argument/")),
         ('colgroup', dict(type='colgroup', tiered_err=True, non_tiered_err=True, non_tiered_errmsg=None)),
         ('index', dict(type='index', tiered_err=True, non_tiered_err=True, non_tiered_errmsg="/Invalid argument/")),
-        ('lsm', dict(type='lsm', tiered_err=True, non_tiered_err=False, non_tiered_errmsg=None)),
         ('backup', dict(type='backup', tiered_err=True, non_tiered_err=False, non_tiered_errmsg="/Operation not supported/")),
     ]
 
@@ -83,6 +82,3 @@ class test_tiered15(TieredConfigMixin, wttest.WiredTigerTestCase):
                 if self.type == "colgroup":
                     self.skipTest('Skip the colgroup type configuration as we expect it to crash.')
                 self.assertRaisesWithMessage(wiredtiger.WiredTigerError, lambda: self.session.create(uri, "tiered_storage=(name=none),type=" + self.type), self.non_tiered_errmsg)
-
-if __name__ == '__main__':
-    wttest.run()

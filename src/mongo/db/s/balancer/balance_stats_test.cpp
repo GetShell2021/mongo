@@ -27,12 +27,36 @@
  *    it in the license file.
  */
 
+#include <memory>
+#include <string>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/s/balancer/balance_stats.h"
 #include "mongo/db/s/balancer/balancer_policy.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 namespace {
@@ -44,8 +68,8 @@ public:
         return ChunkType(_uuid, ChunkRange(minKey, maxKey), _nextVersion, shard);
     }
 
-    ShardType makeShard(const std::string& name, std::vector<std::string> tags = {}) {
-        return ShardType(name, name, tags);
+    ShardType makeShard(const std::string& name, std::vector<std::string> zones = {}) {
+        return ShardType(name, name, zones);
     }
 
     ChunkManager makeRoutingInfo(const KeyPattern& shardKeyPattern,
@@ -53,13 +77,13 @@ public:
         auto routingTableHistory = RoutingTableHistory::makeNew(_nss,
                                                                 _uuid,  // UUID
                                                                 shardKeyPattern,
+                                                                false,  /* unsplittable */
                                                                 {},     // collator
                                                                 false,  // unique
                                                                 _epoch,
                                                                 _timestamp,   // timestamp
                                                                 boost::none,  // time series fields
                                                                 boost::none,  // resharding fields
-                                                                boost::none,  // chunk size bytes
                                                                 true,         // allowMigration
                                                                 chunks);
 
@@ -71,7 +95,7 @@ public:
     }
 
 private:
-    const NamespaceString _nss{"foo.bar"};
+    const NamespaceString _nss = NamespaceString::createNamespaceString_forTest("foo.bar");
     const UUID _uuid = UUID::gen();
     const OID _epoch{OID::gen()};
     const Timestamp _timestamp{Timestamp(1, 1)};

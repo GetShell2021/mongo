@@ -1,8 +1,8 @@
 /**
  * This tests the basic cases for implicit database creation in a sharded cluster.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 2});
 const configDB = st.s.getDB('config');
@@ -40,6 +40,5 @@ assert.commandWorked(st.s.adminCommand({addShard: newShard.getURL()}));
 
 assert.neq(null, configDB.databases.findOne({_id: 'unshardedDB'}));
 
-newShard.stopSet();
 st.stop();
-})();
+newShard.stopSet();

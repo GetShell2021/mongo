@@ -3,13 +3,14 @@
 // aware of the existing index fails.
 //
 // @tags: [
-//   live_record_incompatible,
 //   requires_sharding,
 //   uses_multi_shard_transaction,
 //   uses_transactions,
 // ]
-(function() {
-"use strict";
+import {
+    withAbortAndRetryOnTransientTxnError
+} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "TestDB";
 const collName = "foo";
@@ -43,17 +44,19 @@ let sessionColl = sessionDB[collName];
 
 {
     jsTest.log("Testing createIndexes on an existing index in a transaction");
-    session.startTransaction({writeConcern: {w: "majority"}});
+    withAbortAndRetryOnTransientTxnError(session, () => {
+        session.startTransaction({writeConcern: {w: "majority"}});
 
-    assert.commandWorked(
-        sessionColl.runCommand({createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}]}));
-    // Perform cross-shard writes to execute prepare path.
-    assert.commandWorked(sessionColl.insert({_id: -1, m: -1}));
-    assert.commandWorked(sessionColl.insert({_id: +1, m: +1}));
-    assert.eq(-1, sessionColl.findOne({m: -1})._id);
-    assert.eq(+1, sessionColl.findOne({m: +1})._id);
+        assert.commandWorked(sessionColl.runCommand(
+            {createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}]}));
+        // Perform cross-shard writes to execute prepare path.
+        assert.commandWorked(sessionColl.insert({_id: -1, m: -1}));
+        assert.commandWorked(sessionColl.insert({_id: +1, m: +1}));
+        assert.eq(-1, sessionColl.findOne({m: -1})._id);
+        assert.eq(+1, sessionColl.findOne({m: +1})._id);
 
-    session.commitTransaction();
+        session.commitTransaction();
+    });
 }
 {
     jsTest.log(
@@ -64,11 +67,14 @@ let sessionColl = sessionDB[collName];
     // collection's indexes
     assert.commandWorked(st.shard1.getDB(dbName).getCollection(collName).dropIndexes("a_1"));
 
-    session.startTransaction({writeConcern: {w: "majority"}});
+    withAbortAndRetryOnTransientTxnError(session, () => {
+        session.startTransaction({writeConcern: {w: "majority"}});
 
-    assert.commandFailedWithCode(
-        sessionColl.runCommand({createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}]}),
-        ErrorCodes.OperationNotSupportedInTransaction);
+        assert.commandFailedWithCode(
+            sessionColl.runCommand(
+                {createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}]}),
+            ErrorCodes.OperationNotSupportedInTransaction);
+    });
 
     assert.commandFailedWithCode(session.abortTransaction_forTesting(),
                                  ErrorCodes.NoSuchTransaction);
@@ -79,4 +85,3 @@ st.shard1.getDB(dbName).getCollection(collName).runCommand(
     {createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}]});
 
 st.stop();
-})();

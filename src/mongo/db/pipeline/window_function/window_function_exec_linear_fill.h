@@ -29,12 +29,23 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <utility>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/window_function/partition_iterator.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
 #include "mongo/db/pipeline/window_function/window_function_exec.h"
 #include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/memory_usage_tracker.h"
 
 namespace mongo {
 
@@ -51,7 +62,7 @@ public:
                                  boost::intrusive_ptr<Expression> input,
                                  boost::intrusive_ptr<ExpressionFieldPath> sortBy,
                                  WindowBounds bounds,
-                                 MemoryUsageTracker::PerFunctionMemoryTracker* memTracker)
+                                 MemoryUsageTracker::Impl* memTracker)
         : WindowFunctionExec(PartitionAccessor(iter, PartitionAccessor::Policy::kManual),
                              memTracker),
           _input(std::move(input)),
@@ -59,7 +70,7 @@ public:
           _bounds(std::move(bounds)),
           _prevX1Y1(boost::none),
           _prevX2Y2(boost::none) {}
-    Value getNext() final;
+    Value getNext(boost::optional<Document> current = boost::none) final;
     void reset() final {
         _prevX1Y1 = boost::none;
         _prevX2Y2 = boost::none;

@@ -28,8 +28,19 @@
  */
 #pragma once
 
+#include <memory>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/status.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/periodic_runner.h"
+#include "mongo/util/version/releases.h"
 
 namespace mongo {
 
@@ -51,12 +62,23 @@ public:
     static void start(ServiceContext* serviceCtx, OperationContext* opCtx);
 
     /**
-     * Refreshes all cluster server parameters that have been updated on the config servers since
-     * _latestClusterParameterTime. Called periodically in the run method, which executes in a
-     * background thread. Also called in-line during getClusterParameter on mongos to ensure that
-     * cached values returned are up-to-date.
+     * Callback to be called when the mongos is shutting down. Will stop the currently running
+     * refresh, if one is running, and stop running periodically.
      */
-    Status refreshParameters(OperationContext* opCtx);
+    static void onShutdown(ServiceContext* serviceCtx);
+
+    /**
+     * Refreshes all cluster server parameters from the config servers. Called periodically in the
+     * run method, which executes in a background thread. Also called in-line during
+     * getClusterParameter on mongos to ensure that cached values returned are up-to-date.
+     * If 'ensureReadYourWritesConsistency' is true, then effect of all preceeding operations issued
+     * by the current thread on the cluster parameters is visible after this method returns.
+     * Otherwise, the values of the cluster parameters may be stale after this method returns.
+     */
+    Status refreshParameters(OperationContext* opCtx, bool ensureReadYourWritesConsistency = false);
+
+    // What the actual refresh job runs to do a refresh.
+    Status _refreshParameters(OperationContext* opCtx);
 
     /**
      * Set the period of the background job. This should only be used internally (by the
@@ -64,13 +86,20 @@ public:
      */
     void setPeriod(Milliseconds period);
 
+    // Public for testing.
+    std::unique_ptr<SharedPromise<void>> _refreshPromise;
+
 private:
     void run();
 
     std::unique_ptr<PeriodicJobAnchor> _job;
-    LogicalTime _latestClusterParameterTime = LogicalTime::kUninitialized;
+    multiversion::FeatureCompatibilityVersion _lastFcv;
+    stdx::mutex _mutex;
 };
 
 Status clusterServerParameterRefreshIntervalSecsNotify(const int& newValue);
+
+std::pair<multiversion::FeatureCompatibilityVersion, TenantIdMap<StringMap<BSONObj>>>
+getFCVAndClusterParametersFromConfigServer();
 
 }  // namespace mongo

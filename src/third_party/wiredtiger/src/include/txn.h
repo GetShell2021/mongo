@@ -6,6 +6,8 @@
  * See the file LICENSE for redistribution information.
  */
 
+#pragma once
+
 #define WT_TXN_NONE 0                /* Beginning of time */
 #define WT_TXN_FIRST 1               /* First transaction to run */
 #define WT_TXN_MAX (UINT64_MAX - 10) /* End of time */
@@ -19,10 +21,10 @@
  * the session get rollback reason API call. Users of the API could have a dependency on the format
  * of these messages so changing them must be done with care.
  */
-#define WT_TXN_ROLLBACK_REASON_OLDEST_FOR_EVICTION \
-    "oldest pinned transaction ID rolled back for eviction"
 #define WT_TXN_ROLLBACK_REASON_CACHE_OVERFLOW "transaction rolled back because of cache overflow"
 #define WT_TXN_ROLLBACK_REASON_CONFLICT "conflict between concurrent operations"
+#define WT_TXN_ROLLBACK_REASON_OLDEST_FOR_EVICTION \
+    "oldest pinned transaction ID rolled back for eviction"
 
 /* AUTOMATIC FLAG VALUE GENERATION START 0 */
 #define WT_TXN_LOG_CKPT_CLEANUP 0x01u
@@ -50,6 +52,11 @@ typedef enum {
 } WT_VISIBLE_TYPE;
 
 /*
+ * Enumeration used to track the context of reconstructing modifies within a update list.
+ */
+typedef enum { WT_OPCTX_TRANSACTION, WT_OPCTX_RECONCILATION } WT_OP_CONTEXT;
+
+/*
  * Transaction ID comparison dealing with edge cases.
  *
  * WT_TXN_ABORTED is the largest possible ID (never visible to a running transaction), WT_TXN_NONE
@@ -63,7 +70,8 @@ typedef enum {
     (S2C(s)->txn_global.txn_shared_list == NULL ? NULL : \
                                                   &S2C(s)->txn_global.txn_shared_list[(s)->id])
 
-#define WT_SESSION_IS_CHECKPOINT(s) ((s)->id != 0 && (s)->id == S2C(s)->txn_global.checkpoint_id)
+#define WT_SESSION_IS_CHECKPOINT(s) \
+    ((s)->id != 0 && (s)->id == __wt_atomic_loadv32(&S2C(s)->txn_global.checkpoint_id))
 
 /*
  * Perform an operation at the specified isolation level.
@@ -73,72 +81,86 @@ typedef enum {
  * while this operation is in progress). Check for those cases: the bugs they cause are hard to
  * debug.
  */
-#define WT_WITH_TXN_ISOLATION(s, iso, op)                                       \
-    do {                                                                        \
-        WT_TXN_ISOLATION saved_iso = (s)->isolation;                            \
-        WT_TXN_ISOLATION saved_txn_iso = (s)->txn->isolation;                   \
-        WT_TXN_SHARED *txn_shared = WT_SESSION_TXN_SHARED(s);                   \
-        WT_TXN_SHARED saved_txn_shared = *txn_shared;                           \
-        (s)->txn->forced_iso++;                                                 \
-        (s)->isolation = (s)->txn->isolation = (iso);                           \
-        op;                                                                     \
-        (s)->isolation = saved_iso;                                             \
-        (s)->txn->isolation = saved_txn_iso;                                    \
-        WT_ASSERT((s), (s)->txn->forced_iso > 0);                               \
-        (s)->txn->forced_iso--;                                                 \
-        WT_ASSERT((s),                                                          \
-          txn_shared->id == saved_txn_shared.id &&                              \
-            (txn_shared->metadata_pinned == saved_txn_shared.metadata_pinned || \
-              saved_txn_shared.metadata_pinned == WT_TXN_NONE) &&               \
-            (txn_shared->pinned_id == saved_txn_shared.pinned_id ||             \
-              saved_txn_shared.pinned_id == WT_TXN_NONE));                      \
-        txn_shared->metadata_pinned = saved_txn_shared.metadata_pinned;         \
-        txn_shared->pinned_id = saved_txn_shared.pinned_id;                     \
+#define WT_WITH_TXN_ISOLATION(s, iso, op)                                                        \
+    do {                                                                                         \
+        WT_TXN_ISOLATION saved_iso = (s)->isolation;                                             \
+        WT_TXN_ISOLATION saved_txn_iso = (s)->txn->isolation;                                    \
+        WT_TXN_SHARED *txn_shared = WT_SESSION_TXN_SHARED(s);                                    \
+        WT_TXN_SHARED saved_txn_shared = *txn_shared;                                            \
+        uint64_t txn_shared_id = __wt_atomic_loadv64(&txn_shared->id);                           \
+        uint64_t txn_shared_metadata_pinned = __wt_atomic_loadv64(&txn_shared->metadata_pinned); \
+        uint64_t txn_shared_pinned_id = __wt_atomic_loadv64(&txn_shared->pinned_id);             \
+        uint64_t saved_txn_shared_id = __wt_atomic_loadv64(&saved_txn_shared.id);                \
+        uint64_t saved_txn_shared_metadata_pinned =                                              \
+          __wt_atomic_loadv64(&saved_txn_shared.metadata_pinned);                                \
+        uint64_t saved_txn_shared_pinned_id = __wt_atomic_loadv64(&saved_txn_shared.pinned_id);  \
+                                                                                                 \
+        /* The following variables are only used inside an assert. */                            \
+        WT_UNUSED(txn_shared_id);                                                                \
+        WT_UNUSED(txn_shared_metadata_pinned);                                                   \
+        WT_UNUSED(txn_shared_pinned_id);                                                         \
+        WT_UNUSED(saved_txn_shared_id);                                                          \
+                                                                                                 \
+        (s)->txn->forced_iso++;                                                                  \
+        (s)->isolation = (s)->txn->isolation = (iso);                                            \
+        op;                                                                                      \
+        (s)->isolation = saved_iso;                                                              \
+        (s)->txn->isolation = saved_txn_iso;                                                     \
+        WT_ASSERT((s), (s)->txn->forced_iso > 0);                                                \
+        (s)->txn->forced_iso--;                                                                  \
+        WT_ASSERT((s),                                                                           \
+          txn_shared_id == saved_txn_shared_id &&                                                \
+            (txn_shared_metadata_pinned == saved_txn_shared_metadata_pinned ||                   \
+              saved_txn_shared_metadata_pinned == WT_TXN_NONE) &&                                \
+            (txn_shared_pinned_id == saved_txn_shared_pinned_id ||                               \
+              saved_txn_shared_pinned_id == WT_TXN_NONE));                                       \
+        __wt_atomic_storev64(&txn_shared->metadata_pinned, saved_txn_shared_metadata_pinned);    \
+        __wt_atomic_storev64(&txn_shared->pinned_id, saved_txn_shared_pinned_id);                \
     } while (0)
 
 struct __wt_txn_shared {
     WT_CACHE_LINE_PAD_BEGIN
-    volatile uint64_t id;
-    volatile uint64_t pinned_id;
-    volatile uint64_t metadata_pinned;
+    wt_shared volatile uint64_t id;
+    wt_shared volatile uint64_t pinned_id;
+    wt_shared volatile uint64_t metadata_pinned;
 
     /*
      * The first commit or durable timestamp used for this transaction. Determines its position in
      * the durable queue and prevents the all_durable timestamp moving past this point.
      */
-    wt_timestamp_t pinned_durable_timestamp;
+    wt_shared wt_timestamp_t pinned_durable_timestamp;
 
     /*
      * The read timestamp used for this transaction. Determines what updates can be read and
      * prevents the oldest timestamp moving past this point.
      */
-    wt_timestamp_t read_timestamp;
+    wt_shared wt_timestamp_t read_timestamp;
 
-    volatile uint8_t is_allocating;
+    wt_shared volatile uint8_t is_allocating;
     WT_CACHE_LINE_PAD_END
 };
 
 struct __wt_txn_global {
-    volatile uint64_t current; /* Current transaction ID. */
+    wt_shared volatile uint64_t current; /* Current transaction ID. */
 
     /* The oldest running transaction ID (may race). */
-    volatile uint64_t last_running;
+    wt_shared volatile uint64_t last_running;
 
     /*
      * The oldest transaction ID that is not yet visible to some transaction in the system.
      */
-    volatile uint64_t oldest_id;
+    wt_shared volatile uint64_t oldest_id;
 
-    wt_timestamp_t durable_timestamp;
-    wt_timestamp_t last_ckpt_timestamp;
+    wt_shared wt_timestamp_t durable_timestamp;
+    wt_shared wt_timestamp_t last_ckpt_timestamp;
     wt_timestamp_t meta_ckpt_timestamp;
-    wt_timestamp_t oldest_timestamp;
-    wt_timestamp_t pinned_timestamp;
+    wt_shared wt_timestamp_t oldest_timestamp;
+    wt_shared wt_timestamp_t pinned_timestamp;
     wt_timestamp_t recovery_timestamp;
-    wt_timestamp_t stable_timestamp;
+    wt_shared wt_timestamp_t stable_timestamp;
     wt_timestamp_t version_cursor_pinned_timestamp;
     bool has_durable_timestamp;
-    bool has_oldest_timestamp;
+    wt_shared bool has_oldest_timestamp;
     bool has_pinned_timestamp;
     bool has_stable_timestamp;
     bool oldest_is_pinned;
@@ -159,17 +181,16 @@ struct __wt_txn_global {
      * We rely on the fact that (a) the only table a checkpoint updates is the metadata; and (b)
      * once checkpoint has finished reading a table, it won't revisit it.
      */
-    volatile bool checkpoint_running;    /* Checkpoint running */
-    volatile bool checkpoint_running_hs; /* Checkpoint running and processing history store file */
+    wt_shared volatile bool checkpoint_running; /* Checkpoint running */
+    wt_shared volatile bool
+      checkpoint_running_hs;             /* Checkpoint running and processing history store file */
     volatile uint32_t checkpoint_id;     /* Checkpoint's session ID */
     WT_TXN_SHARED checkpoint_txn_shared; /* Checkpoint's txn shared state */
-    wt_timestamp_t checkpoint_timestamp; /* Checkpoint's timestamp */
-    volatile uint64_t checkpoint_reserved_txn_id; /* A transaction ID reserved by checkpoint for
-                                            prepared transaction resolution. */
+    wt_shared wt_timestamp_t checkpoint_timestamp; /* Checkpoint's timestamp */
 
-    volatile uint64_t debug_ops;       /* Debug mode op counter */
-    uint64_t debug_rollback;           /* Debug mode rollback */
-    volatile uint64_t metadata_pinned; /* Oldest ID for metadata */
+    wt_shared volatile uint64_t debug_ops;       /* Debug mode op counter */
+    uint64_t debug_rollback;                     /* Debug mode rollback */
+    wt_shared volatile uint64_t metadata_pinned; /* Oldest ID for metadata */
 
     WT_TXN_SHARED *txn_shared_list; /* Per-session shared transaction states */
 };
@@ -244,6 +265,22 @@ struct __wt_txn_op {
     uint32_t flags;
 };
 
+/*
+ * WT_TXN_SNAPSHOT --
+ *	A structure to store the transactions snapshot details.
+ */
+struct __wt_txn_snapshot {
+    /*
+     * Snapshot data:
+     *	txn_ids >= snap_max are invisible,
+     *	txn_ids < snap_min are visible,
+     *	everything else is visible unless it is in the snapshot.
+     */
+    uint64_t snap_max, snap_min;
+    uint64_t *snapshot;
+    uint32_t snapshot_count;
+};
+
 #define WT_TS_VERBOSE_PREFIX "unexpected timestamp usage: "
 
 /*
@@ -257,16 +294,13 @@ struct __wt_txn {
 
     uint32_t forced_iso; /* Isolation is currently forced. */
 
-    /*
-     * Snapshot data:
-     *	ids >= snap_max are invisible,
-     *	ids < snap_min are visible,
-     *	everything else is visible unless it is in the snapshot.
-     */
-    uint64_t snap_min, snap_max;
-    uint64_t *snapshot;
-    uint32_t snapshot_count;
     uint32_t txn_logsync; /* Log sync configuration */
+
+    /* Snapshot data. */
+    WT_TXN_SNAPSHOT snapshot_data;
+
+    /* Backup snapshot data. */
+    WT_TXN_SNAPSHOT *backup_snapshot_data;
 
     /*
      * Timestamp copied into updates created by this transaction.
@@ -297,6 +331,7 @@ struct __wt_txn {
      * the current oldest/pinned timestamp, respectively.
      */
     wt_timestamp_t checkpoint_read_timestamp;
+    wt_timestamp_t checkpoint_stable_timestamp;
     wt_timestamp_t checkpoint_oldest_timestamp;
 
     /* Array of modifications by this transaction. */
@@ -334,28 +369,29 @@ struct __wt_txn {
  */
 
 /* AUTOMATIC FLAG VALUE GENERATION START 0 */
-#define WT_TXN_AUTOCOMMIT 0x00001u
-#define WT_TXN_ERROR 0x00002u
-#define WT_TXN_HAS_ID 0x00004u
-#define WT_TXN_HAS_SNAPSHOT 0x00008u
-#define WT_TXN_HAS_TS_COMMIT 0x00010u
-#define WT_TXN_HAS_TS_DURABLE 0x00020u
-#define WT_TXN_HAS_TS_PREPARE 0x00040u
-#define WT_TXN_IGNORE_PREPARE 0x00080u
-#define WT_TXN_IS_CHECKPOINT 0x00100u
-#define WT_TXN_PREPARE 0x00200u
-#define WT_TXN_PREPARE_IGNORE_API_CHECK 0x00400u
-#define WT_TXN_READONLY 0x00800u
-#define WT_TXN_RUNNING 0x01000u
-#define WT_TXN_SHARED_TS_DURABLE 0x02000u
-#define WT_TXN_SHARED_TS_READ 0x04000u
-#define WT_TXN_SYNC_SET 0x08000u
-#define WT_TXN_TS_NOT_SET 0x10000u
-#define WT_TXN_TS_ROUND_PREPARED 0x20000u
-#define WT_TXN_TS_ROUND_READ 0x40000u
-#define WT_TXN_UPDATE 0x80000u
+#define WT_TXN_AUTOCOMMIT 0x000001u
+#define WT_TXN_ERROR 0x000002u
+#define WT_TXN_HAS_ID 0x000004u
+#define WT_TXN_HAS_SNAPSHOT 0x000008u
+#define WT_TXN_HAS_TS_COMMIT 0x000010u
+#define WT_TXN_HAS_TS_DURABLE 0x000020u
+#define WT_TXN_HAS_TS_PREPARE 0x000040u
+#define WT_TXN_IGNORE_PREPARE 0x000080u
+#define WT_TXN_IS_CHECKPOINT 0x000100u
+#define WT_TXN_PREPARE 0x000200u
+#define WT_TXN_PREPARE_IGNORE_API_CHECK 0x000400u
+#define WT_TXN_READONLY 0x000800u
+#define WT_TXN_REFRESH_SNAPSHOT 0x001000u
+#define WT_TXN_RUNNING 0x002000u
+#define WT_TXN_SHARED_TS_DURABLE 0x004000u
+#define WT_TXN_SHARED_TS_READ 0x008000u
+#define WT_TXN_SYNC_SET 0x010000u
+#define WT_TXN_TS_NOT_SET 0x020000u
+#define WT_TXN_TS_ROUND_PREPARED 0x040000u
+#define WT_TXN_TS_ROUND_READ 0x080000u
+#define WT_TXN_UPDATE 0x100000u
     /* AUTOMATIC FLAG VALUE GENERATION STOP 32 */
-    uint32_t flags;
+    wt_shared uint32_t flags;
 
     /*
      * Zero or more bytes of value (the payload) immediately follows the WT_TXN structure. We use a

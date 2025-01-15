@@ -28,14 +28,10 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/storage/storage_engine_lock_file.h"
 
 #include <boost/filesystem.hpp>
 #include <io.h>
-#include <ostream>
-#include <sstream>
 
 #include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
@@ -191,10 +187,7 @@ void StorageEngineLockFile::clearPidAndUnlock() {
     // with StorageEngineLockFile::open().
     Status status = _truncateFile(_lockFileHandle->_handle);
     if (!status.isOK()) {
-        LOGV2(22282,
-              "couldn't remove fs lock: {error}",
-              "Couldn't remove fs lock",
-              "error"_attr = status);
+        LOGV2(22282, "Couldn't remove fs lock", "error"_attr = status);
     }
     CloseHandle(_lockFileHandle->_handle);
     _lockFileHandle->clear();

@@ -10,9 +10,8 @@
  *  multiversion_incompatible
  * ]
  */
-(function() {
-"use strict";
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({
     nodes: [
@@ -28,7 +27,7 @@ const rst = new ReplSetTest({
 });
 
 rst.startSet();
-rst.initiate();
+rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 let primary = rst.getPrimary();
 
@@ -67,4 +66,3 @@ assert.commandWorked(primary.adminCommand({
 }));
 
 rst.stopSet();
-}());

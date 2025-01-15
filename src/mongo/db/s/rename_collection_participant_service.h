@@ -29,9 +29,33 @@
 
 #pragma once
 
+#include <memory>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/sharded_rename_collection_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -42,7 +66,7 @@ public:
     explicit RenameCollectionParticipantService(ServiceContext* serviceContext)
         : PrimaryOnlyService(serviceContext) {}
 
-    ~RenameCollectionParticipantService() = default;
+    ~RenameCollectionParticipantService() override = default;
 
     static RenameCollectionParticipantService* getService(OperationContext* opCtx);
 
@@ -85,10 +109,11 @@ public:
     using Phase = RenameCollectionParticipantPhaseEnum;
 
     explicit RenameParticipantInstance(const BSONObj& participantDoc)
-        : _doc(RenameCollectionParticipantDocument::parse(
-              IDLParserErrorContext("RenameCollectionParticipantDocument"), participantDoc)) {}
+        : _doc(RenameCollectionParticipantDocument::parseOwned(
+              IDLParserContext("RenameCollectionParticipantDocument"), participantDoc.getOwned())),
+          _request(_doc.getRenameCollectionRequest()) {}
 
-    ~RenameParticipantInstance();
+    ~RenameParticipantInstance() override;
 
     /*
      * Check if the given participant document has the same options as the current instance.
@@ -98,18 +123,6 @@ public:
 
     BSONObj doc() {
         return _doc.toBSON();
-    }
-
-    const NamespaceString& fromNss() {
-        return _doc.getFromNss();
-    }
-
-    const UUID& sourceUUID() {
-        return _doc.getSourceUUID();
-    }
-
-    const NamespaceString& toNss() {
-        return _doc.getTo();
     }
 
     /*
@@ -123,8 +136,11 @@ public:
      * Flags CRUD operations as ready to be served and returns a future that will be ready right
      * after releasing the critical section on source and target collection.
      */
-    SharedSemiFuture<void> getUnblockCrudFuture() {
-        stdx::lock_guard<Latch> lg(_mutex);
+    boost::optional<SharedSemiFuture<void>> getUnblockCrudFutureFor(const UUID& sourceUUID) {
+        stdx::lock_guard<stdx::mutex> lg(_stateMutex);
+        if (sourceUUID != _doc.getSourceUUID()) {
+            return boost::none;
+        }
         if (!_canUnblockCRUDPromise.getFuture().isReady()) {
             _canUnblockCRUDPromise.setFrom(Status::OK());
         }
@@ -136,20 +152,23 @@ public:
         MongoProcessInterface::CurrentOpConnectionsMode connMode,
         MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override;
 
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const override {}
+
 private:
     RenameCollectionParticipantDocument _doc;
+    const RenameCollectionRequest _request;
 
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                         const CancellationToken& token) noexcept override final;
+                         const CancellationToken& token) noexcept final;
 
     SemiFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                               const CancellationToken& token) noexcept;
 
-    void interrupt(Status status) noexcept override final;
+    void interrupt(Status status) noexcept final;
 
     template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
-        return [=] {
+    auto _buildPhaseHandler(const Phase& newPhase, Func&& handlerFn) {
+        return [=, this] {
             const auto& currPhase = _doc.getPhase();
 
             if (currPhase > newPhase) {
@@ -160,15 +179,16 @@ private:
                 // Persist the new phase if this is the first time we are executing it.
                 _enterPhase(newPhase);
             }
-            return func();
+            return handlerFn();
         };
     }
 
     void _removeStateDocument(OperationContext* opCtx);
     void _enterPhase(Phase newPhase);
-    void _invalidateFutures(const Status& errStatus);
+    void _invalidateFutures(const Status& errStatus, WithLock);
 
-    Mutex _mutex = MONGO_MAKE_LATCH("RenameParticipantInstance::_mutex");
+    // Protects the state of the service object (the recovery doc and the promise fields).
+    stdx::mutex _stateMutex;
 
     // Ready when step 1 (drop target && rename source) has been completed: once set, a successful
     // response to `ShardsvrRenameCollectionParticipantCommand` can be returned to the coordinator.

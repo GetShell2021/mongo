@@ -1,11 +1,13 @@
 /**
  * @tags: [
  *   uses_multiple_connections,
+ *   uses_parallel_shell,
+ *   # benchRun does not use runCommand which is required by the `simulate_atlas_proxy` override.
+ *   simulate_atlas_proxy_incompatible,
+ *   # TODO SERVER-84638: remove this incompatibility once benchrun passes on shell options.
+ *   grpc_incompatible,
  * ]
  */
-(function() {
-"use strict";
-
 const t = db.bench_test2;
 t.drop();
 
@@ -56,4 +58,3 @@ print("Avg: " + avg);
 print("Std: " + std);
 print("Min: " + min);
 print("Max: " + max);
-})();

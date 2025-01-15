@@ -27,255 +27,108 @@
 # it in the license file.
 #
 """Validate that the commit message is ok."""
-import argparse
-import logging
-import os
+
+import pathlib
 import re
-import sys
-from typing import List, Optional
+import subprocess
 
-from evergreen import EvergreenApi, RetryingEvergreenApi
+import structlog
+import typer
+from git import Commit, Repo
+from typing_extensions import Annotated
 
-from buildscripts.client.jiraclient import JiraAuth, JiraClient, SecurityLevel
-
-JIRA_SERVER = "https://jira.mongodb.org"
-EVG_CONFIG_FILE = "~/.evergreen.yml"
-SERVER_TICKET_PREFIX = "SERVER-"
-PUBLIC_PROJECT_PREFIX = "mongodb-mongo-"
-
-LOGGER = logging.getLogger(__name__)
-
-ERROR_MSG = """
-################################################################################
-Encountered an invalid commit message. Please correct to the commit message to
-continue.
-
-Commit message should start with a Public Jira ticket, an "Import" for wiredtiger
-or tools, or a "Revert" message.
-
-{error_msg} on '{branch}':
-'{commit_message}'
-################################################################################
-"""
-
-COMMON_PUBLIC_PATTERN = r"""
-    ((?P<revert>Revert)\s+[\"\']?)?                         # Revert (optional)
-    ((?P<ticket>(?:EVG|SERVER|WT)-[0-9]+)[\"\']?\s*)               # ticket identifier
-    (?P<body>(?:(?!\(cherry\spicked\sfrom).)*)?             # To also capture the body
-    (?P<backport>\(cherry\spicked\sfrom.*)?                 # back port (optional)
-    """
-"""Common Public pattern format."""
-
-COMMON_LINT_PATTERN = r"(?P<lint>Fix\slint)"
-"""Common Lint pattern format."""
-
-COMMON_IMPORT_PATTERN = r"(?P<imported>Import\s(wiredtiger|tools):\s.*)"
-"""Common Import pattern format."""
-
-COMMON_REVERT_IMPORT_PATTERN = (r"Revert\s+[\"\']?(?P<imported>Import\s(wiredtiger|tools):\s.*)")
-"""Common revert Import pattern format."""
-
-COMMON_PRIVATE_PATTERN = r"""
-    ((?P<revert>Revert)\s+[\"\']?)?                                     # Revert (optional)
-    ((?P<ticket>[A-Z]+-[0-9]+)[\"\']?\s*)                               # ticket identifier
-    (?P<body>(?:(?!('\s(into\s'(([^/]+))/(([^:]+)):(([^']+))'))).)*)?   # To also capture the body
-"""
-"""Common Private pattern format."""
+LOGGER = structlog.get_logger(__name__)
 
 STATUS_OK = 0
 STATUS_ERROR = 1
 
+repo_root = pathlib.Path(
+    subprocess.run(
+        "git rev-parse --show-toplevel", shell=True, text=True, capture_output=True
+    ).stdout.strip()
+)
 
-def new_patch_description(pattern: str) -> str:
-    """
-    Wrap the pattern to conform to the new commit queue patch description format.
+pr_template = ""
+with open(repo_root / ".github" / "pull_request_template.md", "r") as r:
+    pr_template = r.read().strip()
 
-    Add the commit queue prefix and suffix to the pattern. The format looks like:
+BANNED_STRINGS = ["https://spruce.mongodb.com", "https://evergreen.mongodb.com", pr_template]
 
-    Commit Queue Merge: '<commit message>' into '<owner>/<repo>:<branch>'
+VALID_SUMMARY = re.compile(r'(Revert ")?(SERVER-[0-9]+|Import wiredtiger)')
 
-    :param pattern: The pattern to wrap.
-    :return: A pattern to match the new format for the patch description.
-    """
-    return (r"""^((?P<commitqueue>Commit\sQueue\sMerge:)\s')"""
-            f"{pattern}"
-            # r"""('\s(?P<into>into\s'((?P<owner>[^/]+))/((?P<repo>[^:]+)):((?P<branch>[^']+))'))"""
+
+def is_valid_commit(commit: Commit) -> bool:
+    # Valid values look like:
+    # 1. SERVER-\d+
+    # 2. Revert "SERVER-\d+
+    # 3. Import wiredtiger
+    # 4. Revert "Import wiredtiger
+    if not VALID_SUMMARY.match(commit.summary):
+        LOGGER.error(
+            "Commit did not contain a valid summary",
+            commit_hexsha=commit.hexsha,
+            commit_summary=commit.summary,
+        )
+        return False
+
+    # Remove all whitespace from comparisons. GitHub line-wraps commit messages, which adds
+    # newline characters that otherwise would not match verbatim such banned strings.
+    stripped_message = "".join(commit.message.split())
+    for banned_string in BANNED_STRINGS:
+        if "".join(banned_string.split()) in stripped_message:
+            LOGGER.error(
+                "Commit contains banned string (ignoring whitespace)",
+                banned_string=banned_string,
+                commit_hexsha=commit.hexsha,
+                commit_message=commit.message,
             )
-
-
-def old_patch_description(pattern: str) -> str:
-    """
-    Wrap the pattern to conform to the new commit queue patch description format.
-
-    Just add a start anchor. The format looks like:
-
-    <commit message>
-
-    :param pattern: The pattern to wrap.
-    :return: A pattern to match the old format for the patch description.
-    """
-    return r"^" f"{pattern}"
-
-
-# NOTE: re.VERBOSE is for visibility / debugging. As such significant white space must be
-# escaped (e.g ' ' to \s).
-VALID_PATTERNS = [
-    re.compile(
-        new_patch_description(COMMON_PUBLIC_PATTERN),
-        re.MULTILINE | re.DOTALL | re.VERBOSE,
-    ),
-    re.compile(
-        old_patch_description(COMMON_PUBLIC_PATTERN),
-        re.MULTILINE | re.DOTALL | re.VERBOSE,
-    ),
-    re.compile(
-        new_patch_description(COMMON_LINT_PATTERN),
-        re.MULTILINE | re.DOTALL | re.VERBOSE,
-    ),
-    re.compile(
-        old_patch_description(COMMON_LINT_PATTERN),
-        re.MULTILINE | re.DOTALL | re.VERBOSE,
-    ),
-    re.compile(
-        new_patch_description(COMMON_IMPORT_PATTERN),
-        re.MULTILINE | re.DOTALL | re.VERBOSE,
-    ),
-    re.compile(
-        old_patch_description(COMMON_IMPORT_PATTERN),
-        re.MULTILINE | re.DOTALL | re.VERBOSE,
-    ),
-    re.compile(
-        new_patch_description(COMMON_REVERT_IMPORT_PATTERN),
-        re.MULTILINE | re.DOTALL | re.VERBOSE,
-    ),
-    re.compile(
-        old_patch_description(COMMON_REVERT_IMPORT_PATTERN),
-        re.MULTILINE | re.DOTALL | re.VERBOSE,
-    ),
-]
-"""valid public patterns."""
-
-PRIVATE_PATTERNS = [
-    re.compile(
-        new_patch_description(COMMON_PRIVATE_PATTERN),
-        re.MULTILINE | re.DOTALL | re.VERBOSE,
-    ),
-    re.compile(
-        old_patch_description(COMMON_PRIVATE_PATTERN),
-        re.MULTILINE | re.DOTALL | re.VERBOSE,
-    ),
-]
-"""private patterns."""
-
-
-class CommitMessageValidationOrchestrator:
-    """An orchestrator to validate that commit messages are valid."""
-
-    def __init__(self, evg_api: EvergreenApi, jira_client: JiraClient) -> None:
-        """
-        Initialize the orchestrator.
-
-        :param evg_api: Evergreen API client.
-        :param jira_client: Client to Jira API.
-        """
-        self.evg_api = evg_api
-        self.jira_client = jira_client
-
-    def validate_ticket(self, ticket: str, project: str) -> bool:
-        """
-        Check that the given Jira ticket has a proper security level.
-
-        Commits targeting a public project should not have a defined security level (these are
-        public by default).
-
-        :param ticket: Ticket to check.
-        :param project: Project commit is targeting.
-        :return: True if ticket is valid.
-        """
-        if ticket.startswith(SERVER_TICKET_PREFIX) and project.startswith(PUBLIC_PROJECT_PREFIX):
-            security_level = self.jira_client.get_ticket_security_level(ticket)
-            return security_level == SecurityLevel.NONE
-        return True
-
-    def validate_msg(self, message: str, project: str) -> bool:
-        """
-        Check that the given message is valid.
-
-        :param message: Commit message to validate.
-        :param project: Project commit is targeting.
-        :return: True if the message is valid.
-        """
-        valid_matches = [valid_pattern.match(message) for valid_pattern in VALID_PATTERNS]
-        if any(valid_matches):
-            ticket_matches = [pattern.match(message) for pattern in VALID_PATTERNS[0:2]]
-            for match in [ticket_match for ticket_match in ticket_matches if ticket_match]:
-                if not self.validate_ticket(match.group("ticket"), project):
-                    print(
-                        ERROR_MSG.format(
-                            error_msg="Reference to a internal Jira Ticket",
-                            branch=project,
-                            commit_message=message,
-                        ))
-                    return False
-            return True
-        elif any(private_pattern.match(message) for private_pattern in PRIVATE_PATTERNS):
-            print(
-                ERROR_MSG.format(
-                    error_msg="Reference to a private project",
-                    branch=project,
-                    commit_message=message,
-                ))
-            return False
-        else:
-            print(
-                ERROR_MSG.format(
-                    error_msg="Commit without a ticket",
-                    branch=project,
-                    commit_message=message,
-                ))
             return False
 
-    def validate_commit_messages(self, version_id: str) -> int:
-        """
-        Validate the commit messages for the given build.
-
-        :param version_id: ID of version to validate.
-        :param evg_api: Evergreen API client.
-        :return: True if all commit messages were valid.
-        """
-        found_error = False
-        code_changes = self.evg_api.patch_by_id(version_id).module_code_changes
-        for change in code_changes:
-            for message in change.commit_messages:
-                is_valid = self.validate_msg(message, change.branch_name)
-                found_error = found_error or not is_valid
-
-        return STATUS_ERROR if found_error else STATUS_OK
+    return True
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """Execute Main function to validate commit messages."""
-    parser = argparse.ArgumentParser(
-        usage="Validate the commit message. "
-        "It validates the latest message when no arguments are provided.")
-    parser.add_argument(
-        "version_id",
-        metavar="version id",
-        help="The id of the version to validate",
+def main(
+    branch_name: Annotated[
+        str,
+        typer.Option(envvar="BRANCH_NAME", help="Name of the branch to compare against HEAD"),
+    ],
+    is_commit_queue: Annotated[
+        str,
+        typer.Option(
+            envvar="IS_COMMIT_QUEUE",
+            help="If this is being run in the commit/merge queue. Set to anything to be considered part of the commit/merge queue.",
+        ),
+    ] = "",
+):
+    """
+    Validate the commit message.
+
+    It validates the latest message when no arguments are provided.
+    """
+
+    if not is_commit_queue:
+        LOGGER.info("Exiting early since this is not running in the commit/merge queue")
+        raise typer.Exit(code=STATUS_OK)
+
+    diff_commits = subprocess.run(
+        ["git", "log", '--pretty=format:"%H"', f"{branch_name}...HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    parser.add_argument(
-        "--evg-config-file",
-        default=EVG_CONFIG_FILE,
-        help="Path to evergreen configuration file containing auth information.",
-    )
-    args = parser.parse_args(argv)
-    evg_api = RetryingEvergreenApi.get_api(config_file=os.path.expanduser(args.evg_config_file))
-    jira_auth = JiraAuth()
-    jira_client = JiraClient(JIRA_SERVER, jira_auth)
-    orchestrator = CommitMessageValidationOrchestrator(evg_api, jira_client)
+    # Comes back like "hash1"\n"hash2"\n...
+    commit_hashs: list[str] = diff_commits.stdout.replace('"', "").splitlines()
+    LOGGER.info("Diff commit hashes", commit_hashs=commit_hashs)
+    repo = Repo(repo_root)
 
-    return orchestrator.validate_commit_messages(args.version_id)
+    for commit_hash in commit_hashs:
+        commit = repo.commit(commit_hash)
+        if not is_valid_commit(commit):
+            LOGGER.error("Found an invalid commit", commit=commit)
+            raise typer.Exit(code=STATUS_ERROR)
+
+    return
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    typer.run(main)

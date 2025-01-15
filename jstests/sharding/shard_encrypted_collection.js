@@ -1,12 +1,15 @@
 // Verify valid and invalid scenarios for sharding an encrypted collection
 
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 /**
  * @tags: [
  *  requires_fcv_60,
  * ]
  */
-(function() {
-'use strict';
+
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
 
 const st = new ShardingTest({shards: 1, mongos: 1});
 const mongos = st.s0;
@@ -39,6 +42,10 @@ function testShardingCommand(command) {
     let res = null;
     let commandObj = {};
     commandObj[command] = kDbName + '.basic';
+
+    if (command === "reshardCollection") {
+        commandObj['numInitialChunks'] = 1;
+    }
 
     jsTestLog('Fail ' + command + ' if shard key is an encrypted field');
     commandObj['key'] = {firstName: 1};
@@ -73,4 +80,3 @@ testShardingCommand("reshardCollection");
 testShardingCommand("refineCollectionShardKey");
 
 st.stop();
-})();

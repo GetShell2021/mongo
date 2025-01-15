@@ -27,21 +27,35 @@
  *    it in the license file.
  */
 
-#include "mongo/base/status.h"
-#include "mongo/db/range_arithmetic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/chunk_version.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/resharding/common_types_gen.h"
 #include "mongo/s/sharding_test_fixture_common.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
 
-using unittest::assertGet;
 
-const NamespaceString kNss("test.foo");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.foo");
 const ShardId kThisShard("thisShard");
 const ShardId kOtherShard("otherShard");
 
@@ -55,8 +69,8 @@ CollectionMetadata makeCollectionMetadataImpl(
 
     const OID epoch = OID::gen();
 
-    const Timestamp kRouting(100, 0);
-    const Timestamp kChunkManager(staleChunkManager ? 99 : 100, 0);
+    const Timestamp kOnCurrentShardSince(100, 0);
+    const boost::optional<Timestamp> kChunkManager(staleChunkManager, Timestamp{99, 0});
 
     std::vector<ChunkType> allChunks;
     auto nextMinKey = shardKeyPattern.globalMin();
@@ -66,12 +80,18 @@ CollectionMetadata makeCollectionMetadataImpl(
             // Need to add a chunk to the other shard from nextMinKey to myNextChunk.first.
             allChunks.emplace_back(
                 uuid, ChunkRange{nextMinKey, myNextChunk.first}, version, kOtherShard);
-            allChunks.back().setHistory({ChunkHistory(kRouting, kOtherShard)});
+            auto& chunk = allChunks.back();
+            chunk.setOnCurrentShardSince(kOnCurrentShardSince);
+            chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), chunk.getShard())});
+
             version.incMajor();
         }
         allChunks.emplace_back(
             uuid, ChunkRange{myNextChunk.first, myNextChunk.second}, version, kThisShard);
-        allChunks.back().setHistory({ChunkHistory(kRouting, kThisShard)});
+        auto& chunk = allChunks.back();
+        chunk.setOnCurrentShardSince(kOnCurrentShardSince);
+        chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), chunk.getShard())});
+
         version.incMajor();
         nextMinKey = myNextChunk.second;
     }
@@ -79,7 +99,9 @@ CollectionMetadata makeCollectionMetadataImpl(
     if (SimpleBSONObjComparator::kInstance.evaluate(nextMinKey < shardKeyPattern.globalMax())) {
         allChunks.emplace_back(
             uuid, ChunkRange{nextMinKey, shardKeyPattern.globalMax()}, version, kOtherShard);
-        allChunks.back().setHistory({ChunkHistory(kRouting, kOtherShard)});
+        auto& chunk = allChunks.back();
+        chunk.setOnCurrentShardSince(kOnCurrentShardSince);
+        chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), chunk.getShard())});
     }
 
     return CollectionMetadata(
@@ -89,13 +111,13 @@ CollectionMetadata makeCollectionMetadataImpl(
                          RoutingTableHistory::makeNew(kNss,
                                                       uuid,
                                                       shardKeyPattern,
+                                                      false, /* unsplittable */
                                                       nullptr,
                                                       false,
                                                       epoch,
                                                       timestamp,
                                                       boost::none /* timeseriesFields */,
                                                       std::move(reshardingFields),
-                                                      boost::none /* chunkSizeBytes */,
                                                       true,
                                                       allChunks)),
                      kChunkManager),
@@ -123,7 +145,7 @@ protected:
             reshardingFields.setRecipientFields(std::move(recipientFields));
         } else if (state == CoordinatorStateEnum::kBlockingWrites) {
             TypeCollectionDonorFields donorFields{
-                resharding::constructTemporaryReshardingNss(kNss.db(), existingUuid),
+                resharding::constructTemporaryReshardingNss(kNss, existingUuid),
                 KeyPattern{BSON("newKey" << 1)},
                 {kThisShard, kOtherShard}};
             reshardingFields.setDonorFields(std::move(donorFields));
@@ -294,7 +316,7 @@ TEST_F(SingleChunkMinMaxCompoundKeyFixture, KeyBelongsToMe) {
     ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << MINKEY << "b" << 10)));
     ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << 10 << "b" << 20)));
 
-    ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSON("a" << MAXKEY << "b" << MAXKEY)));
+    ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << MAXKEY << "b" << MAXKEY)));
 
     ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSONObj()));
 }
@@ -376,10 +398,10 @@ TEST_F(ThreeChunkWithRangeGapFixture, KeyBelongsToMe) {
     ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << 10)));
     ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << 30)));
     ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << 40)));
+    ASSERT(makeCollectionMetadata().keyBelongsToMe(BSON("a" << MAXKEY)));
 
     ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSON("a" << 20)));
     ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSON("a" << 25)));
-    ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSON("a" << MAXKEY)));
 
     ASSERT(!makeCollectionMetadata().keyBelongsToMe(BSONObj()));
 }

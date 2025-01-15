@@ -2,8 +2,12 @@
  *  @tags: [requires_fcv_53]
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// Because this test intentionally causes the server to crash, we need to instruct the
+// shell to clean up the core dump that is left behind.
+TestData.cleanUpCoreDumpsFromExpectedCrash = true;
+
 const params = {
     healthMonitoringIntensities: tojson({
         values: [
@@ -44,4 +48,3 @@ const offParams = {
 st = new ShardingTest({mongos: [{setParameter: Object.assign({}, offParams, setFailPoint)}]});
 assert.commandWorked(st.s0.adminCommand({"ping": 1}));
 st.stop();
-})();

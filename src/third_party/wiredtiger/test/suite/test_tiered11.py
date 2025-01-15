@@ -98,7 +98,7 @@ class test_tiered11(wttest.WiredTigerTestCase, TieredConfigMixin):
         new_end_ts = self.add_data(self.nentries)
         # We have a new stable timestamp, but after the checkpoint. Make
         # sure the flush tier records the correct timestamp.
-        self.session.flush_tier(None)
+        self.session.checkpoint('flush_tier=(enabled)')
         # Make sure a new checkpoint doesn't change any of our timestamp info.
         self.session.checkpoint()
 
@@ -110,6 +110,3 @@ class test_tiered11(wttest.WiredTigerTestCase, TieredConfigMixin):
         time_str = "flush_time=0"
         self.check_metadata(self.tiereduri, time_str, False)
         self.check_metadata(self.objuri, time_str, False)
-
-if __name__ == '__main__':
-    wttest.run()

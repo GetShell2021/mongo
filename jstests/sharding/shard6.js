@@ -1,12 +1,11 @@
 // shard6.js
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 var summary = "";
 
 var s = new ShardingTest({name: "shard6", shards: 2});
 
-s.adminCommand({enablesharding: "test"});
-s.ensurePrimaryShard('test', s.shard1.shardName);
+s.adminCommand({enablesharding: "test", primaryShard: s.shard1.shardName});
 s.adminCommand({shardcollection: "test.data", key: {num: 1}});
 
 var version = s.getDB("admin").runCommand({buildinfo: 1}).versionArray;
@@ -103,11 +102,6 @@ checkItCount(2);
 
 poolStats("after checking itcount");
 
-// --- Verify that modify & save style updates doesn't work on sharded clusters ---
-
-var o = db.data.findOne();
-o.x = 16;
-assert.commandFailedWithCode(db.data.save(o), ErrorCodes.ShardKeyNotFound);
 poolStats("at end");
 
 print(summary);
@@ -117,4 +111,3 @@ assert.throws(function() {
 });
 
 s.stop();
-})();

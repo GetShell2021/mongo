@@ -8,6 +8,7 @@ its name.
 
 import threading
 from contextlib import contextmanager
+
 from buildscripts.resmokelib.utils import default_if_none
 
 # Specifying 'LEAVE_UNREGISTERED' as the "REGISTERED_NAME" attribute will cause the class to be
@@ -48,7 +49,7 @@ def make_registry_metaclass(registry_store, base_metaclass=None):
     class Registry(base_metaclass):
         """A metaclass that stores a reference to all registered classes."""
 
-        def __new__(mcs, class_name, base_classes, class_dict):  # pylint: disable=bad-mcs-classmethod-argument,bad-classmethod-argument
+        def __new__(mcs, class_name, base_classes, class_dict):  # pylint: disable=bad-classmethod-argument
             """Create and returns a new instance of Registry.
 
             The registry is a class named 'class_name' derived from 'base_classes'
@@ -74,7 +75,8 @@ def make_registry_metaclass(registry_store, base_metaclass=None):
                 if name_to_register in registry_store:
                     raise ValueError(
                         "The name %s is already registered; a different value for the"
-                        " 'REGISTERED_NAME' attribute must be chosen" % (registered_name))
+                        " 'REGISTERED_NAME' attribute must be chosen" % (registered_name)
+                    )
                 registry_store[name_to_register] = cls
 
             return cls

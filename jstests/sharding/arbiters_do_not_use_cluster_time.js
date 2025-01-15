@@ -1,9 +1,12 @@
 /**
  * Tests that arbiters do not gossip clusterTime or operationTime.
+ *
+ * A config server can't have arbiter nodes.
+ * @tags: [config_shard_incompatible]
  */
 
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 let st = new ShardingTest({
     shards: {
         rs0: {
@@ -39,4 +42,3 @@ for (let i = 0; i < secondaries.length; i++) {
 }
 assert.eq(foundArbiter, true);
 st.stop();
-})();

@@ -4,15 +4,18 @@
  * than attempt to use the node.
  *
  * This test only makes sense for storage engines that support recover to stable timestamp.
- * @tags: [requires_persistence, requires_journaling, requires_replication,
+ * @tags: [requires_persistence, requires_replication,
  * requires_majority_read_concern, uses_transactions, uses_prepare_transaction,
  * # We don't expect to do this while upgrading.
  * multiversion_incompatible]
  */
 
-(function() {
-"use strict";
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint, kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
+// Because this test intentionally causes the server to crash, we need to instruct the
+// shell to clean up the core dump that is left behind.
+TestData.cleanUpCoreDumpsFromExpectedCrash = true;
 
 const dbName = TestData.testName;
 const logLevel = tojson({storage: {recovery: 2}});
@@ -30,7 +33,7 @@ const startParams = {
 };
 const nodes = rst.startSet({setParameter: startParams});
 let restoreNode = nodes[1];
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 const primary = rst.getPrimary();
 const db = primary.getDB(dbName);
 const collName = "testcoll";
@@ -124,10 +127,35 @@ assert.docEq({_id: lastId, paddingStr: paddingStr},
 
 clearRawMongoProgramOutput();
 jsTestLog("Restarting restore node again, in repl set mode");
-restoreNode = rst.restart(restoreNode, {noReplSet: false, setParameter: startParams});
+restoreNode = rst.restart(restoreNode, {
+    noReplSet: false,
+    setParameter: Object.merge(startParams, {
+        'failpoint.hangBeforeUnrecoverableRollbackError': tojson({mode: 'alwaysOn'}),
+
+    })
+});
+
+// We need to wait until the node has done enough initialization before waiting on the failpoint.
+rst.waitForState(restoreNode, ReplSetTest.State.ROLLBACK);
+
+// It is possible that 'waitForFailPoint' is called as connections are being closed, triggering
+// an exception. In this case, retry until we are sure connections are finished closing.
+assert.soonNoExcept(function() {
+    assert.commandWorked(restoreNode.adminCommand({
+        waitForFailPoint: 'hangBeforeUnrecoverableRollbackError',
+        timesEntered: 1,
+        maxTimeMS: kDefaultWaitForFailPointTimeout
+    }));
+    return true;
+});
+clearRawMongoProgramOutput();
+
+assert.commandWorked(restoreNode.adminCommand(
+    {'configureFailPoint': 'hangBeforeUnrecoverableRollbackError', 'mode': 'off'}));
 
 // This node should not come back up, because it has no stable timestamp to recover to.
-assert.soon(() => (rawMongoProgramOutput().search("UnrecoverableRollbackError") >= 0));
+const subStr = "UnrecoverableRollbackError";
+assert.soon(() => (rawMongoProgramOutput(subStr).search(subStr) >= 0));
 // Hide the exit code from stopSet.
 waitMongoProgram(parseInt(restoreNode.port));
 
@@ -136,4 +164,3 @@ rst.remove(primary);
 rst.remove(restoreNode);
 // Shut down the set.
 rst.stopSet();
-})();

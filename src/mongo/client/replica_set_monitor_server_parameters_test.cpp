@@ -27,14 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/client/replica_set_monitor_protocol_test_util.h"
 #include "mongo/client/replica_set_monitor_server_parameters.h"
-#include "mongo/client/streamable_replica_set_monitor.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/db/service_context.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -44,12 +41,12 @@ namespace {
  */
 class ReplicaSetMonitorProtocolTest : public unittest::Test {
 protected:
-    void setUp() {
+    void setUp() override {
         setGlobalServiceContext(ServiceContext::make());
         ReplicaSetMonitor::cleanup();
     }
 
-    void tearDown() {
+    void tearDown() override {
         ReplicaSetMonitor::cleanup();
         ReplicaSetMonitorProtocolTestUtil::resetRSMProtocol();
     }

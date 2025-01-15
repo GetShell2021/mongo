@@ -28,45 +28,28 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 
 namespace mongo {
 namespace {
-
-bool nonShardedCollectionCommandPassthrough(OperationContext* opCtx,
-                                            StringData dbName,
-                                            const NamespaceString& nss,
-                                            const ChunkManager& cm,
-                                            const BSONObj& cmdObj,
-                                            Shard::RetryPolicy retryPolicy,
-                                            BSONObjBuilder* out) {
-    const StringData cmdName(cmdObj.firstElementFieldName());
-    uassert(ErrorCodes::IllegalOperation,
-            str::stream() << "Can't do command: " << cmdName << " on a sharded collection",
-            !cm.isSharded());
-
-    auto responses = scatterGatherVersionedTargetByRoutingTable(
-        opCtx, dbName, nss, cm, cmdObj, ReadPreferenceSetting::get(opCtx), retryPolicy, {}, {});
-    invariant(responses.size() == 1);
-
-    const auto cmdResponse = uassertStatusOK(std::move(responses.front().swResponse));
-    const auto status = getStatusFromCommandResult(cmdResponse.data);
-
-    uassert(ErrorCodes::IllegalOperation,
-            str::stream() << "Can't do command: " << cmdName << " on a sharded collection",
-            !ErrorCodes::isStaleShardVersionError(status));
-
-    out->appendElementsUnique(CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.data));
-    return status.isOK();
-}
 
 class ConvertToCappedCmd : public BasicCommand {
 public:
@@ -80,43 +63,59 @@ public:
         return AllowedOnSecondary::kNever;
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsCollectionRequired(dbname, cmdObj).ns();
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsCollectionRequired(dbName, cmdObj);
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::convertToCapped);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::convertToCapped)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs(dbName, cmdObj));
-        const auto cm =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
-        uassert(ErrorCodes::IllegalOperation,
-                "You can't convertToCapped a sharded collection",
-                !cm.isSharded());
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
+        const long long size = cmdObj.getField("size").safeNumberLong();
 
-        // convertToCapped creates a temp collection and renames it at the end. It will require
-        // special handling for create collection.
-        return nonShardedCollectionCommandPassthrough(
+        uassert(ErrorCodes::InvalidOptions,
+                "Capped collection size must be greater than zero",
+                size > 0);
+
+        ShardsvrConvertToCappedRequest req;
+        req.setSize(size);
+
+        ShardsvrConvertToCapped shardSvrConvertToCappedCommand(nss);
+        shardSvrConvertToCappedCommand.setDbName(dbName);
+        shardSvrConvertToCappedCommand.setShardsvrConvertToCappedRequest(std::move(req));
+        generic_argument_util::setMajorityWriteConcern(shardSvrConvertToCappedCommand,
+                                                       &opCtx->getWriteConcern());
+
+        const CachedDatabaseInfo dbInfo =
+            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, nss.dbName()));
+        auto cmdResponse = executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
             opCtx,
             dbName,
-            nss,
-            cm,
-            applyReadWriteConcern(
-                opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
-            Shard::RetryPolicy::kIdempotent,
-            &result);
-    }
+            dbInfo,
+            shardSvrConvertToCappedCommand.toBSON(),
+            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+            Shard::RetryPolicy::kIdempotent);
 
-} convertToCappedCmd;
+        const auto remoteResponse = uassertStatusOK(cmdResponse.swResponse);
+        uassertStatusOK(getStatusFromCommandResult(remoteResponse.data));
+
+        return true;
+    }
+};
+MONGO_REGISTER_COMMAND(ConvertToCappedCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

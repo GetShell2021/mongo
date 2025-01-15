@@ -27,18 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/accumulator_js_reduce.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/process_interface/standalone_process_interface.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -46,7 +62,7 @@ namespace {
 class MapReduceFixture : public ServiceContextMongoDTest {
 protected:
     MapReduceFixture() {
-        _expCtx.mongoProcessInterface = std::make_shared<StandaloneProcessInterface>(nullptr);
+        _expCtx.setMongoProcessInterface(std::make_shared<StandaloneProcessInterface>(nullptr));
     }
 
     auto getExpCtx() {
@@ -63,7 +79,7 @@ private:
 
 void MapReduceFixture::setUp() {
     ServiceContextMongoDTest::setUp();
-    ScriptEngine::setup(false);
+    ScriptEngine::setup(ExecutionEnvironment::Server);
 }
 
 void MapReduceFixture::tearDown() {
@@ -78,7 +94,7 @@ static void assertProcessFailsWithCode(ExpressionContext* const expCtx,
                                        const std::string& eval,
                                        Value processArgument,
                                        int code) {
-    auto accum = AccName::create(expCtx, eval);
+    auto accum = make_intrusive<AccName>(expCtx, eval);
     ASSERT_THROWS_CODE(accum->process(processArgument, false), AssertionException, code);
 }
 
@@ -98,7 +114,7 @@ static void assertExpectedResults(ExpressionContext* const expCtx,
                                   Value expectedResult) {
     // Asserts that result equals expected result when not sharded.
     {
-        auto accum = AccName::create(expCtx, eval);
+        auto accum = make_intrusive<AccName>(expCtx, eval);
         for (auto&& val : data) {
             accum->process(val, false);
         }
@@ -109,8 +125,8 @@ static void assertExpectedResults(ExpressionContext* const expCtx,
 
     // Asserts that result equals expected result when all input is on one shard.
     {
-        auto accum = AccName::create(expCtx, eval);
-        auto shard = AccName::create(expCtx, eval);
+        auto accum = make_intrusive<AccName>(expCtx, eval);
+        auto shard = make_intrusive<AccName>(expCtx, eval);
         for (auto&& val : data) {
             shard->process(val, false);
         }
@@ -122,9 +138,9 @@ static void assertExpectedResults(ExpressionContext* const expCtx,
 
     // Asserts that result equals expected result when each input is on a separate shard.
     {
-        auto accum = AccName::create(expCtx, eval);
+        auto accum = make_intrusive<AccName>(expCtx, eval);
         for (auto&& val : data) {
-            auto shard = AccName::create(expCtx, eval);
+            auto shard = make_intrusive<AccName>(expCtx, eval);
             shard->process(val, false);
             accum->process(shard->getValue(true), true);
         }
@@ -160,7 +176,7 @@ TEST_F(MapReduceFixture, InternalJsReduceProducesExpectedResults) {
 
 TEST_F(MapReduceFixture, InternalJsReduceIdempotentOnlyWhenJSFunctionIsIdempotent) {
     std::string eval("function(key, values) { return Array.sum(values) + 1; };");
-    auto accum = AccumulatorInternalJsReduce::create(getExpCtx(), eval);
+    auto accum = make_intrusive<AccumulatorInternalJsReduce>(getExpCtx(), eval);
 
     // A non-idempotent Javascript function will produce non-idempotent results. In this case a
     // single document reduce causes a change in value.
@@ -178,7 +194,7 @@ TEST_F(MapReduceFixture, InternalJsReduceFailsWhenEvalContainsInvalidJavascript)
     std::string eval("INVALID_JAVASCRIPT");
     // Multiple source documents.
     {
-        auto accum = AccumulatorInternalJsReduce::create(getExpCtx(), "INVALID_JAVASCRIPT");
+        auto accum = make_intrusive<AccumulatorInternalJsReduce>(getExpCtx(), "INVALID_JAVASCRIPT");
         auto input = Value(DOC("k" << Value(1) << "v" << Value(2)));
         accum->process(input, false);
         accum->process(input, false);
@@ -188,12 +204,44 @@ TEST_F(MapReduceFixture, InternalJsReduceFailsWhenEvalContainsInvalidJavascript)
 
     // Single source document.
     {
-        auto accum = AccumulatorInternalJsReduce::create(getExpCtx(), "INVALID_JAVASCRIPT");
+        auto accum = make_intrusive<AccumulatorInternalJsReduce>(getExpCtx(), "INVALID_JAVASCRIPT");
 
         auto input = Value(DOC("k" << Value(1) << "v" << Value(2)));
         accum->process(input, false);
 
         ASSERT_THROWS_CODE(accum->getValue(false), DBException, ErrorCodes::JSInterpreterFailure);
+    }
+}
+
+TEST_F(
+    MapReduceFixture,
+    InternalJsReduceFailsDependentOnDocumentCountWhenEvalIsInvalidJavascriptWithSingleReduceOpt) {
+    RAIIServerParameterControllerForTest flag("mrEnableSingleReduceOptimization", true);
+    std::string eval("INVALID_JAVASCRIPT");
+    // Multiple source documents should evaluate the passed in function and return an error with
+    // invalid javascript.
+    {
+        auto accum = make_intrusive<AccumulatorInternalJsReduce>(getExpCtx(), "INVALID_JAVASCRIPT");
+        auto input = Value(DOC("k" << Value(1) << "v" << Value(2)));
+        accum->process(input, false);
+        accum->process(input, false);
+
+        ASSERT_THROWS_CODE(accum->getValue(false), DBException, ErrorCodes::JSInterpreterFailure);
+    }
+
+    // Single source document. With the reduce optimization, we simply return this document rather
+    // than executing the JS engine at all, so no error is thrown.
+    {
+        auto accum = make_intrusive<AccumulatorInternalJsReduce>(getExpCtx(), "INVALID_JAVASCRIPT");
+
+        auto input = Value(DOC("k" << Value(1) << "v" << Value(2)));
+        auto expectedResult = Value(2);
+
+        accum->process(input, false);
+        Value result = accum->getValue(false);
+
+        ASSERT_VALUE_EQ(expectedResult, result);
+        ASSERT_EQUALS(expectedResult.getType(), result.getType());
     }
 }
 
@@ -249,8 +297,7 @@ TEST_F(MapReduceFixture, InternalJsReduceFailsIfEvalArgumentNotOfTypeStringOrCod
 TEST_F(MapReduceFixture, InternalJsReduceFailsIfDataArgumentNotDocument) {
     std::string eval("function(key, values) { return Array.sum(values); };");
     auto argument = Value(Value(2));
-    assertProcessFailsWithCode<AccumulatorInternalJsReduce>(
-        getExpCtx(), std::move(eval), argument, 31242);
+    assertProcessFailsWithCode<AccumulatorInternalJsReduce>(getExpCtx(), eval, argument, 31242);
 }
 
 TEST_F(MapReduceFixture, InternalJsReduceFailsIfDataArgumentDoesNotContainExpectedFields) {

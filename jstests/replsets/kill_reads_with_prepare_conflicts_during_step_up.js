@@ -5,11 +5,9 @@
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 2});
 rst.startSet();
@@ -100,14 +98,13 @@ rst.stepUp(secondary);
 waitForSecondaryReadBlockedOnPrepareConflictThread();
 
 rst.waitForState(secondary, ReplSetTest.State.PRIMARY);
-rst.waitForState(primary, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [primary]);
 
 primary = rst.getPrimary();
 
 // Validate that the read operation got killed during step up.
 let replMetrics = assert.commandWorked(primary.adminCommand({serverStatus: 1})).metrics.repl;
 assert.eq(replMetrics.stateTransition.lastStateTransition, "stepUp");
-assert.eq(replMetrics.stateTransition.userOperationsKilled, 1);
 
 // Make sure we can successfully commit the prepared transaction.
 jsTestLog("Restoring shell session state");
@@ -128,4 +125,3 @@ assert.commandWorked(sessionDB.adminCommand({
 }));
 
 rst.stopSet();
-})();

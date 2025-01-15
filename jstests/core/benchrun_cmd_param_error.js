@@ -4,10 +4,14 @@
  * - No readCmd param or readCmd: false is specified for read ops
  * - No writeCmd param or writeCmd: false is specified for write ops
  * - Exhaust query is requested
+ *
+ * @tags: [
+ *   # benchRun does not use runCommand which is required by the `simulate_atlas_proxy` override.
+ *   simulate_atlas_proxy_incompatible,
+ *   # TODO SERVER-84638: remove this incompatibility once benchrun passes on shell options.
+ *   grpc_incompatible,
+ * ]
  */
-(function() {
-"use strict";
-
 const testDB = db.getSiblingDB(jsTestName());
 testDB.dropDatabase();
 const coll = testDB.coll;
@@ -111,4 +115,3 @@ opsAndErrors.forEach(opAndError => {
 
     assert.throwsWithCode(() => benchRun(benchArgs), opAndError.error);
 });
-})();

@@ -15,13 +15,8 @@ static int __col_insert_alloc(WT_SESSION_IMPL *, uint64_t, u_int, WT_INSERT **, 
  *     Column-store delete, insert, and update.
  */
 int
-__wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_UPDATE *upd_arg,
-  u_int modify_type, bool exclusive
-#ifdef HAVE_DIAGNOSTIC
-  ,
-  bool restore
-#endif
-)
+__wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_UPDATE **updp_arg,
+  u_int modify_type, bool exclusive, bool restore)
 {
     WT_BTREE *btree;
     WT_DECL_RET;
@@ -30,20 +25,22 @@ __wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_U
     WT_PAGE *page;
     WT_PAGE_MODIFY *mod;
     WT_SESSION_IMPL *session;
-    WT_UPDATE *last_upd, *old_upd, *upd;
+    WT_UPDATE *last_upd, *old_upd, *upd, *upd_arg;
     wt_timestamp_t prev_upd_ts;
     size_t ins_size, upd_size;
     u_int i, skipdepth;
-    bool append, inserted_to_update_chain, added_to_txn;
+    bool added_to_txn, append, inserted_to_update_chain;
 
     btree = CUR2BT(cbt);
     ins = NULL;
     page = cbt->ref->page;
     session = CUR2S(cbt);
     last_upd = NULL;
+    upd_arg = updp_arg == NULL ? NULL : *updp_arg;
     upd = upd_arg;
     prev_upd_ts = WT_TS_NONE;
     added_to_txn = append = inserted_to_update_chain = false;
+    upd_size = 0;
 
     /*
      * We should have one of the following:
@@ -83,11 +80,13 @@ __wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_U
         }
     } else {
         /* Since on this path we never set append, make sure we aren't appending. */
-        WT_ASSERT(session, recno != WT_RECNO_OOB);
-        WT_ASSERT(session,
+        WT_ASSERT_ALWAYS(
+          session, recno != WT_RECNO_OOB, "Out-of-bound recno provided for a non-append operation");
+        WT_ASSERT_OPTIONAL(session, WT_DIAGNOSTIC_KEY_OUT_OF_ORDER,
           cbt->compare == 0 ||
             recno <= (btree->type == BTREE_COL_VAR ? __col_var_last_recno(cbt->ref) :
-                                                     __col_fix_last_recno(cbt->ref)));
+                                                     __col_fix_last_recno(cbt->ref)),
+          "Out-of-bound recno provided for a non-append operation");
     }
 
     /*
@@ -151,7 +150,8 @@ __wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_U
              * If we restore an update chain in update restore eviction, there should be no update
              * on the existing update chain.
              */
-            WT_ASSERT(session, !restore || old_upd == NULL);
+            WT_ASSERT_ALWAYS(session, !restore || old_upd == NULL,
+              "Illegal update on chain during update restore eviction");
 
             /*
              * We can either put multiple new updates or a single update on the update chain.
@@ -269,7 +269,7 @@ __wt_col_modify(WT_CURSOR_BTREE *cbt, uint64_t recno, const WT_ITEM *value, WT_U
      * function can safely free the updates if it receives an error return.
      */
     if (added_to_txn && modify_type != WT_UPDATE_RESERVE) {
-        if (__wt_log_op(session))
+        if (__wt_txn_log_op_check(session))
             WT_ERR(__wt_txn_log_op(session, cbt));
 
         /*
@@ -309,6 +309,13 @@ err:
             if (last_upd != NULL)
                 last_upd->next = NULL;
         }
+
+        /*
+         * If upd was freed or if we know that its ownership was moved to a page, set the update
+         * argument to NULL to prevent future use by the caller.
+         */
+        if (upd == NULL && updp_arg != NULL)
+            *updp_arg = NULL;
     }
 
     return (ret);

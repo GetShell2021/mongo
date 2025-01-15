@@ -27,11 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/inlined_vector.h>
+#include <absl/container/node_hash_map.h>
+#include <utility>
 
-#include "mongo/db/exec/sbe/stages/unique.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/stages/unique.h"
 
 namespace mongo {
 namespace sbe {
@@ -39,13 +44,14 @@ UniqueStage::UniqueStage(std::unique_ptr<PlanStage> input,
                          value::SlotVector keys,
                          PlanNodeId planNodeId,
                          bool participateInTrialRunTracking)
-    : PlanStage("unique"_sd, planNodeId, participateInTrialRunTracking), _keySlots(keys) {
+    : PlanStage("unique"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
+      _keySlots(keys) {
     _children.emplace_back(std::move(input));
 }
 
 std::unique_ptr<PlanStage> UniqueStage::clone() const {
     return std::make_unique<UniqueStage>(
-        _children[0]->clone(), _keySlots, _commonStats.nodeId, _participateInTrialRunTracking);
+        _children[0]->clone(), _keySlots, _commonStats.nodeId, participateInTrialRunTracking());
 }
 
 void UniqueStage::prepare(CompileCtx& ctx) {
@@ -61,8 +67,11 @@ value::SlotAccessor* UniqueStage::getAccessor(CompileCtx& ctx, value::SlotId slo
 
 void UniqueStage::open(bool reOpen) {
     auto optTimer(getOptTimer(_opCtx));
-
     ++_commonStats.opens;
+
+    if (reOpen) {
+        _seen.clear();
+    }
     _children[0]->open(reOpen);
 }
 

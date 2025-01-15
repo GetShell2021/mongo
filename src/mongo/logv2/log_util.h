@@ -29,11 +29,12 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <functional>
 
-#include <boost/optional.hpp>
-#include <mongo/base/status.h>
-#include <mongo/base/string_data.h>
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 
 namespace mongo::logv2 {
 
@@ -41,6 +42,7 @@ constexpr auto kServerLogTag = "server"_sd;
 constexpr auto kAuditLogTag = "audit"_sd;
 
 using LogRotateCallback = std::function<Status(bool, StringData, std::function<void(Status)>)>;
+using ShouldEmitLogServiceFn = std::function<bool()>;
 
 /**
  * logType param needs to have static lifetime. If a new logType needs to be defined, add it above
@@ -100,5 +102,17 @@ bool shouldRedactBinDataEncrypt();
  * Sets the redact mode of the bin data encrypt field.
  */
 void setShouldRedactBinDataEncrypt(bool enabled);
+
+/**
+ * Returns true if log service names should be emitted. Returns false until setShouldEmitLogService
+ * is called.
+ */
+bool shouldEmitLogService();
+
+/**
+ * Set a callback which shouldEmitLogService() invokes to determine whether log service names should
+ * be emitted.
+ */
+void setShouldEmitLogService(ShouldEmitLogServiceFn fn);
 
 }  // namespace mongo::logv2

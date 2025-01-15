@@ -1,22 +1,25 @@
 // Tests of $changeStream notifications for metadata operations.
 // Do not run in whole-cluster passthrough since this test assumes that the change stream will be
 // invalidated by a database drop.
-// @tags: [do_not_run_in_whole_cluster_passthrough]
-(function() {
-"use strict";
+// @tags: [
+//   do_not_run_in_whole_cluster_passthrough,
+//   requires_fcv_63,
+// ]
+import {
+    assertCreateCollection,
+    assertDropAndRecreateCollection,
+    assertDropCollection,
+} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ChangeStreamTest} from "jstests/libs/query/change_stream_util.js";
 
-load("jstests/libs/change_stream_util.js");        // For isChangeStreamsOptimizationEnabled.
-load('jstests/replsets/libs/two_phase_drops.js');  // For 'TwoPhaseDropCollectionTest'.
-load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
-load("jstests/libs/fixture_helpers.js");           // For isSharded.
-
-db = db.getSiblingDB(jsTestName());
-let cst = new ChangeStreamTest(db);
+const testDb = db.getSiblingDB(jsTestName());
+let cst = new ChangeStreamTest(testDb);
 
 // Test that it is possible to open a new change stream cursor on a collection that does not
 // exist.
 const collName = "test";
-assertDropCollection(db, collName);
+assertDropCollection(testDb, collName);
 
 // Asserts that resuming a change stream with 'spec' and an explicit simple collation returns
 // the results specified by 'expected'.
@@ -42,17 +45,14 @@ assert.eq(change.nextBatch.length, 0, tojson(change.nextBatch));
 
 // Dropping the empty database should not generate any notification for the change stream, since
 // the collection does not exist yet.
-assert.commandWorked(db.dropDatabase());
+assert.commandWorked(testDb.dropDatabase());
 change = cst.getNextBatch(cursor);
 assert.neq(change.id, 0);
 assert.eq(change.nextBatch.length, 0, tojson(change.nextBatch));
 
 // After collection creation, we expect to see oplog entries for each subsequent operation.
-let coll = assertCreateCollection(db, collName);
+let coll = assertCreateCollection(testDb, collName);
 assert.commandWorked(coll.insert({_id: 0}));
-
-// Determine the number of shards that the collection is distributed across.
-const numShards = FixtureHelpers.numberOfShardsForCollection(coll);
 
 change = cst.getOneChange(cursor);
 assert.eq(change.operationType, "insert", tojson(change));
@@ -61,7 +61,7 @@ assert.eq(change.operationType, "insert", tojson(change));
 assert.commandWorked(coll.insert({_id: 1}));
 assert.commandWorked(coll.update({_id: 1}, {$set: {a: 1}}));
 assert.commandWorked(coll.remove({_id: 1}));
-assertDropCollection(db, coll.getName());
+assertDropCollection(testDb, coll.getName());
 
 // We should get oplog entries of type insert, update, delete, drop, and invalidate. The cursor
 // should be closed.
@@ -78,26 +78,20 @@ const resumeToken = changes[0]._id;
 const resumeTokenDrop = changes[3]._id;
 const resumeTokenInvalidate = changes[4]._id;
 
-// Verify we can startAfter the invalidate. We should see one drop event for every other shard
-// that the collection was present on, or nothing if the collection was not sharded. This test
+// Verify we can startAfter the invalidate, but no new events may be retrieved. This test
 // exercises the bug described in SERVER-41196.
 const restartedStream = coll.watch([], {startAfter: resumeTokenInvalidate});
-for (let i = 0; i < numShards - 1; ++i) {
-    assert.soon(() => restartedStream.hasNext());
-    const nextEvent = restartedStream.next();
-    assert.eq(nextEvent.operationType, "drop", () => tojson(nextEvent));
-}
 assert(!restartedStream.hasNext(), () => tojson(restartedStream.next()));
 
 // Verify that we can resume a stream after a collection drop without an explicit collation.
-assert.commandWorked(db.runCommand({
+assert.commandWorked(testDb.runCommand({
     aggregate: coll.getName(),
     pipeline: [{$changeStream: {resumeAfter: resumeToken}}],
     cursor: {}
 }));
 
 // Recreate the collection.
-coll = assertCreateCollection(db, collName);
+coll = assertCreateCollection(testDb, collName);
 assert.commandWorked(coll.insert({_id: "after recreate"}));
 
 // Test resuming the change stream from the collection drop using 'resumeAfter'. If running in a
@@ -116,7 +110,7 @@ cst.consumeDropUpTo({
 });
 
 // Test resuming the change stream from the invalidate after the drop using 'resumeAfter'.
-assert.commandFailedWithCode(db.runCommand({
+assert.commandFailedWithCode(testDb.runCommand({
     aggregate: coll.getName(),
     pipeline: [{$changeStream: {resumeAfter: resumeTokenInvalidate}}],
     cursor: {},
@@ -124,17 +118,15 @@ assert.commandFailedWithCode(db.runCommand({
 }),
                              ErrorCodes.InvalidResumeToken);
 
-// Test that if change stream optimization is enabled, then even after the 'invalidate' event has
-// been filtered out, the cursor should hold the resume token of the 'invalidate' event.
-if (isChangeStreamsOptimizationEnabled(db)) {
-    const resumeStream =
-        coll.watch([{$match: {operationType: "DummyOperationType"}}], {resumeAfter: resumeToken});
-    assert.soon(() => {
-        assert(!resumeStream.hasNext());
-        return resumeStream.isExhausted();
-    });
-    assert.eq(resumeStream.getResumeToken(), resumeTokenInvalidate);
-}
+// Even after the 'invalidate' event has been filtered out, the cursor should hold the resume token
+// of the 'invalidate' event.
+const resumeStream =
+    coll.watch([{$match: {operationType: "DummyOperationType"}}], {resumeAfter: resumeToken});
+assert.soon(() => {
+    assert(!resumeStream.hasNext());
+    return resumeStream.isExhausted();
+});
+assert.eq(resumeStream.getResumeToken(), resumeTokenInvalidate);
 
 // Test resuming the change stream from the collection drop using 'startAfter'.
 assertResumeExpected({
@@ -154,7 +146,7 @@ cst.consumeDropUpTo({
     dropType: "drop",
     expectedNext: {
         operationType: "insert",
-        ns: {db: db.getName(), coll: coll.getName()},
+        ns: {db: testDb.getName(), coll: coll.getName()},
         fullDocument: {_id: "after recreate"},
         documentKey: {_id: "after recreate"}
     },
@@ -165,20 +157,20 @@ cst.consumeDropUpTo({
 // rename. Sharded collections cannot be renamed.
 if (!FixtureHelpers.isSharded(coll)) {
     cursor = cst.startWatchingChanges({collection: collName, pipeline: [{$changeStream: {}}]});
-    assertDropCollection(db, "renamed_coll");
+    assertDropCollection(testDb, "renamed_coll");
     assert.commandWorked(coll.renameCollection("renamed_coll"));
     expectedChanges = [
         {
             operationType: "rename",
-            ns: {db: db.getName(), coll: collName},
-            to: {db: db.getName(), coll: "renamed_coll"},
+            ns: {db: testDb.getName(), coll: collName},
+            to: {db: testDb.getName(), coll: "renamed_coll"},
         },
         {operationType: "invalidate"}
     ];
     cst.assertNextChangesEqual(
         {cursor: cursor, expectedChanges: expectedChanges, expectInvalidate: true});
 
-    coll = db["renamed_coll"];
+    coll = testDb["renamed_coll"];
 
     // Repeat the test, this time with a change stream open on the target.
     cursor = cst.startWatchingChanges({collection: collName, pipeline: [{$changeStream: {}}]});
@@ -186,8 +178,8 @@ if (!FixtureHelpers.isSharded(coll)) {
     expectedChanges = [
         {
             operationType: "rename",
-            ns: {db: db.getName(), coll: "renamed_coll"},
-            to: {db: db.getName(), coll: collName},
+            ns: {db: testDb.getName(), coll: "renamed_coll"},
+            to: {db: testDb.getName(), coll: collName},
         },
         {operationType: "invalidate"}
     ];
@@ -195,7 +187,7 @@ if (!FixtureHelpers.isSharded(coll)) {
     const resumeTokenRename = changes[0]._id;
     const resumeTokenInvalidate = changes[1]._id;
 
-    coll = db[collName];
+    coll = testDb[collName];
     assert.commandWorked(coll.insert({_id: "after rename"}));
 
     // Test resuming the change stream from the collection rename using 'resumeAfter'.
@@ -205,7 +197,7 @@ if (!FixtureHelpers.isSharded(coll)) {
         expected: [{operationType: "invalidate"}]
     });
     // Test resuming the change stream from the invalidate after the rename using 'resumeAfter'.
-    assert.commandFailedWithCode(db.runCommand({
+    assert.commandFailedWithCode(testDb.runCommand({
         aggregate: coll.getName(),
         pipeline: [{$changeStream: {resumeAfter: resumeTokenInvalidate}}],
         cursor: {},
@@ -223,7 +215,7 @@ if (!FixtureHelpers.isSharded(coll)) {
     // Test resuming the change stream from the invalidate after the rename using 'startAfter'.
     expectedChanges = [{
         operationType: "insert",
-        ns: {db: db.getName(), coll: coll.getName()},
+        ns: {db: testDb.getName(), coll: coll.getName()},
         fullDocument: {_id: "after rename"},
         documentKey: {_id: "after rename"}
     }];
@@ -233,8 +225,8 @@ if (!FixtureHelpers.isSharded(coll)) {
         expected: expectedChanges
     });
 
-    assertDropAndRecreateCollection(db, "renamed_coll");
-    assert.commandWorked(db.renamed_coll.insert({_id: 0}));
+    assertDropAndRecreateCollection(testDb, "renamed_coll");
+    assert.commandWorked(testDb.renamed_coll.insert({_id: 0}));
 
     // Repeat the test again, this time using the 'dropTarget' option with an existing target
     // collection.
@@ -244,15 +236,15 @@ if (!FixtureHelpers.isSharded(coll)) {
     expectedChanges = [
         {
             operationType: "rename",
-            ns: {db: db.getName(), coll: collName},
-            to: {db: db.getName(), coll: "renamed_coll"},
+            ns: {db: testDb.getName(), coll: collName},
+            to: {db: testDb.getName(), coll: "renamed_coll"},
         },
         {operationType: "invalidate"}
     ];
     cst.assertNextChangesEqual(
         {cursor: cursor, expectedChanges: expectedChanges, expectInvalidate: true});
 
-    coll = db["renamed_coll"];
+    coll = testDb["renamed_coll"];
 
     // Test the behavior of a change stream watching the target collection of a $out aggregation
     // stage.
@@ -262,7 +254,7 @@ if (!FixtureHelpers.isSharded(coll)) {
     // to the target. Do not explicitly check the 'ns' field.
     const rename = cst.getOneChange(cursor);
     assert.eq(rename.operationType, "rename", tojson(rename));
-    assert.eq(rename.to, {db: db.getName(), coll: collName}, tojson(rename));
+    assert.eq(rename.to, {db: testDb.getName(), coll: collName}, tojson(rename));
     assert.eq(cst.getOneChange(cursor, true).operationType, "invalidate");
 }
 
@@ -272,12 +264,12 @@ cursor = cst.startWatchingChanges({
     collection: coll.getName(),
     pipeline: [{$changeStream: {}}],
 });
-assert.commandWorked(db.dropDatabase());
+assert.commandWorked(testDb.dropDatabase());
 
 expectedChanges = [
     {
         operationType: "drop",
-        ns: {db: db.getName(), coll: coll.getName()},
+        ns: {db: testDb.getName(), coll: coll.getName()},
     },
     {operationType: "invalidate"}
 ];
@@ -285,4 +277,3 @@ cst.assertNextChangesEqual(
     {cursor: cursor, expectedChanges: expectedChanges, expectInvalidate: true});
 
 cst.cleanUp();
-}());

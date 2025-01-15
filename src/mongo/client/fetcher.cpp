@@ -27,16 +27,24 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/client/fetcher.h"
-
+#include <mutex>
 #include <ostream>
 #include <utility>
 
-#include "mongo/db/jsobj.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/fetcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
@@ -49,9 +57,6 @@
 namespace mongo {
 
 namespace {
-
-using executor::RemoteCommandRequest;
-using executor::RemoteCommandResponse;
 
 using RemoteCommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackArgs;
 const char* kCursorFieldName = "cursor";
@@ -113,7 +118,8 @@ Status parseCursorResponse(const BSONObj& obj,
                       str::stream() << "'" << kCursorFieldName << "." << kNamespaceFieldName
                                     << "' field must be a string: " << obj);
     }
-    const NamespaceString tempNss(namespaceElement.valueStringData());
+    const NamespaceString tempNss = NamespaceStringUtil::deserialize(
+        boost::none, namespaceElement.valueStringData(), SerializationContext::stateDefault());
     if (!tempNss.isValid()) {
         return Status(ErrorCodes::BadValue,
                       str::stream() << "'" << kCursorFieldName << "." << kNamespaceFieldName
@@ -167,7 +173,7 @@ Status parseCursorResponse(const BSONObj& obj,
 
 Fetcher::Fetcher(executor::TaskExecutor* executor,
                  const HostAndPort& source,
-                 const std::string& dbname,
+                 const DatabaseName& dbname,
                  const BSONObj& findCmdObj,
                  CallbackFn work,
                  const BSONObj& metadata,
@@ -218,14 +224,14 @@ std::string Fetcher::toString() const {
 }
 
 std::string Fetcher::getDiagnosticString() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     str::stream output;
     output << "Fetcher";
     output << " source: " << _source.toString();
-    output << " database: " << _dbname;
+    output << " database: " << toStringForLogging(_dbname);
     output << " query: " << _cmdObj;
     output << " query metadata: " << _metadata;
-    output << " active: " << _isActive_inlock();
+    output << " active: " << _isActive(lk);
     output << " findNetworkTimeout: " << _findNetworkTimeout;
     output << " getMoreNetworkTimeout: " << _getMoreNetworkTimeout;
     output << " shutting down?: " << _isShuttingDown_inlock();
@@ -241,16 +247,16 @@ std::string Fetcher::getDiagnosticString() const {
 }
 
 bool Fetcher::isActive() const {
-    stdx::lock_guard<Latch> lk(_mutex);
-    return _isActive_inlock();
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _isActive(lk);
 }
 
-bool Fetcher::_isActive_inlock() const {
+bool Fetcher::_isActive(WithLock lk) const {
     return State::kRunning == _state || State::kShuttingDown == _state;
 }
 
 Status Fetcher::schedule() {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     switch (_state) {
         case State::kPreStart:
             _state = State::kRunning;
@@ -273,7 +279,7 @@ Status Fetcher::schedule() {
 }
 
 void Fetcher::shutdown() {
-    stdx::lock_guard<Latch> lock(_mutex);
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
     switch (_state) {
         case State::kPreStart:
             // Transition directly from PreStart to Complete if not started yet.
@@ -298,9 +304,9 @@ void Fetcher::shutdown() {
 
 Status Fetcher::join(Interruptible* interruptible) {
     try {
-        stdx::unique_lock<Latch> lk(_mutex);
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
         interruptible->waitForConditionOrInterrupt(
-            _condition, lk, [this]() { return !_isActive_inlock(); });
+            _condition, lk, [&]() { return !_isActive(lk); });
         return Status::OK();
     } catch (const DBException&) {
         return exceptionToStatus();
@@ -312,12 +318,12 @@ void Fetcher::_join() {
 }
 
 Fetcher::State Fetcher::getState_forTest() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _state;
 }
 
 bool Fetcher::_isShuttingDown() const {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _isShuttingDown_inlock();
 }
 
@@ -326,7 +332,7 @@ bool Fetcher::_isShuttingDown_inlock() const {
 }
 
 Status Fetcher::_scheduleGetMore(const BSONObj& cmdObj) {
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (_isShuttingDown_inlock()) {
         return Status(ErrorCodes::CallbackCanceled,
                       "fetcher was shut down after previous batch was processed");
@@ -384,10 +390,10 @@ void Fetcher::_callback(const RemoteCommandCallbackArgs& rcbd, const char* batch
         return;
     }
 
-    batchData.otherFields.metadata = std::move(rcbd.response.data);
+    batchData.otherFields.metadata = rcbd.response.data;
     batchData.elapsed = rcbd.response.elapsed.value_or(Microseconds{0});
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         batchData.first = _first;
         _first = false;
     }
@@ -430,17 +436,13 @@ void Fetcher::_sendKillCursors(const CursorId id, const NamespaceString& nss) {
         auto logKillCursorsResult = [](const RemoteCommandCallbackArgs& args) {
             if (!args.response.isOK()) {
                 LOGV2_WARNING(23918,
-                              "killCursors command task failed: {error}",
                               "killCursors command task failed",
                               "error"_attr = redact(args.response.status));
                 return;
             }
             auto status = getStatusFromCommandResult(args.response.data);
             if (!status.isOK()) {
-                LOGV2_WARNING(23919,
-                              "killCursors command failed: {error}",
-                              "killCursors command failed",
-                              "error"_attr = redact(status));
+                LOGV2_WARNING(23919, "killCursors command failed", "error"_attr = redact(status));
             }
         };
 
@@ -451,7 +453,6 @@ void Fetcher::_sendKillCursors(const CursorId id, const NamespaceString& nss) {
         auto scheduleResult = _executor->scheduleRemoteCommand(request, logKillCursorsResult);
         if (!scheduleResult.isOK()) {
             LOGV2_WARNING(23920,
-                          "Failed to schedule killCursors command: {error}",
                           "Failed to schedule killCursors command",
                           "error"_attr = redact(scheduleResult.getStatus()));
         }
@@ -465,7 +466,7 @@ void Fetcher::_finishCallback() {
     // 'tempWork' must be declared before lock guard 'lk' so that it is destroyed outside the lock.
     Fetcher::CallbackFn tempWork;
 
-    stdx::lock_guard<Latch> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     invariant(State::kComplete != _state);
     _state = State::kComplete;
     _first = false;

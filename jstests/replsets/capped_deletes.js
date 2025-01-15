@@ -1,17 +1,16 @@
 /**
  * Tests user deletes on capped collections.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-let replTest = new ReplSetTest({name: "capped_deletes", nodes: 2});
+let replTest = new ReplSetTest({name: jsTestName(), nodes: 2});
 replTest.startSet();
 replTest.initiate();
 
 let primary = replTest.getPrimary();
 
 let dbName = "test";
-let collName = "capped_deletes";
+let collName = jsTestName();
 
 let db = primary.getDB(dbName);
 
@@ -44,4 +43,3 @@ assert.eq(res.n, 7, res);
 assert.commandWorked(res);
 
 replTest.stopSet();
-}());

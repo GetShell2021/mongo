@@ -1,8 +1,7 @@
-Replication TLA+ Specifications
-===============================
+# MongoDB TLA+/PlusCal Specifications
 
-These are formal specifications for exploring possible replication protocols.
-Some are experiments, some reflect MongoDB's actual implementation. See the
+This folder contains formal specifications of various components in order to check their
+correctness. Some are experiments, some reflect MongoDB's actual implementation. See the
 comments in each spec for details.
 
 Some specs are intended for model-checking. They are in subdirectories like:

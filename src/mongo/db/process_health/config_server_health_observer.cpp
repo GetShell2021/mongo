@@ -27,17 +27,60 @@
  *    it in the license file.
  */
 
+#include <algorithm>
+#include <boost/smart_ptr.hpp>
+#include <cstdint>
+#include <memory>
+#include <mutex>
 #include <random>
+#include <tuple>
+#include <utility>
+#include <vector>
 
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/process_health/fault_manager_config.h"
+#include "mongo/db/process_health/health_check_status.h"
+#include "mongo/db/process_health/health_monitoring_server_parameters_gen.h"
+#include "mongo/db/process_health/health_observer.h"
 #include "mongo/db/process_health/health_observer_base.h"
-
-#include "mongo/db/catalog_raii.h"
-#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/process_health/health_observer_registration.h"
-#include "mongo/executor/remote_command_request.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/service_context.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/future_util.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/timer.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kProcessHealth
 
@@ -64,7 +107,7 @@ static constexpr Milliseconds kServerRequestTimeout{10000};
 class ConfigServerHealthObserver final : public HealthObserverBase {
 public:
     explicit ConfigServerHealthObserver(ServiceContext* svcCtx);
-    ~ConfigServerHealthObserver() = default;
+    ~ConfigServerHealthObserver() override = default;
 
     /**
      * Health observer unique type.
@@ -169,7 +212,12 @@ Future<ConfigServerHealthObserver::CheckResult> ConfigServerHealthObserver::_che
     auto checkCtx =
         std::make_shared<CheckContext>(std::move(periodicCheckContext.cancellationToken));
     checkCtx->taskExecutor = periodicCheckContext.taskExecutor;
-    checkCtx->client = _svcCtx->makeClient("ConfigServerHealthObserver");
+
+    // TODO(SERVER-74659): Please revisit if this thread could be made killable.
+    checkCtx->client = _svcCtx->getService(ClusterRole::RouterServer)
+                           ->makeClient("ConfigServerHealthObserver",
+                                        Client::noSession(),
+                                        ClientOperationKillableByStepdown{false});
     checkCtx->opCtx = checkCtx->client->makeOperationContext();
     checkCtx->opCtx->setDeadlineAfterNowBy(kObserverTimeout, ErrorCodes::ExceededTimeLimit);
 
@@ -201,36 +249,28 @@ Future<ConfigServerHealthObserver::CheckResult> ConfigServerHealthObserver::_che
 void ConfigServerHealthObserver::_runSmokeReadShardsCommand(std::shared_ptr<CheckContext> ctx) {
     const ReadPreferenceSetting readPref(ReadPreference::Nearest, TagSet{});
 
-    BSONObj readConcernObj = [&] {
-        repl::ReadConcernArgs readConcern{repl::ReadConcernLevel::kAvailableReadConcern};
-        BSONObjBuilder bob;
-        readConcern.appendInfo(&bob);
-        return bob.done().getObjectField(repl::ReadConcernArgs::kReadConcernFieldName).getOwned();
-    }();
-
     BSONObjBuilder findCmdBuilder;
     FindCommandRequest findCommand(NamespaceString::kConfigsvrShardsNamespace);
-    findCommand.setReadConcern(readConcernObj);
+    findCommand.setReadConcern(repl::ReadConcernArgs::kAvailable);
     findCommand.setLimit(1);
     findCommand.setSingleBatch(true);
     findCommand.setMaxTimeMS(Milliseconds(kServerRequestTimeout).count());
-    findCommand.serialize(BSONObj(), &findCmdBuilder);
+    findCommand.serialize(&findCmdBuilder);
 
     // `runCommand()` is not futurized so this method is blocking.
     Timer t;
     StatusWith<Shard::CommandResponse> findOneShardResponse{ErrorCodes::HostUnreachable,
                                                             "Config server read was not run"};
     try {
-        findOneShardResponse =
-            Grid::get(ctx->opCtx.get())
-                ->shardRegistry()
-                ->getConfigShard()
-                ->runCommand(ctx->opCtx.get(),
-                             readPref,
-                             NamespaceString::kConfigsvrShardsNamespace.db().toString(),
-                             findCmdBuilder.done(),
-                             kServerRequestTimeout,
-                             Shard::RetryPolicy::kNoRetry);
+        findOneShardResponse = Grid::get(ctx->opCtx.get())
+                                   ->shardRegistry()
+                                   ->getConfigShard()
+                                   ->runCommand(ctx->opCtx.get(),
+                                                readPref,
+                                                NamespaceString::kConfigsvrShardsNamespace.dbName(),
+                                                findCmdBuilder.done(),
+                                                kServerRequestTimeout,
+                                                Shard::RetryPolicy::kNoRetry);
     } catch (const DBException& exc) {
         findOneShardResponse = StatusWith<Shard::CommandResponse>(exc.toStatus());
     }
@@ -341,7 +381,8 @@ Future<void> ConfigServerHealthObserver::_runPing(HostAndPort server,
     Timer t;
     ctx->taskExecutor
         ->scheduleRemoteCommand(
-            {server, "admin", BSON("ping" << 1), nullptr, kServerRequestTimeout}, completionToken)
+            {server, DatabaseName::kAdmin, BSON("ping" << 1), nullptr, kServerRequestTimeout},
+            completionToken)
         .then([promise, server, t](const executor::RemoteCommandResponse& response) {
             if (!response.status.isOK()) {
                 promise->setError(response.status);

@@ -7,13 +7,14 @@
  *     # that migration by sending a new `moveChunk` command to the donor shard causing the test to
  *     # hang.
  *     does_not_support_stepdowns,
+ *     # Flaky with a config shard because the failovers it triggers trigger a retry from mongos,
+ *     # which can prevent the fail point from being unset and time out.
+ *     config_shard_incompatible,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/chunk_manipulation_util.js');
+import {moveChunkParallel} from "jstests/libs/chunk_manipulation_util.js";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Disable checking for index consistency to ensure that the config server doesn't trigger a
 // StaleShardVersion exception on the shards and cause them to refresh their sharding metadata. That
@@ -26,6 +27,7 @@ const nodeOptions = {
 // the shards that would interfere with the migration recovery interleaving this test requires.
 var st = new ShardingTest({
     shards: {rs0: {nodes: 2}, rs1: {nodes: 1}},
+    config: 3,
     other: {configOptions: nodeOptions, enableBalancer: false}
 });
 let staticMongod = MongoRunner.runMongod({});
@@ -61,7 +63,8 @@ const rs0Secondary = st.rs0.getSecondary();
 let hangInEnsureChunkVersionIsGreaterThanInterruptibleFailpoint =
     configureFailPoint(rs0Secondary, "hangInEnsureChunkVersionIsGreaterThanInterruptible");
 
-assert.commandWorked(st.rs0.getPrimary().adminCommand({replSetStepDown: 60, force: true}));
+st.rs0.stepUp(rs0Secondary);
+
 joinMoveChunk1();
 migrationCommitNetworkErrorFailpoint.off();
 skipShardFilteringMetadataRefreshFailpoint.off();
@@ -110,4 +113,3 @@ joinMoveChunk2();
 
 MongoRunner.stopMongod(staticMongod);
 st.stop();
-})();

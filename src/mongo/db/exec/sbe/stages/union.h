@@ -29,9 +29,17 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <queue>
+#include <vector>
 
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
 /**
@@ -69,15 +77,19 @@ public:
     std::vector<DebugPrinter::Block> debugPrint() const final;
     size_t estimateCompileTimeSize() const final;
 
+protected:
+    bool shouldOptimizeSaveState(size_t idx) const final {
+        return _currentStageIndex == idx;
+    }
+
 private:
     struct UnionBranch {
-        PlanStage* stage{nullptr};
-        const bool reOpen{false};
+        PlanStage* const stage{nullptr};
         bool isOpen{false};
 
         void open() {
             if (!isOpen) {
-                stage->open(reOpen);
+                stage->open(false /*reOpen*/);
                 isOpen = true;
             }
         }

@@ -30,12 +30,26 @@
 #pragma once
 
 #include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <cstring>
+#include <fmt/format.h>
 #include <iosfwd>
+#include <mutex>
 #include <string>
+#include <tuple>
+#include <utility>
+#include <variant>
 
+#include "mongo/base/data_view.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/repl/optime.h"
@@ -43,35 +57,24 @@
 #include "mongo/db/tenant_id.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 
-class NamespaceString {
+class NamespaceString : private DatabaseName {
 public:
-    constexpr static size_t MaxDatabaseNameLen =
-        128;  // max str len for the db name, including null char
     constexpr static size_t MaxNSCollectionLenFCV42 = 120U;
-    constexpr static size_t MaxNsCollectionLen = 255;
+    constexpr static size_t MaxUserNsCollectionLen = 255;
+    constexpr static size_t MaxInternalNsCollectionLen = 511;
 
     // The maximum namespace length of sharded collections is less than that of unsharded ones since
     // the namespace of the cached chunks metadata, local to each shard, is composed by the
     // namespace of the related sharded collection (i.e., config.cache.chunks.<ns>).
-    constexpr static size_t MaxNsShardedCollectionLen = 235;  // 255 - len(ChunkType::ShardNSPrefix)
+    constexpr static size_t MaxUserNsShardedCollectionLen =
+        235;  // 255 - len(ChunkType::ShardNSPrefix)
 
     // Reserved system namespaces
-
-    // Namespace for the admin database
-    static constexpr StringData kAdminDb = "admin"_sd;
-
-    // Namespace for the local database
-    static constexpr StringData kLocalDb = "local"_sd;
-
-    // Namespace for the sharding config database
-    static constexpr StringData kConfigDb = "config"_sd;
-
-    // The $external database used by X.509, LDAP, etc...
-    static constexpr StringData kExternalDb = "$external"_sd;
 
     // Name for the system views collection
     static constexpr StringData kSystemDotViewsCollectionName = "system.views"_sd;
@@ -79,8 +82,17 @@ public:
     // Name for the system.js collection
     static constexpr StringData kSystemDotJavascriptCollectionName = "system.js"_sd;
 
+    // Name of the pre-images collection.
+    static constexpr StringData kPreImagesCollectionName = "system.preimages"_sd;
+
+    // Prefix for the collection storing collection statistics.
+    static constexpr StringData kStatisticsCollectionPrefix = "system.statistics."_sd;
+
     // Name for the change stream change collection.
     static constexpr StringData kChangeCollectionName = "system.change_collection"_sd;
+
+    // Name for the profile collection
+    static constexpr StringData kSystemDotProfileCollectionName = "system.profile"_sd;
 
     // Names of privilege document collections
     static constexpr StringData kSystemUsers = "system.users"_sd;
@@ -88,7 +100,6 @@ public:
 
     // Prefix for orphan collections
     static constexpr StringData kOrphanCollectionPrefix = "orphan."_sd;
-    static constexpr StringData kOrphanCollectionDb = "local"_sd;
 
     // Prefix for collections that store the local resharding oplog buffer.
     static constexpr StringData kReshardingLocalOplogBufferPrefix =
@@ -100,135 +111,31 @@ public:
     // Prefix for temporary resharding collection.
     static constexpr StringData kTemporaryReshardingCollectionPrefix = "system.resharding."_sd;
 
+    // Prefix for temporary timeseries resharding collection.
+    static constexpr StringData kTemporaryTimeseriesReshardingCollectionPrefix =
+        "system.buckets.resharding."_sd;
+
     // Prefix for time-series buckets collection.
     static constexpr StringData kTimeseriesBucketsCollectionPrefix = "system.buckets."_sd;
 
-    // Namespace for storing configuration data, which needs to be replicated if the server is
-    // running as a replica set. Documents in this collection should represent some configuration
-    // state of the server, which needs to be recovered/consulted at startup. Each document in this
-    // namespace should have its _id set to some string, which meaningfully describes what it
-    // represents. For example, 'shardIdentity' and 'featureCompatibilityVersion'.
-    static const NamespaceString kServerConfigurationNamespace;
+    // Collection name that is used for { aggregate: 1, ... } style aggregations.
+    static constexpr auto kCollectionlessAggregateCollection = "$cmd.aggregate"_sd;
 
-    // Namespace for storing the logical sessions information
-    static const NamespaceString kLogicalSessionsNamespace;
+    // Prefix for the temporary collection used by the $out stage.
+    static constexpr StringData kOutTmpCollectionPrefix = "tmp.agg_out."_sd;
 
-    // Namespace for storing databases information
-    static const NamespaceString kConfigDatabasesNamespace;
+    // Maintainers Note: The large set of `NamespaceString`-typed static data
+    // members of the `NamespaceString` class representing system-reserved
+    // collections is now generated from "namespace_string_reserved.def.h".
+    // Please make edits there to add or change such constants.
 
-    // Namespace for storing the transaction information for each session
-    static const NamespaceString kSessionTransactionsTableNamespace;
-
-    // Name for a shard's collections metadata collection, each document of which indicates the
-    // state of a specific collection
-    static const NamespaceString kShardConfigCollectionsNamespace;
-
-    // Name for a shard's databases metadata collection, each document of which indicates the state
-    // of a specific database
-    static const NamespaceString kShardConfigDatabasesNamespace;
-
-    // Namespace for storing keys for signing and validating cluster times created by the cluster
-    // that this node is in.
-    static const NamespaceString kKeysCollectionNamespace;
-
-    // Namespace for storing keys for validating cluster times created by other clusters.
-    static const NamespaceString kExternalKeysCollectionNamespace;
-
-    // Namespace of the the oplog collection.
-    static const NamespaceString kRsOplogNamespace;
-
-    // Namespace for storing the persisted state of transaction coordinators.
-    static const NamespaceString kTransactionCoordinatorsNamespace;
-
-    // Namespace for storing the persisted state of migration coordinators.
-    static const NamespaceString kMigrationCoordinatorsNamespace;
-
-    // Namespace for storing the persisted state of migration recipients.
-    static const NamespaceString kMigrationRecipientsNamespace;
-
-    // Namespace for storing the persisted state of tenant migration donors.
-    static const NamespaceString kTenantMigrationDonorsNamespace;
-
-    // Namespace for storing the persisted state of tenant migration recipient service instances.
-    static const NamespaceString kTenantMigrationRecipientsNamespace;
-
-    // Namespace for view on local.oplog.rs for tenant migrations.
-    static const NamespaceString kTenantMigrationOplogView;
-
-    // Namespace for storing the persisted state of tenant split donors.
-    static const NamespaceString kShardSplitDonorsNamespace;
-
-    // Namespace for replica set configuration settings.
-    static const NamespaceString kSystemReplSetNamespace;
-
-    // Namespace for storing the last replica set election vote.
-    static const NamespaceString kLastVoteNamespace;
-
-    // Namespace for change stream pre-images collection.
-    static const NamespaceString kChangeStreamPreImagesNamespace;
-
-    // Namespace for index build entries.
-    static const NamespaceString kIndexBuildEntryNamespace;
-
-    // Namespace for pending range deletions.
-    static const NamespaceString kRangeDeletionNamespace;
-
-    // Namespace containing pending range deletions snapshots for rename operations.
-    static const NamespaceString kRangeDeletionForRenameNamespace;
-
-    // Namespace for the coordinator's resharding operation state.
-    static const NamespaceString kConfigReshardingOperationsNamespace;
-
-    // Namespace for the donor shard's local resharding operation state.
-    static const NamespaceString kDonorReshardingOperationsNamespace;
-
-    // Namespace for the recipient shard's local resharding operation state.
-    static const NamespaceString kRecipientReshardingOperationsNamespace;
-
-    // Namespace for persisting sharding DDL coordinators state documents
-    static const NamespaceString kShardingDDLCoordinatorsNamespace;
-
-    // Namespace for persisting sharding DDL rename participant state documents
-    static const NamespaceString kShardingRenameParticipantsNamespace;
-
-    // Namespace for balancer settings and default read and write concerns.
-    static const NamespaceString kConfigSettingsNamespace;
-
-    // Namespace for vector clock state.
-    static const NamespaceString kVectorClockNamespace;
-
-    // Namespace for storing oplog applier progress for resharding.
-    static const NamespaceString kReshardingApplierProgressNamespace;
-
-    // Namespace for storing config.transactions cloner progress for resharding.
-    static const NamespaceString kReshardingTxnClonerProgressNamespace;
-
-    // Namespace for storing config.collectionCriticalSections documents
-    static const NamespaceString kCollectionCriticalSectionsNamespace;
-
-    // Dummy namespace used for forcing secondaries to handle an oplog entry on its own batch.
-    static const NamespaceString kForceOplogBatchBoundaryNamespace;
-
-    // Namespace used for storing retryable findAndModify images.
-    static const NamespaceString kConfigImagesNamespace;
-
-    // Namespace used for persisting ConfigsvrCoordinator state documents.
-    static const NamespaceString kConfigsvrCoordinatorsNamespace;
-
-    // Namespace for storing user write blocking critical section documents
-    static const NamespaceString kUserWritesCriticalSectionsNamespace;
-
-    // Namespace used during the recovery procedure for the config server.
-    static const NamespaceString kConfigsvrRestoreNamespace;
-
-    // Namespace used for CompactParticipantCoordinator service.
-    static const NamespaceString kCompactStructuredEncryptionCoordinatorNamespace;
-
-    // Namespace used for storing cluster wide parameters.
-    static const NamespaceString kClusterParametersNamespace;
-
-    // Namespace used for storing the list of shards on the CSRS
-    static const NamespaceString kConfigsvrShardsNamespace;
+    // The constants are declared as merely `const` but have `constexpr`
+    // definitions below. Because the `NamespaceString` class enclosing their
+    // type is incomplete, they can't be _declared_ fully constexpr (a constexpr
+    // limitation).
+#define NSS_CONSTANT(id, db, coll) static const NamespaceString id;
+#include "namespace_string_reserved.def.h"  // IWYU pragma: keep
+#undef NSS_CONSTANT
 
     /**
      * Constructs an empty NamespaceString.
@@ -236,69 +143,74 @@ public:
     NamespaceString() = default;
 
     /**
-     * Constructs a NamespaceString from the fully qualified namespace named in "ns" and the
-     * tenantId. "ns" is NOT expected to contain the tenantId.
+     * Constructs a NamespaceString for the given database.
      */
-    explicit NamespaceString(boost::optional<TenantId> tenantId, StringData ns) {
-        _dotIndex = ns.find(".");
+    explicit NamespaceString(DatabaseName dbName) : DatabaseName(std::move(dbName)) {}
 
-        uassert(ErrorCodes::InvalidNamespace,
-                "namespaces cannot have embedded null characters",
-                ns.find('\0') == std::string::npos);
-
-        StringData db = ns.substr(0, _dotIndex);
-        _dbName = DatabaseName(std::move(tenantId), db);
-        _ns = ns.toString();
-    }
-
-    // TODO SERVER-65920 Remove this constructor once all constructor call sites have been updated
-    // to pass tenantId explicitly
-    explicit NamespaceString(StringData ns, boost::optional<TenantId> tenantId = boost::none)
-        : NamespaceString(std::move(tenantId), ns) {}
+    constexpr NamespaceString(const char* data, size_t length) : DatabaseName(data, length) {}
 
     /**
-     * Constructs a NamespaceString for the given database and collection names.
-     * "dbName" must not contain a ".", and "collectionName" must not start with one.
+     * Construct a NamespaceString from a const reference. This constructor is required to avoid
+     * invoking DatabaseName(const DatabaseName&..) which would discard the collection from the
+     * underlying data.
      */
-    NamespaceString(DatabaseName dbName, StringData collectionName)
-        : _dbName(std::move(dbName)), _ns(str::stream() << _dbName.db() << '.' << collectionName) {
-        auto db = _dbName.db();
+    NamespaceString(NamespaceString&& other) = default;
 
-        uassert(ErrorCodes::InvalidNamespace,
-                "'.' is an invalid character in the database name: " + db,
-                db.find('.') == std::string::npos);
-        uassert(ErrorCodes::InvalidNamespace,
-                "Collection names cannot start with '.': " + collectionName,
-                collectionName.empty() || collectionName[0] != '.');
+    NamespaceString(const NamespaceString& other) noexcept
+        : DatabaseName(other._data, other.sizeWithTenant() + kDataOffset, TrustedInitTag{}) {}
+    NamespaceString& operator=(NamespaceString&& other) = default;
 
-        _dotIndex = db.size();
-        dassert(_ns[_dotIndex] == '.');
-
-        uassert(ErrorCodes::InvalidNamespace,
-                "namespaces cannot have embedded null characters",
-                _ns.find('\0') == std::string::npos);
+    /**
+     * Copy assignment operator. This cannot be defaulted as we must avoid calling DatabaseName copy
+     * assignment operator which would discard the collection from _data.
+     */
+    NamespaceString& operator=(const NamespaceString& other) noexcept {
+        _data = other._data;
+        return *this;
     }
 
     /**
-     * Constructs a NamespaceString for the given db name, collection name, and tenantId.
-     * "db" must not contain a ".", and "collectionName" must not start with one. "dbName" is
-     * NOT expected to contain a tenantId.
+     * Constructs a NamespaceString in the global config db, "config.<collName>".
      */
-    NamespaceString(boost::optional<TenantId> tenantId, StringData db, StringData collectionName)
-        : NamespaceString(DatabaseName(std::move(tenantId), db), collectionName) {}
-
-    // TODO SERVER-65920 Remove this constructor once all constructor call sites have been updated
-    // to pass tenantId explicitly
-    NamespaceString(StringData db,
-                    StringData collectionName,
-                    boost::optional<TenantId> tenantId = boost::none)
-        : NamespaceString(DatabaseName(std::move(tenantId), db), collectionName) {}
+    static NamespaceString makeGlobalConfigCollection(StringData collName);
 
     /**
-     * Constructs a NamespaceString from the string 'ns'. Should only be used when reading a
-     * namespace from disk. 'ns' is expected to contain a tenantId when running in Serverless mode.
+     * Constructs a NamespaceString in the local db, "local.<collName>".
      */
-    static NamespaceString parseFromStringExpectTenantIdInMultitenancyMode(StringData ns);
+    static NamespaceString makeLocalCollection(StringData collName);
+
+    /**
+     * These functions construct a NamespaceString without checking for presence of TenantId.
+     *
+     * MUST only be used for tests.
+     */
+    static NamespaceString createNamespaceString_forTest(StringData ns) {
+        return NamespaceString(boost::none, ns);
+    }
+
+    static NamespaceString createNamespaceString_forTest(const DatabaseName& dbName) {
+        return NamespaceString(dbName);
+    }
+
+    static NamespaceString createNamespaceString_forTest(StringData db, StringData coll) {
+        return NamespaceString(boost::none, db, coll);
+    }
+
+    static NamespaceString createNamespaceString_forTest(const DatabaseName& dbName,
+                                                         StringData coll) {
+        return NamespaceString(dbName, coll);
+    }
+
+    static NamespaceString createNamespaceString_forTest(const boost::optional<TenantId>& tenantId,
+                                                         StringData ns) {
+        return NamespaceString(tenantId, ns);
+    }
+
+    static NamespaceString createNamespaceString_forTest(const boost::optional<TenantId>& tenantId,
+                                                         StringData db,
+                                                         StringData coll) {
+        return NamespaceString(tenantId, db, coll);
+    }
 
     /**
      * Constructs the namespace '<dbName>.$cmd.aggregate', which we use as the namespace for
@@ -312,62 +224,218 @@ public:
     static NamespaceString makeChangeCollectionNSS(const boost::optional<TenantId>& tenantId);
 
     /**
+     * Constructs the pre-images collection namespace for a tenant if the 'tenantId' is specified,
+     * otherwise creates a default pre-images collection namespace.
+     */
+    static NamespaceString makePreImageCollectionNSS(const boost::optional<TenantId>& tenantId);
+
+    /**
      * Constructs a NamespaceString representing a listCollections namespace. The format for this
      * namespace is "<dbName>.$cmd.listCollections".
      */
     static NamespaceString makeListCollectionsNSS(const DatabaseName& dbName);
 
     /**
-     * NOTE: DollarInDbNameBehavior::allow is deprecated.
-     *
-     * Please use DollarInDbNameBehavior::disallow and check explicitly for any DB names that must
-     * contain a $.
+     * Constructs a NamespaceString representing a shardsvrParticipantBlock namespace. The format
+     * for this namespace is "<dbName>.$cmd.shardsvrParticipantBlock".
      */
-    enum class DollarInDbNameBehavior {
-        Disallow,
-        Allow,  // Deprecated
-    };
+    static NamespaceString makeCollectionlessShardsvrParticipantBlockNSS(
+        const DatabaseName& dbName);
 
-    const boost::optional<TenantId>& tenantId() const {
-        return _dbName.tenantId();
+    /**
+     * Constructs the cluster parameters NamespaceString for the specified tenant. The format for
+     * this namespace is "(<tenantId>_)config.clusterParameters".
+     */
+    static NamespaceString makeClusterParametersNSS(const boost::optional<TenantId>& tenantId);
+
+    /**
+     * Constructs the system.views NamespaceString for the specified DatabaseName.
+     */
+    static NamespaceString makeSystemDotViewsNamespace(const DatabaseName& dbName);
+
+    /**
+     * Constructs the system.profile NamespaceString for the specified DatabaseName.
+     */
+    static NamespaceString makeSystemDotProfileNamespace(const DatabaseName& dbName);
+
+    /**
+     * Constructs a NamespaceString representing a BulkWrite namespace. The format for this
+     * namespace is admin.$cmd.bulkWrite".
+     */
+    static NamespaceString makeBulkWriteNSS(const boost::optional<TenantId>& tenantId);
+
+    /**
+     * Constructs the oplog buffer NamespaceString for the given migration id for movePrimary op.
+     */
+    static NamespaceString makeMovePrimaryOplogBufferNSS(const UUID& migrationId);
+
+    /**
+     * Constructs the NamesapceString to store the collections to clone by the movePrimary op.
+     */
+    static NamespaceString makeMovePrimaryCollectionsToCloneNSS(const UUID& migrationId);
+
+    /**
+     * Constructs the NamespaceString prefix for temporary movePrimary recipient collections.
+     */
+    static NamespaceString makeMovePrimaryTempCollectionsPrefix(const UUID& migrationId);
+
+    /**
+     * Constructs the oplog buffer NamespaceString for the given UUID and donor shardId.
+     */
+    static NamespaceString makeReshardingLocalOplogBufferNSS(const UUID& existingUUID,
+                                                             const std::string& donorShardId);
+
+    /**
+     * Constructs the conflict stash NamespaceString for the given UUID and donor shardId.
+     */
+    static NamespaceString makeReshardingLocalConflictStashNSS(const UUID& existingUUID,
+                                                               const std::string& donorShardId);
+
+    /**
+     * Constructs the tenant-specific admin.system.users NamespaceString for the given tenant,
+     * "tenant_admin.system.users".
+     */
+    static NamespaceString makeTenantUsersCollection(const boost::optional<TenantId>& tenantId);
+
+    /**
+     * Constructs the tenant-specific admin.system.roles NamespaceString for the given tenant,
+     * "tenant_admin.system.roles".
+     */
+    static NamespaceString makeTenantRolesCollection(const boost::optional<TenantId>& tenantId);
+
+    /**
+     * Constructs the command NamespaceString, "<dbName>.$cmd".
+     */
+    static NamespaceString makeCommandNamespace(const DatabaseName& dbName);
+
+    /**
+     * Constructs a dummy NamespaceString, "<tenantId>.config.dummy.namespace", to be used where a
+     * placeholder NamespaceString is needed. It must be acceptable for tenantId to be empty, so we
+     * use "config" as the db.
+     */
+    static NamespaceString makeDummyNamespace(const boost::optional<TenantId>& tenantId);
+
+
+    boost::optional<TenantId> tenantId() const {
+        if (!hasTenantId()) {
+            return boost::none;
+        }
+
+        return TenantId{OID::from(_data.data() + kDataOffset)};
     }
 
-    StringData db() const {
-        // TODO SERVER-65456 Remove this function.
-        return _dbName.db();
+    using DatabaseName::db;
+
+    /**
+     * This function must only be used in sharding code (src/mongo/s and src/mongo/db/s).
+     */
+    StringData db_forSharding() const {
+        return db_deprecated();
+    }
+
+    /**
+     * This function must only be used in unit tests.
+     */
+    StringData db_forTest() const {
+        return db_deprecated();
     }
 
     const DatabaseName& dbName() const {
-        return _dbName;
+        return *this;
     }
 
     StringData coll() const {
-        return _dotIndex == std::string::npos
-            ? StringData()
-            : StringData(_ns.c_str() + _dotIndex + 1, _ns.size() - 1 - _dotIndex);
+        const auto offset = kDataOffset + dbSize() + 1 + tenantIdSize();
+        if (offset > _data.size()) {
+            return {};
+        }
+
+        return StringData{_data.data() + offset, _data.size() - offset};
     }
 
-    const std::string& ns() const {
-        return _ns;
+    ConstDataRange asDataRange() const {
+        auto nss = ns();
+        return ConstDataRange(nss.data(), nss.size());
     }
 
-    const std::string& toString() const {
+    StringData ns_forTest() const {
         return ns();
     }
 
-    std::string toStringWithTenantId() const {
-        if (auto tenantId = _dbName.tenantId())
-            return str::stream() << *tenantId << '_' << ns();
-
-        return ns();
+    /**
+     * Gets a namespace string without tenant id.
+     *
+     * MUST only be used for tests.
+     */
+    std::string toString_forTest() const {
+        return toString();
     }
 
+    /**
+     * Returns a namespace string without tenant id.
+     * Please use the NamespaceStringUtil::serialize class instead to apply the proper serialization
+     * behavior.
+     * Only to be used when a tenant id cannot be tolerated in the serialized output, and should
+     * otherwise be avoided whenever possible.
+     *
+     * MUST only be used for very specific cases.
+     */
+    std::string serializeWithoutTenantPrefix_UNSAFE() const {
+        return toString();
+    }
+
+    /**
+     * Gets a namespace string with tenant id.
+     *
+     * MUST only be used for tests.
+     */
+    std::string toStringWithTenantId_forTest() const {
+        return toStringWithTenantId();
+    }
+
+    /**
+     * This function should only be used when creating a resouce id for nss.
+     */
+    std::string toStringForResourceId() const {
+        return toStringWithTenantId();
+    }
+
+    /**
+     * This function should only be used when logging a NamespaceString in an error message.
+     */
+    std::string toStringForErrorMsg() const {
+        return toStringWithTenantId();
+    }
+
+    /**
+     * Method to be used only when logging a NamespaceString in a log message.
+     * It is called anytime a NamespaceString is logged by logAttrs or otherwise.
+     */
+    friend std::string toStringForLogging(const NamespaceString& nss) {
+        return nss.toStringWithTenantId();
+    }
+
+    /**
+     * Returns the size of the database and collection (including the 'dot').
+     */
     size_t size() const {
-        return _ns.size();
+        auto offset = kDataOffset + tenantIdSize();
+        return _data.size() - offset;
+    }
+
+    /**
+     * Returns the size of the tenant id, database and collection (including the 'dot').
+     */
+    size_t sizeWithTenant() const {
+        return _data.size() - kDataOffset;
+    }
+
+    size_t dbSize() const {
+        return DatabaseName::size();
     }
 
     bool isEmpty() const {
-        return _ns.empty();
+        return size() == 0;
     }
 
     //
@@ -375,31 +443,38 @@ public:
     //
 
     bool isHealthlog() const {
-        return isLocal() && coll() == "system.healthlog";
+        return isLocalDB() && coll() == "system.healthlog";
     }
     bool isSystem() const {
         return coll().startsWith("system.");
     }
     bool isNormalCollection() const {
-        return !isSystem() && !(isLocal() && coll().startsWith("replset."));
+        return !isSystem() && !(isLocalDB() && coll().startsWith("replset."));
     }
     bool isAdminDB() const {
-        return db() == kAdminDb;
+        return db_deprecated() == DatabaseName::kAdmin.db(omitTenant);
     }
-    bool isLocal() const {
-        return db() == kLocalDb;
+    bool isLocalDB() const {
+        return db_deprecated() == DatabaseName::kLocal.db(omitTenant);
     }
     bool isSystemDotProfile() const {
-        return coll() == "system.profile";
+        return coll() == kSystemDotProfileCollectionName;
     }
     bool isSystemDotViews() const {
         return coll() == kSystemDotViewsCollectionName;
     }
+    static bool resolvesToSystemDotViews(StringData ns) {
+        auto nss = NamespaceString(boost::none, ns);
+        return nss.isSystemDotViews();
+    }
     bool isSystemDotJavascript() const {
         return coll() == kSystemDotJavascriptCollectionName;
     }
+    bool isSystemDotUsers() const {
+        return coll() == kSystemUsers;
+    }
     bool isServerConfigurationCollection() const {
-        return (db() == kAdminDb) && (coll() == "system.version");
+        return isAdminDB() && (coll() == "system.version");
     }
     bool isPrivilegeCollection() const {
         if (!isAdminDB()) {
@@ -408,33 +483,44 @@ public:
         return (coll() == kSystemUsers) || (coll() == kSystemRoles);
     }
     bool isConfigDB() const {
-        return db() == kConfigDb;
+        return db_deprecated() == DatabaseName::kConfig.db(omitTenant);
     }
     bool isCommand() const {
         return coll() == "$cmd";
     }
     bool isOplog() const {
-        return oplog(_ns);
+        return oplog(ns());
     }
     bool isOnInternalDb() const {
-        if (db() == kAdminDb)
-            return true;
-        if (db() == kLocalDb)
-            return true;
-        if (db() == kConfigDb)
-            return true;
-        return false;
+        return isAdminDB() || isLocalDB() || isConfigDB();
     }
 
     bool isOrphanCollection() const {
-        return db() == kOrphanCollectionDb && coll().startsWith(kOrphanCollectionPrefix);
+        return isLocalDB() && coll().startsWith(kOrphanCollectionPrefix);
     }
 
     /**
-     * Returns whether the specified namespace is used for internal purposes only and can
-     * never be marked as anything other than UNSHARDED.
+     * foo = true
+     * foo. = false
+     * foo.a = false
      */
-    bool isNamespaceAlwaysUnsharded() const;
+    bool isDbOnly() const {
+        return kDataOffset + DatabaseName::sizeWithTenant() == _data.size();
+    }
+
+    /**
+     * Returns whether the specified namespace is never tracked in the sharding catalog.
+     *
+     * These class of namespaces are used for internal purposes only and they are only registered in
+     * the local catalog but not tracked by the sharding catalog.
+     */
+    bool isNamespaceAlwaysUntracked() const;
+
+    /**
+     * Returns whether the specified namespace is shard-local, meaning it exists independently on
+     * each shard.
+     */
+    bool isShardLocalNamespace() const;
 
     /**
      * Returns whether the specified namespace is config.cache.chunks.<>.
@@ -482,14 +568,27 @@ public:
     bool isConfigTransactionsCollection() const;
 
     /**
-     * Returns whether the specified namespace is <database>.enxcol_.<.+>.(esc|ecc|ecoc).
+     * Returns whether the specified namespace is <database>.enxcol_.<.+>.(esc|ecoc).
      */
     bool isFLE2StateCollection() const;
+
+    static bool isFLE2StateCollection(StringData coll);
 
     /**
      * Returns true if the namespace is an oplog or a change collection, false otherwise.
      */
     bool isOplogOrChangeCollection() const;
+
+    /**
+     * Returns true if the namespace is a system.statistics collection, false otherwise.
+     */
+    bool isSystemStatsCollection() const;
+
+    /**
+     * Returns true if the collection starts with "system.buckets.tmp.agg_out". Used for $out to
+     * time-series collections.
+     */
+    bool isOutTmpBucketsCollection() const;
 
     /**
      * Returns the time-series buckets namespace for this view.
@@ -537,17 +636,13 @@ public:
      */
     bool isCollectionlessAggregateNS() const;
     bool isListCollectionsCursorNS() const;
+    bool isCollectionlessShardsvrParticipantBlockNS() const;
 
     /**
      * Returns true if a client can modify this namespace even though it is under ".system."
      * For example <dbname>.system.users is ok for regular clients to update.
      */
-    bool isLegalClientSystemNS(const ServerGlobalParams::FeatureCompatibility& currentFCV) const;
-
-    /**
-     * Returns true if this namespace refers to a drop-pending collection.
-     */
-    bool isDropPendingNamespace() const;
+    bool isLegalClientSystemNS() const;
 
     /**
      * Returns true if operations on this namespace must be applied in their own oplog batch.
@@ -555,25 +650,19 @@ public:
     bool mustBeAppliedInOwnOplogBatch() const;
 
     /**
-     * Returns the drop-pending namespace name for this namespace, provided the given optime.
-     *
-     * Example:
-     *     test.foo -> test.system.drop.<timestamp seconds>i<timestamp increment>t<term>.foo
-     */
-    NamespaceString makeDropPendingNamespace(const repl::OpTime& opTime) const;
-
-    /**
-     * Returns the optime used to generate the drop-pending namespace.
-     * Returns an error if this namespace is not drop-pending.
-     */
-    StatusWith<repl::OpTime> getDropPendingNamespaceOpTime() const;
-
-    /**
      * Returns true if the namespace is valid. Special namespaces for internal use are considered as
      * valid.
      */
-    bool isValid(DollarInDbNameBehavior behavior = DollarInDbNameBehavior::Allow) const {
-        return validDBName(db(), behavior) && !coll().empty();
+    bool isValid(DatabaseName::DollarInDbNameBehavior behavior =
+                     DatabaseName::DollarInDbNameBehavior::Allow) const {
+        return DatabaseName::validDBName(db_deprecated(), behavior) && !coll().empty();
+    }
+
+    static bool isValid(StringData ns,
+                        DatabaseName::DollarInDbNameBehavior behavior =
+                            DatabaseName::DollarInDbNameBehavior::Allow) {
+        const auto nss = NamespaceString(boost::none, ns);
+        return nss.isValid(behavior);
     }
 
     /**
@@ -582,7 +671,7 @@ public:
     std::string getSisterNS(StringData local) const;
 
     NamespaceString getCommandNS() const {
-        return {db(), "$cmd"};
+        return {dbName(), "$cmd"};
     }
 
     void serializeCollectionName(BSONObjBuilder* builder, StringData fieldName) const;
@@ -594,29 +683,6 @@ public:
         return ns.startsWith("local.oplog.");
     }
 
-    /**
-     * samples:
-     *   good
-     *      foo
-     *      bar
-     *      foo-bar
-     *   bad:
-     *      foo bar
-     *      foo.bar
-     *      foo"bar
-     *
-     * @param db - a possible database name
-     * @param DollarInDbNameBehavior - please do not change the default value. DB names that must
-     *                                 contain a $ should be checked explicitly.
-     * @return if db is an allowed database name
-     */
-    static bool validDBName(StringData dbName,
-                            DollarInDbNameBehavior behavior = DollarInDbNameBehavior::Disallow);
-
-    static bool validDBName(const DatabaseName& dbName,
-                            DollarInDbNameBehavior behavior = DollarInDbNameBehavior::Disallow) {
-        return validDBName(dbName.db(), behavior);
-    }
 
     /**
      * Takes a fully qualified namespace (ie dbname.collectionName), and returns true if
@@ -630,7 +696,7 @@ public:
      * @param ns - a full namespace (a.b)
      * @return if db.coll is an allowed collection name
      */
-    static bool validCollectionComponent(StringData ns);
+    static bool validCollectionComponent(const NamespaceString& ns);
 
     /**
      * Takes a collection name and returns true if it is a valid collection name.
@@ -645,48 +711,130 @@ public:
      */
     static bool validCollectionName(StringData coll);
 
-    // Relops among `NamespaceString`.
-    friend bool operator==(const NamespaceString& a, const NamespaceString& b) {
-        return (a.tenantId() == b.tenantId()) && (a.ns() == b.ns());
-    }
-    friend bool operator!=(const NamespaceString& a, const NamespaceString& b) {
-        return !(a == b);
-    }
-    friend bool operator<(const NamespaceString& a, const NamespaceString& b) {
-        if (a.tenantId() != b.tenantId()) {
-            return a.tenantId() < b.tenantId();
+    int compare(const NamespaceString& other) const {
+        if (hasTenantId() && !other.hasTenantId()) {
+            return 1;
         }
-        return a.ns() < b.ns();
-    }
-    friend bool operator>(const NamespaceString& a, const NamespaceString& b) {
-        if (a.tenantId() != b.tenantId()) {
-            return a.tenantId() > b.tenantId();
+
+        if (other.hasTenantId() && !hasTenantId()) {
+            return -1;
         }
-        return a.ns() > b.ns();
+
+        return StringData{_data.data() + kDataOffset, _data.size() - kDataOffset}.compare(
+            StringData{other._data.data() + kDataOffset, other._data.size() - kDataOffset});
     }
-    friend bool operator<=(const NamespaceString& a, const NamespaceString& b) {
-        return !(a > b);
+
+    /**
+     * Use to compare the TenantId and `db` part of a NamespaceString.
+     */
+    bool isEqualDb(const NamespaceString& other) const {
+        return tenantId() == other.tenantId() && db_deprecated() == other.db_deprecated();
     }
-    friend bool operator>=(const NamespaceString& a, const NamespaceString& b) {
-        return !(a < b);
+
+    friend bool operator==(const NamespaceString& lhs, const NamespaceString& rhs) {
+        return StringData{lhs._data.data(), lhs._data.size()} ==
+            StringData{rhs._data.data(), rhs._data.size()};
+    }
+
+    friend bool operator<(const NamespaceString& lhs, const NamespaceString& rhs) {
+        return lhs.compare(rhs) < 0;
+    }
+
+    friend bool operator<=(const NamespaceString& lhs, const NamespaceString& rhs) {
+        return lhs.compare(rhs) <= 0;
+    }
+
+    friend bool operator>(const NamespaceString& lhs, const NamespaceString& rhs) {
+        return lhs.compare(rhs) > 0;
+    }
+
+    friend bool operator>=(const NamespaceString& lhs, const NamespaceString& rhs) {
+        return lhs.compare(rhs) >= 0;
     }
 
     template <typename H>
     friend H AbslHashValue(H h, const NamespaceString& nss) {
-        if (nss.tenantId()) {
-            return H::combine(std::move(h), nss._dbName.tenantId().get(), nss._ns);
-        }
-        return H::combine(std::move(h), nss._ns);
+        return H::combine(std::move(h), std::string_view{nss._data.data(), nss._data.size()});
     }
 
     friend auto logAttrs(const NamespaceString& nss) {
         return "namespace"_attr = nss;
     }
 
+    /**
+     * This function removes the tenant id and returns the namespace part of NamespaceString.
+     */
+    friend StringData redactTenant(const NamespaceString& nss) {
+        return nss.ns();
+    }
+
 private:
-    DatabaseName _dbName;
-    std::string _ns;
-    size_t _dotIndex = std::string::npos;
+    friend class NamespaceStringUtil;
+    friend class NamespaceStringTest;
+    friend class AuthNamespaceStringUtil;
+
+    /**
+     * In order to construct NamespaceString objects, use NamespaceStringUtil. The functions
+     * on NamespaceStringUtil make assertions necessary when running in Serverless.
+     */
+
+    /**
+     * Constructs a NamespaceString from the fully qualified namespace named in "ns" and the
+     * tenantId. "ns" is NOT expected to contain the tenantId.
+     */
+    NamespaceString(boost::optional<TenantId> tenantId, StringData ns)
+        : DatabaseName(Storage::make(tenantId, ns), TrustedInitTag{}) {}
+
+    /**
+     * Constructs a NamespaceString for the given database and collection names.
+     * "dbName" must not contain a ".", and "collectionName" must not start with one.
+     */
+    NamespaceString(DatabaseName dbName, StringData collectionName)
+        : DatabaseName(Storage::make(dbName, collectionName), TrustedInitTag{}) {}
+
+    /**
+     * Constructs a NamespaceString for the given db name, collection name, and tenantId.
+     * "db" must not contain a ".", and "collectionName" must not start with one. "db" is
+     * NOT expected to contain a tenantId.
+     */
+    NamespaceString(boost::optional<TenantId> tenantId, StringData db, StringData collectionName)
+        : DatabaseName(Storage::make(tenantId, db, collectionName),
+                       DatabaseName::TrustedInitTag{}) {}
+
+    /**
+     * Please refer to NamespaceStringUtil::serialize method or use ns_forTest to satisfy any unit
+     * test needing access to ns().
+     */
+    StringData ns() const {
+        auto offset = kDataOffset + tenantIdSize();
+        return StringData{_data.data() + offset, _data.size() - offset};
+    }
+
+    std::string toString() const {
+        return ns().toString();
+    }
+
+    std::string toStringWithTenantId() const {
+        if (hasTenantId()) {
+            return str::stream() << TenantId{OID::from(_data.data() + kDataOffset)} << "_" << ns();
+        }
+
+        return ns().toString();
+    }
+
+    /**
+     * This method is deprecated and will be removed as part of SERVER-65456. We strongly
+     * encourage to make the use of `dbName`, which returns a DatabaseName object instead.
+     * In case you would need to a StringData object instead we strongly recommend taking a look
+     * at the DatabaseNameUtil::serialize method which takes in a DatabaseName object.
+     */
+    StringData db_deprecated() const {
+        return dbName().db(omitTenant);
+    }
+
+    static constexpr size_t kDataOffset = sizeof(uint8_t);
+    static constexpr uint8_t kTenantIdMask = 0x80;
+    static constexpr uint8_t kDatabaseNameOffsetEndMask = 0x7F;
 };
 
 /**
@@ -695,81 +843,73 @@ private:
  */
 class NamespaceStringOrUUID {
 public:
-    NamespaceStringOrUUID(NamespaceString nss) : _nss(std::move(nss)) {}
+    NamespaceStringOrUUID() = delete;
+    NamespaceStringOrUUID(NamespaceString nss) : _nssOrUUID(std::move(nss)) {}
+    // NamespaceStringOrUUID(const NamespaceString& nss) : _nssOrUUID(nss) {}
     NamespaceStringOrUUID(DatabaseName dbname, UUID uuid)
-        : _uuid(std::move(uuid)), _dbname(std::move(dbname)) {}
-    NamespaceStringOrUUID(boost::optional<TenantId> tenantId, std::string db, UUID uuid)
-        : _uuid(std::move(uuid)), _dbname(DatabaseName(std::move(tenantId), std::move(db))) {}
-    // TODO SERVER-65920 Remove once all call sites have been changed to take tenantId explicitly
-    NamespaceStringOrUUID(std::string db,
-                          UUID uuid,
-                          boost::optional<TenantId> tenantId = boost::none)
-        : _uuid(std::move(uuid)), _dbname(DatabaseName(std::move(tenantId), std::move(db))) {}
+        : _nssOrUUID(UUIDWithDbName{std::move(dbname), std::move(uuid)}) {}
 
-    const boost::optional<NamespaceString>& nss() const {
-        return _nss;
+    bool isNamespaceString() const {
+        return holds_alternative<NamespaceString>(_nssOrUUID);
     }
 
-    void setNss(const NamespaceString& nss) {
-        _nss = nss;
+    const NamespaceString& nss() const {
+        invariant(holds_alternative<NamespaceString>(_nssOrUUID));
+        return get<NamespaceString>(_nssOrUUID);
     }
 
-    const boost::optional<UUID>& uuid() const {
-        return _uuid;
+    bool isUUID() const {
+        return holds_alternative<UUIDWithDbName>(_nssOrUUID);
     }
 
-    /**
-     * Returns database name if this object was initialized with a UUID.
-     *
-     * TODO SERVER-66887 remove this function for better clarity once call sites have been changed
-     */
-    std::string dbname() const {
-        return _dbname ? _dbname->db() : "";
-    }
-
-    const boost::optional<DatabaseName>& dbName() const {
-        return _dbname;
-    }
-
-    void preferNssForSerialization() {
-        _preferNssForSerialization = true;
+    const UUID& uuid() const {
+        invariant(holds_alternative<UUIDWithDbName>(_nssOrUUID));
+        return get<1>(get<UUIDWithDbName>(_nssOrUUID));
     }
 
     /**
-     * Returns database name derived from either '_nss' or '_dbname'.
+     * Returns the database name.
      */
-    StringData db() const {
-        return _nss ? _nss->db() : StringData(_dbname->db());
+    const DatabaseName& dbName() const {
+        if (holds_alternative<NamespaceString>(_nssOrUUID)) {
+            return get<NamespaceString>(_nssOrUUID).dbName();
+        }
+
+        return get<0>(get<UUIDWithDbName>(_nssOrUUID));
     }
 
     /**
-     * Returns OK if either the nss is not set or is a valid nss. Otherwise returns an
-     * InvalidNamespace error.
+     * This function should only be used when logging a NamespaceStringOrUUID in an error message.
      */
-    Status isNssValid() const;
+    std::string toStringForErrorMsg() const;
 
-    std::string toString() const;
+    /**
+     * Method to be used only when logging a NamespaceStringOrUUID in a log message.
+     */
+    friend std::string toStringForLogging(const NamespaceStringOrUUID& nssOrUUID);
 
     void serialize(BSONObjBuilder* builder, StringData fieldName) const;
 
+    template <typename H>
+    friend H AbslHashValue(H h, const NamespaceStringOrUUID& nssOrUUID) {
+        if (nssOrUUID.isNamespaceString()) {
+            return H::combine(std::move(h), nssOrUUID.nss());
+        } else {
+            return H::combine(std::move(h), nssOrUUID.uuid());
+        }
+    }
+
+    ConstDataRange asDataRange() const {
+        if (isNamespaceString()) {
+            return nss().asDataRange();
+        }
+        return uuid().asDataRange();
+    }
+
 private:
-    // At any given time exactly one of these optionals will be initialized.
-    boost::optional<NamespaceString> _nss;
-    boost::optional<UUID> _uuid;
-
-    // When seralizing, if both '_nss' and '_uuid' are present, use '_nss'.
-    bool _preferNssForSerialization = false;
-
-    // Empty when '_nss' is non-none, and contains the database name when '_uuid' is
-    // non-none. Although the UUID specifies a collection uniquely, we must later verify that the
-    // collection belongs to the database named here.
-    boost::optional<DatabaseName> _dbname;
+    using UUIDWithDbName = std::tuple<DatabaseName, UUID>;
+    std::variant<NamespaceString, UUIDWithDbName> _nssOrUUID;
 };
-
-std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss);
-std::ostream& operator<<(std::ostream& stream, const NamespaceStringOrUUID& nsOrUUID);
-StringBuilder& operator<<(StringBuilder& builder, const NamespaceString& nss);
-StringBuilder& operator<<(StringBuilder& builder, const NamespaceStringOrUUID& nsOrUUID);
 
 /**
  * "database.a.b.c" -> "database"
@@ -778,12 +918,10 @@ inline StringData nsToDatabaseSubstring(StringData ns) {
     size_t i = ns.find('.');
     if (i == std::string::npos) {
         massert(
-            10078, "nsToDatabase: db too long", ns.size() < NamespaceString::MaxDatabaseNameLen);
+            10078, "nsToDatabase: db too long", ns.size() <= DatabaseName::kMaxDatabaseNameLength);
         return ns;
     }
-    massert(10088,
-            "nsToDatabase: db too long",
-            i < static_cast<size_t>(NamespaceString::MaxDatabaseNameLen));
+    massert(10088, "nsToDatabase: db too long", i <= DatabaseName::kMaxDatabaseNameLength);
     return ns.substr(0, i);
 }
 
@@ -819,58 +957,14 @@ inline bool nsIsFull(StringData ns) {
     return true;
 }
 
-/**
- * foo = true
- * foo. = false
- * foo.a = false
- */
-inline bool nsIsDbOnly(StringData ns) {
-    size_t i = ns.find('.');
-    if (i == std::string::npos)
-        return true;
-    return false;
-}
 
-inline bool NamespaceString::validDBName(StringData db, DollarInDbNameBehavior behavior) {
-    if (db.size() == 0 || db.size() >= 64)
-        return false;
-
-    for (StringData::const_iterator iter = db.begin(), end = db.end(); iter != end; ++iter) {
-        switch (*iter) {
-            case '\0':
-            case '/':
-            case '\\':
-            case '.':
-            case ' ':
-            case '"':
-                return false;
-            case '$':
-                if (behavior == DollarInDbNameBehavior::Disallow)
-                    return false;
-                continue;
-#ifdef _WIN32
-            // We prohibit all FAT32-disallowed characters on Windows
-            case '*':
-            case '<':
-            case '>':
-            case ':':
-            case '|':
-            case '?':
-                return false;
-#endif
-            default:
-                continue;
-        }
-    }
-    return true;
-}
-
-inline bool NamespaceString::validCollectionComponent(StringData ns) {
-    size_t idx = ns.find('.');
+inline bool NamespaceString::validCollectionComponent(const NamespaceString& ns) {
+    const auto nsStr = ns.ns();
+    size_t idx = nsStr.find('.');
     if (idx == std::string::npos)
         return false;
 
-    return validCollectionName(ns.substr(idx + 1)) || oplog(ns);
+    return validCollectionName(nsStr.substr(idx + 1)) || oplog(nsStr);
 }
 
 inline bool NamespaceString::validCollectionName(StringData coll) {
@@ -892,5 +986,46 @@ inline bool NamespaceString::validCollectionName(StringData coll) {
 
     return true;
 }
+
+inline std::string stringifyForAssert(const NamespaceString& nss) {
+    return toStringForLogging(nss);
+}
+
+// Here are the `constexpr` definitions for the
+// constant static data members of `NamespaceString`. They cannot be defined
+// `constexpr` inside the class definition, but they can be upgraded to
+// `constexpr` here below it. Each one needs to be initialized with the address
+// of their associated data, so those are all defined first, as
+// variables named by the same `id`, but in separate nested namespace.
+
+// cribbed from https://accu.org/journals/overload/30/172/wu/
+namespace namespace_string_data {
+
+template <size_t dbSize, size_t collSize>
+constexpr auto makeNsData(const char* db, const char* coll) {
+    // No dot if both db and coll are empty.
+    constexpr size_t dot = !!collSize;
+    std::array<char, 1 + dbSize + dot + collSize> result{};
+    auto p = result.begin();
+    *p++ = dbSize;
+    p = std::copy_n(db, dbSize, p);
+    if (dot)
+        *p++ = '.';
+    p = std::copy_n(coll, collSize, p);
+    return result;
+}
+
+#define NSS_CONSTANT(id, dbname, coll) \
+    constexpr inline auto id##_data =  \
+        makeNsData<dbname.size(), coll.size()>(dbname.db(OmitTenant{}).rawData(), coll.rawData());
+#include "namespace_string_reserved.def.h"
+#undef NSS_CONSTANT
+}  // namespace namespace_string_data
+
+#define NSS_CONSTANT(id, db, coll)                                                                \
+    constexpr inline NamespaceString NamespaceString::id(namespace_string_data::id##_data.data(), \
+                                                         namespace_string_data::id##_data.size());
+#include "namespace_string_reserved.def.h"
+#undef NSS_CONSTANT
 
 }  // namespace mongo

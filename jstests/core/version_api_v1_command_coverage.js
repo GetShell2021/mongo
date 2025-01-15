@@ -3,13 +3,13 @@
  * parameters.
  *
  * @tags: [
+ *   # The test runs commands that are not allowed with security token: createUser, dropUser.
+ *   not_allowed_with_signed_security_token,
  *   requires_non_retryable_commands,
  *   uses_api_parameters,
+ *   creates_and_authenticates_user,
  * ]
  */
-
-(function() {
-"use strict";
 
 let counter = 0;
 const counter_fun = function() {
@@ -17,7 +17,8 @@ const counter_fun = function() {
 };
 
 const testDB = db.getSiblingDB(jsTestName());
-const testColl = testDB.getCollection("test");
+const collName = jsTestName();
+const testColl = testDB.getCollection(collName);
 
 function runTest({cmd, apiVersion1, apiStrict, apiDeprecationErrors}) {
     // Instantiate "cmd" so we can modify it.
@@ -80,4 +81,3 @@ for (let {cmd, apiVersion1} of commands) {
         }
     }
 }
-})();

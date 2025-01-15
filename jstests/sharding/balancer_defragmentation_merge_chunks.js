@@ -5,16 +5,17 @@
  *  # This test does not support stepdowns of CSRS because of how it uses failpoints
  *  # to control phase transition
  *  does_not_support_stepdowns,
+ *  requires_fcv_61,
  * ]
  */
 
-(function() {
-'use strict';
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
 
-load("jstests/libs/fail_point_util.js");
-load('jstests/sharding/autosplit_include.js');
-load("jstests/sharding/libs/find_chunks_util.js");
-load("jstests/sharding/libs/defragmentation_util.js");
+import {configureFailPointForRS} from "jstests/libs/fail_point_util.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {defragmentationUtil} from "jstests/sharding/libs/defragmentation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 Random.setRandomSeed();
 
@@ -29,10 +30,12 @@ const st = new ShardingTest({
             setParameter: {
                 logComponentVerbosity: tojson({sharding: {verbosity: 2}}),
                 chunkDefragmentationThrottlingMS: 0,
-                reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000 /* 1 day */
+                reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000, /* 1 day */
+                // Shorten time between balancer rounds for faster initial balancing
+                balancerMigrationsThrottlingMs: 200
             }
         },
-        shardOptions: {
+        rsOptions: {
             setParameter: {
                 reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000 /* 1 day */
             }
@@ -50,15 +53,6 @@ function getNewColl() {
     return db[collNamePrefix + '_' + collCounter++];
 }
 
-// Shorten time between balancer rounds for faster initial balancing
-st.forEachConfigServer((conn) => {
-    conn.adminCommand({
-        configureFailPoint: 'overrideBalanceRoundInterval',
-        mode: 'alwaysOn',
-        data: {intervalMs: 200}
-    });
-});
-
 const targetChunkSizeMB = 2;
 
 function setupCollection() {
@@ -70,30 +64,12 @@ function setupCollection() {
                                                    10 /* numChunks */,
                                                    targetChunkSizeMB / 2 /* maxChunkFillMB */,
                                                    0 /* numZones */,
-                                                   32 * 1024 /* docSizeBytes */,
+                                                   [32 * 1024, 32 * 1024] /* docSizeBytesRange */,
                                                    1000 /* chunkSpacing */,
                                                    false /* disableCollectionBalancing */);
     jsTest.log("Collection " + coll.getFullName() + ", number of chunks before defragmentation: " +
                findChunksUtil.countChunksForNs(st.s.getDB('config'), coll.getFullName()));
     return coll;
-}
-
-function setFailPointOnConfigNodes(failpoint, mode) {
-    // Use clearFailPointOnConfigNodes() instead
-    assert(mode !== "off");
-    let timesEnteredByNode = {};
-    st.forEachConfigServer((config) => {
-        const fp =
-            assert.commandWorked(config.adminCommand({configureFailPoint: failpoint, mode: mode}));
-        timesEnteredByNode[config.host] = fp.count;
-    });
-    return timesEnteredByNode;
-}
-
-function clearFailPointOnConfigNodes(failpoint) {
-    st.forEachConfigServer((config) => {
-        assert.commandWorked(config.adminCommand({configureFailPoint: failpoint, mode: "off"}));
-    });
 }
 
 // Setup collection for first tests
@@ -128,6 +104,41 @@ jsTest.log("Test command chunk size bounds.");
                                  ErrorCodes.InvalidOptions);
 }
 
+jsTest.log("Test command - apply default value to chunkSize");
+{
+    st.stopBalancer();
+    let getMaxChunkSizeFor = (nss) => {
+        return st.s.getDB("config").collections.findOne({_id: nss}).maxChunkSizeBytes;
+    };
+
+    // Generic Behavior
+    assert.commandWorked(st.s.adminCommand({
+        configureCollectionBalancing: coll1Name,
+        chunkSize: 1024,
+    }));
+    assert.eq(1024 * 1024 * 1024, getMaxChunkSizeFor(coll1Name));
+
+    assert.commandWorked(st.s.adminCommand({
+        configureCollectionBalancing: coll1Name,
+        chunkSize: 0,
+    }));
+    assert.eq(undefined, getMaxChunkSizeFor(coll1Name));
+
+    // Specific treatment for config.system.sessions
+    const sessionsCollName = "config.system.sessions";
+    assert.commandWorked(st.s.adminCommand({
+        configureCollectionBalancing: sessionsCollName,
+        chunkSize: 1024,
+    }));
+    assert.eq(1024 * 1024 * 1024, getMaxChunkSizeFor(sessionsCollName));
+
+    assert.commandWorked(st.s.adminCommand({
+        configureCollectionBalancing: sessionsCollName,
+        chunkSize: 0,
+    }));
+    assert.eq(200000, getMaxChunkSizeFor(sessionsCollName));
+}
+
 jsTest.log("Begin and end defragmentation with balancer off.");
 {
     st.stopBalancer();
@@ -158,7 +169,8 @@ jsTest.log("Begin and end defragmentation with balancer on");
 {
     st.startBalancer();
     // Allow the first phase transition to build the initial defragmentation state
-    setFailPointOnConfigNodes("skipDefragmentationPhaseTransition", {skip: 1});
+    let configRSFailPoints = configureFailPointForRS(
+        st.configRS.nodes, "skipDefragmentationPhaseTransition", {}, {skip: 1});
     assert.commandWorked(st.s.adminCommand({
         configureCollectionBalancing: coll1Name,
         defragmentCollection: true,
@@ -174,7 +186,7 @@ jsTest.log("Begin and end defragmentation with balancer on");
         chunkSize: targetChunkSizeMB,
     }));
     // Ensure that the policy completes the phase transition...
-    clearFailPointOnConfigNodes("skipDefragmentationPhaseTransition");
+    configRSFailPoints.off();
     defragmentationUtil.waitForEndOfDefragmentation(st.s, coll1Name);
     st.stopBalancer();
 }
@@ -185,7 +197,8 @@ jsTest.log("Begin defragmentation with balancer off, end with it on");
     const nss = coll.getFullName();
     st.stopBalancer();
     // Allow the first phase transition to build the initial defragmentation state
-    setFailPointOnConfigNodes("skipDefragmentationPhaseTransition", {skip: 1});
+    let configRSFailPoints = configureFailPointForRS(
+        st.configRS.nodes, "skipDefragmentationPhaseTransition", {}, {skip: 1});
     assert.commandWorked(st.s.adminCommand({
         configureCollectionBalancing: nss,
         defragmentCollection: true,
@@ -201,7 +214,7 @@ jsTest.log("Begin defragmentation with balancer off, end with it on");
         chunkSize: targetChunkSizeMB,
     }));
     // Ensure that the policy completes the phase transition...
-    clearFailPointOnConfigNodes("skipDefragmentationPhaseTransition");
+    configRSFailPoints.off();
     defragmentationUtil.waitForEndOfDefragmentation(st.s, nss);
     st.stopBalancer();
 }
@@ -216,7 +229,8 @@ jsTest.log("Changed uuid causes defragmentation to restart");
     coll.insertOne({key: 1, key2: 1});
     assert.commandWorked(db.adminCommand({split: nss, middle: {key: 1}}));
     // Pause defragmentation after initialization but before phase 1 runs
-    setFailPointOnConfigNodes("afterBuildingNextDefragmentationPhase", "alwaysOn");
+    let configRSFailPoints = configureFailPointForRS(
+        st.configRS.nodes, "afterBuildingNextDefragmentationPhase", {}, "alwaysOn");
     assert.commandWorked(st.s.adminCommand({
         configureCollectionBalancing: nss,
         defragmentCollection: true,
@@ -224,9 +238,10 @@ jsTest.log("Changed uuid causes defragmentation to restart");
     }));
     st.startBalancer();
     // Reshard collection
-    assert.commandWorked(db.adminCommand({reshardCollection: nss, key: {key2: 1}}));
+    assert.commandWorked(
+        db.adminCommand({reshardCollection: nss, key: {key2: 1}, numInitialChunks: 1}));
     // Let defragementation run
-    clearFailPointOnConfigNodes("afterBuildingNextDefragmentationPhase");
+    configRSFailPoints.off();
     defragmentationUtil.waitForEndOfDefragmentation(st.s, nss);
     st.stopBalancer();
     // Ensure the defragmentation succeeded
@@ -244,7 +259,8 @@ jsTest.log("Refined shard key causes defragmentation to restart");
     coll.insertOne({key: 1, key2: 1});
     assert.commandWorked(db.adminCommand({split: nss, middle: {key: 1}}));
     // Pause defragmentation after initialization but before phase 1 runs
-    setFailPointOnConfigNodes("afterBuildingNextDefragmentationPhase", "alwaysOn");
+    let configRSFailPoints = configureFailPointForRS(
+        st.configRS.nodes, "afterBuildingNextDefragmentationPhase", {}, "alwaysOn");
     assert.commandWorked(st.s.adminCommand({
         configureCollectionBalancing: nss,
         defragmentCollection: true,
@@ -255,7 +271,7 @@ jsTest.log("Refined shard key causes defragmentation to restart");
     assert.commandWorked(coll.createIndex({key: 1, key2: 1}));
     assert.commandWorked(db.adminCommand({refineCollectionShardKey: nss, key: {key: 1, key2: 1}}));
     // Let defragementation run
-    clearFailPointOnConfigNodes("afterBuildingNextDefragmentationPhase");
+    configRSFailPoints.off();
     defragmentationUtil.waitForEndOfDefragmentation(st.s, nss);
     st.stopBalancer();
     // Ensure the defragmentation succeeded
@@ -264,4 +280,3 @@ jsTest.log("Refined shard key causes defragmentation to restart");
 }
 
 st.stop();
-})();

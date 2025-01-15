@@ -7,12 +7,11 @@
 //   do_not_wrap_aggregations_in_facets,
 //   does_not_support_stepdowns,
 //   requires_profiling,
+//   not_allowed_with_signed_security_token,
+//   cannot_run_during_upgrade_downgrade,
 // ]
 
-(function() {
-'use strict';
-
-load("jstests/libs/profiler.js");  // For 'getLatestProfilerEntry()'.
+import {getLatestProfilerEntry} from "jstests/libs/profiler.js";
 
 const testDB = db.getSiblingDB(jsTestName());
 assert.commandWorked(testDB.dropDatabase());
@@ -40,7 +39,10 @@ function testPushedDownSBEPlanReplanning(match1, match2, pushedDownStage) {
     lcoll.aggregate(pushedDownPipeline).itcount();
     lcoll.aggregate(pushedDownPipeline).itcount();
 
-    assert.commandWorked(testDB.setProfilingLevel(2));
+    // Don't profile the setFCV command, which could be run during this test in the
+    // fcv_upgrade_downgrade_replica_sets_jscore_passthrough suite.
+    assert.commandWorked(testDB.setProfilingLevel(
+        1, {filter: {'command.setFeatureCompatibilityVersion': {'$exists': false}}}));
     // The cached plan is not efficient for the 'match2' stage and replanning will happen.
     const pipelineTriggeringReplanning = [match2, pushedDownStage];
     lcoll.aggregate(pipelineTriggeringReplanning).itcount();
@@ -68,4 +70,3 @@ function testPushedDownSBEPlanReplanning(match1, match2, pushedDownStage) {
     testPushedDownSBEPlanReplanning(
         {$match: {a: 5, b: 15}}, {$match: {a: 15, b: 10}}, {$group: {_id: "$a"}});
 })();
-}());

@@ -5,11 +5,13 @@
  * @tags: [uses_transactions, uses_prepare_transaction, uses_multi_shard_transaction]
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    checkDecisionIs,
+    checkDocumentDeleted,
+    runCommitThroughMongosInParallelThread
+} from 'jstests/sharding/libs/txn_two_phase_commit_util.js';
 
 const dbName = "test";
 const collName = "foo";
@@ -34,49 +36,6 @@ const checkParticipantListMatches = function(
                        .findOne({"_id.lsid.id": lsid.id, "_id.txnNumber": txnNumber});
     assert.neq(null, coordDoc);
     assert.sameMembers(coordDoc.participants, expectedParticipantList);
-};
-
-const checkDecisionIs = function(coordinatorConn, lsid, txnNumber, expectedDecision) {
-    let coordDoc = coordinatorConn.getDB("config")
-                       .getCollection("transaction_coordinators")
-                       .findOne({"_id.lsid.id": lsid.id, "_id.txnNumber": txnNumber});
-    assert.neq(null, coordDoc);
-    assert.eq(expectedDecision, coordDoc.decision.decision);
-    if (expectedDecision === "commit") {
-        assert.neq(null, coordDoc.decision.commitTimestamp);
-    } else {
-        assert.eq(null, coordDoc.decision.commitTimestamp);
-    }
-};
-
-const checkDocumentDeleted = function(coordinatorConn, lsid, txnNumber) {
-    let coordDoc = coordinatorConn.getDB("config")
-                       .getCollection("transaction_coordinators")
-                       .findOne({"_id.lsid.id": lsid.id, "_id.txnNumber": txnNumber});
-    return null === coordDoc;
-};
-
-const runCommitThroughMongosInParallelShellExpectSuccess = function() {
-    const runCommitExpectSuccessCode = "assert.commandWorked(db.adminCommand({" +
-        "commitTransaction: 1," +
-        "lsid: " + tojson(lsid) + "," +
-        "txnNumber: NumberLong(" + txnNumber + ")," +
-        "stmtId: NumberInt(0)," +
-        "autocommit: false," +
-        "}));";
-    return startParallelShell(runCommitExpectSuccessCode, st.s.port);
-};
-
-const runCommitThroughMongosInParallelShellExpectAbort = function() {
-    const runCommitExpectSuccessCode = "assert.commandFailedWithCode(db.adminCommand({" +
-        "commitTransaction: 1," +
-        "lsid: " + tojson(lsid) + "," +
-        "txnNumber: NumberLong(" + txnNumber + ")," +
-        "stmtId: NumberInt(0)," +
-        "autocommit: false," +
-        "})," +
-        "ErrorCodes.NoSuchTransaction);";
-    return startParallelShell(runCommitExpectSuccessCode, st.s.port);
 };
 
 const startSimulatingNetworkFailures = function(connArray) {
@@ -130,8 +89,8 @@ const setUp = function() {
     // shard0: [-inf, 0)
     // shard1: [0, 10)
     // shard2: [10, +inf)
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: coordinator.shardName}));
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: dbName, primaryShard: coordinator.shardName}));
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 10}}));
@@ -192,12 +151,14 @@ const testCommitProtocol = function(shouldCommit, simulateNetworkFailures) {
         configureFailPoint(coordinator, "hangBeforeWaitingForDecisionWriteConcern", {}, "alwaysOn");
 
     // Run commitTransaction through a parallel shell.
-    let awaitResult;
+    let commitThread;
     if (shouldCommit) {
-        awaitResult = runCommitThroughMongosInParallelShellExpectSuccess();
+        commitThread = runCommitThroughMongosInParallelThread(lsid, txnNumber, st.s.host);
     } else {
-        awaitResult = runCommitThroughMongosInParallelShellExpectAbort();
+        commitThread = runCommitThroughMongosInParallelThread(
+            lsid, txnNumber, st.s.host, ErrorCodes.NoSuchTransaction);
     }
+    commitThread.start();
 
     // Check that the coordinator wrote the participant list.
     hangBeforeWaitingForParticipantListWriteConcernFp.wait();
@@ -211,7 +172,7 @@ const testCommitProtocol = function(shouldCommit, simulateNetworkFailures) {
     hangBeforeWaitingForDecisionWriteConcernFp.off();
 
     // Check that the coordinator deleted its persisted state.
-    awaitResult();
+    commitThread.join();
     assert.soon(function() {
         return checkDocumentDeleted(coordinator, lsid, txnNumber);
     });
@@ -244,4 +205,3 @@ testCommitProtocol(false /* test abort */, true /* with network failures */);
 testCommitProtocol(true /* test commit */, true /* with network failures */);
 
 st.stop();
-})();

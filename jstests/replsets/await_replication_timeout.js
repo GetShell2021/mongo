@@ -1,9 +1,7 @@
 // Tests timeout behavior of waiting for write concern as well as its interaction with maxTimeMs
 
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 var replTest = new ReplSetTest({nodes: 3});
 replTest.startSet();
@@ -21,7 +19,7 @@ replTest.awaitReplication();
 // Insert a document and implicitly create the collection.
 let resetCollection = function(w) {
     assert.commandWorked(
-        testColl.insert({_id: 0}, {writeConcern: {w: w, wtimeout: replTest.kDefaultTimeoutMS}}));
+        testColl.insert({_id: 0}, {writeConcern: {w: w, wtimeout: replTest.timeoutMS}}));
     assert.eq(1, testColl.find().itcount());
 };
 
@@ -33,8 +31,8 @@ replTest.stop(2);
 // Test wtimeout
 var res = testDB.runCommand(
     {insert: collName, documents: [{a: 1}], writeConcern: {w: 3, wtimeout: 1000}});
-assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
-assert.eq(ErrorCodes.WriteConcernFailed, res.writeConcernError.code);
+assert.commandFailedWithCode(res, ErrorCodes.WriteConcernTimeout);
+assert.eq(ErrorCodes.WriteConcernTimeout, res.writeConcernError.code);
 
 // Test maxTimeMS timeout
 res = testDB.runCommand(
@@ -48,8 +46,8 @@ res = testDB.runCommand({
     writeConcern: {w: 3, wtimeout: 1000},
     maxTimeMS: 10 * 1000
 });
-assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
-assert.eq(ErrorCodes.WriteConcernFailed, res.writeConcernError.code);
+assert.commandFailedWithCode(res, ErrorCodes.WriteConcernTimeout);
+assert.eq(ErrorCodes.WriteConcernTimeout, res.writeConcernError.code);
 
 // Test with wtimeout > maxTimeMS
 res = testDB.runCommand({
@@ -62,8 +60,8 @@ assert.commandFailedWithCode(res, ErrorCodes.MaxTimeMSExpired);
 
 // dropDatabase respects the 'w' field when it is stronger than the default of majority.
 res = testDB.runCommand({dropDatabase: 1, writeConcern: {w: 3, wtimeout: 1000}});
-assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
-assert.eq(ErrorCodes.WriteConcernFailed, res.writeConcernError.code);
+assert.commandFailedWithCode(res, ErrorCodes.WriteConcernTimeout);
+assert.eq(ErrorCodes.WriteConcernTimeout, res.writeConcernError.code);
 
 resetCollection(2);
 
@@ -77,8 +75,7 @@ stopServerReplication(secondary);
 // dropDatabase defaults to 'majority' when a weaker 'w' field is provided, but respects
 // 'wtimeout'.
 res = testDB.runCommand({dropDatabase: 1, writeConcern: {w: 1, wtimeout: 1000}});
-assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
+assert.commandFailedWithCode(res, ErrorCodes.WriteConcernTimeout);
 
 restartServerReplication(secondary);
 replTest.stopSet();
-})();

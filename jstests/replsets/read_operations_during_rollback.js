@@ -6,11 +6,9 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/rollback_test.js");
-load("jstests/replsets/rslib.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -109,12 +107,19 @@ rollbackTest.transitionToSteadyStateOperations();
 
 const replMetrics = assert.commandWorked(rollbackNode.adminCommand({serverStatus: 1})).metrics.repl;
 assert.eq(replMetrics.stateTransition.lastStateTransition, "rollback");
-assert(replMetrics.stateTransition.userOperationsRunning,
-       () => "Response should have a 'stateTransition.userOperationsRunning' field: " +
-           tojson(replMetrics));
-assert(replMetrics.stateTransition.userOperationsKilled,
-       () => "Response should have a 'stateTransition.userOperationsKilled' field: " +
-           tojson(replMetrics));
+// TODO (SERVER-85259): Remove references to replMetrics.stateTransition.userOperations*
+assert(
+    replMetrics.stateTransition.totalOperationsRunning ||
+        replMetrics.stateTransition.userOperationsRunning,
+    () =>
+        "Response should have a 'stateTransition.totalOperationsRunning' or 'stateTransition.userOperationsRunning' (bin <= 7.2) field: " +
+        tojson(replMetrics));
+assert(
+    replMetrics.stateTransition.totalOperationsKilled ||
+        replMetrics.stateTransition.userOperationsKilled,
+    () =>
+        "Response should have a 'stateTransition.totalOperationsKilled' or 'stateTransition.userOperationsKilled' (bin <= 7.2) field: " +
+        tojson(replMetrics));
 
 // Run a getMore against the idle cursor that remained open throughout the rollback. The getMore
 // should fail since the cursor has been invalidated by the rollback.
@@ -124,4 +129,3 @@ assert.commandFailedWithCode(
 
 // Check the replica set.
 rollbackTest.stop();
-}());

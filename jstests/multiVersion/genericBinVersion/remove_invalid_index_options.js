@@ -4,10 +4,8 @@
  *
  * @tags: [requires_replication]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var nodes = {
     n1: {binVersion: "latest"},
@@ -39,15 +37,21 @@ assert.commandWorked(primaryColl.createIndex({x: 1}, {safe: true, sparse: true, 
 assert.commandWorked(primaryColl.createIndex({y: 1}, {sparse: true}));
 assert.commandWorked(primaryColl.createIndex({z: 1}, {xyz: false}));
 
+// Make sure the createIndex oplogs are applied on secondary before turning off the failpoint.
+rst.awaitReplication();
 fpPrimary.off();
 fpSecondary.off();
 
 // Verify that the primary (latest) and secondary (last-lts) detect invalid index options.
 let validateRes = assert.commandWorked(primaryDB.runCommand({validate: collName}));
-assert(!validateRes.valid);
+assert(validateRes.valid);
+assert.eq(validateRes.errors.length, 0);
+assert.eq(validateRes.warnings.length, 2);
 
 validateRes = assert.commandWorked(secondaryDB.runCommand({validate: collName}));
-assert(!validateRes.valid);
+assert(validateRes.valid);
+assert.eq(validateRes.errors.length, 0);
+assert.eq(validateRes.warnings.length, 2);
 
 // Use collMod to remove the invalid index options in the collection.
 assert.commandWorked(primaryDB.runCommand({collMod: collName}));
@@ -64,9 +68,12 @@ checkLog.containsJson(secondary, 23878, {fieldName: "xyz"});
 // Verify that the index no longer has invalid index options.
 validateRes = assert.commandWorked(primaryDB.runCommand({validate: collName}));
 assert(validateRes.valid);
+assert.eq(validateRes.errors.length, 0);
+assert.eq(validateRes.warnings.length, 0);
 
 validateRes = assert.commandWorked(secondaryDB.runCommand({validate: collName}));
 assert(validateRes.valid);
+assert.eq(validateRes.errors.length, 0);
+assert.eq(validateRes.warnings.length, 0);
 
 rst.stopSet();
-})();

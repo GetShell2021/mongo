@@ -2,14 +2,10 @@
  * Tests the behavior of quiesce mode: the period during secondary shutdown where existing
  * operations are allowed to continue and new operations are accepted, but hello requests return
  * a ShutdownInProgress error, so that clients begin routing operations elsewhere.
- * @tags: [
- *   live_record_incompatible,
- * ]
  */
-(function() {
-"use strict";
-load("jstests/libs/parallel_shell_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({
     name: "quiesce_mode",
@@ -17,7 +13,7 @@ const replTest = new ReplSetTest({
     nodeOptions: {setParameter: "shutdownTimeoutMillisForSignaledShutdown=5000"}
 });
 replTest.startSet();
-replTest.initiateWithHighElectionTimeout();
+replTest.initiate();
 
 const dbName = "test";
 const collName = "coll";
@@ -57,6 +53,7 @@ function runFind() {
 jsTestLog("Test quiesce mode when shutting down a secondary");
 
 jsTestLog("Create a cursor on the secondary.");
+replTest.awaitReplication();
 let res = assert.commandWorked(secondaryDB.runCommand({find: collName, batchSize: 2}));
 assert.eq(2, res.cursor.firstBatch.length, res);
 let cursorId = res.cursor.id;
@@ -124,11 +121,9 @@ jsTestLog("Let shutdown progress to start killing operations.");
 let pauseWhileKillingOperationsFailPoint =
     configureFailPoint(secondary, "pauseWhileKillingOperationsAtShutdown");
 quiesceModeFailPoint.off();
-try {
-    pauseWhileKillingOperationsFailPoint.wait();
-} catch (e) {
-    // This can throw if the waitForFailPoint command is killed by the shutdown.
-}
+
+// The waitForFailPoint command can fail with InterruptedAtShutdown if killed by the shutdown.
+pauseWhileKillingOperationsFailPoint.wait({expectedErrorCodes: [ErrorCodes.InterruptedAtShutdown]});
 
 jsTestLog("Operations fail with a shutdown error and append the topologyVersion.");
 checkTopologyVersion(assert.commandFailedWithCode(secondaryDB.runCommand({find: collName}),
@@ -212,11 +207,8 @@ jsTestLog("Let shutdown progress to start killing operations.");
 pauseWhileKillingOperationsFailPoint =
     configureFailPoint(primary, "pauseWhileKillingOperationsAtShutdown");
 quiesceModeFailPoint.off();
-try {
-    pauseWhileKillingOperationsFailPoint.wait();
-} catch (e) {
-    // This can throw if the waitForFailPoint command is killed by the shutdown.
-}
+// The waitForFailPoint command can fail with InterruptedAtShutdown if killed by the shutdown.
+pauseWhileKillingOperationsFailPoint.wait({expectedErrorCodes: [ErrorCodes.InterruptedAtShutdown]});
 
 jsTestLog("Operations fail with a shutdown error and append the topologyVersion.");
 checkTopologyVersion(assert.commandFailedWithCode(primaryDB.runCommand({find: collName}),
@@ -224,4 +216,3 @@ checkTopologyVersion(assert.commandFailedWithCode(primaryDB.runCommand({find: co
                      topologyVersionField);
 
 replTest.stopSet();
-})();

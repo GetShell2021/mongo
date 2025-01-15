@@ -4,8 +4,7 @@
  *
  * @tags: [requires_persistence, requires_replication]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({
     name: "recoveryAfterCleanShutdown",
@@ -13,7 +12,7 @@ const rst = new ReplSetTest({
     nodeOptions: {setParameter: {logComponentVerbosity: tojsononeline({storage: {recovery: 2}})}}
 });
 const nodes = rst.startSet();
-rst.initiate();
+rst.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 
 const dbName = "recovery_clean_shutdown";
 let primaryDB = rst.getPrimary().getDB(dbName);
@@ -78,4 +77,3 @@ assert.commandWorked(
 
 // Fast metadata count should be correct after restart in the face of a clean shutdown.
 rst.stopSet();
-}());

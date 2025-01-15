@@ -9,13 +9,20 @@
  *
  * This test is labeled resource intensive because its total io_write is 70MB compared to a median
  * of 5MB across all sharding tests in wiredTiger.
- * @tags: [resource_intensive]
+ *
+ * Incompatible with config shard because it disables replication on shards but expects the
+ * config server to still satisfy majority write concern, which can't be true for a config shard.
+ * @tags: [resource_intensive, config_shard_incompatible]
  */
-load('jstests/libs/write_concern_util.js');
-load('jstests/multiVersion/libs/auth_helpers.js');
-
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    assertWriteConcernError,
+    restartReplicationOnAllShards,
+    runCommandCheckAdmin,
+    stopReplicationOnSecondaries,
+    stopReplicationOnSecondariesOfAllShards,
+} from "jstests/libs/write_concern_util.js";
 
 // Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
@@ -241,4 +248,3 @@ commands.forEach(function(cmd) {
 });
 
 st.stop();
-})();

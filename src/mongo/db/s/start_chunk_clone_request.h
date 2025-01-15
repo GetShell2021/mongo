@@ -29,14 +29,23 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
 
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/connection_string.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/migration_session_id.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -91,6 +100,10 @@ public:
 
     bool hasMigrationId() const {
         return _migrationId.is_initialized();
+    }
+
+    bool parallelFetchingSupported() const {
+        return _parallelFetchingSupported;
     }
 
     const UUID& getMigrationId() const {
@@ -161,6 +174,8 @@ private:
 
     // The parsed secondary throttle options
     MigrationSecondaryThrottleOptions _secondaryThrottle;
+
+    bool _parallelFetchingSupported;
 };
 
 }  // namespace mongo

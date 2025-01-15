@@ -1,4 +1,4 @@
-/*
+/**
  * This test exercises the "linearizable" readConcern option on a simple sharded cluster.
  * Note that a full linearizable read concern test exists in
  * "replsets/linearizable_read_concern.js". This test exists mainly to affirm that a
@@ -19,27 +19,23 @@
  * document. This test is mainly trying to ensure that system behavior is
  * reasonable when executing linearizable reads in a sharded cluster, so as to
  * exercise possible (invalid) user behavior.
+ * @tags: [
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
 
-load("jstests/replsets/rslib.js");
-load("jstests/libs/write_concern_util.js");
-
-(function() {
-"use strict";
-
-// Skip db hash check and shard replication since this test leaves a replica set shard
-// partitioned.
-TestData.skipCheckDBHashes = true;
-TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {shardCollectionWithChunks} from "jstests/libs/write_concern_util.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
 var testName = "linearizable_read_concern";
 
 var st = new ShardingTest({
     name: testName,
-    shards: 2,
     other: {rs0: {nodes: 3}, rs1: {nodes: 3}, useBridge: true},
     mongos: 1,
-    config: 1,
+    config: TestData.configShard ? undefined : 1,
     enableBalancer: false
 });
 
@@ -55,7 +51,7 @@ var testDB = st.s.getDB(dbName);
 
 // Set high election timeout so that primary doesn't step down during linearizable read test.
 var cfg = shard0ReplTest.getReplSetConfigFromNode(0);
-cfg.settings.electionTimeoutMillis = shard0ReplTest.kDefaultTimeoutMS;
+cfg.settings.electionTimeoutMillis = shard0ReplTest.timeoutMS;
 reconfig(shard0ReplTest, cfg, true);
 
 // Set up sharded collection. Put 5 documents on each shard, with keys {x: 0...9}.
@@ -83,7 +79,7 @@ var res = assert.commandFailed(testDB.runReadCommand({
     find: collName,
     filter: dualShardQueryFilter,
     readConcern: {level: "linearizable"},
-    maxTimeMS: shard0ReplTest.kDefaultTimeoutMS
+    maxTimeMS: shard0ReplTest.timeoutMS
 }));
 assert.eq(res.code, ErrorCodes.doMongosRewrite(st.s, ErrorCodes.NotWritablePrimary));
 
@@ -96,7 +92,7 @@ var res = assert.commandWorked(testDB.runReadCommand({
     sort: {x: 1},
     filter: dualShardQueryFilter,
     readConcern: {level: "linearizable"},
-    maxTimeMS: shard0ReplTest.kDefaultTimeoutMS
+    maxTimeMS: shard0ReplTest.timeoutMS
 }));
 
 // Make sure data was returned from both shards correctly.
@@ -124,5 +120,9 @@ var result = testDB.runReadCommand({
 });
 assert.commandFailedWithCode(result, ErrorCodes.MaxTimeMSExpired);
 
+// Reconnect so the config server is available for shutdown hooks and to allow potential write
+// operations triggered by consistency checks.
+secondaries[0].reconnect(primary);
+secondaries[1].reconnect(primary);
+
 st.stop();
-})();

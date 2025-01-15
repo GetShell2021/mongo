@@ -29,12 +29,15 @@
 
 #pragma once
 
-#include "mongo/base/status.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
-#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/read_write_concern_provenance_base_gen.h"
-#include "mongo/idl/basic_types_gen.h"
+#include "mongo/idl/idl_parser.h"
 
 namespace mongo {
 
@@ -144,7 +147,7 @@ public:
     /**
      * Creates a provenance with source according to the given object's 'provenance' field.
      */
-    static ReadWriteConcernProvenance parse(const IDLParserErrorContext& ctxt,
+    static ReadWriteConcernProvenance parse(const IDLParserContext& ctxt,
                                             const BSONObj& bsonObject);
 
     /**

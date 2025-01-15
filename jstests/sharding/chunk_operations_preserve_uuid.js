@@ -2,10 +2,7 @@
  * Test that chunk operations preserve collection UUID in config.chunks documents
  */
 
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 let st = new ShardingTest({mongos: 1, shards: 3});
 
@@ -50,4 +47,3 @@ assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {x: -100}, to: st.s
 allChunksWithUUID();
 
 st.stop();
-})();

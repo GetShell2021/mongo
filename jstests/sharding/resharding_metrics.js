@@ -1,8 +1,5 @@
-(function() {
-'use strict';
-
-load("jstests/libs/discover_topology.js");
-load("jstests/sharding/libs/resharding_test_fixture.js");
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const kNamespace = 'test.resharding';
 function getCurrentOpSection(mongo, role) {
@@ -19,7 +16,6 @@ function getCurrentOpSection(mongo, role) {
         jsTest.log(tojson(report));
         return false;
     }, `: was unable to find resharding ${role} service in currentOp output from ${mongo.host}`);
-
     return curOpSection;
 }
 
@@ -48,6 +44,17 @@ const inputCollection = reshardingTest.createShardedCollection({
 
 const recipientShardNames = reshardingTest.recipientShardNames;
 const topology = DiscoverTopology.findConnectedNodes(inputCollection.getMongo());
+let allNodes = [];
+for (let [_, shardReplSet] of Object.entries(topology.shards)) {
+    allNodes.push(shardReplSet.primary);
+}
+allNodes.push(topology.configsvr.primary);
+allNodes.forEach((hostName) => {
+    const status = new Mongo(hostName).getDB('admin').serverStatus({});
+    const shardingStats = status.shardingStatistics;
+    assert(!shardingStats.hasOwnProperty('resharding'));
+});
+
 reshardingTest.withReshardingInBackground(
     {
         newShardKeyPattern: {newKey: 1},
@@ -56,7 +63,7 @@ reshardingTest.withReshardingInBackground(
             {min: {newKey: 0}, max: {newKey: MaxKey}, shard: recipientShardNames[1]},
         ],
     },
-    (tempNs) => {
+    () => {
         // Wait for the resharding operation and the donor services to start.
         const mongos = inputCollection.getMongo();
         assert.soon(() => {
@@ -80,8 +87,6 @@ reshardingTest.withReshardingInBackground(
             assert(curOpSection.hasOwnProperty('recipientState'), tojson(curOpSection));
             assert(curOpSection.hasOwnProperty('documentsCopied'), tojson(curOpSection));
             assert(curOpSection.hasOwnProperty('oplogEntriesApplied'), tojson(curOpSection));
-            assert(curOpSection.hasOwnProperty('remainingOperationTimeEstimatedSecs'),
-                   tojson(curOpSection));
         });
 
         const curOpSection =
@@ -91,19 +96,12 @@ reshardingTest.withReshardingInBackground(
                tojson(curOpSection));
     });
 
-let allNodes = [];
-for (let [_, shardReplSet] of Object.entries(topology.shards)) {
-    allNodes.push(shardReplSet.primary);
-}
-allNodes.push(topology.configsvr.primary);
-
 allNodes.forEach((hostName) => {
     const serverStatus = getServerStatusSection(new Mongo(hostName));
 
     let debugStr = () => {
         return 'server: ' + tojson(hostName) + ', serverStatusSection: ' + tojson(serverStatus);
     };
-
     assert(serverStatus.hasOwnProperty('countSucceeded'), debugStr());
     assert(serverStatus.hasOwnProperty('countFailed'), debugStr());
 
@@ -126,4 +124,3 @@ allNodes.forEach((hostName) => {
 });
 
 reshardingTest.teardown();
-})();

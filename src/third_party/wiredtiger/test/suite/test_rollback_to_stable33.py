@@ -26,6 +26,7 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
+from rollback_to_stable_util import verify_rts_logs
 import wttest
 from wtdataset import SimpleDataSet
 from wtscenario import make_scenarios
@@ -41,10 +42,22 @@ class test_rollback_to_stable33(wttest.WiredTigerTestCase):
         ('no', dict(logged=False)),
         ('yes', dict(logged=True))
     ]
-    scenarios = make_scenarios(format_values, logged)
+    worker_thread_values = [
+        ('0', dict(threads=0)),
+        ('4', dict(threads=4)),
+        ('8', dict(threads=8))
+    ]
+    scenarios = make_scenarios(format_values, logged, worker_thread_values)
 
     # Configure an in-memory database.
-    conn_config = 'in_memory=true'
+    conn_config = 'in_memory=true,verbose=(rts:5)'
+
+    # Don't raise errors for these, the expectation is that the RTS verifier will
+    # run on the test output.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ignoreStdoutPattern('WT_VERB_RTS')
+        self.addTearDownAction(verify_rts_logs)
 
     # Smoke test RTS on in-memory databases.
     def test_rollback_to_stable33(self):
@@ -65,19 +78,16 @@ class test_rollback_to_stable33(wttest.WiredTigerTestCase):
 
         # Set stable to 20 and rollback.
         self.conn.set_timestamp('stable_timestamp=' + self.timestamp_str(20))
-        self.conn.rollback_to_stable()
+        self.conn.rollback_to_stable('threads=' + str(self.threads))
 
         # Objects with logging enabled should not be rolled back, objects without logging enabled
         # should have their updates rolled back.
         c = self.session.open_cursor(uri, None)
         if self.logged:
-            self.assertEquals(c[ds.key(10)], ds.value(100))
-            self.assertEquals(c[ds.key(11)], ds.value(101))
-            self.assertEquals(c[ds.key(12)], ds.value(102))
+            self.assertEqual(c[ds.key(10)], ds.value(100))
+            self.assertEqual(c[ds.key(11)], ds.value(101))
+            self.assertEqual(c[ds.key(12)], ds.value(102))
         else:
-            self.assertEquals(c[ds.key(10)], ds.value(10))
-            self.assertEquals(c[ds.key(11)], ds.value(11))
-            self.assertEquals(c[ds.key(12)], ds.value(12))
-
-if __name__ == '__main__':
-    wttest.run()
+            self.assertEqual(c[ds.key(10)], ds.value(10))
+            self.assertEqual(c[ds.key(11)], ds.value(11))
+            self.assertEqual(c[ds.key(12)], ds.value(12))

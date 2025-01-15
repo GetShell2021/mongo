@@ -27,22 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/matcher/expression_where.h"
-
 #include <memory>
+#include <string>
 
-#include "mongo/base/init.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
-#include "mongo/db/jsobj.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/scripting/engine.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/db/matcher/expression_where.h"
 
 
 namespace mongo {
@@ -51,17 +44,17 @@ using std::unique_ptr;
 
 WhereMatchExpression::WhereMatchExpression(OperationContext* opCtx,
                                            WhereParams params,
-                                           StringData dbName)
+                                           const DatabaseName& dbName)
     : WhereMatchExpressionBase(std::move(params)),
       _opCtx(opCtx),
-      _jsFunction(std::make_unique<JsFunction>(_opCtx, getCode(), dbName.toString())) {}
+      _jsFunction(std::make_unique<JsFunction>(_opCtx, getCode(), dbName)) {}
 
 bool WhereMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
     validateState();
     return _jsFunction->runAsPredicate(doc->toBSON());
 }
 
-unique_ptr<MatchExpression> WhereMatchExpression::shallowClone() const {
+unique_ptr<MatchExpression> WhereMatchExpression::clone() const {
     validateState();
 
     WhereParams params;

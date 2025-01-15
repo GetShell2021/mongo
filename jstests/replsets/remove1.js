@@ -8,14 +8,16 @@
  * Make sure both nodes are either primary or secondary
  */
 
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconnect} from "jstests/replsets/rslib.js";
+
 var name = "removeNodes";
 var host = getHostName();
 
 print("Start set with two nodes");
 var replTest = new ReplSetTest({name: name, nodes: 2});
 var nodes = replTest.startSet();
-replTest.initiate();
+replTest.initiate(null, null, {initiateWithDefaultElectionTimeout: true});
 var primary = replTest.getPrimary();
 var secondary = replTest.getSecondary();
 

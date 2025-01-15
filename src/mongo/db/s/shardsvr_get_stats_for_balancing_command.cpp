@@ -28,15 +28,32 @@
  */
 
 
+#include <boost/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/s/balancer_stats_registry.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/request_types/get_stats_for_balancing_gen.h"
-#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -75,7 +92,7 @@ public:
         using InvocationBase::InvocationBase;
 
         Reply typedRun(OperationContext* opCtx) {
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             uassert(ErrorCodes::InvalidOptions,
@@ -119,13 +136,8 @@ public:
                 return 0LL;
             }
 
-            const long long numOrphanDocs = [&] {
-                if (!feature_flags::gOrphanTracking.isEnabled(
-                        serverGlobalParams.featureCompatibility)) {
-                    return 0LL;
-                }
-                return BalancerStatsRegistry::get(opCtx)->getCollNumOrphanDocs(*collUUID);
-            }();
+            const long long numOrphanDocs =
+                BalancerStatsRegistry::get(opCtx)->getCollNumOrphanDocs(*collUUID);
 
             if (numRecords <= numOrphanDocs) {
                 // The number of records and the number of orphans documents are not updated
@@ -139,7 +151,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            return {request().getDbName(), ""};
+            return NamespaceString(request().getDbName());
         }
 
         bool supportsWriteConcern() const override {
@@ -150,11 +162,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-} _shardsvrGetStatsForBalancingCmd;
+};
+MONGO_REGISTER_COMMAND(ShardsvrGetStatsForBalancingCmd).forShard();
 
 }  // namespace
 }  // namespace mongo

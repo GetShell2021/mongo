@@ -2,10 +2,7 @@
 // Basic tests for enableSharding command.
 //
 
-(function() {
-'use strict';
-
-load("jstests/libs/feature_flag_util.js");  // for FeatureFlagUtil.isEnabled
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({shards: 2});
 
@@ -90,4 +87,3 @@ jsTest.log(
 }
 
 st.stop();
-})();

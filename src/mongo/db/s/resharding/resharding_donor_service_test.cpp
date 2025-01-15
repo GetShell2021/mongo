@@ -28,33 +28,57 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include <boost/optional/optional_io.hpp>
+#include <boost/cstdint.hpp>
+#include <initializer_list>
+#include <ostream>
+#include <string>
 #include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/op_observer_noop.h"
-#include "mongo/db/op_observer_registry.h"
-#include "mongo/db/ops/update.h"
-#include "mongo/db/ops/update_request.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/persistent_task_store.h"
-#include "mongo/db/repl/drop_pending_collection_reaper.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/primary_only_service_test_fixture.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
-#include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/recoverable_critical_section_service.h"
 #include "mongo/db/s/resharding/resharding_change_event_o2_field_gen.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_donor_service.h"
 #include "mongo/db/s/resharding/resharding_service_test_helpers.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/s/sharding_recovery_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -65,7 +89,8 @@ namespace {
 using DonorStateTransitionController =
     resharding_service_test_helpers::StateTransitionController<DonorStateEnum>;
 using OpObserverForTest =
-    resharding_service_test_helpers::OpObserverForTest<DonorStateEnum, ReshardingDonorDocument>;
+    resharding_service_test_helpers::StateTransitionControllerOpObserver<DonorStateEnum,
+                                                                         ReshardingDonorDocument>;
 using PauseDuringStateTransitions =
     resharding_service_test_helpers::PauseDuringStateTransitions<DonorStateEnum>;
 
@@ -85,33 +110,31 @@ public:
                                    const BSONObj& query,
                                    const BSONObj& update) override {}
 
-    void clearFilteringMetadata(OperationContext* opCtx,
-                                const NamespaceString& sourceNss,
-                                const NamespaceString& tempReshardingNss) override {}
-};
+    void refreshCollectionPlacementInfo(OperationContext* opCtx,
+                                        const NamespaceString& sourceNss) override {}
 
-class DonorOpObserverForTest : public OpObserverForTest {
-public:
-    DonorOpObserverForTest(std::shared_ptr<DonorStateTransitionController> controller)
-        : OpObserverForTest(std::move(controller),
-                            NamespaceString::kDonorReshardingOperationsNamespace) {}
-
-    DonorStateEnum getState(const ReshardingDonorDocument& donorDoc) override {
-        return donorDoc.getMutableState().getState();
+    std::unique_ptr<ShardingRecoveryService::BeforeReleasingCustomAction>
+    getOnReleaseCriticalSectionCustomAction() override {
+        return std::make_unique<ShardingRecoveryService::NoCustomAction>();
     }
 };
 
 class ReshardingDonorServiceForTest : public ReshardingDonorService {
 public:
     explicit ReshardingDonorServiceForTest(ServiceContext* serviceContext)
-        : ReshardingDonorService(serviceContext) {}
+        : ReshardingDonorService(serviceContext), _serviceContext(serviceContext) {}
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override {
         return std::make_shared<DonorStateMachine>(
             this,
-            ReshardingDonorDocument::parse({"ReshardingDonorServiceForTest"}, initialState),
-            std::make_unique<ExternalStateForTest>());
+            ReshardingDonorDocument::parse(IDLParserContext{"ReshardingDonorServiceForTest"},
+                                           initialState),
+            std::make_unique<ExternalStateForTest>(),
+            _serviceContext);
     }
+
+private:
+    ServiceContext* _serviceContext;
 };
 
 class ReshardingDonorServiceTest : public repl::PrimaryOnlyServiceMongoDTest {
@@ -127,12 +150,15 @@ public:
 
         auto serviceContext = getServiceContext();
         auto storageMock = std::make_unique<repl::StorageInterfaceMock>();
-        repl::DropPendingCollectionReaper::set(
-            serviceContext, std::make_unique<repl::DropPendingCollectionReaper>(storageMock.get()));
         repl::StorageInterface::set(serviceContext, std::move(storageMock));
 
         _controller = std::make_shared<DonorStateTransitionController>();
-        _opObserverRegistry->addObserver(std::make_unique<DonorOpObserverForTest>(_controller));
+        _opObserverRegistry->addObserver(std::make_unique<OpObserverForTest>(
+            _controller,
+            NamespaceString::kDonorReshardingOperationsNamespace,
+            [](const ReshardingDonorDocument& donorDoc) {
+                return donorDoc.getMutableState().getState();
+            }));
     }
 
     DonorStateTransitionController* controller() {
@@ -148,13 +174,14 @@ public:
                                      isAlsoRecipient ? donorShardId : ShardId{"recipient2"},
                                      ShardId{"recipient3"}});
 
-        NamespaceString sourceNss("sourcedb.sourcecollection");
+        NamespaceString sourceNss =
+            NamespaceString::createNamespaceString_forTest("sourcedb.sourcecollection");
         auto sourceUUID = UUID::gen();
         auto commonMetadata = CommonReshardingMetadata(
             UUID::gen(),
             sourceNss,
             sourceUUID,
-            resharding::constructTemporaryReshardingNss(sourceNss.db(), sourceUUID),
+            resharding::constructTemporaryReshardingNss(sourceNss, sourceUUID),
             BSON("newKey" << 1));
         commonMetadata.setStartTime(getServiceContext()->getFastClockSource()->now());
 
@@ -209,6 +236,22 @@ public:
             opCtx, NamespaceString::kDonorReshardingOperationsNamespace, MODE_IS);
         ASSERT_TRUE(bool(donorColl));
         ASSERT_TRUE(bool(donorColl->isEmpty(opCtx)));
+    }
+
+    ReshardingDonorDocument getPersistedDonorDocument(OperationContext* opCtx,
+                                                      UUID reshardingUUID) {
+        boost::optional<ReshardingDonorDocument> persistedDonorDocument;
+        PersistentTaskStore<ReshardingDonorDocument> store(
+            NamespaceString::kDonorReshardingOperationsNamespace);
+        store.forEach(opCtx,
+                      BSON(ReshardingDonorDocument::kReshardingUUIDFieldName << reshardingUUID),
+                      [&](const auto& donorDocument) {
+                          persistedDonorDocument.emplace(donorDocument);
+                          return false;
+                      });
+
+        ASSERT(persistedDonorDocument);
+        return persistedDonorDocument.get();
     }
 
 private:
@@ -272,9 +315,10 @@ TEST_F(ReshardingDonorServiceTest, WritesNoOpOplogEntryOnReshardingBegin) {
               ErrorCodes::InterruptedDueToReplStateChange);
 
     DBDirectClient client(opCtx.get());
-    NamespaceString sourceNss("sourcedb", "sourcecollection");
+    NamespaceString sourceNss =
+        NamespaceString::createNamespaceString_forTest("sourcedb", "sourcecollection");
     FindCommandRequest findRequest{NamespaceString::kRsOplogNamespace};
-    findRequest.setFilter(BSON("ns" << sourceNss.toString()));
+    findRequest.setFilter(BSON("ns" << sourceNss.toString_forTest()));
     auto cursor = client.find(std::move(findRequest));
 
     ASSERT_TRUE(cursor->more()) << "Found no oplog entries for source collection";
@@ -284,7 +328,7 @@ TEST_F(ReshardingDonorServiceTest, WritesNoOpOplogEntryOnReshardingBegin) {
 
     ReshardBeginChangeEventO2Field expectedChangeEvent{sourceNss, doc.getReshardingUUID()};
     auto receivedChangeEvent = ReshardBeginChangeEventO2Field::parse(
-        IDLParserErrorContext("ReshardBeginChangeEventO2Field"), *op.getObject2());
+        IDLParserContext("ReshardBeginChangeEventO2Field"), *op.getObject2());
 
     ASSERT_EQ(OpType_serializer(op.getOpType()), OpType_serializer(repl::OpTypeEnum::kNoop))
         << op.getEntry();
@@ -313,7 +357,8 @@ TEST_F(ReshardingDonorServiceTest, WritesNoOpOplogEntryToGenerateMinFetchTimesta
 
     DBDirectClient client(opCtx.get());
     FindCommandRequest findRequest{NamespaceString::kRsOplogNamespace};
-    findRequest.setFilter(BSON("ns" << NamespaceString::kForceOplogBatchBoundaryNamespace.ns()));
+    findRequest.setFilter(
+        BSON("ns" << redactTenant(NamespaceString::kForceOplogBatchBoundaryNamespace)));
     auto cursor = client.find(std::move(findRequest));
 
     ASSERT_TRUE(cursor->more()) << "Found no oplog entries for source collection";
@@ -418,8 +463,10 @@ TEST_F(ReshardingDonorServiceTest, StepDownStepUpEachTransition) {
                     DonorStateMachine::insertStateDocument(opCtx.get(), doc);
                     return DonorStateMachine::getOrCreate(opCtx.get(), _service, doc.toBSON());
                 } else {
-                    auto maybeDonor = DonorStateMachine::lookup(opCtx.get(), _service, instanceId);
-                    ASSERT_TRUE(bool(maybeDonor));
+                    auto [maybeDonor, isPausedOrShutdown] =
+                        DonorStateMachine::lookup(opCtx.get(), _service, instanceId);
+                    ASSERT_TRUE(maybeDonor);
+                    ASSERT_FALSE(isPausedOrShutdown);
 
                     // Allow the transition to prevState to succeed on this primary-only service
                     // instance.
@@ -480,8 +527,10 @@ TEST_F(ReshardingDonorServiceTest, StepDownStepUpEachTransition) {
         }
 
         // Finally complete the operation and ensure its success.
-        auto maybeDonor = DonorStateMachine::lookup(opCtx.get(), _service, instanceId);
-        ASSERT_TRUE(bool(maybeDonor));
+        auto [maybeDonor, isPausedOrShutdown] =
+            DonorStateMachine::lookup(opCtx.get(), _service, instanceId);
+        ASSERT_TRUE(maybeDonor);
+        ASSERT_FALSE(isPausedOrShutdown);
 
         auto donor = *maybeDonor;
         stateTransitionsGuard.unset(DonorStateEnum::kDone);
@@ -490,6 +539,55 @@ TEST_F(ReshardingDonorServiceTest, StepDownStepUpEachTransition) {
         ASSERT_OK(donor->getCompletionFuture().getNoThrow());
         checkStateDocumentRemoved(opCtx.get());
     }
+}
+
+TEST_F(ReshardingDonorServiceTest, ReportForCurrentOpAfterCompletion) {
+    const auto donorState = DonorStateEnum::kDonatingInitialData;
+
+    PauseDuringStateTransitions stateTransitionsGuard{controller(), donorState};
+    auto doc = makeStateDocument(false /* isAlsoRecipient */);
+    auto instanceId =
+        BSON(ReshardingDonorDocument::kReshardingUUIDFieldName << doc.getReshardingUUID());
+
+    auto opCtx = makeOperationContext();
+    auto donor = [&] {
+        createSourceCollection(opCtx.get(), doc);
+
+        DonorStateMachine::insertStateDocument(opCtx.get(), doc);
+        return DonorStateMachine::getOrCreate(opCtx.get(), _service, doc.toBSON());
+    }();
+
+    // Step down before the transition to state can complete.
+    stateTransitionsGuard.wait(donorState);
+    stepDown();
+    stateTransitionsGuard.unset(donorState);
+
+    // At this point, the resharding metrics will have been unregistered from the cumulative metrics
+    ASSERT_EQ(donor->getCompletionFuture().getNoThrow(),
+              ErrorCodes::InterruptedDueToReplStateChange);
+
+    // Now call step up. The old donor object has not yet been destroyed because we still hold
+    // a shared pointer to it ('donor') - this can happen in production after a failover if a
+    // state machine is slow to clean up.
+    stepUp(opCtx.get());
+
+    // Assert that the old donor object will return a currentOp report, because the resharding
+    // metrics still exist on the coordinator object itelf.
+    ASSERT(donor->reportForCurrentOp(MongoProcessInterface::CurrentOpConnectionsMode::kExcludeIdle,
+                                     MongoProcessInterface::CurrentOpSessionsMode::kIncludeIdle));
+
+    // Ensure the new donor started up successfully (and thus, registered new resharding metrics),
+    // despite the "zombie" state machine still existing.
+    auto [maybeDonor, isPausedOrShutdown] =
+        DonorStateMachine::lookup(opCtx.get(), _service, instanceId);
+    ASSERT_TRUE(maybeDonor);
+    ASSERT_FALSE(isPausedOrShutdown);
+    auto newDonor = *maybeDonor;
+    ASSERT_NE(donor, newDonor);
+
+    // No need to finish the resharding op, so we just cancel the op.
+    newDonor->abort(false);
+    ASSERT_OK(newDonor->getCompletionFuture().getNoThrow());
 }
 
 DEATH_TEST_REGEX_F(ReshardingDonorServiceTest, CommitFn, "4457001.*tripwire") {
@@ -611,8 +709,10 @@ TEST_F(ReshardingDonorServiceTest, CompletesWithStepdownAfterAbort) {
         donor.reset();
         stepUp(opCtx.get());
 
-        auto maybeDonor = DonorStateMachine::lookup(opCtx.get(), _service, instanceId);
-        ASSERT_TRUE(bool(maybeDonor));
+        auto [maybeDonor, isPausedOrShutdown] =
+            DonorStateMachine::lookup(opCtx.get(), _service, instanceId);
+        ASSERT_TRUE(maybeDonor);
+        ASSERT_FALSE(isPausedOrShutdown);
 
         donor = *maybeDonor;
         doneTransitionGuard.reset();
@@ -693,20 +793,10 @@ TEST_F(ReshardingDonorServiceTest, TruncatesXLErrorOnDonorDocument) {
         // errored locally. It is therefore safe to check its local state document until
         // DonorStateMachine::abort() is called.
         {
-            boost::optional<ReshardingDonorDocument> persistedDonorDocument;
-            PersistentTaskStore<ReshardingDonorDocument> store(
-                NamespaceString::kDonorReshardingOperationsNamespace);
-            store.forEach(
-                opCtx.get(),
-                BSON(ReshardingDonorDocument::kReshardingUUIDFieldName << doc.getReshardingUUID()),
-                [&](const auto& donorDocument) {
-                    persistedDonorDocument.emplace(donorDocument);
-                    return false;
-                });
-
-            ASSERT(persistedDonorDocument);
+            auto persistedDonorDocument =
+                getPersistedDonorDocument(opCtx.get(), doc.getReshardingUUID());
             auto persistedAbortReasonBSON =
-                persistedDonorDocument->getMutableState().getAbortReason();
+                persistedDonorDocument.getMutableState().getAbortReason();
             ASSERT(persistedAbortReasonBSON);
             // The actual abortReason will be slightly larger than kReshardErrorMaxBytes bytes due
             // to the primitive truncation algorithm - Check that the total size is less than
@@ -750,14 +840,14 @@ TEST_F(ReshardingDonorServiceTest, RestoreMetricsOnKBlockingWrites) {
 
     // This acquires the critical section required by resharding donor machine when it is in
     // kBlockingWrites.
-    RecoverableCriticalSectionService::get(opCtx.get())
-        ->acquireRecoverableCriticalSectionBlockWrites(opCtx.get(),
-                                                       doc.getSourceNss(),
-                                                       BSON("command"
-                                                            << "resharding_donor"
-                                                            << "collection"
-                                                            << doc.getSourceNss().toString()),
-                                                       ShardingCatalogClient::kLocalWriteConcern);
+    ShardingRecoveryService::get(opCtx.get())
+        ->acquireRecoverableCriticalSectionBlockWrites(
+            opCtx.get(),
+            doc.getSourceNss(),
+            BSON("command"
+                 << "resharding_donor"
+                 << "collection" << doc.getSourceNss().toString_forTest()),
+            ShardingCatalogClient::kLocalWriteConcern);
 
     auto donor = DonorStateMachine::getOrCreate(opCtx.get(), _service, doc.toBSON());
     notifyReshardingCommitting(opCtx.get(), *donor, doc);
@@ -767,13 +857,127 @@ TEST_F(ReshardingDonorServiceTest, RestoreMetricsOnKBlockingWrites) {
         donor
             ->reportForCurrentOp(MongoProcessInterface::CurrentOpConnectionsMode::kExcludeIdle,
                                  MongoProcessInterface::CurrentOpSessionsMode::kExcludeIdle)
-            .get();
+            .value();
     ASSERT_EQ(currOp.getStringField("donorState"),
               DonorState_serializer(DonorStateEnum::kBlockingWrites));
     ASSERT_GTE(currOp.getField("totalOperationTimeElapsedSecs").Long(), opTimeDurationSecs);
 
     stateTransitionsGuard.unset(kDoneState);
     ASSERT_OK(donor->getCompletionFuture().getNoThrow());
+}
+
+TEST_F(ReshardingDonorServiceTest, AbortAfterStepUpWithAbortReasonFromCoordinator) {
+    repl::primaryOnlyServiceTestStepUpWaitForRebuildComplete.setMode(FailPoint::alwaysOn);
+    const auto abortErrMsg = "Recieved abort from the resharding coordinator";
+
+    for (bool isAlsoRecipient : {false, true}) {
+        LOGV2(8743302,
+              "Running case",
+              "test"_attr = _agent.getTestName(),
+              "isAlsoRecipient"_attr = isAlsoRecipient);
+
+        auto removeDonorDocFailpoint = globalFailPointRegistry().find("removeDonorDocFailpoint");
+        auto timesEnteredFailPoint = removeDonorDocFailpoint->setMode(FailPoint::alwaysOn);
+
+        auto doc = makeStateDocument(isAlsoRecipient);
+        auto instanceId =
+            BSON(ReshardingDonorDocument::kReshardingUUIDFieldName << doc.getReshardingUUID());
+
+        auto opCtx = makeOperationContext();
+        createSourceCollection(opCtx.get(), doc);
+        if (isAlsoRecipient) {
+            createTemporaryReshardingCollection(opCtx.get(), doc);
+        }
+
+        DonorStateMachine::insertStateDocument(opCtx.get(), doc);
+        auto donor = DonorStateMachine::getOrCreate(opCtx.get(), _service, doc.toBSON());
+
+        donor->abort(false);
+        removeDonorDocFailpoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+
+        // Ensure the node is aborting with abortReason from coordinator.
+        {
+            auto persistedDonorDocument =
+                getPersistedDonorDocument(opCtx.get(), doc.getReshardingUUID());
+            auto state = persistedDonorDocument.getMutableState().getState();
+            ASSERT_EQ(state, DonorStateEnum::kDone);
+
+            auto abortReason = persistedDonorDocument.getMutableState().getAbortReason();
+            ASSERT(abortReason);
+            ASSERT_EQ(abortReason->getIntField("code"), ErrorCodes::ReshardCollectionAborted);
+            ASSERT_EQ(abortReason->getStringField("errmsg").toString(), abortErrMsg);
+        }
+
+        stepDown();
+        ASSERT_EQ(donor->getCompletionFuture().getNoThrow(),
+                  ErrorCodes::InterruptedDueToReplStateChange);
+        donor.reset();
+
+        stepUp(opCtx.get());
+        removeDonorDocFailpoint->waitForTimesEntered(timesEnteredFailPoint + 2);
+
+        auto [maybeDonor, isPausedOrShutdown] =
+            DonorStateMachine::lookup(opCtx.get(), _service, instanceId);
+        ASSERT_TRUE(maybeDonor);
+        ASSERT_FALSE(isPausedOrShutdown);
+        donor = *maybeDonor;
+
+        removeDonorDocFailpoint->setMode(FailPoint::off);
+        ASSERT_OK(donor->getCompletionFuture().getNoThrow());
+        checkStateDocumentRemoved(opCtx.get());
+    }
+}
+
+TEST_F(ReshardingDonorServiceTest, FailoverAfterDonorErrorsPriorToObtainingTimestamp) {
+    for (bool isAlsoRecipient : {false, true}) {
+        LOGV2(8743303,
+              "Running case",
+              "test"_attr = _agent.getTestName(),
+              "isAlsoRecipient"_attr = isAlsoRecipient);
+
+        std::string errMsg("Simulating an unrecoverable error for testing");
+        FailPointEnableBlock failpoint("reshardingDonorFailsBeforeObtainingTimestamp",
+                                       BSON("errmsg" << errMsg));
+
+        auto doc = makeStateDocument(isAlsoRecipient);
+        auto instanceId =
+            BSON(ReshardingDonorDocument::kReshardingUUIDFieldName << doc.getReshardingUUID());
+
+        auto opCtx = makeOperationContext();
+        DonorStateMachine::insertStateDocument(opCtx.get(), doc);
+        auto donor = DonorStateMachine::getOrCreate(opCtx.get(), _service, doc.toBSON());
+
+        auto localTransitionToErrorFuture = donor->awaitInBlockingWritesOrError();
+        ASSERT_OK(localTransitionToErrorFuture.getNoThrow());
+
+        stepDown();
+        ASSERT_EQ(donor->getCompletionFuture().getNoThrow(),
+                  ErrorCodes::InterruptedDueToReplStateChange);
+        donor.reset();
+
+        stepUp(opCtx.get());
+        auto [maybeDonor, isPausedOrShutdown] =
+            DonorStateMachine::lookup(opCtx.get(), _service, instanceId);
+        ASSERT_TRUE(maybeDonor);
+        ASSERT_FALSE(isPausedOrShutdown);
+        donor = *maybeDonor;
+
+        {
+            auto persistedDonorDocument =
+                getPersistedDonorDocument(opCtx.get(), doc.getReshardingUUID());
+            auto state = persistedDonorDocument.getMutableState().getState();
+            ASSERT_EQ(state, DonorStateEnum::kError);
+
+            auto abortReason = persistedDonorDocument.getMutableState().getAbortReason();
+            ASSERT(abortReason);
+            ASSERT_EQ(abortReason->getIntField("code"), ErrorCodes::InternalError);
+            ASSERT_EQ(abortReason->getStringField("errmsg").toString(),
+                      "Simulating an unrecoverable error for testing");
+        }
+
+        donor->abort(false);
+        ASSERT_OK(donor->getCompletionFuture().getNoThrow());
+    }
 }
 
 }  // namespace

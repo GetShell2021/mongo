@@ -43,9 +43,11 @@ macro(define_wiredtiger_library target type)
     #   of a 'SHARED' wiredtiger library would conflict.
     # NO_SYSTEM_FROM_IMPORTED - don't treat include interface directories consumed on an imported target as system
     #   directories.
+    # C_STANDARD - require C11 from the compiler.
     set_target_properties(${target} PROPERTIES
         OUTPUT_NAME "wiredtiger"
         NO_SYSTEM_FROM_IMPORTED TRUE
+        C_STANDARD 11
     )
 
     # Ensure we link any available library dependencies to our wiredtiger target.
@@ -70,9 +72,6 @@ macro(define_wiredtiger_library target type)
     if(ENABLE_MEMKIND)
         target_link_libraries(${target} PRIVATE wt::memkind)
     endif()
-    if(ENABLE_TCMALLOC)
-        target_link_libraries(${target} PRIVATE wt::tcmalloc)
-    endif()
 
     # We want to capture any transitive dependencies associated with the builtin library
     # target and ensure we are explicitly linking the 3rd party libraries.
@@ -94,5 +93,21 @@ macro(define_wiredtiger_library target type)
 
     if(HAVE_BUILTIN_EXTENSION_ZSTD)
         target_link_libraries(${target} PRIVATE wt::zstd)
+    endif()
+
+    if(HAVE_BUILTIN_EXTENSION_IAA)
+        target_link_libraries(${target} PRIVATE iaacodec)
+	if(HAVE_LIBCXX)
+	    target_link_libraries(${target} PRIVATE ${HAVE_LIBCXX})
+	    if(HAVE_LIBCXX_INCLUDES)
+	        target_include_directories(${target} PRIVATE  ${HAVE_LIBCXX_INCLUDES})
+	    endif()
+        endif()
+	if(HAVE_LIBACCEL_CONFIG)
+            target_link_libraries(${target} PRIVATE ${HAVE_LIBACCEL_CONFIG})
+            if(HAVE_LIBACCEL_CONFIG_INCLUDES)
+	        target_include_directories(${target} PRIVATE ${HAVE_LIBACCEL_CONFIG_INCLUDES})
+	    endif()
+        endif()
     endif()
 endmacro()

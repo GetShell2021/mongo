@@ -4,10 +4,8 @@
  * ]
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/retryable_writes_util.js");
+import {RetryableWritesUtil} from "jstests/libs/retryable_writes_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function runConfigsvrRemoveTagsWithRetries(conn, ns, lsid, txnNumber) {
     var res;
@@ -84,4 +82,3 @@ assert.eq(2, configDB.tags.countDocuments({ns: ns}));
 assert.eq(2, configDB.tags.countDocuments({ns: anotherNs}));
 
 st.stop();
-})();

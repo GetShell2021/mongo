@@ -1,11 +1,5 @@
-// SERVER-29425 added a new expression, $sortArray, which consumes an array or a nullish value
-// and produces either the sorted version of that array, or null. In this test file, we check the
-// behavior and error cases.
-load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
-load("jstests/aggregation/extras/utils.js");        // For assertErrorCode.
-
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
+import {assertErrorCode} from "jstests/aggregation/extras/utils.js";
 
 let coll = db.sortArray;
 coll.drop();
@@ -38,7 +32,9 @@ let assertDBOutputEquals = (expected, output) => {
 };
 
 assertErrorCode(coll, [{$project: {sorted: {$sortArray: 1}}}], 2942500);
+// $num exists in all documents, while $notAField doesn't exist in any.
 assertErrorCode(coll, [{$project: {sorted: {$sortArray: "$num"}}}], 2942500);
+assertErrorCode(coll, [{$project: {sorted: {$sortArray: "$notAField"}}}], 2942500);
 
 assertDBOutputEquals([1, 2, 3], coll.aggregate([
     {$project: {sorted: {$sortArray: {input: {$literal: [1, 2, 3]}, sortBy: 1}}}}
@@ -218,4 +214,3 @@ assertDBOutputEquals(
     coll.aggregate(
         [{$project: {sorted: {$sortArray: {input: "$collatorObjectTestField", sortBy: {a: 1}}}}}],
         {collation: {locale: "en", numericOrdering: true}}));
-}());

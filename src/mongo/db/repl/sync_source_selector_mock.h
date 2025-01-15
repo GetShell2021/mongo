@@ -30,9 +30,13 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/rpc/metadata/oplog_query_metadata.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
@@ -48,7 +52,7 @@ public:
     using ChooseNewSyncSourceHook = std::function<void()>;
 
     SyncSourceSelectorMock();
-    virtual ~SyncSourceSelectorMock();
+    ~SyncSourceSelectorMock() override;
 
     void clearSyncSourceDenylist() override;
     HostAndPort chooseNewSyncSource(const OpTime& ot) override;
@@ -95,7 +99,8 @@ private:
     OpTime _chooseNewSyncSourceOpTime;
 
     // This is run every time chooseNewSyncSource() is called.
-    ChooseNewSyncSourceHook _chooseNewSyncSourceHook = []() {};
+    ChooseNewSyncSourceHook _chooseNewSyncSourceHook = []() {
+    };
 
     // This is the most recently denylisted sync source passed to denylistSyncSource().
     HostAndPort _lastDenylistedSyncSource;

@@ -28,12 +28,40 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <memory>
+#include <utility>
+#include <vector>
 
-#include "mongo/s/cluster_ddl.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/executor/remote_command_response.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/cluster_ddl.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/router_role.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/s/transaction_router.h"
+#include "mongo/s/transaction_router_resource_yielder.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/read_through_cache.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -42,34 +70,31 @@ namespace mongo {
 namespace cluster {
 namespace {
 
+MONGO_FAIL_POINT_DEFINE(createUnshardedCollectionRandomizeDataShard);
+
 std::vector<AsyncRequestsSender::Request> buildUnshardedRequestsForAllShards(
     OperationContext* opCtx, std::vector<ShardId> shardIds, const BSONObj& cmdObj) {
     auto cmdToSend = cmdObj;
-    appendShardVersion(cmdToSend, ChunkVersion::UNSHARDED());
+    appendShardVersion(cmdToSend, ShardVersion::UNSHARDED());
 
     std::vector<AsyncRequestsSender::Request> requests;
+    requests.reserve(shardIds.size());
     for (auto&& shardId : shardIds)
         requests.emplace_back(std::move(shardId), cmdToSend);
 
     return requests;
 }
 
-AsyncRequestsSender::Response executeCommandAgainstDatabasePrimaryOrFirstShard(
-    OperationContext* opCtx,
-    StringData dbName,
-    const CachedDatabaseInfo& dbInfo,
-    const BSONObj& cmdObj,
-    const ReadPreferenceSetting& readPref,
-    Shard::RetryPolicy retryPolicy) {
-    ShardId shardId;
-    if (dbName == NamespaceString::kConfigDb) {
-        auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
-        uassert(ErrorCodes::IllegalOperation, "there are no shards to target", !shardIds.empty());
-        std::sort(shardIds.begin(), shardIds.end());
-        shardId = shardIds[0];
-    } else {
-        shardId = dbInfo->getPrimary();
-    }
+AsyncRequestsSender::Response executeCommandAgainstFirstShard(OperationContext* opCtx,
+                                                              const DatabaseName& dbName,
+                                                              const CachedDatabaseInfo& dbInfo,
+                                                              const BSONObj& cmdObj,
+                                                              const ReadPreferenceSetting& readPref,
+                                                              Shard::RetryPolicy retryPolicy) {
+    auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+    uassert(ErrorCodes::IllegalOperation, "there are no shards to target", !shardIds.empty());
+    std::sort(shardIds.begin(), shardIds.end());
+    ShardId shardId = shardIds[0];
 
     auto responses =
         gatherResponses(opCtx,
@@ -84,32 +109,47 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimaryOrFirstShard(
 }  // namespace
 
 CachedDatabaseInfo createDatabase(OperationContext* opCtx,
-                                  StringData dbName,
+                                  const DatabaseName& dbName,
                                   const boost::optional<ShardId>& suggestedPrimaryId) {
     auto catalogCache = Grid::get(opCtx)->catalogCache();
 
     auto dbStatus = catalogCache->getDatabase(opCtx, dbName);
 
     if (dbStatus == ErrorCodes::NamespaceNotFound) {
-        ConfigsvrCreateDatabase request(dbName.toString());
-        request.setDbName(NamespaceString::kAdminDb);
+        ConfigsvrCreateDatabase request(
+            DatabaseNameUtil::serialize(dbName, SerializationContext::stateCommandRequest()));
+        request.setDbName(DatabaseName::kAdmin);
+        generic_argument_util::setMajorityWriteConcern(request);
         if (suggestedPrimaryId)
             request.setPrimaryShardId(*suggestedPrimaryId);
 
-        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-        auto response = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(request.toBSON({})),
-            Shard::RetryPolicy::kIdempotent));
+        if (auto txnRouter = TransactionRouter::get(opCtx)) {
+            txnRouter.annotateCreatedDatabase(dbName);
+        }
+
+        // If this is a database creation triggered by a command running inside a transaction, the
+        // _configsvrCreateDatabase command here will also need to run inside that session. Yield
+        // the session here. Otherwise, if this router is also the configsvr primary, the
+        // _configsvrCreateDatabase command would not be able to check out the session.
+        auto txnRouterResourceYielder = TransactionRouterResourceYielder::makeForRemoteCommand();
+        auto sendCommand = [&] {
+            auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+            auto response = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                DatabaseName::kAdmin,
+                request.toBSON(),
+                Shard::RetryPolicy::kIdempotent));
+            return response;
+        };
+        auto response = runWithYielding(opCtx, txnRouterResourceYielder.get(), sendCommand);
         uassertStatusOK(response.writeConcernStatus);
         uassertStatusOKWithContext(response.commandStatus,
-                                   str::stream()
-                                       << "Database " << dbName << " could not be created");
+                                   str::stream() << "Database " << dbName.toStringForErrorMsg()
+                                                 << " could not be created");
 
         auto createDbResponse = ConfigsvrCreateDatabaseResponse::parse(
-            IDLParserErrorContext("configsvrCreateDatabaseResponse"), response.response);
+            IDLParserContext("configsvrCreateDatabaseResponse"), response.response);
         catalogCache->onStaleDatabaseVersion(dbName, createDbResponse.getDatabaseVersion());
 
         dbStatus = catalogCache->getDatabase(opCtx, dbName);
@@ -118,27 +158,156 @@ CachedDatabaseInfo createDatabase(OperationContext* opCtx,
     return uassertStatusOK(std::move(dbStatus));
 }
 
-void createCollection(OperationContext* opCtx, const ShardsvrCreateCollection& request) {
+void createCollection(OperationContext* opCtx, ShardsvrCreateCollection request) {
     const auto& nss = request.getNamespace();
-    const auto dbInfo = createDatabase(opCtx, nss.db());
+    const auto dbInfo = createDatabase(opCtx, nss.dbName());
 
-    auto cmdResponse = executeCommandAgainstDatabasePrimaryOrFirstShard(
-        opCtx,
-        nss.db(),
-        dbInfo,
-        CommandHelpers::appendMajorityWriteConcern(request.toBSON({})),
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        Shard::RetryPolicy::kIdempotent);
+    // The config.system.session collection can only exist as sharded and it's essential for the
+    // correct cluster functionality. To prevent potential issues, the operation must always be
+    // performed as a sharded creation with internal defaults. Ignore potentially different
+    // user-provided parameters.
+    if (nss == NamespaceString::kLogicalSessionsNamespace) {
+        auto newRequest = shardLogicalSessionsCollectionRequest();
+        bool isValidRequest = newRequest.getShardsvrCreateCollectionRequest().toBSON().woCompare(
+                                  request.getShardsvrCreateCollectionRequest().toBSON()) == 0;
+        if (!isValidRequest) {
+            LOGV2_WARNING(
+                9733600,
+                "Detected an invalid creation request for {nss}. To guarantee the correct "
+                "behavior, the request will be replaced with a shardCollection with internal "
+                "defaults",
+                "nss"_attr = nss.toStringForErrorMsg(),
+                "original request"_attr = request.toBSON(),
+                "new request"_attr = newRequest.toBSON());
+            request = newRequest;
+        }
+    }
+
+    if (MONGO_unlikely(createUnshardedCollectionRandomizeDataShard.shouldFail()) &&
+        request.getUnsplittable() && !request.getDataShard()) {
+        // Select a random 'dataShard'.
+        const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+        const auto allShardIds = shardRegistry->getAllShardIds(opCtx);
+        std::random_device random_device;
+        std::mt19937 engine{random_device()};
+        std::uniform_int_distribution<int> dist(0, allShardIds.size() - 1);
+
+        ShardsvrCreateCollection requestWithRandomDataShard(request);
+        requestWithRandomDataShard.setDataShard(allShardIds[dist(engine)]);
+
+        LOGV2_DEBUG(8339600,
+                    2,
+                    "Selected a random data shard for createCollection",
+                    "nss"_attr = nss,
+                    "dataShard"_attr = *requestWithRandomDataShard.getDataShard());
+
+        try {
+            createCollection(opCtx, std::move(requestWithRandomDataShard));
+            return;
+        } catch (const ExceptionFor<ErrorCodes::AlreadyInitialized>&) {
+            // If the collection already exists but we randomly selected a dataShard that turns out
+            // to be different than the current one, then createCollection will fail with
+            // AlreadyInitialized error. However, this error can also occur for other reasons. So
+            // let's run createCollection again without selecting a random dataShard.
+        }
+    }
+    // Note that this check must run separately to manage the case a request already comes with
+    // dataShard selected (as for $out or specific tests) and the checkpoint is enabled. In that
+    // case, we leave the dataShard selected instead of randomize it, but we will track the
+    // collection.
+    if (MONGO_unlikely(createUnshardedCollectionRandomizeDataShard.shouldFail()) &&
+        request.getDataShard()) {
+        // To set dataShard we need to pass from the coordinator and track the collection. Only the
+        // createUnsplittableCollection command can do that. Convert the create request to the test
+        // command request by enabling the flag below when the failpoint is active.
+        request.setIsFromCreateUnsplittableCollectionTestCommand(true);
+    }
+
+    request.setReadConcern(repl::ReadConcernArgs::get(opCtx));
+
+    const bool isSharded = !request.getUnsplittable();
+    auto cmdObjWithWc = [&]() {
+        // TODO SERVER-77915: Remove the check "isSharded && nss.isConfigDB()" once 8.0 becomes last
+        // LTS. This is a special check for config.system.sessions since the request comes from
+        // the CSRS which is upgraded first
+        if (isSharded && nss.isConfigDB()) {
+            generic_argument_util::setMajorityWriteConcern(request);
+            return request.toBSON();
+        }
+        // propagate write concern if asked by the caller otherwise we set
+        //  - majority if we are not in a transaction
+        //  - default wc in case of transaction (no other wc are allowed).
+        if (opCtx->getWriteConcern().getProvenance().isClientSupplied()) {
+            auto wc = opCtx->getWriteConcern();
+            request.setWriteConcern(wc);
+        } else {
+            if (!opCtx->inMultiDocumentTransaction()) {
+                generic_argument_util::setMajorityWriteConcern(request);
+            }
+        }
+        return request.toBSON();
+    }();
+    auto cmdResponse = [&]() {
+        if (isSharded && nss.isConfigDB())
+            return executeCommandAgainstFirstShard(
+                opCtx,
+                nss.dbName(),
+                dbInfo,
+                cmdObjWithWc,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                Shard::RetryPolicy::kIdempotent);
+        else {
+            return executeCommandAgainstDatabasePrimaryOnlyAttachingDbVersion(
+                opCtx,
+                nss.dbName(),
+                dbInfo,
+                cmdObjWithWc,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                Shard::RetryPolicy::kIdempotent);
+        }
+    }();
 
     const auto remoteResponse = uassertStatusOK(cmdResponse.swResponse);
     uassertStatusOK(getStatusFromCommandResult(remoteResponse.data));
 
-    auto createCollResp = CreateCollectionResponse::parse(IDLParserErrorContext("createCollection"),
-                                                          remoteResponse.data);
+    auto createCollResp =
+        CreateCollectionResponse::parse(IDLParserContext("createCollection"), remoteResponse.data);
 
     auto catalogCache = Grid::get(opCtx)->catalogCache();
-    catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
-        nss, createCollResp.getCollectionVersion(), dbInfo->getPrimary());
+    catalogCache->onStaleCollectionVersion(nss, createCollResp.getCollectionVersion());
+}
+
+void createCollectionWithRouterLoop(OperationContext* opCtx,
+                                    const ShardsvrCreateCollection& request) {
+    sharding::router::CollectionRouter router(opCtx->getServiceContext(), request.getNamespace());
+    router.route(opCtx,
+                 "cluster::createCollectionWithRouterLoop",
+                 [&](OperationContext* opCtx, const CollectionRoutingInfo& cri) {
+                     cluster::createCollection(opCtx, request);
+                 });
+}
+
+void createCollectionWithRouterLoop(OperationContext* opCtx, const NamespaceString& nss) {
+    auto dbName = nss.dbName();
+
+    ShardsvrCreateCollection shardsvrCollCommand(nss);
+    ShardsvrCreateCollectionRequest request;
+
+    request.setUnsplittable(true);
+
+    shardsvrCollCommand.setShardsvrCreateCollectionRequest(request);
+    shardsvrCollCommand.setDbName(nss.dbName());
+
+    createCollectionWithRouterLoop(opCtx, shardsvrCollCommand);
+}
+
+ShardsvrCreateCollection shardLogicalSessionsCollectionRequest() {
+    ShardsvrCreateCollection systemSessionRequest(NamespaceString::kLogicalSessionsNamespace);
+    ShardsvrCreateCollectionRequest params;
+    params.setShardKey(BSON("_id" << 1));
+    systemSessionRequest.setShardsvrCreateCollectionRequest(std::move(params));
+    systemSessionRequest.setDbName(NamespaceString::kLogicalSessionsNamespace.dbName());
+    return systemSessionRequest;
 }
 
 }  // namespace cluster

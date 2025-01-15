@@ -30,33 +30,45 @@
 
 #include "mongo/db/server_options_server_helpers.h"
 
-#include <algorithm>
-#include <boost/algorithm/string/classification.hpp>
+#include <boost/algorithm/string/constants.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/trim.hpp>
-#include <boost/filesystem.hpp>
+#include <boost/core/addressof.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/function/function_base.hpp>
+#include <boost/iterator/iterator_facade.hpp>
 #include <fmt/format.h>
-#include <ios>
+// IWYU pragma: no_include "boost/system/detail/error_code.hpp"
+#include <boost/type_index/type_index_facade.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <cstdlib>
 #include <iostream>
+#include <map>
+#include <type_traits>
+#include <utility>
+#include <variant>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
-#include "mongo/bson/util/builder.h"
-#include "mongo/config.h"
+#include "mongo/bson/oid.h"
+#include "mongo/config.h"  // IWYU pragma: keep
+#include "mongo/db/auth/cluster_auth_mode.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/server_options_base.h"
 #include "mongo/db/server_options_helpers.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/transport/message_compressor_registry.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
-#include "mongo/util/fail_point.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/cidr.h"
 #include "mongo/util/net/socket_utils.h"
-#include "mongo/util/net/ssl_options.h"
-#include "mongo/util/options_parser/options_parser.h"
-#include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/options_parser/value.h"
 #include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
@@ -64,8 +76,6 @@
 
 using std::endl;
 using std::string;
-
-namespace moe = ::mongo::optionenvironment;
 
 namespace mongo {
 
@@ -113,6 +123,34 @@ Status setParsedOpts(const moe::Environment& params) {
     cmdline_utils::censorBSONObj(&serverGlobalParams.parsedOpts);
     return Status::OK();
 }
+
+bool shouldFork(const moe::Environment& params) {
+    auto paramYes = [](const moe::Environment& params, const std::string& key) {
+        return params.count(key) && params[key].as<bool>();
+    };
+
+    auto envVarYes = [](const std::string& envKey) {
+        auto envVal = getenv(envKey.c_str());
+        return envVal && std::string{envVal} == "1";
+    };
+
+    if (paramYes(params, "shutdown")) {
+        return false;
+    }
+
+    if (envVarYes("MONGODB_CONFIG_OVERRIDE_NOFORK")) {
+        LOGV2(7484500,
+              "Environment variable MONGODB_CONFIG_OVERRIDE_NOFORK == 1, "
+              "overriding \"processManagement.fork\" to false");
+        return false;
+    }
+
+    if (paramYes(params, "processManagement.fork")) {
+        return true;
+    }
+
+    return false;
+}
 }  // namespace
 
 void printCommandLineOpts(std::ostream* os) {
@@ -121,10 +159,7 @@ void printCommandLineOpts(std::ostream* os) {
                       tojson(serverGlobalParams.parsedOpts, ExtendedRelaxedV2_0_0, true))
             << std::endl;
     } else {
-        LOGV2(21951,
-              "Options set by command line: {options}",
-              "Options set by command line",
-              "options"_attr = serverGlobalParams.parsedOpts);
+        LOGV2(21951, "Options set by command line", "options"_attr = serverGlobalParams.parsedOpts);
     }
 }
 
@@ -306,13 +341,6 @@ Status storeServerOptions(const moe::Environment& params) {
         serverGlobalParams.listenBacklog = params["net.listenBacklog"].as<int>();
     }
 
-    if (params.count("net.transportLayer")) {
-        serverGlobalParams.transportLayer = params["net.transportLayer"].as<std::string>();
-        if (serverGlobalParams.transportLayer != "asio") {
-            return {ErrorCodes::BadValue, "Unsupported value for transportLayer. Must be \"asio\""};
-        }
-    }
-
     if (params.count("security.transitionToAuth")) {
         serverGlobalParams.transitionToAuth = params["security.transitionToAuth"].as<bool>();
     }
@@ -333,15 +361,18 @@ Status storeServerOptions(const moe::Environment& params) {
     }
 
     if (params.count("net.maxIncomingConnectionsOverride")) {
+        std::vector<std::variant<CIDR, std::string>> maxConnsOverride;
         auto ranges = params["net.maxIncomingConnectionsOverride"].as<std::vector<std::string>>();
         for (const auto& range : ranges) {
             auto swr = CIDR::parse(range);
             if (!swr.isOK()) {
-                serverGlobalParams.maxConnsOverride.push_back(range);
+                maxConnsOverride.push_back(range);
             } else {
-                serverGlobalParams.maxConnsOverride.push_back(std::move(swr.getValue()));
+                maxConnsOverride.push_back(std::move(swr.getValue()));
             }
         }
+        serverGlobalParams.maxConnsOverride.update(
+            std::make_shared<decltype(maxConnsOverride)>(std::move(maxConnsOverride)));
     }
 
     if (params.count("net.reservedAdminThreads")) {
@@ -360,10 +391,11 @@ Status storeServerOptions(const moe::Environment& params) {
                 serverGlobalParams.bind_ips.emplace_back("::");
             }
         } else {
-            boost::split(serverGlobalParams.bind_ips,
-                         bind_ip,
-                         [](char c) { return c == ','; },
-                         boost::token_compress_on);
+            boost::split(
+                serverGlobalParams.bind_ips,
+                bind_ip,
+                [](char c) { return c == ','; },
+                boost::token_compress_on);
         }
     }
 
@@ -383,10 +415,7 @@ Status storeServerOptions(const moe::Environment& params) {
         serverGlobalParams.unixSocketPermissions =
             params["net.unixDomainSocket.filePermissions"].as<int>();
     }
-
-    if ((params.count("processManagement.fork") &&
-         params["processManagement.fork"].as<bool>() == true) &&
-        (!params.count("shutdown") || params["shutdown"].as<bool>() == false)) {
+    if (shouldFork(params)) {
         serverGlobalParams.doFork = true;
     }
 #endif  // _WIN32
@@ -433,7 +462,7 @@ Status storeServerOptions(const moe::Environment& params) {
     }
 
     if (params.count("net.compression.compressors")) {
-        const auto ret =
+        auto ret =
             storeMessageCompressionOptions(params["net.compression.compressors"].as<string>());
         if (!ret.isOK()) {
             return ret;

@@ -124,6 +124,8 @@ structs:
                 optional: true
             active:
                 type: bool
+                # TODO(SERVER-77873): Deprecated by the resharding improvements project, and should
+                # be removed with that feature flag.
                 description: >-
                     Dummy field that always has the same value (true) to have a unique
                     index on in order to prevent multiple resharding operations from being active at
@@ -132,4 +134,50 @@ structs:
             metrics:
                 type: ReshardingCoordinatorMetrics
                 description: "Metrics related to the coordinator."
+                optional: true
+            shardDistribution:
+                type: array<ShardKeyRange>
+                description: "The key ranges for the new shard key. This should be continuous and complete."
+                optional: true
+            unique:
+                type: bool
+                description: "The user-specified value for the unique request field."
+                optional: true
+            collation:
+                type: object_owned
+                description: "The user-specified value for the collation request field."
+                optional: true
+            sourceKey:
+                type: object_owned
+                description:  >-
+                    The shard key of the collection before resharding
+                    (defined as optional for retro compatibility).
+                optional: true
+            forceRedistribution:
+                type: bool
+                description: "Whether to initiate reshardCollection if the shardKey doesn't change."
+                optional: true
+            quiescePeriodEnd:
+                type: date
+                description: "When to release the instance following its completion."
+                optional: true
+            recipientOplogBatchTaskCount:
+                type: long
+                description: >-
+                    "The number of subtasks to divide a single oplog batch into, so that it may be applied
+                    concurrently by multiple threads on the recipient."
+                optional: true
+            relaxed:
+                type: optionalBool
+                description: >-
+                    "Runs the cloner aggregation without specifying a collection
+                    UUID to avoid errors in a scenario where the collection UUIDs
+                    are inconsistent among shards."
+            criticalSectionExpiresAt:
+                type: date
+                description: "When to timeout after the critical session is initiated."
+                optional: true
+            numSamplesPerChunk:
+                type: long
+                description: "The number of documents to sample on new chunks"
                 optional: true

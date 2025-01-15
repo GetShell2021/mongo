@@ -128,7 +128,7 @@ class test_timestamp26_read_timestamp(wttest.WiredTigerTestCase):
         self.session.begin_transaction()
         c.set_key(key)
         if self.read_ts != 'always':
-            self.assertEquals(c.search(), 0)
+            self.assertEqual(c.search(), 0)
             self.assertEqual(c.get_value(), value)
         else:
             msg = '/read timestamps required and none set/'
@@ -141,7 +141,7 @@ class test_timestamp26_read_timestamp(wttest.WiredTigerTestCase):
         self.session.timestamp_transaction('read_timestamp=20')
         c.set_key(key)
         if self.read_ts != 'never':
-            self.assertEquals(c.search(), 0)
+            self.assertEqual(c.search(), 0)
             self.assertEqual(c.get_value(), value)
         else:
             msg = '/read timestamps disallowed/'
@@ -308,7 +308,7 @@ class test_timestamp26_inconsistent_update(wttest.WiredTigerTestCase):
         c[key] = ds.value(1)
         self.session.commit_transaction('commit_timestamp=' + self.timestamp_str(2))
 
-        # Upate the data item at timestamp 1, which should fail.
+        # Update the data item at timestamp 1, which should fail.
         self.session.begin_transaction()
         self.session.timestamp_transaction('commit_timestamp=' + self.timestamp_str(1))
         c[key] = ds.value(2)
@@ -321,7 +321,7 @@ class test_timestamp26_inconsistent_update(wttest.WiredTigerTestCase):
         self.session.timestamp_transaction('commit_timestamp=' + self.timestamp_str(1))
         c[ds.key(2)] = ds.value(3)
         self.session.commit_transaction()
-        
+
         # Insert key1 at timestamp 10 and key2 at 15. Then update both keys in one transaction at
         # timestamp 13, and we should get a complaint about usage.
         key1 = ds.key(3)
@@ -340,6 +340,7 @@ class test_timestamp26_inconsistent_update(wttest.WiredTigerTestCase):
         msg = '/before the previous update/'
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.commit_transaction(), msg)
+        self.ignoreStdoutPatternIfExists(msg)
 
     # Try to update a key previously used with timestamps without one. We should get the
     # inconsistent usage error/message.
@@ -372,11 +373,10 @@ class test_timestamp26_inconsistent_update(wttest.WiredTigerTestCase):
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.commit_transaction(), msg)
 
+        self.ignoreStdoutPatternIfExists(msg)
+
     # Smoke test setting the timestamp at various points in the transaction.
     def test_timestamp_ts_order(self):
-        if wiredtiger.diagnostic_build():
-            self.skipTest('requires a non-diagnostic build')
-
         # Create an object that's never written, it's just used to generate valid k/v pairs.
         ds = SimpleDataSet(
             self, 'file:notused', 10, key_format=self.key_format, value_format=self.value_format)
@@ -398,31 +398,31 @@ class test_timestamp26_inconsistent_update(wttest.WiredTigerTestCase):
         c[key1] = ds.value(14)
         c[key2] = ds.value(15)
         self.session.commit_transaction()
-        self.assertEquals(c[key1], ds.value(14))
-        self.assertEquals(c[key2], ds.value(15))
+        self.assertEqual(c[key1], ds.value(14))
+        self.assertEqual(c[key2], ds.value(15))
 
         self.session.begin_transaction()
         c[key1] = ds.value(16)
         self.session.timestamp_transaction('commit_timestamp=' + self.timestamp_str(31))
         c[key2] = ds.value(17)
         self.session.commit_transaction()
-        self.assertEquals(c[key1], ds.value(16))
-        self.assertEquals(c[key2], ds.value(17))
+        self.assertEqual(c[key1], ds.value(16))
+        self.assertEqual(c[key2], ds.value(17))
 
         self.session.begin_transaction()
         c[key1] = ds.value(18)
         c[key2] = ds.value(19)
         self.session.timestamp_transaction('commit_timestamp=' + self.timestamp_str(32))
         self.session.commit_transaction()
-        self.assertEquals(c[key1], ds.value(18))
-        self.assertEquals(c[key2], ds.value(19))
+        self.assertEqual(c[key1], ds.value(18))
+        self.assertEqual(c[key2], ds.value(19))
 
         self.session.begin_transaction()
         c[key1] = ds.value(20)
         c[key2] = ds.value(21)
         self.session.commit_transaction('commit_timestamp=' + self.timestamp_str(33))
-        self.assertEquals(c[key1], ds.value(20))
-        self.assertEquals(c[key2], ds.value(21))
+        self.assertEqual(c[key1], ds.value(20))
+        self.assertEqual(c[key2], ds.value(21))
 
 # Test that timestamps are ignored in logged files.
 class test_timestamp26_log_ts(wttest.WiredTigerTestCase):
@@ -442,9 +442,6 @@ class test_timestamp26_log_ts(wttest.WiredTigerTestCase):
 
     # Smoke test that logged files don't complain about timestamps.
     def test_log_ts(self):
-        if wiredtiger.diagnostic_build():
-            self.skipTest('requires a non-diagnostic build')
-
         # Create an object that's never written, it's just used to generate valid k/v pairs.
         ds = SimpleDataSet(
             self, 'file:notused', 10, key_format=self.key_format, value_format=self.value_format)
@@ -544,5 +541,5 @@ class test_timestamp26_in_memory_ts(wttest.WiredTigerTestCase):
             self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
                 lambda: self.session.commit_transaction(), msg)
 
-if __name__ == '__main__':
-    wttest.run()
+        self.ignoreStdoutPatternIfExists('/unexpected timestamp usage/')
+        self.ignoreStdoutPatternIfExists('/no timestamp provided/')

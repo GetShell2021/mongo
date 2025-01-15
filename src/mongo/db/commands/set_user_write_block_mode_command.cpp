@@ -28,19 +28,36 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/set_user_write_block_mode_gen.h"
-#include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/global_user_write_block_state.h"
 #include "mongo/db/s/user_writes_recoverable_critical_section_service.h"
-#include "mongo/db/server_feature_flags_gen.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
@@ -71,24 +88,16 @@ public:
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName
                                   << " cannot be run on shardsvrs nor configsvrs",
-                    serverGlobalParams.clusterRole == ClusterRole::None);
+                    serverGlobalParams.clusterRole.has(ClusterRole::None));
 
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName << " cannot be run on standalones",
-                    repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
-                        repl::ReplicationCoordinator::modeNone);
+                    repl::ReplicationCoordinator::get(opCtx)->getSettings().isReplSet());
 
             // Only one attempt to change write block mode may make progress at once, because the
             // way we enable/disable user index build blocking is not concurrency-safe.
             stdx::lock_guard lock(_mutex);
             {
-                // TODO SERVER-65010 Remove FCV guard once 6.0 has branched out
-                FixedFCVRegion fixedFcvRegion(opCtx);
-                uassert(ErrorCodes::IllegalOperation,
-                        "featureFlagUserWriteBlocking not enabled",
-                        gFeatureFlagUserWriteBlocking.isEnabled(
-                            serverGlobalParams.featureCompatibility));
-
                 if (request().getGlobal()) {
                     // Enabling write block mode on a replicaset requires several steps
                     // First, we must prevent new index builds from starting
@@ -132,18 +141,20 @@ public:
             return false;
         }
         NamespaceString ns() const override {
-            return NamespaceString();
+            return NamespaceString::kEmpty;
         }
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForPrivilege(Privilege{ResourcePattern::forClusterResource(),
-                                                             ActionType::setUserWriteBlockMode}));
+                        ->isAuthorizedForPrivilege(Privilege{
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::setUserWriteBlockMode}));
         }
 
-        Mutex _mutex = MONGO_MAKE_LATCH("SetUserWriteBlockModeCommand::_mutex");
+        stdx::mutex _mutex;
     };
-} setUserWriteBlockModeCommand;
+};
+MONGO_REGISTER_COMMAND(SetUserWriteBlockModeCommand).forShard();
 }  // namespace
 }  // namespace mongo

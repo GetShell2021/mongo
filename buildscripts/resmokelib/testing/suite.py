@@ -3,11 +3,13 @@
 import itertools
 import threading
 import time
+from typing import Any, Dict, List
 
 from buildscripts.resmokelib import config as _config
 from buildscripts.resmokelib import selector as _selector
 from buildscripts.resmokelib.testing import report as _report
 from buildscripts.resmokelib.testing import summary as _summary
+from buildscripts.resmokelib.utils import evergreen_conn
 
 # Map of error codes that could be seen. This is collected from:
 # * dbshell.cpp
@@ -59,7 +61,7 @@ def synchronized(method):
     return synced
 
 
-class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-public-methods
+class Suite(object):
     """A suite of tests of a particular kind (e.g. C++ unit tests, dbtests, jstests)."""
 
     def __init__(self, suite_name, suite_config, suite_options=_config.SuiteOptions.ALL_INHERITED):
@@ -121,7 +123,46 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
                 raise TypeError("Expected dictionary of arguments to mongos")
             return [mongos_options], []
 
-        return _selector.filter_tests(test_kind, selector_config)
+        tests, excluded = _selector.filter_tests(test_kind, selector_config)
+
+        # Apply Evergreen API test selection if:
+        # 1. We have tests to filter
+        # 2. We're running in Evergreen
+        # 3. Test selection is enabled
+        if tests and _config.EVERGREEN_TASK_ID and _config.ENABLE_EVERGREEN_API_TEST_SELECTION:
+            evg_api = evergreen_conn.get_evergreen_api()
+            try:
+                result = evg_api.select_tests(
+                    str(_config.EVERGREEN_PROJECT_NAME),
+                    str(_config.EVERGREEN_VARIANT_NAME),
+                    str(_config.EVERGREEN_REQUESTER),
+                    str(_config.EVERGREEN_TASK_ID),
+                    str(_config.EVERGREEN_TASK_NAME),
+                    tests,
+                )
+            except Exception as ex:
+                print(
+                    "ERROR: failure using the select tests evergreen endpoint with the following arguments:"
+                )
+                print(f"Project name: {str(_config.EVERGREEN_PROJECT_NAME)}")
+                print(f"Variant name: {str(_config.EVERGREEN_VARIANT_NAME)}")
+                print(f"Requester: {str(_config.EVERGREEN_REQUESTER)}")
+                print(f"Task ID: {str(_config.EVERGREEN_TASK_ID)}")
+                print(f"Task name: {str(_config.EVERGREEN_TASK_NAME)}")
+                print(f"Tests: {tests}")
+                raise ex
+
+            evergreen_filtered_tests = result["tests"]
+            evergreen_excluded_tests = set(evergreen_filtered_tests).symmetric_difference(
+                set(tests)
+            )
+            print(f"Evergreen excluded the following tests: {evergreen_excluded_tests}")
+            excluded.extend(evergreen_excluded_tests)
+            tests = evergreen_filtered_tests
+
+        # Always group tests at the end
+        tests = _selector.group_tests(test_kind, selector_config, tests)
+        return tests, excluded
 
     def get_name(self):
         """Return the name of the test suite."""
@@ -182,6 +223,11 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
 
         :return: Number of jobs to start.
         """
+        # If we are building images for an external SUT, we are not actually running
+        # any tests & just need a single "job" to create a resmoke fixture to base the
+        # external SUT off of.
+        if _config.DOCKER_COMPOSE_BUILD_IMAGES:
+            return 1
         num_jobs_to_start = self.options.num_jobs
         num_tests = self._get_num_test_runs()
 
@@ -251,7 +297,7 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
         return self._reports
 
     @synchronized
-    def summarize(self, sb):
+    def summarize(self, sb: List[str]):
         """Append a summary of the suite onto the string builder 'sb'."""
         if not self._reports and not self._partial_reports:
             sb.append("No tests ran.")
@@ -312,11 +358,12 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
         for iteration in range(num_iterations):
             # Summarize each execution as a bulleted list of results.
             bulleter_sb = []
-            summary = self._summarize_report(reports[iteration], start_times[iteration],
-                                             end_times[iteration], bulleter_sb)
+            summary = self._summarize_report(
+                reports[iteration], start_times[iteration], end_times[iteration], bulleter_sb
+            )
             combined_summary = _summary.combine(combined_summary, summary)
 
-            for (i, line) in enumerate(bulleter_sb):
+            for i, line in enumerate(bulleter_sb):
                 # Only bullet first line, indent others.
                 prefix = "* " if i == 0 else "  "
                 sb.append(prefix + line)
@@ -329,8 +376,12 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
         Also append a summary of that execution onto the string builder 'sb'.
         """
 
-        return self._summarize_report(self._reports[iteration], self._test_start_times[iteration],
-                                      self._test_end_times[iteration], sb)
+        return self._summarize_report(
+            self._reports[iteration],
+            self._test_start_times[iteration],
+            self._test_end_times[iteration],
+            sb,
+        )
 
     def _summarize_report(self, report, start_time, end_time, sb):
         """Return the summary information of the execution.
@@ -358,11 +409,14 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
             sb.append("All %d test(s) passed in %0.2f seconds." % (num_run, time_taken))
             return _summary.Summary(num_run, time_taken, num_run, 0, 0, 0)
 
-        summary = _summary.Summary(num_run, time_taken, report.num_succeeded, num_skipped,
-                                   num_failed, report.num_errored)
+        summary = _summary.Summary(
+            num_run, time_taken, report.num_succeeded, num_skipped, num_failed, report.num_errored
+        )
 
-        sb.append("%d test(s) ran in %0.2f seconds"
-                  " (%d succeeded, %d were skipped, %d failed, %d errored)" % summary)
+        sb.append(
+            "%d test(s) ran in %0.2f seconds"
+            " (%d succeeded, %d were skipped, %d failed, %d errored)" % summary
+        )
 
         test_names = []
 
@@ -370,8 +424,18 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
             sb.append("The following tests failed (with exit code):")
             for test_info in itertools.chain(report.get_failed(), report.get_interrupted()):
                 test_names.append(test_info.test_file)
-                sb.append("    %s (%d %s)" % (test_info.test_file, test_info.return_code,
-                                              translate_exit_code(test_info.return_code)))
+                sb.append(
+                    "    %s (%d %s)"
+                    % (
+                        test_info.test_file,
+                        test_info.return_code,
+                        translate_exit_code(test_info.return_code),
+                    )
+                )
+
+                for exception_extractor in test_info.exception_extractors:
+                    for log_line in exception_extractor.get_exception():
+                        sb.append("        %s" % (log_line))
 
         if report.num_errored > 0:
             sb.append("The following tests had errors:")
@@ -379,10 +443,16 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
                 test_names.append(test_info.test_file)
                 sb.append("    %s" % (test_info.test_file))
 
+                if test_info.error:
+                    for log_line in test_info.error:
+                        sb.append("        %s" % (log_line))
+
         if num_failed > 0 or report.num_errored > 0:
             test_names.sort(key=_report.test_order)
-            sb.append("If you're unsure where to begin investigating these errors, "
-                      "consider looking at tests in the following order:")
+            sb.append(
+                "If you're unsure where to begin investigating these errors, "
+                "consider looking at tests in the following order:"
+            )
             for test_name in test_names:
                 sb.append("    %s" % (test_name))
 
@@ -393,7 +463,8 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
         """Log summary of all suites."""
         sb = []
         sb.append(
-            "Summary of all suites: %d suites ran in %0.2f seconds" % (len(suites), time_taken))
+            "Summary of all suites: %d suites ran in %0.2f seconds" % (len(suites), time_taken)
+        )
         for suite in suites:
             suite_sb = []
             suite.summarize(suite_sb)
@@ -414,3 +485,38 @@ class Suite(object):  # pylint: disable=too-many-instance-attributes,too-many-pu
             for test_name in self.tests:
                 test_case_names.append(test_name)
         return test_case_names
+
+    def is_matrix_suite(self):
+        return "matrix_suite" in self.get_config()
+
+    def get_description(self):
+        if "description" not in self.get_config():
+            return None
+
+        return self.get_config()["description"]
+
+    class METRIC_NAMES:
+        DISPLAY_NAME = "suite_display_name"
+        NAME = "suite_name"
+        NUM_JOBS_TO_START = "suite_num_jobs_to_start"
+        NUM_TIMES_TO_REPEAT_TESTS = "suite_num_times_to_repeat_tests"
+        IS_MATRIX_SUITE = "suite_is_matrix_suite"
+        KIND = "suite_kind"
+        RETURN_CODE = "suite_return_code"
+        RETURN_STATUS = "suite_return_status"
+        ERRORNO = "suite_errorno"
+
+    def get_suite_otel_attributes(self) -> Dict[str, Any]:
+        attributes = {
+            Suite.METRIC_NAMES.DISPLAY_NAME: self.get_display_name(),
+            Suite.METRIC_NAMES.NAME: self.get_name(),
+            Suite.METRIC_NAMES.NUM_JOBS_TO_START: self.get_num_jobs_to_start(),
+            Suite.METRIC_NAMES.NUM_TIMES_TO_REPEAT_TESTS: self.get_num_times_to_repeat_tests(),
+            Suite.METRIC_NAMES.IS_MATRIX_SUITE: self.is_matrix_suite(),
+        }
+        # Note '' and 0 we want to return and those are both falsey
+        if self.test_kind is not None:
+            attributes[Suite.METRIC_NAMES.KIND] = self.test_kind
+        if self.return_code is not None:
+            attributes[Suite.METRIC_NAMES.RETURN_CODE] = self.return_code
+        return attributes

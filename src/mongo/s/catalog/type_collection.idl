@@ -30,7 +30,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/db/keypattern.idl"
     - "mongo/s/chunk_version.idl"
     - "mongo/s/resharding/type_collection_fields.idl"
@@ -44,7 +44,7 @@ enums:
             kMergeAndMeasureChunks : "mergeAndMeasureChunks"
             kMoveAndMergeChunks: "moveAndMergeChunks"
             kMergeChunks : "mergeChunks"
-            kSplitChunks: "splitChunks"
+            kSplitChunks: "splitChunks" # Never used but kept for parsing backwards compatibility
             kFinished: "finished"
 
 structs:
@@ -105,19 +105,13 @@ structs:
                 type: safeInt64
                 description: "Max chunk size in bytes."
                 optional: true
-            # TODO SERVER-65332 remove the field once 6.0 becomes lastLTS
-            chunksAlreadySplitForDowngrade:
-                type: optionalBool
-                description: "This flag will be set to true by the balancer when all the chunks of 
-                              this collection have been already split and ready for downgrade"
-                default: false
-            defragmentCollection: 
+            defragmentCollection:
                 type: bool
                 description: "Balancer will merge chunks up to the configured maxChunkSizeBytes."
                 optional: true
-            noAutoSplit: 
+            enableAutoMerge:
                 type: bool
-                description: "Specifies whether the auto-splitter should be running or not for this collection."
+                description: "Specifies whether the auto-merger should be running or not for this collection."
                 optional: true
             defragmentationPhase:
                 type: DefragmentationPhase
@@ -143,6 +137,12 @@ structs:
 
                               If the flag is not present it defaults to true."
                 optional: true
+            unsplittable:
+                type: optionalBool
+                description: "Flag that identifies whether the collection is splittable in multiple 
+                            chunks. If unsplittable, the collection is always equivalent to a 1 
+                            chunk collection."
+
             timeseriesFields:
                 type: TypeCollectionTimeseriesFields
                 description: "Time-series collection fields. Only set when this is a time-series
@@ -154,4 +154,9 @@ structs:
                 description: "DEPRECATED flag that determines wether this collection allows chunks to
                                move. This will only prevent migration from committing and new balancer
                                rounds, this flag will not be loaded by shards."
+                optional: true
+            indexVersion:
+                type: timestamp
+                description: "Current collection index version. It will tick everytime a global index 
+                                is created or dropped."
                 optional: true

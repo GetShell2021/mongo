@@ -27,12 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/s/catalog/type_database_gen.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/database_version.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/uuid.h"
 
 namespace {
@@ -42,39 +51,35 @@ using std::string;
 
 TEST(DatabaseType, Empty) {
     // Constructing from empty BSON must fails
-    ASSERT_THROWS(DatabaseType::parse(IDLParserErrorContext("DatabaseType"), BSONObj()),
+    ASSERT_THROWS(DatabaseType::parse(IDLParserContext("DatabaseType"), BSONObj()),
                   AssertionException);
 }
 
 TEST(DatabaseType, Basic) {
     UUID uuid = UUID::gen();
     Timestamp timestamp = Timestamp(1, 1);
-    const auto dbObj =
-        BSON(DatabaseType::kNameFieldName
-             << "mydb" << DatabaseType::kPrimaryFieldName << "shard"
-             << DatabaseType::kShardedFieldName << true << DatabaseType::kVersionFieldName
-             << BSON("uuid" << uuid << "lastMod" << 0 << "timestamp" << timestamp));
+    const auto dbObj = BSON(DatabaseType::kDbNameFieldName
+                            << "mydb" << DatabaseType::kPrimaryFieldName << "shard"
+                            << DatabaseType::kVersionFieldName
+                            << BSON("uuid" << uuid << "lastMod" << 0 << "timestamp" << timestamp));
 
-    const auto db = DatabaseType::parse(IDLParserErrorContext("DatabaseType"), dbObj);
-    ASSERT_EQUALS(db.getName(), "mydb");
+    const auto db = DatabaseType::parse(IDLParserContext("DatabaseType"), dbObj);
+    ASSERT_EQUALS(db.getDbName(), DatabaseName::createDatabaseName_forTest(boost::none, "mydb"));
     ASSERT_EQUALS(db.getPrimary(), "shard");
-    ASSERT_TRUE(db.getSharded());
     ASSERT_EQUALS(db.getVersion().getUuid(), uuid);
     ASSERT_EQUALS(db.getVersion().getLastMod(), 0);
 }
 
 TEST(DatabaseType, BadType) {
     // Cosntructing from an BSON object with a malformed database must fails
-    const auto dbObj = BSON(DatabaseType::kNameFieldName << 0);
-    ASSERT_THROWS(DatabaseType::parse(IDLParserErrorContext("DatabaseType"), dbObj),
-                  AssertionException);
+    const auto dbObj = BSON(DatabaseType::kDbNameFieldName << 0);
+    ASSERT_THROWS(DatabaseType::parse(IDLParserContext("DatabaseType"), dbObj), AssertionException);
 }
 
 TEST(DatabaseType, MissingRequired) {
     // Cosntructing from an BSON object without all the required fields must fails
-    const auto dbObj = BSON(DatabaseType::kNameFieldName << "mydb");
-    ASSERT_THROWS(DatabaseType::parse(IDLParserErrorContext("DatabaseType"), dbObj),
-                  AssertionException);
+    const auto dbObj = BSON(DatabaseType::kDbNameFieldName << "mydb");
+    ASSERT_THROWS(DatabaseType::parse(IDLParserContext("DatabaseType"), dbObj), AssertionException);
 }
 
 }  // unnamed namespace

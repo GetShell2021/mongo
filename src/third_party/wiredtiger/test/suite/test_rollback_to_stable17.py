@@ -27,6 +27,7 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 from helper import simulate_crash_restart
+from rollback_to_stable_util import verify_rts_logs
 import wttest
 from wiredtiger import stat
 from wtscenario import make_scenarios
@@ -46,10 +47,21 @@ class test_rollback_to_stable17(wttest.WiredTigerTestCase):
         ('inmem', dict(in_memory=True))
     ]
 
-    scenarios = make_scenarios(format_values, in_memory_values)
+    worker_thread_values = [
+        ('0', dict(threads=0)),
+        ('4', dict(threads=4)),
+        ('8', dict(threads=8))
+    ]
+
+    scenarios = make_scenarios(format_values, in_memory_values, worker_thread_values)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ignoreStdoutPattern('WT_VERB_RTS')
+        self.addTearDownAction(verify_rts_logs)
 
     def conn_config(self):
-        config = 'cache_size=200MB,statistics=(all)'
+        config = 'cache_size=200MB,statistics=(all),verbose=(rts:5)'
         if self.in_memory:
             config += ',in_memory=true'
         return config
@@ -110,7 +122,7 @@ class test_rollback_to_stable17(wttest.WiredTigerTestCase):
             simulate_crash_restart(self,".", "RESTART")
         else:
             # Manually call rollback_to_stable for in memory keys/values.
-            self.conn.rollback_to_stable()
+            self.conn.rollback_to_stable('threads=' + str(self.threads))
 
         # Check that keys at timestamps 2 and 5 have the correct values they were updated with.
         self.check(values[0], uri, nrows - 1, 2)
@@ -128,6 +140,3 @@ class test_rollback_to_stable17(wttest.WiredTigerTestCase):
         self.assertGreaterEqual(upd_aborted + hs_removed, (nrows*2) - 2)
 
         self.session.close()
-
-if __name__ == '__main__':
-    wttest.run()

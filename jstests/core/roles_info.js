@@ -1,11 +1,14 @@
 // Test invocations of {rolesInfo: ...} command
+//
 // @tags: [
+//   # The test runs commands that are not allowed with security token: createRole, dropRole.
+//   not_allowed_with_signed_security_token,
 //   requires_multi_updates,
 //   requires_non_retryable_commands,
+//   # `rolesInfo` response has empty database name that doesn't work with the response checker of
+//   # simulate_mongoq override.
+//   simulate_mongoq_incompatible,
 // ]
-
-(function() {
-'use strict';
 
 // Setup some sample roles.
 const dbname = db.getName();
@@ -106,4 +109,3 @@ checkForBuiltinRole(multiRoles, fqReadRoleName);
 checkForBuiltinRole(multiRoles, {db: dbname, role: 'readWrite'});
 
 assert.commandWorked(db.runCommand({dropRole: 'testRoleJSCoreRolesInfo'}));
-})();

@@ -27,51 +27,76 @@
  *    it in the license file.
  */
 
+// IWYU pragma: no_include "cxxabi.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+#include <list>
+#include <memory>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/index/index_constants.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
-#include "mongo/db/s/resharding/resharding_oplog_applier_progress_gen.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/resharding/resharding_recipient_service_external_state.h"
-#include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/executor/remote_command_request.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog_cache_test_fixture.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/database_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
 
-class RecipientServiceExternalStateTest : public CatalogCacheTestFixture,
-                                          public ServiceContextMongoDTest {
-public:
-    const ShardKeyPattern kShardKey = ShardKeyPattern(BSON("_id" << 1));
-
-    const NamespaceString kOrigNss = NamespaceString("db.foo");
-    const OID kOrigEpoch = OID::gen();
-    const Timestamp kOrigTimestamp = Timestamp(1);
-    const UUID kOrigUUID = UUID::gen();
-
-    const NamespaceString kReshardingNss = NamespaceString(
-        str::stream() << "db." << NamespaceString::kTemporaryReshardingCollectionPrefix
-                      << kOrigUUID);
-    const ShardKeyPattern kReshardingKey = ShardKeyPattern(BSON("newKey" << 1));
-    const OID kReshardingEpoch = OID::gen();
-    const Timestamp kReshardingTimestamp = Timestamp(2);
-    const UUID kReshardingUUID = UUID::gen();
-
-    const CommonReshardingMetadata kMetadata{
-        kReshardingUUID, kOrigNss, kOrigUUID, kReshardingNss, kReshardingKey.getKeyPattern()};
-    const Timestamp kDefaultFetchTimestamp = Timestamp(200, 1);
+class RecipientServiceExternalStateTest : public ShardCatalogCacheTestFixture {
+protected:
+    RecipientServiceExternalStateTest()
+        : ShardCatalogCacheTestFixture(std::make_unique<MongoDScopedGlobalServiceContextForTest>(
+              MongoDScopedGlobalServiceContextForTest::Options{}
+                  .setCreateShardingState(false)
+                  .useMockClock(true)
+                  .useMockTickSource(true),
+              shouldSetupTL)) {}
 
     void setUp() override {
-        CatalogCacheTestFixture::setUp();
+        ShardCatalogCacheTestFixture::setUp();
 
         repl::ReplicationCoordinator::set(
             getServiceContext(),
@@ -83,11 +108,17 @@ public:
         repl::StorageInterface::set(getServiceContext(), std::move(_storageInterfaceImpl));
 
         repl::createOplog(operationContext());
-        MongoDSessionCatalog::onStepUp(operationContext());
+
+        MongoDSessionCatalog::set(
+            getServiceContext(),
+            std::make_unique<MongoDSessionCatalog>(
+                std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(operationContext());
+        mongoDSessionCatalog->onStepUp(operationContext());
     }
 
     void tearDown() override {
-        CatalogCacheTestFixture::tearDown();
+        ShardCatalogCacheTestFixture::tearDown();
     }
 
     void expectListCollections(const NamespaceString& nss,
@@ -96,7 +127,7 @@ public:
                                const HostAndPort& expectedHost) {
         onCommand([&](const executor::RemoteCommandRequest& request) {
             ASSERT_EQ(request.cmdObj.firstElementFieldName(), "listCollections"_sd);
-            ASSERT_EQUALS(nss.db(), request.dbname);
+            ASSERT_EQUALS(nss.dbName(), request.dbname);
             ASSERT_EQUALS(expectedHost, request.target);
             ASSERT_BSONOBJ_EQ(request.cmdObj["filter"].Obj(), BSON("info.uuid" << uuid));
             ASSERT(request.cmdObj.hasField("databaseVersion"));
@@ -105,7 +136,8 @@ public:
                                    << "local"
                                    << "afterClusterTime" << kDefaultFetchTimestamp));
 
-            std::string listCollectionsNs = str::stream() << nss.db() << "$cmd.listCollections";
+            std::string listCollectionsNs = str::stream()
+                << nss.db_forTest() << "$cmd.listCollections";
             return BSON("ok" << 1 << "cursor"
                              << BSON("id" << 0LL << "ns" << listCollectionsNs << "firstBatch"
                                           << collectionsDocs));
@@ -118,17 +150,18 @@ public:
                            const HostAndPort& expectedHost) {
         onCommand([&](const executor::RemoteCommandRequest& request) {
             ASSERT_EQ(request.cmdObj.firstElementFieldName(), "listIndexes"_sd);
-            ASSERT_EQUALS(nss.db(), request.dbname);
+            ASSERT_EQUALS(nss.dbName(), request.dbname);
             ASSERT_EQUALS(expectedHost, request.target);
-            ASSERT_EQ(unittest::assertGet(UUID::parse(request.cmdObj.firstElement())), uuid);
+            ASSERT_EQ(request.cmdObj.firstElement().checkAndGetStringData(), nss.coll());
             ASSERT(request.cmdObj.hasField("shardVersion"));
             ASSERT_BSONOBJ_EQ(request.cmdObj["readConcern"].Obj(),
                               BSON("level"
                                    << "local"
                                    << "afterClusterTime" << kDefaultFetchTimestamp));
 
-            return BSON("ok" << 1 << "cursor"
-                             << BSON("id" << 0LL << "ns" << nss.ns() << "firstBatch" << indexDocs));
+            return BSON(
+                "ok" << 1 << "cursor"
+                     << BSON("id" << 0LL << "ns" << nss.ns_forTest() << "firstBatch" << indexDocs));
         });
     }
 
@@ -175,6 +208,9 @@ public:
             return std::vector<BSONObj>{coll.toBSON(), chunkObj};
         }());
 
+        expectCollectionAndIndexesAggregation(
+            tempNss, epoch, timestamp, uuid, skey, boost::none, {});
+
         future.default_timed_get();
     }
 
@@ -204,11 +240,10 @@ public:
     void expectStaleDbVersionError(const NamespaceString& nss, StringData expectedCmdName) {
         onCommand([&](const executor::RemoteCommandRequest& request) {
             ASSERT_EQ(request.cmdObj.firstElementFieldNameStringData(), expectedCmdName);
-            return createErrorCursorResponse(
-                Status(StaleDbRoutingVersion(nss.db().toString(),
-                                             DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
-                                             boost::none),
-                       "dummy stale db version error"));
+            return createErrorCursorResponse(Status(
+                StaleDbRoutingVersion(
+                    nss.dbName(), DatabaseVersion(UUID::gen(), Timestamp(1, 1)), boost::none),
+                "dummy stale db version error"));
         });
     }
 
@@ -225,7 +260,7 @@ public:
                                     const std::vector<BSONObj>& indexes) {
         DBDirectClient client(operationContext());
 
-        auto collInfos = client.getCollectionInfos(nss.db().toString());
+        auto collInfos = client.getCollectionInfos(nss.dbName());
         ASSERT_EQ(collInfos.size(), 1);
         ASSERT_EQ(collInfos.front()["name"].str(), nss.coll());
         ASSERT_EQ(unittest::assertGet(UUID::parse(collInfos.front()["info"]["uuid"])), uuid);
@@ -250,14 +285,35 @@ public:
         RecipientStateMachineExternalStateImpl externalState;
         externalState.ensureTempReshardingCollectionExistsWithIndexes(
             operationContext(), kMetadata, kDefaultFetchTimestamp);
-        CollectionShardingRuntime csr(getServiceContext(), kOrigNss, executor());
-        ASSERT(csr.getCurrentMetadataIfKnown() == boost::none);
+
+        AutoGetCollection autoColl(operationContext(), kReshardingNss, MODE_IX);
+        auto scopedCsr = CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(
+            operationContext(), kReshardingNss);
+        ASSERT(scopedCsr->getCurrentMetadataIfKnown() == boost::none);
     }
+
+    const ShardKeyPattern kShardKey = ShardKeyPattern(BSON("_id" << 1));
+
+    const NamespaceString kOrigNss = NamespaceString::createNamespaceString_forTest("db.foo");
+    const OID kOrigEpoch = OID::gen();
+    const Timestamp kOrigTimestamp = Timestamp(1);
+    const UUID kOrigUUID = UUID::gen();
+
+    const NamespaceString kReshardingNss = NamespaceString::createNamespaceString_forTest(
+        str::stream() << "db." << NamespaceString::kTemporaryReshardingCollectionPrefix
+                      << kOrigUUID);
+    const ShardKeyPattern kReshardingKey = ShardKeyPattern(BSON("newKey" << 1));
+    const OID kReshardingEpoch = OID::gen();
+    const Timestamp kReshardingTimestamp = Timestamp(2);
+    const UUID kReshardingUUID = UUID::gen();
+
+    const CommonReshardingMetadata kMetadata{
+        kReshardingUUID, kOrigNss, kOrigUUID, kReshardingNss, kReshardingKey.getKeyPattern()};
+    const Timestamp kDefaultFetchTimestamp = Timestamp(200, 1);
 };
 
 TEST_F(RecipientServiceExternalStateTest, ReshardingConfigServerUpdatesHaveNoTimeout) {
     RecipientStateMachineExternalStateImpl externalState;
-
     auto future = launchAsync([&] {
         externalState.updateCoordinatorDocument(operationContext(),
                                                 BSON("query"
@@ -301,13 +357,16 @@ TEST_F(RecipientServiceExternalStateTest, CreateLocalReshardingCollectionBasic) 
                                                    kReshardingEpoch,
                                                    kReshardingTimestamp);
 
-    const std::vector<BSONObj> indexes = {BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                                   << "_id_"),
-                                          BSON("v" << 2 << "key"
-                                                   << BSON("a" << 1 << "b"
-                                                               << "hashed")
-                                                   << "name"
-                                                   << "indexOne")};
+    const std::vector<BSONObj> indexes = {
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
+        BSON("v" << 2 << "key"
+                 << BSON("a" << 1 << "b"
+                             << "hashed")
+                 << "name"
+                 << "indexOne")};
+    // When creating collection, only _id index should be created.
+    const std::vector<BSONObj> expectedIndexes = {
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName)};
     auto future = launchAsync([&] {
         expectRefreshReturnForOriginalColl(
             kOrigNss, kShardKey, kOrigUUID, kOrigEpoch, kOrigTimestamp);
@@ -317,16 +376,23 @@ TEST_F(RecipientServiceExternalStateTest, CreateLocalReshardingCollectionBasic) 
             {BSON("name" << kOrigNss.coll() << "options" << BSONObj() << "info"
                          << BSON("readOnly" << false << "uuid" << kOrigUUID) << "idIndex"
                          << BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                     << "_id_"))},
+                                     << IndexConstants::kIdIndexName))},
             HostAndPort(shards[1].getHost()));
         expectListIndexes(kOrigNss, kOrigUUID, indexes, HostAndPort(shards[0].getHost()));
+        expectCollectionAndIndexesAggregation(kReshardingNss,
+                                              kReshardingEpoch,
+                                              kReshardingTimestamp,
+                                              kReshardingUUID,
+                                              kShardKey,
+                                              boost::none,
+                                              {});
     });
 
     verifyTempReshardingCollectionAndMetadata();
 
     future.default_timed_get();
 
-    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, indexes);
+    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, expectedIndexes);
 }
 
 TEST_F(RecipientServiceExternalStateTest,
@@ -356,13 +422,17 @@ TEST_F(RecipientServiceExternalStateTest,
                                                    kReshardingEpoch,
                                                    kReshardingTimestamp);
 
-    const std::vector<BSONObj> indexes = {BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                                   << "_id_"),
-                                          BSON("v" << 2 << "key"
-                                                   << BSON("a" << 1 << "b"
-                                                               << "hashed")
-                                                   << "name"
-                                                   << "indexOne")};
+    const std::vector<BSONObj> indexes = {
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
+        BSON("v" << 2 << "key"
+                 << BSON("a" << 1 << "b"
+                             << "hashed")
+                 << "name"
+                 << "indexOne")};
+    // When creating collection, only _id index should be created.
+    const std::vector<BSONObj> expectedIndexes = {
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName)};
+
     auto future = launchAsync([&] {
         expectRefreshReturnForOriginalColl(
             kOrigNss, kShardKey, kOrigUUID, kOrigEpoch, kOrigTimestamp);
@@ -374,20 +444,27 @@ TEST_F(RecipientServiceExternalStateTest,
             {BSON("name" << kOrigNss.coll() << "options" << BSONObj() << "info"
                          << BSON("readOnly" << false << "uuid" << kOrigUUID) << "idIndex"
                          << BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                     << "_id_"))},
+                                     << IndexConstants::kIdIndexName))},
             HostAndPort(shards[1].getHost()));
 
         expectStaleEpochError(kOrigNss, "listIndexes");
         expectRefreshReturnForOriginalColl(
             kOrigNss, kShardKey, kOrigUUID, kOrigEpoch, kOrigTimestamp);
         expectListIndexes(kOrigNss, kOrigUUID, indexes, HostAndPort(shards[0].getHost()));
+        expectCollectionAndIndexesAggregation(kReshardingNss,
+                                              kReshardingEpoch,
+                                              kReshardingTimestamp,
+                                              kReshardingUUID,
+                                              kShardKey,
+                                              boost::none,
+                                              {});
     });
 
     verifyTempReshardingCollectionAndMetadata();
 
     future.default_timed_get();
 
-    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, indexes);
+    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, expectedIndexes);
 }
 
 TEST_F(RecipientServiceExternalStateTest,
@@ -417,14 +494,16 @@ TEST_F(RecipientServiceExternalStateTest,
                                                    kReshardingEpoch,
                                                    kReshardingTimestamp);
 
-    const std::vector<BSONObj> indexes = {BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                                   << "_id_"),
-                                          BSON("v" << 2 << "key"
-                                                   << BSON("a" << 1 << "b"
-                                                               << "hashed")
-                                                   << "name"
-                                                   << "indexOne")};
-
+    const std::vector<BSONObj> indexes = {
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
+        BSON("v" << 2 << "key"
+                 << BSON("a" << 1 << "b"
+                             << "hashed")
+                 << "name"
+                 << "indexOne")};
+    // When creating collection, only _id index should be created.
+    const std::vector<BSONObj> expectedIndexes = {
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName)};
     // Create the collection and indexes to simulate retrying after a failover. Only include the id
     // index, because it is needed to create the collection.
     CollectionOptionsAndIndexes optionsAndIndexes = {
@@ -448,16 +527,23 @@ TEST_F(RecipientServiceExternalStateTest,
             {BSON("name" << kOrigNss.coll() << "options" << BSONObj() << "info"
                          << BSON("readOnly" << false << "uuid" << kOrigUUID) << "idIndex"
                          << BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                     << "_id_"))},
+                                     << IndexConstants::kIdIndexName))},
             HostAndPort(shards[1].getHost()));
         expectListIndexes(kOrigNss, kOrigUUID, indexes, HostAndPort(shards[0].getHost()));
+        expectCollectionAndIndexesAggregation(kReshardingNss,
+                                              kReshardingEpoch,
+                                              kReshardingTimestamp,
+                                              kReshardingUUID,
+                                              kShardKey,
+                                              boost::none,
+                                              {});
     });
 
     verifyTempReshardingCollectionAndMetadata();
 
     future.default_timed_get();
 
-    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, indexes);
+    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, expectedIndexes);
 }
 
 TEST_F(RecipientServiceExternalStateTest,
@@ -487,15 +573,21 @@ TEST_F(RecipientServiceExternalStateTest,
                                                    kReshardingEpoch,
                                                    kReshardingTimestamp);
 
-    const std::vector<BSONObj> indexes = {BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                                   << "_id_"),
-                                          BSON("v" << 2 << "key"
-                                                   << BSON("a" << 1 << "b"
-                                                               << "hashed")
-                                                   << "name"
-                                                   << "indexOne"),
-                                          BSON("v" << 2 << "key" << BSON("c.d" << 1) << "name"
-                                                   << "nested")};
+    const std::vector<BSONObj> indexes = {
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
+        BSON("v" << 2 << "key"
+                 << BSON("a" << 1 << "b"
+                             << "hashed")
+                 << "name"
+                 << "indexOne"),
+        BSON("v" << 2 << "key" << BSON("c.d" << 1) << "name"
+                 << "nested")};
+    // When creating collection, only _id index should be created, the other index is cloned
+    // manually.
+    const std::vector<BSONObj> expectedIndexes = {
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
+        BSON("v" << 2 << "key" << BSON("c.d" << 1) << "name"
+                 << "nested")};
 
     // Create the collection and indexes to simulate retrying after a failover. Only include the id
     // index, because it is needed to create the collection.
@@ -520,16 +612,23 @@ TEST_F(RecipientServiceExternalStateTest,
             {BSON("name" << kOrigNss.coll() << "options" << BSONObj() << "info"
                          << BSON("readOnly" << false << "uuid" << kOrigUUID) << "idIndex"
                          << BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                     << "_id_"))},
+                                     << IndexConstants::kIdIndexName))},
             HostAndPort(shards[1].getHost()));
         expectListIndexes(kOrigNss, kOrigUUID, indexes, HostAndPort(shards[0].getHost()));
+        expectCollectionAndIndexesAggregation(kReshardingNss,
+                                              kReshardingEpoch,
+                                              kReshardingTimestamp,
+                                              kReshardingUUID,
+                                              kShardKey,
+                                              boost::none,
+                                              {});
     });
 
     verifyTempReshardingCollectionAndMetadata();
 
     future.default_timed_get();
 
-    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, indexes);
+    verifyCollectionAndIndexes(kReshardingNss, kReshardingUUID, expectedIndexes);
 }
 
 TEST_F(RecipientServiceExternalStateTest,
@@ -559,13 +658,13 @@ TEST_F(RecipientServiceExternalStateTest,
                                                    kReshardingEpoch,
                                                    kReshardingTimestamp);
 
-    const std::vector<BSONObj> indexes = {BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                                   << "_id_"),
-                                          BSON("v" << 2 << "key"
-                                                   << BSON("a" << 1 << "b"
-                                                               << "hashed")
-                                                   << "name"
-                                                   << "indexOne")};
+    const std::vector<BSONObj> indexes = {
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
+        BSON("v" << 2 << "key"
+                 << BSON("a" << 1 << "b"
+                             << "hashed")
+                 << "name"
+                 << "indexOne")};
 
     // Create the collection and indexes to simulate retrying after a failover.
     CollectionOptionsAndIndexes optionsAndIndexes = {
@@ -582,9 +681,16 @@ TEST_F(RecipientServiceExternalStateTest,
             {BSON("name" << kOrigNss.coll() << "options" << BSONObj() << "info"
                          << BSON("readOnly" << false << "uuid" << kOrigUUID) << "idIndex"
                          << BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                                     << "_id_"))},
+                                     << IndexConstants::kIdIndexName))},
             HostAndPort(shards[1].getHost()));
         expectListIndexes(kOrigNss, kOrigUUID, indexes, HostAndPort(shards[0].getHost()));
+        expectCollectionAndIndexesAggregation(kReshardingNss,
+                                              kReshardingEpoch,
+                                              kReshardingTimestamp,
+                                              kReshardingUUID,
+                                              kShardKey,
+                                              boost::none,
+                                              {});
     });
 
     verifyTempReshardingCollectionAndMetadata();

@@ -6,23 +6,28 @@
 // A restarted standalone will lose all data when using an ephemeral storage engine.
 // @tags: [requires_persistence]
 
-// The UUID consistency check uses connections to shards cached on the ShardingTest object, but this
-// test restarts a shard, so the cached connection is not usable.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// The following checks use connections to shards cached on the ShardingTest object, but this test
+// restarts a shard, so the cached connection is not usable.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
-(function() {
-"use strict";
-
-var st = new ShardingTest({shards: 2});
+var st = new ShardingTest({
+    shards: 2,
+    // By default, our test infrastructure sets the election timeout to a very high value (24
+    // hours). For this test, we need a shorter election timeout because it relies on nodes running
+    // an election when they do not detect an active primary. Therefore, we are setting the
+    // electionTimeoutMillis to its default value.
+    initiateWithDefaultElectionTimeout: true
+});
 
 jsTestLog("Setting up initial data");
-
+assert.commandWorked(
+    st.s0.adminCommand({enableSharding: 'test', primaryShard: st.shard0.shardName}));
 for (var i = 0; i < 100; i++) {
     assert.commandWorked(st.s.getDB('test').foo.insert({_id: i}));
 }
-
-assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard0.shardName);
 
 assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.foo', key: {_id: 1}}));
 assert.commandWorked(st.s0.adminCommand({split: 'test.foo', find: {_id: 50}}));
@@ -85,6 +90,5 @@ assert.soon(function() {
 
 assert.eq(100, newMongosConn.getDB('test').foo.find().itcount());
 
-st.stop();
+st.stop({parallelSupported: false});
 MongoRunner.stopMongos(newMongosInfo);
-}());

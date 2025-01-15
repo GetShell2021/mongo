@@ -29,17 +29,31 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #include "mongo/base/clonable_ptr.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/clustered_collection_options_gen.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/index/multikey_paths.h"
+#include "mongo/db/index_builds/resumable_index_builds_gen.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/db/storage/record_store.h"
 
 namespace mongo {
@@ -47,8 +61,8 @@ namespace mongo {
 class Client;
 class Collection;
 class CollectionPtr;
-
 class IndexDescriptor;
+
 struct InsertDeleteOptions;
 
 struct BsonRecord {
@@ -186,15 +200,15 @@ public:
          * it should pass in a null value.
          */
         AllIndexesIterator(OperationContext* opCtx,
-                           std::unique_ptr<std::vector<IndexCatalogEntry*>> ownedContainer);
+                           std::unique_ptr<std::vector<const IndexCatalogEntry*>> ownedContainer);
 
     private:
         const IndexCatalogEntry* _advance() override;
 
         OperationContext* const _opCtx;
-        std::vector<IndexCatalogEntry*>::const_iterator _iterator;
-        std::vector<IndexCatalogEntry*>::const_iterator _endIterator;
-        std::unique_ptr<std::vector<IndexCatalogEntry*>> _ownedContainer;
+        std::vector<const IndexCatalogEntry*>::const_iterator _iterator;
+        std::vector<const IndexCatalogEntry*>::const_iterator _endIterator;
+        std::unique_ptr<std::vector<const IndexCatalogEntry*>> _ownedContainer;
     };
 
     enum class InclusionPolicy {
@@ -215,7 +229,9 @@ public:
     virtual std::unique_ptr<IndexCatalog> clone() const = 0;
 
     // Must be called before used.
-    virtual Status init(OperationContext* opCtx, Collection* collection) = 0;
+    virtual void init(OperationContext* opCtx,
+                      Collection* collection,
+                      bool isPointInTimeRead = false) = 0;
 
     // ---- accessors -----
 
@@ -223,12 +239,15 @@ public:
 
     virtual bool haveAnyIndexesInProgress() const = 0;
 
-    virtual int numIndexesTotal(OperationContext* opCtx) const = 0;
+    virtual int numIndexesTotal() const = 0;
 
-    virtual int numIndexesReady(OperationContext* opCtx) const = 0;
+    virtual int numIndexesReady() const = 0;
 
-    virtual int numIndexesInProgress(OperationContext* opCtx) const = 0;
+    virtual int numIndexesInProgress() const = 0;
 
+    /**
+     * Returns true if the _id index exists.
+     */
     virtual bool haveIdIndex(OperationContext* opCtx) const = 0;
 
     /**
@@ -277,6 +296,16 @@ public:
         InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) const = 0;
 
     /**
+     * Finds the index with the given ident. The ident uniquely identifies an index.
+     *
+     * Returns nullptr if the index is not found.
+     */
+    virtual const IndexDescriptor* findIndexByIdent(
+        OperationContext* opCtx,
+        StringData ident,
+        InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) const = 0;
+
+    /**
      * Reload the index definition for 'oldDesc' from the CollectionCatalogEntry.  'oldDesc'
      * must be a ready index that is already registered with the index catalog.  Returns an
      * unowned pointer to the descriptor for the new index definition.
@@ -298,6 +327,21 @@ public:
      * such index. Never returns nullptr.
      */
     virtual const IndexCatalogEntry* getEntry(const IndexDescriptor* desc) const = 0;
+
+    /**
+     * Returns a writable IndexCatalogEntry copy that will be returned by current and future calls
+     * to this function. Any previous IndexCatalogEntry/IndexDescriptor pointers that were returned
+     * may be invalidated.
+     */
+    virtual IndexCatalogEntry* getWritableEntryByName(
+        OperationContext* opCtx,
+        StringData name,
+        InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) = 0;
+    virtual IndexCatalogEntry* getWritableEntryByKeyPatternAndOptions(
+        OperationContext* opCtx,
+        const BSONObj& key,
+        const BSONObj& indexSpec,
+        InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) = 0;
 
     /**
      * Returns a pointer to the index catalog entry associated with 'desc', where the caller assumes
@@ -327,13 +371,16 @@ public:
 
     virtual IndexCatalogEntry* createIndexEntry(OperationContext* opCtx,
                                                 Collection* collection,
-                                                std::unique_ptr<IndexDescriptor> descriptor,
+                                                IndexDescriptor&& descriptor,
                                                 CreateIndexEntryFlags flags) = 0;
 
     /**
      * Call this only on an empty collection from inside a WriteUnitOfWork. Index creation on an
      * empty collection can be rolled back as part of a larger WUOW. Returns the full specification
      * of the created index, as it is stored in this index catalog.
+     *
+     * This function doesn't apply the default collation because this function is called in
+     * different cases where we want to make an index with a non-default collator.
      */
     virtual StatusWith<BSONObj> createIndexOnEmptyCollection(OperationContext* opCtx,
                                                              Collection* collection,
@@ -374,6 +421,29 @@ public:
         bool removeIndexBuildsToo) const = 0;
 
     /**
+     * Options struct used for IndexCatalog::removeExistingIndexesNoChecks. See the comments above
+     * the members explaining what they each stand for.
+     */
+    struct RemoveExistingIndexesFlags {
+        RemoveExistingIndexesFlags(){};
+        RemoveExistingIndexesFlags(
+            bool removeInProgressIndexBuilds,
+            const std::map<StringData, std::set<IndexType>>* fieldsToUseForComparison)
+            : removeInProgressIndexBuilds(removeInProgressIndexBuilds),
+              fieldsToUseForComparison(fieldsToUseForComparison){};
+        // Flag indicating whether we should also check unfinished index builds for wether the given
+        // specs match.
+        bool removeInProgressIndexBuilds = true;
+        // Pointer to a map containing all the allowed fields we'll use for comparing entries. For
+        // example, if we have an existing invalid on-disk index spec where we have extra unknown
+        // fields this will ignore them when comparing for a match. Note that this can also repair
+        // the on-disk index spec so that invalid fields become valid.
+        //
+        // Useful when comapring against output that has been fixed beforehand and won't affect the
+        // correctness of the check.
+        const std::map<StringData, std::set<IndexType>>* fieldsToUseForComparison = nullptr;
+    };
+    /**
      * Filters out ready and in-progress indexes that already exist and returns the remaining
      * indexes. Additionally filters out non-_id indexes if the replica set member config has
      * {buildIndexes:false} set.
@@ -382,11 +452,15 @@ public:
      *
      * This should only be used when we are confident in the specs, such as when specs are received
      * via replica set cloning or chunk migrations.
+     *
+     * 'flagsToUse' controls whether in-progress index builds are also filtered out and whether we
+     * should also use a subset of fields when comparing.
      */
     virtual std::vector<BSONObj> removeExistingIndexesNoChecks(
         OperationContext* opCtx,
         const CollectionPtr& collection,
-        const std::vector<BSONObj>& indexSpecsToBuild) const = 0;
+        const std::vector<BSONObj>& indexSpecsToBuild,
+        RemoveExistingIndexesFlags flagsToUse = RemoveExistingIndexesFlags()) const = 0;
 
     /**
      * Drops indexes in the index catalog that returns true when it's descriptor returns true for
@@ -409,14 +483,14 @@ public:
                                 std::function<void(const IndexDescriptor*)> onDropFn) = 0;
 
     /**
-     * Drops the index given its descriptor.
+     * Resets the index given its descriptor.
      *
-     * The caller must hold the collection X lock and ensure no index builds are in progress on the
-     * collection.
+     * This can only be called during startup recovery as it involves recreating the index table to
+     * allow bulk cursors to be used again.
      */
-    virtual Status dropIndex(OperationContext* opCtx,
-                             Collection* collection,
-                             const IndexDescriptor* desc) = 0;
+    virtual Status resetUnfinishedIndexForRecovery(OperationContext* opCtx,
+                                                   Collection* collection,
+                                                   IndexCatalogEntry* entry) = 0;
 
     /**
      * Drops an unfinished index given its descriptor.
@@ -425,7 +499,7 @@ public:
      */
     virtual Status dropUnfinishedIndex(OperationContext* opCtx,
                                        Collection* collection,
-                                       const IndexDescriptor* desc) = 0;
+                                       IndexCatalogEntry* entry) = 0;
 
     /**
      * Drops the index given its catalog entry.
@@ -472,6 +546,9 @@ public:
     /**
      * Both 'keysInsertedOut' and 'keysDeletedOut' are required and will be set to the number of
      * index keys inserted and deleted by this operation, respectively.
+     * The 'opDiff' argument specifies an optional document containing the differences between
+     * 'oldDoc' and 'newDoc' that can be used to decide which indexes have to be modified. If
+     * set to null, all indexes should be updated.
      *
      * This method may throw.
      */
@@ -479,6 +556,7 @@ public:
                                 const CollectionPtr& coll,
                                 const BSONObj& oldDoc,
                                 const BSONObj& newDoc,
+                                const BSONObj* opDiff,
                                 const RecordId& recordId,
                                 int64_t* keysInsertedOut,
                                 int64_t* keysDeletedOut) const = 0;
@@ -498,8 +576,10 @@ public:
     /*
      * Attempt compaction on all ready indexes to regain disk space, if the storage engine's index
      * supports compaction in-place.
+     * Returns an estimated number of bytes when doing a dry run.
      */
-    virtual Status compactIndexes(OperationContext* opCtx) const = 0;
+    virtual StatusWith<int64_t> compactIndexes(OperationContext* opCtx,
+                                               const CompactOptions& options) const = 0;
 
     virtual std::string getAccessMethodName(const BSONObj& keyPattern) = 0;
 
@@ -528,6 +608,24 @@ public:
     virtual void indexBuildSuccess(OperationContext* opCtx,
                                    Collection* coll,
                                    IndexCatalogEntry* index) = 0;
+
+    /**
+     * Helper function which normalizes index specs. This function will populate a complete
+     * collation spec in cases where the index spec specifies a collation, and will add the
+     * collection-default collation, if present, in cases where collation is omitted. If the index
+     * spec omits the collation and the collection does not have a default, the collation field is
+     * omitted from the spec.
+     *
+     * If 'collection' is null, no changes are made to the input specs.
+     *
+     * This function throws on error.
+     */
+    static BSONObj normalizeIndexSpecs(OperationContext* opCtx,
+                                       const CollectionPtr& collection,
+                                       const BSONObj& indexSpec);
+    static std::vector<BSONObj> normalizeIndexSpecs(OperationContext* opCtx,
+                                                    const CollectionPtr& collection,
+                                                    const std::vector<BSONObj>& indexSpecs);
 };
 
 inline IndexCatalog::InclusionPolicy operator|(IndexCatalog::InclusionPolicy lhs,

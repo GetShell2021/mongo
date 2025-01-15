@@ -28,18 +28,31 @@
  */
 
 
+#include <memory>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/coll_mod_gen.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/repl/repl_set_config.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharded_collmod_gen.h"
-#include "mongo/logv2/log.h"
-#include "mongo/util/str.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -66,10 +79,6 @@ public:
         return Command::AllowedOnSecondary::kNever;
     }
 
-    bool supportsRetryableWrite() const final {
-        return true;
-    }
-
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
@@ -77,7 +86,7 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCollMod can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
@@ -88,11 +97,12 @@ public:
             repl::ReadConcernArgs::get(opCtx) =
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-            const auto& collMod = request().getCollModRequest();
-            if (collMod.getTimeseries() && collMod.getTimeseries().get().getGranularity()) {
-                auto granularity = collMod.getTimeseries().get().getGranularity().get();
-                ShardingCatalogManager::get(opCtx)->updateTimeSeriesGranularity(
-                    opCtx, ns(), granularity);
+            auto& ts = request().getCollModRequest().getTimeseries();
+            if (ts.has_value() &&
+                (ts->getGranularity().has_value() || ts->getBucketMaxSpanSeconds().has_value() ||
+                 ts->getBucketRoundingSeconds().has_value())) {
+                ShardingCatalogManager::get(opCtx)->updateTimeSeriesBucketingParameters(
+                    opCtx, ns(), ts.get());
             }
         }
 
@@ -109,11 +119,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-} configsvrCollModCmd;
+};
+MONGO_REGISTER_COMMAND(ConfigsvrCollModCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

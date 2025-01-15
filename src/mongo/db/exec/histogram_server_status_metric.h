@@ -52,8 +52,7 @@ namespace mongo {
  */
 class HistogramServerStatusMetric {
 public:
-    HistogramServerStatusMetric(std::string name, std::vector<uint64_t> bounds)
-        : _hist{std::move(bounds)}, _metric{std::move(name), this} {}
+    explicit HistogramServerStatusMetric(std::vector<uint64_t> bounds) : _hist{std::move(bounds)} {}
 
     void increment(uint64_t value) {
         _hist.increment(value);
@@ -72,30 +71,36 @@ public:
         return v;
     }
 
-private:
-    class Metric : public ServerStatusMetric {
-    public:
-        Metric(std::string name, const HistogramServerStatusMetric* owner)
-            : ServerStatusMetric{std::move(name)}, _owner{owner} {}
+    const Histogram<uint64_t>& hist() const {
+        return _hist;
+    }
 
-        void appendAtLeaf(BSONObjBuilder& bob) const override {
-            _owner->_appendTo(_leafName, bob);
+private:
+    Histogram<uint64_t> _hist;
+};
+
+template <>
+struct ServerStatusMetricPolicySelection<HistogramServerStatusMetric> {
+    class Policy {
+    public:
+        explicit Policy(std::vector<uint64_t> bounds) : _v{std::move(bounds)} {}
+
+        auto& value() {
+            return _v;
+        }
+
+        void appendTo(BSONObjBuilder& bob, StringData leafName) const {
+            BSONArrayBuilder arr{bob.subarrayStart(leafName)};
+            for (auto&& [count, lower, upper] : _v.hist())
+                BSONObjBuilder{arr.subobjStart()}
+                    .append("lowerBound", static_cast<long long>(lower ? *lower : 0))
+                    .append("count", count);
         }
 
     private:
-        const HistogramServerStatusMetric* const _owner;
+        HistogramServerStatusMetric _v;
     };
-
-    void _appendTo(StringData leafName, BSONObjBuilder& bob) const {
-        BSONArrayBuilder arr{bob.subarrayStart(leafName)};
-        for (auto&& [count, lower, upper] : _hist)
-            BSONObjBuilder(arr.subobjStart())
-                .append("lowerBound", static_cast<long long>(lower ? *lower : 0))
-                .append("count", count);
-    }
-
-    Histogram<uint64_t> _hist;
-    Metric _metric;
+    using type = Policy;
 };
 
 }  // namespace mongo

@@ -5,13 +5,7 @@
  *
  * @tags: [requires_fcv_60]
  */
-(function() {
-
-"use strict";
-
-load("jstests/libs/discover_topology.js");
-load("jstests/sharding/libs/resharding_test_fixture.js");
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 function runTest(reshardInPlace) {
     const reshardingTest = new ReshardingTest({numDonors: 2, numRecipients: 2, reshardInPlace});
@@ -76,24 +70,27 @@ function runTest(reshardInPlace) {
         txnNumber: NumberLong(3),
     };
 
+    const expectedTransientErrors = new Set([
+        ErrorCodes.StaleConfig,
+        ErrorCodes.NoSuchTransaction,
+        ErrorCodes.ShardCannotRefreshDueToLocksHeld,
+        ErrorCodes.LockTimeout,
+        ErrorCodes.IncompleteTransactionHistory,
+        ErrorCodes.WriteConflict,
+    ]);
+
     function runCommandRetryOnTransientErrors(db, cmdObj) {
         let res;
         assert.soon(() => {
             res = db.runCommand(cmdObj);
-            try {
-                assert.commandWorked(res);
-                return true;
-            } catch (error) {
-                assert.commandFailedWithCode(res, [
-                    ErrorCodes.StaleConfig,
-                    ErrorCodes.NoSuchTransaction,
-                    ErrorCodes.ShardCannotRefreshDueToLocksHeld,
-                    ErrorCodes.LockTimeout,
-                    ErrorCodes.IncompleteTransactionHistory
-                ]);
+
+            if (expectedTransientErrors.has(res.code) ||
+                (res.writeErrors && expectedTransientErrors.has(res.writeErrors[0].code))) {
                 cmdObj.txnNumber = NumberLong(cmdObj.txnNumber + 1);
                 return false;
             }
+            assert.commandWorked(res);
+            return true;
         });
         return res;
     }
@@ -166,4 +163,3 @@ function runTest(reshardInPlace) {
 
 runTest(true /* reshardInPlace */);
 runTest(false /* reshardInPlace */);
-})();

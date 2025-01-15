@@ -11,6 +11,10 @@ import { updateCheckbox } from "./redux/nodes";
 import { setGraphData } from "./redux/graphData";
 import { setNodeInfos } from "./redux/nodeInfo";
 import { getGraphData } from "./redux/store";
+import { setLinks } from "./redux/links";
+import { setLinksTrans } from "./redux/linksTrans";
+
+const {REACT_APP_API_URL} = process.env;
 
 const OverflowTip = (props) => {
   const textElementRef = useRef(null);
@@ -26,31 +30,36 @@ const OverflowTip = (props) => {
 
   function newGraphData() {
     let gitHash = props.selectedGraph;
-    let postData = {
-        "selected_nodes": props.nodes.filter(node => node.selected == true).map(node => node.node)
-    };
-    fetch('/api/graphs/' + gitHash + '/d3', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(postData)
-    })
-      .then(response => response.json())
-      .then(data => {
-        props.setGraphData(data.graphData);
-      });
-    fetch('/api/graphs/' + gitHash + '/nodes/details', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(postData)
-    })
-      .then(response => response.json())
-      .then(data => {
-        props.setNodeInfos(data.nodeInfos);
-      });
+    if (gitHash) {
+      let postData = {
+          "selected_nodes": props.nodes.filter(node => node.selected == true).map(node => node.node),
+          "transitive_edges": props.showTransitive
+      };
+      fetch(REACT_APP_API_URL + '/api/graphs/' + gitHash + '/d3', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(postData)
+      })
+        .then(response => response.json())
+        .then(data => {
+          props.setGraphData(data.graphData);
+          props.setLinks(data.graphData.links);
+          props.setLinksTrans(data.graphData.links_trans);
+        });
+      fetch(REACT_APP_API_URL + '/api/graphs/' + gitHash + '/nodes/details', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(postData)
+      })
+        .then(response => response.json())
+        .then(data => {
+          props.setNodeInfos(data.nodeInfos);
+        });
+    }
   }
 
   useEffect(() => {
@@ -98,4 +107,4 @@ const OverflowTip = (props) => {
   );
 };
 
-export default connect(getGraphData, { updateCheckbox, setGraphData, setNodeInfos })(OverflowTip);
+export default connect(getGraphData, { updateCheckbox, setGraphData, setNodeInfos, setLinks, setLinksTrans })(OverflowTip);

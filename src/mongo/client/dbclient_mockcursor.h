@@ -29,9 +29,12 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/dbclient_cursor.h"
+#include "mongo/platform/basic.h"
 
 namespace mongo {
 
@@ -42,7 +45,7 @@ public:
                        bool provideResumeToken = false,
                        unsigned long batchSize = 0);
 
-    virtual ~DBClientMockCursor() {}
+    ~DBClientMockCursor() override {}
 
     bool more() override;
 

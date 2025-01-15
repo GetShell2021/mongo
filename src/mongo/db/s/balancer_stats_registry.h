@@ -29,28 +29,20 @@
 
 #pragma once
 
-#include "mongo/db/concurrency/d_concurrency.h"
+#include <memory>
+#include <string>
+
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/s/range_deleter_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
-
-/**
- * Acquires the config db lock in IX mode and the collection lock for config.rangeDeletions in X
- * mode.
- */
-class ScopedRangeDeleterLock {
-public:
-    ScopedRangeDeleterLock(OperationContext* opCtx);
-    ScopedRangeDeleterLock(OperationContext* opCtx, const UUID& collectionUuid);
-
-private:
-    Lock::DBLock _configLock;
-    Lock::CollectionLock _rangeDeletionLock;
-    boost::optional<Lock::ResourceLock> _collectionUuidLock;
-};
 
 /**
  * The BalancerStatsRegistry is used to cache metadata on shards, such as the orphan documents
@@ -76,13 +68,6 @@ public:
     static BalancerStatsRegistry* get(OperationContext* opCtx);
 
     /**
-     * Non blocking initialization. Performs an asyncronous initialization of this registry.
-     */
-    void initializeAsync(OperationContext* opCtx);
-
-    void terminate();
-
-    /**
      * Update orphan document count for a specific collection.
      * `delta` is the increment/decrement that will be applied to the current cached count.
      *
@@ -102,20 +87,37 @@ public:
                                                    const UUID& collectionUUID) const;
 
 private:
-    void onInitialDataAvailable(OperationContext* opCtx,
-                                bool isMajorityDataAvailable) override final {}
-    void onStepUpBegin(OperationContext* opCtx, long long term) override final {}
-    void onBecomeArbiter() override final {}
-    void onShutdown() override final {}
+    void onSetCurrentConfig(OperationContext* opCtx) final {}
+    void onConsistentDataAvailable(OperationContext* opCtx,
+                                   bool isMajority,
+                                   bool isRollback) final {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) final {}
+    void onBecomeArbiter() final {}
+    void onRollbackBegin() final {}
 
-    void onStartup(OperationContext* opCtx) override final;
-    void onStepUpComplete(OperationContext* opCtx, long long term) override final;
-    void onStepDown() override final;
+    void onStartup(OperationContext* opCtx) final;
+    void onStepUpComplete(OperationContext* opCtx, long long term) final;
+    void onStepDown() final;
+    void onShutdown() final;
+
+    inline std::string getServiceName() const final {
+        return "BalancerStatsRegistry";
+    }
 
     void _loadOrphansCount(OperationContext* opCtx);
     bool _isInitialized() const {
         return _state.load() == State::kInitialized;
     }
+
+    /**
+     * Non blocking initialization. Performs an asynchronous initialization of this registry.
+     */
+    void _initializeAsync(OperationContext* opCtx);
+
+    /**
+     * Terminate the asynchronous initialization of this registry.
+     */
+    void _terminate(stdx::unique_lock<stdx::mutex>& lock);
 
     struct CollectionStats {
         // Number of orphan documents for this collection
@@ -132,11 +134,11 @@ private:
         kSecondary,
     };
 
-    mutable Mutex _stateMutex = MONGO_MAKE_LATCH("BalancerStatsRegistry::_stateMutex");
+    mutable stdx::mutex _stateMutex;
     AtomicWord<State> _state{State::kSecondary};
     ServiceContext::UniqueOperationContext _initOpCtxHolder;
 
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("BalancerStatsRegistry::_mutex");
+    mutable stdx::mutex _mutex;
     // Map containing all the currently cached collection stats
     stdx::unordered_map<UUID, CollectionStats, UUID::Hash> _collStatsMap;
 

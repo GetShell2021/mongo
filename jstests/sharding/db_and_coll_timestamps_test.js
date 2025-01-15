@@ -8,10 +8,10 @@
  * collection, dropping and creating a collection, or refining the sharding key.
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-load("jstests/sharding/libs/find_chunks_util.js");
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
 
 function checkTimestampConsistencyInPersistentMetadata(
     dbName, nss, dbTimestampInConfig, collTimestampInConfig) {
@@ -108,4 +108,3 @@ checkTimestampConsistencyInPersistentMetadata(
     kDbName, kNs, dbTimestampAfterRefine, collTimestampAfterRefine);
 
 st.stop();
-})();

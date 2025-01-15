@@ -27,23 +27,35 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <vector>
 
-#include "mongo/db/exec/sbe/accumulator_sum_value_enum.h"
-#include "mongo/db/pipeline/accumulator.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/sbe/accumulator_sum_value_enum.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_helpers.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/window_function/window_function_avg.h"
 #include "mongo/db/pipeline/window_function/window_function_expression.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/summation.h"
 
 namespace mongo {
 
-using boost::intrusive_ptr;
+template <>
+Value ExpressionFromAccumulator<AccumulatorAvg>::evaluate(const Document& root,
+                                                          Variables* variables) const {
+    return evaluateAccumulator(*this, root, variables);
+}
 
 REGISTER_ACCUMULATOR(avg, genericParseSingleExpressionAccumulator<AccumulatorAvg>);
 REGISTER_STABLE_EXPRESSION(avg, ExpressionFromAccumulator<AccumulatorAvg>::parse);
@@ -63,7 +75,7 @@ Value serializePartialSum(BSONType nonDecimalTotalType,
 void AccumulatorAvg::processInternal(const Value& input, bool merging) {
     if (merging) {
         // We expect an object that contains both a partial sum and a count.
-        verify(input.getType() == Object);
+        MONGO_verify(input.getType() == Object);
 
         auto partialSumVal = input[stage_builder::partialSumName];
         tassert(6422700, "'ps' field must be present", !partialSumVal.missing());
@@ -113,10 +125,6 @@ void AccumulatorAvg::processInternal(const Value& input, bool merging) {
     _count++;
 }
 
-intrusive_ptr<AccumulatorState> AccumulatorAvg::create(ExpressionContext* const expCtx) {
-    return new AccumulatorAvg(expCtx);
-}
-
 Decimal128 AccumulatorAvg::_getDecimalTotal() const {
     return _decimalTotal.add(_nonDecimalTotal.getDecimal());
 }
@@ -141,7 +149,7 @@ Value AccumulatorAvg::getValue(bool toBeMerged) {
 AccumulatorAvg::AccumulatorAvg(ExpressionContext* const expCtx)
     : AccumulatorState(expCtx), _count(0) {
     // This is a fixed size AccumulatorState so we never need to update this
-    _memUsageBytes = sizeof(*this);
+    _memUsageTracker.set(sizeof(*this));
 }
 
 void AccumulatorAvg::reset() {

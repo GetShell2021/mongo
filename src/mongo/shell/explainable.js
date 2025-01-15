@@ -162,6 +162,10 @@ var Explainable = (function() {
                 distinctCmd.maxTimeMS = options.maxTimeMS;
             }
 
+            if (options && options.hasOwnProperty("hint")) {
+                distinctCmd.hint = options.hint;
+            }
+
             var explainCmd = buildExplainCmd(distinctCmd, this._verbosity);
             var explainResult = this._collection.runReadCommand(explainCmd);
             return throwOrReturn(explainResult);
@@ -660,7 +664,8 @@ let Explain = (function() {
         }
 
         const queryPlanner = explain.queryPlanner;
-        const isShardedFind = queryPlanner && queryPlanner.mongosPlannerVersion === 1;
+        const isShardedFind = queryPlanner && queryPlanner.winningPlan &&
+            queryPlanner.winningPlan.hasOwnProperty("shards");
         if (isShardedFind) {
             return doShardedFindReformatting(explain, fieldsToKeepSet);
         }

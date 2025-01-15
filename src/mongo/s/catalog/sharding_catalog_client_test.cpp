@@ -27,32 +27,57 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "cxxabi.h"
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <system_error>
+#include <tuple>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/json.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/query_request_helper.h"
-#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/time_proof_service.h"
 #include "mongo/db/vector_clock.h"
+#include "mongo/executor/network_connection_hook.h"
+#include "mongo/executor/network_interface_mock.h"
+#include "mongo/executor/network_test_env.h"
+#include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/rpc/metadata/tracking_metadata.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_collection_gen.h"
 #include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/chunk_version.h"
-#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/database_version.h"
-#include "mongo/s/sharding_router_test_fixture.h"
+#include "mongo/s/sharding_mongos_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/stdx/future.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
@@ -60,31 +85,22 @@
 namespace mongo {
 namespace {
 
-using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
-using executor::RemoteCommandResponse;
-using executor::TaskExecutor;
 using repl::OpTime;
 using rpc::ReplSetMetadata;
 using std::vector;
 using unittest::assertGet;
 
 const int kMaxCommandRetry = 3;
-const NamespaceString kNamespace("TestDB", "TestColl");
-
-BSONObj getReplSecondaryOkMetadata() {
-    BSONObjBuilder o;
-    ReadPreferenceSetting(ReadPreference::Nearest).toContainingBSON(&o);
-    o.append(rpc::kReplSetMetadataFieldName, 1);
-    return o.obj();
-}
+const NamespaceString kNamespace =
+    NamespaceString::createNamespaceString_forTest("TestDB", "TestColl");
 
 using ShardingCatalogClientTest = ShardingTestFixture;
 
 TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    CollectionType expectedColl(NamespaceString("TestDB.TestNS"),
+    CollectionType expectedColl(NamespaceString::createNamespaceString_forTest("TestDB.TestNS"),
                                 OID::gen(),
                                 Timestamp(1, 1),
                                 Date_t::now(),
@@ -99,19 +115,16 @@ TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
 
     onFindWithMetadataCommand(
         [this, &expectedColl, newOpTime](const RemoteCommandRequest& request) {
-            ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                              rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-            auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+            auto opMsg = static_cast<OpMsgRequest>(request);
             auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
             // Ensure the query is correct
-            ASSERT_EQ(query->getNamespaceOrUUID().nss().value_or(NamespaceString()),
-                      CollectionType::ConfigNS);
-            ASSERT_BSONOBJ_EQ(query->getFilter(),
-                              BSON(CollectionType::kNssFieldName << expectedColl.getNss().ns()));
+            ASSERT_EQ(query->getNamespaceOrUUID().nss(), CollectionType::ConfigNS);
+            ASSERT_BSONOBJ_EQ(
+                query->getFilter(),
+                BSON(CollectionType::kNssFieldName << expectedColl.getNss().ns_forTest()));
             ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
-            ASSERT_EQ(query->getLimit().get(), 1);
+            ASSERT_EQ(query->getLimit().value(), 1);
 
             checkReadConcern(request.cmdObj,
                              VectorClock::kInitialComponentTime.asTimestamp(),
@@ -141,7 +154,8 @@ TEST_F(ShardingCatalogClientTest, GetCollectionNotExisting) {
 
     auto future = launchAsync([this] {
         ASSERT_THROWS_CODE(
-            catalogClient()->getCollection(operationContext(), NamespaceString("NonExistent")),
+            catalogClient()->getCollection(
+                operationContext(), NamespaceString::createNamespaceString_forTest("NonExistent")),
             DBException,
             ErrorCodes::NamespaceNotFound);
     });
@@ -153,36 +167,37 @@ TEST_F(ShardingCatalogClientTest, GetCollectionNotExisting) {
 }
 
 TEST_F(ShardingCatalogClientTest, GetDatabaseInvalidName) {
-    ASSERT_THROWS_CODE(catalogClient()->getDatabase(
-                           operationContext(), "b.c", repl::ReadConcernLevel::kMajorityReadConcern),
-                       DBException,
-                       ErrorCodes::InvalidNamespace);
+    ASSERT_THROWS_CODE(
+        catalogClient()->getDatabase(operationContext(),
+                                     DatabaseName::createDatabaseName_forTest(boost::none, "b.c"),
+                                     repl::ReadConcernLevel::kMajorityReadConcern),
+        DBException,
+        ErrorCodes::InvalidNamespace);
 }
 
 TEST_F(ShardingCatalogClientTest, GetDatabaseExisting) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    DatabaseType expectedDb(
-        "bigdata", ShardId("shard0000"), DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
+    DatabaseType expectedDb(DatabaseName::createDatabaseName_forTest(boost::none, "bigdata"),
+                            ShardId("shard0000"),
+                            DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
 
     const OpTime newOpTime(Timestamp(7, 6), 5);
 
     auto future = launchAsync([this, &expectedDb] {
-        return catalogClient()->getDatabase(
-            operationContext(), expectedDb.getName(), repl::ReadConcernLevel::kMajorityReadConcern);
+        return catalogClient()->getDatabase(operationContext(),
+                                            expectedDb.getDbName(),
+                                            repl::ReadConcernLevel::kMajorityReadConcern);
     });
 
     onFindWithMetadataCommand([this, &expectedDb, newOpTime](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        auto opMsg = static_cast<OpMsgRequest>(request);
         auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-        ASSERT_EQ(query->getNamespaceOrUUID().nss().value_or(NamespaceString()),
-                  NamespaceString::kConfigDatabasesNamespace);
-        ASSERT_BSONOBJ_EQ(query->getFilter(),
-                          BSON(DatabaseType::kNameFieldName << expectedDb.getName()));
+        ASSERT_EQ(query->getNamespaceOrUUID().nss(), NamespaceString::kConfigDatabasesNamespace);
+        ASSERT_BSONOBJ_EQ(
+            query->getFilter(),
+            BSON(DatabaseType::kDbNameFieldName << expectedDb.getDbName().toString_forTest()));
         ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
         ASSERT(!query->getLimit());
 
@@ -213,12 +228,16 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseStaleSecondaryRetrySuccess) {
     HostAndPort secondHost{"TestHost2"};
     configTargeter()->setFindHostReturnValue(firstHost);
 
-    DatabaseType expectedDb(
-        "bigdata", ShardId("shard0000"), DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
+    DatabaseType expectedDb(DatabaseName::createDatabaseName_forTest(boost::none, "bigdata"),
+                            ShardId("shard0000"),
+                            DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
 
     auto future = launchAsync([this, &expectedDb] {
         return catalogClient()->getDatabase(
-            operationContext(), expectedDb.getName(), repl::ReadConcernLevel::kMajorityReadConcern);
+            operationContext(),
+            DatabaseName::createDatabaseName_forTest(boost::none,
+                                                     expectedDb.getDbName().toString_forTest()),
+            repl::ReadConcernLevel::kMajorityReadConcern);
     });
 
     // Return empty result set as if the database wasn't found
@@ -243,11 +262,12 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseStaleSecondaryRetryNoPrimary) {
     configTargeter()->setFindHostReturnValue(testHost);
 
     auto future = launchAsync([this] {
-        ASSERT_THROWS_CODE(
-            catalogClient()->getDatabase(
-                operationContext(), "NonExistent", repl::ReadConcernLevel::kMajorityReadConcern),
-            DBException,
-            ErrorCodes::NotWritablePrimary);
+        ASSERT_THROWS_CODE(catalogClient()->getDatabase(
+                               operationContext(),
+                               DatabaseName::createDatabaseName_forTest(boost::none, "NonExistent"),
+                               repl::ReadConcernLevel::kMajorityReadConcern),
+                           DBException,
+                           ErrorCodes::NotWritablePrimary);
     });
 
     // Return empty result set as if the database wasn't found
@@ -266,11 +286,12 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseNotExisting) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
-        ASSERT_THROWS_CODE(
-            catalogClient()->getDatabase(
-                operationContext(), "NonExistent", repl::ReadConcernLevel::kMajorityReadConcern),
-            DBException,
-            ErrorCodes::NamespaceNotFound);
+        ASSERT_THROWS_CODE(catalogClient()->getDatabase(
+                               operationContext(),
+                               DatabaseName::createDatabaseName_forTest(boost::none, "NonExistent"),
+                               repl::ReadConcernLevel::kMajorityReadConcern),
+                           DBException,
+                           ErrorCodes::NamespaceNotFound);
     });
 
     onFindCommand([](const RemoteCommandRequest& request) { return vector<BSONObj>{}; });
@@ -286,7 +307,6 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsValid) {
     s1.setName("shard0000");
     s1.setHost("ShardHost");
     s1.setDraining(false);
-    s1.setMaxSizeMB(50);
     s1.setTags({"tag1", "tag2", "tag3"});
 
     ShardType s2;
@@ -296,7 +316,6 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsValid) {
     ShardType s3;
     s3.setName("shard0002");
     s3.setHost("ShardHost");
-    s3.setMaxSizeMB(65);
 
     const vector<ShardType> expectedShardsList = {s1, s2, s3};
 
@@ -307,17 +326,13 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsValid) {
     });
 
     onFindCommand([this, &s1, &s2, &s3](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        auto opMsg = static_cast<OpMsgRequest>(request);
         auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-        ASSERT_EQ(query->getNamespaceOrUUID().nss().value_or(NamespaceString()),
-                  NamespaceString::kConfigsvrShardsNamespace);
+        ASSERT_EQ(query->getNamespaceOrUUID().nss(), NamespaceString::kConfigsvrShardsNamespace);
         ASSERT_BSONOBJ_EQ(query->getFilter(), BSONObj());
         ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
-        ASSERT_FALSE(query->getLimit().is_initialized());
+        ASSERT_FALSE(query->getLimit().has_value());
 
         checkReadConcern(request.cmdObj,
                          VectorClock::kInitialComponentTime.asTimestamp(),
@@ -359,6 +374,36 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsWithInvalidShard) {
     future.default_timed_get();
 }
 
+TEST_F(ShardingCatalogClientTest, GetAllShardsWithDrainingShard) {
+    configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
+
+    auto future = launchAsync([this]() {
+        const auto shards =
+            assertGet(catalogClient()->getAllShards(operationContext(),
+                                                    repl::ReadConcernLevel::kMajorityReadConcern,
+                                                    true /* excludeDraining */));
+        return shards.value;
+    });
+
+    onFindCommand([this](const RemoteCommandRequest& request) {
+        const auto opMsg = static_cast<OpMsgRequest>(request);
+        const auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
+
+        ASSERT_EQ(query->getNamespaceOrUUID().nss(), NamespaceString::kConfigsvrShardsNamespace);
+        ASSERT_BSONOBJ_EQ(query->getFilter(), BSON(ShardType::draining.ne(true)));
+        ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
+        ASSERT_FALSE(query->getLimit().has_value());
+
+        checkReadConcern(request.cmdObj,
+                         VectorClock::kInitialComponentTime.asTimestamp(),
+                         repl::OpTime::kUninitializedTerm);
+
+        return vector<BSONObj>{};
+    });
+
+    future.default_timed_get();
+}
+
 TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
@@ -369,16 +414,14 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
     ChunkType chunkA;
     chunkA.setName(OID::gen());
     chunkA.setCollectionUUID(collUuid);
-    chunkA.setMin(BSON("a" << 1));
-    chunkA.setMax(BSON("a" << 100));
+    chunkA.setRange({BSON("a" << 1), BSON("a" << 100)});
     chunkA.setVersion(ChunkVersion({collEpoch, collTimestamp}, {1, 2}));
     chunkA.setShard(ShardId("shard0000"));
 
     ChunkType chunkB;
     chunkB.setName(OID::gen());
     chunkB.setCollectionUUID(collUuid);
-    chunkB.setMin(BSON("a" << 100));
-    chunkB.setMax(BSON("a" << 200));
+    chunkB.setRange({BSON("a" << 100), BSON("a" << 200)});
     chunkB.setVersion(ChunkVersion({collEpoch, collTimestamp}, {3, 4}));
     chunkB.setShard(ShardId("shard0001"));
 
@@ -394,7 +437,7 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
     auto future = launchAsync([this, &chunksQuery, newOpTime, &collEpoch, &collTimestamp] {
         OpTime opTime;
 
-        const auto chunks =
+        auto chunks =
             assertGet(catalogClient()->getChunks(operationContext(),
                                                  chunksQuery,
                                                  BSON(ChunkType::lastmod() << -1),
@@ -409,38 +452,34 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
         return chunks;
     });
 
-    onFindWithMetadataCommand(
-        [this, &chunksQuery, chunkA, chunkB, newOpTime](const RemoteCommandRequest& request) {
-            ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                              rpc::TrackingMetadata::removeTrackingData(request.metadata));
+    onFindWithMetadataCommand([this, &chunksQuery, chunkA, chunkB, newOpTime](
+                                  const RemoteCommandRequest& request) {
+        auto opMsg = static_cast<OpMsgRequest>(request);
+        auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-            auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
-            auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
+        ASSERT_EQ(query->getNamespaceOrUUID().nss(), NamespaceString::kConfigsvrChunksNamespace);
+        ASSERT_BSONOBJ_EQ(query->getFilter(), chunksQuery);
+        ASSERT_BSONOBJ_EQ(query->getSort(), BSON(ChunkType::lastmod() << -1));
+        ASSERT_EQ(query->getLimit().value(), 1);
 
-            ASSERT_EQ(query->getNamespaceOrUUID().nss().value_or(NamespaceString()),
-                      ChunkType::ConfigNS);
-            ASSERT_BSONOBJ_EQ(query->getFilter(), chunksQuery);
-            ASSERT_BSONOBJ_EQ(query->getSort(), BSON(ChunkType::lastmod() << -1));
-            ASSERT_EQ(query->getLimit().get(), 1);
+        checkReadConcern(request.cmdObj,
+                         VectorClock::kInitialComponentTime.asTimestamp(),
+                         repl::OpTime::kUninitializedTerm);
 
-            checkReadConcern(request.cmdObj,
-                             VectorClock::kInitialComponentTime.asTimestamp(),
-                             repl::OpTime::kUninitializedTerm);
+        ReplSetMetadata metadata(10,
+                                 {newOpTime, Date_t() + Seconds(newOpTime.getSecs())},
+                                 newOpTime,
+                                 100,
+                                 0,
+                                 OID(),
+                                 -1,
+                                 true);
+        BSONObjBuilder builder;
+        metadata.writeToMetadata(&builder).transitional_ignore();
 
-            ReplSetMetadata metadata(10,
-                                     {newOpTime, Date_t() + Seconds(newOpTime.getSecs())},
-                                     newOpTime,
-                                     100,
-                                     0,
-                                     OID(),
-                                     -1,
-                                     true);
-            BSONObjBuilder builder;
-            metadata.writeToMetadata(&builder).transitional_ignore();
-
-            return std::make_tuple(vector<BSONObj>{chunkA.toConfigBSON(), chunkB.toConfigBSON()},
-                                   builder.obj());
-        });
+        return std::make_tuple(vector<BSONObj>{chunkA.toConfigBSON(), chunkB.toConfigBSON()},
+                               builder.obj());
+    });
 
     const auto& chunks = future.default_timed_get();
     ASSERT_BSONOBJ_EQ(chunkA.toConfigBSON(), chunks[0].toConfigBSON());
@@ -462,7 +501,7 @@ TEST_F(ShardingCatalogClientTest, GetChunksForUUIDNoSortNoLimit) {
              << BSON("$gte" << static_cast<long long>(queryChunkVersion.toLong()))));
 
     auto future = launchAsync([this, &chunksQuery, &collEpoch, &collTimestamp] {
-        const auto chunks =
+        auto chunks =
             assertGet(catalogClient()->getChunks(operationContext(),
                                                  chunksQuery,
                                                  BSONObj(),
@@ -477,17 +516,13 @@ TEST_F(ShardingCatalogClientTest, GetChunksForUUIDNoSortNoLimit) {
     });
 
     onFindCommand([this, &chunksQuery](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        auto opMsg = static_cast<OpMsgRequest>(request);
         auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-        ASSERT_EQ(query->getNamespaceOrUUID().nss().value_or(NamespaceString()),
-                  ChunkType::ConfigNS);
+        ASSERT_EQ(query->getNamespaceOrUUID().nss(), NamespaceString::kConfigsvrChunksNamespace);
         ASSERT_BSONOBJ_EQ(query->getFilter(), chunksQuery);
         ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
-        ASSERT_FALSE(query->getLimit().is_initialized());
+        ASSERT_FALSE(query->getLimit().has_value());
 
         checkReadConcern(request.cmdObj,
                          VectorClock::kInitialComponentTime.asTimestamp(),
@@ -527,15 +562,13 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSInvalidChunk) {
     onFindCommand([&chunksQuery, collUuid](const RemoteCommandRequest& request) {
         ChunkType chunkA;
         chunkA.setCollectionUUID(collUuid);
-        chunkA.setMin(BSON("a" << 1));
-        chunkA.setMax(BSON("a" << 100));
+        chunkA.setRange({BSON("a" << 1), BSON("a" << 100)});
         chunkA.setVersion(ChunkVersion({OID::gen(), Timestamp(1, 1)}, {1, 2}));
         chunkA.setShard(ShardId("shard0000"));
 
         ChunkType chunkB;
         chunkB.setCollectionUUID(collUuid);
-        chunkB.setMin(BSON("a" << 100));
-        chunkB.setMax(BSON("a" << 200));
+        chunkB.setRange({BSON("a" << 100), BSON("a" << 200)});
         chunkB.setVersion(ChunkVersion({OID::gen(), Timestamp(1, 1)}, {3, 4}));
         // Missing shard id
 
@@ -551,7 +584,10 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementReadCommand) {
     auto future = launchAsync([this] {
         BSONObjBuilder responseBuilder;
         bool ok = catalogClient()->runUserManagementReadCommand(
-            operationContext(), "test", BSON("usersInfo" << 1), &responseBuilder);
+            operationContext(),
+            DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+            BSON("usersInfo" << 1),
+            &responseBuilder);
         ASSERT_TRUE(ok);
 
         BSONObj response = responseBuilder.obj();
@@ -568,10 +604,10 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementReadCommand) {
             return o.obj();
         }());
 
-        ASSERT_BSONOBJ_EQ(kReplPrimaryPreferredMetadata,
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(kReplPrimaryPreferredMetadata, request.metadata);
 
-        ASSERT_EQUALS("test", request.dbname);
+        ASSERT_EQUALS(DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                      request.dbname);
         ASSERT_BSONOBJ_EQ(BSON("usersInfo" << 1 << "maxTimeMS" << 30000), request.cmdObj);
 
         return BSON("ok" << 1 << "users" << BSONArrayBuilder().arr());
@@ -586,7 +622,10 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementReadCommandUnsatisfiedReadPre
 
     BSONObjBuilder responseBuilder;
     bool ok = catalogClient()->runUserManagementReadCommand(
-        operationContext(), "test", BSON("usersInfo" << 1), &responseBuilder);
+        operationContext(),
+        DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+        BSON("usersInfo" << 1),
+        &responseBuilder);
     ASSERT_FALSE(ok);
 
     Status commandStatus = getStatusFromCommandResult(responseBuilder.obj());
@@ -598,18 +637,21 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandSuccess) {
 
     auto future = launchAsync([this] {
         BSONObjBuilder responseBuilder;
-        auto status = catalogClient()->runUserManagementWriteCommand(operationContext(),
-                                                                     "dropUser",
-                                                                     "test",
-                                                                     BSON("dropUser"
-                                                                          << "test"),
-                                                                     &responseBuilder);
+        auto status =
+            catalogClient()->runUserManagementWriteCommand(operationContext(),
+                                                           "dropUser",
+                                                           DatabaseName::createDatabaseName_forTest(
+                                                               boost::none, "test"),
+                                                           BSON("dropUser"
+                                                                << "test"),
+                                                           &responseBuilder);
         ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::UserNotFound, status);
     });
 
     onCommand([](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS("test", request.dbname);
+        ASSERT_EQUALS(DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                      request.dbname);
         // Since no write concern was sent we will add w:majority
         ASSERT_BSONOBJ_EQ(BSON("dropUser"
                                << "test"
@@ -620,8 +662,7 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandSuccess) {
                                << "maxTimeMS" << 30000),
                           request.cmdObj);
 
-        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         BSONObjBuilder responseBuilder;
         CommandHelpers::appendCommandStatusNoThrow(
@@ -640,7 +681,8 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandInvalidWriteConce
     auto status =
         catalogClient()->runUserManagementWriteCommand(operationContext(),
                                                        "dropUser",
-                                                       "test",
+                                                       DatabaseName::createDatabaseName_forTest(
+                                                           boost::none, "test"),
                                                        BSON("dropUser"
                                                             << "test"
                                                             << "writeConcern" << BSON("w" << 2)),
@@ -661,7 +703,7 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandRewriteWriteConce
                 catalogClient()->runUserManagementWriteCommand(
                     operationContext(),
                     "dropUser",
-                    "test",
+                    DatabaseName::createDatabaseName_forTest(boost::none, "test"),
                     BSON("dropUser"
                          << "test"
                          << "writeConcern" << BSON("w" << 1 << "wtimeout" << 30)),
@@ -671,7 +713,8 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandRewriteWriteConce
         });
 
     onCommand([](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS("test", request.dbname);
+        ASSERT_EQUALS(DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                      request.dbname);
         ASSERT_BSONOBJ_EQ(BSON("dropUser"
                                << "test"
                                << "writeConcern"
@@ -681,8 +724,7 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandRewriteWriteConce
                                << "maxTimeMS" << 30000),
                           request.cmdObj);
 
-        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         BSONObjBuilder responseBuilder;
         CommandHelpers::appendCommandStatusNoThrow(
@@ -699,12 +741,14 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandNotWritablePrimar
 
     auto future = launchAsync([this] {
         BSONObjBuilder responseBuilder;
-        auto status = catalogClient()->runUserManagementWriteCommand(operationContext(),
-                                                                     "dropUser",
-                                                                     "test",
-                                                                     BSON("dropUser"
-                                                                          << "test"),
-                                                                     &responseBuilder);
+        auto status =
+            catalogClient()->runUserManagementWriteCommand(operationContext(),
+                                                           "dropUser",
+                                                           DatabaseName::createDatabaseName_forTest(
+                                                               boost::none, "test"),
+                                                           BSON("dropUser"
+                                                                << "test"),
+                                                           &responseBuilder);
         ASSERT_NOT_OK(status);
         ASSERT_EQUALS(ErrorCodes::NotWritablePrimary, status);
     });
@@ -730,12 +774,14 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandNotWritablePrimar
 
     auto future = launchAsync([this] {
         BSONObjBuilder responseBuilder;
-        auto status = catalogClient()->runUserManagementWriteCommand(operationContext(),
-                                                                     "dropUser",
-                                                                     "test",
-                                                                     BSON("dropUser"
-                                                                          << "test"),
-                                                                     &responseBuilder);
+        auto status =
+            catalogClient()->runUserManagementWriteCommand(operationContext(),
+                                                           "dropUser",
+                                                           DatabaseName::createDatabaseName_forTest(
+                                                               boost::none, "test"),
+                                                           BSON("dropUser"
+                                                                << "test"),
+                                                           &responseBuilder);
         ASSERT_OK(status);
     });
 
@@ -754,7 +800,8 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandNotWritablePrimar
 
     onCommand([host2](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(host2, request.target);
-        ASSERT_EQUALS("test", request.dbname);
+        ASSERT_EQUALS(DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                      request.dbname);
         // Since no write concern was sent we will add w:majority
         ASSERT_BSONOBJ_EQ(BSON("dropUser"
                                << "test"
@@ -765,8 +812,7 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandNotWritablePrimar
                                << "maxTimeMS" << 30000),
                           request.cmdObj);
 
-        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
         return BSON("ok" << 1);
     });
@@ -778,14 +824,14 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandNotWritablePrimar
 TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    CollectionType coll1(NamespaceString{"test.coll1"},
+    CollectionType coll1(NamespaceString::createNamespaceString_forTest("test.coll1"),
                          OID::gen(),
                          Timestamp(1, 1),
                          network()->now(),
                          UUID::gen(),
                          BSON("_id" << 1));
 
-    CollectionType coll2(NamespaceString{"anotherdb.coll1"},
+    CollectionType coll2(NamespaceString::createNamespaceString_forTest("anotherdb.coll1"),
                          OID::gen(),
                          Timestamp(1, 1),
                          network()->now(),
@@ -794,18 +840,15 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
 
     const OpTime newOpTime(Timestamp(7, 6), 5);
 
-    auto future = launchAsync(
-        [this, newOpTime] { return catalogClient()->getCollections(operationContext(), {}); });
+    auto future = launchAsync([this, newOpTime] {
+        return catalogClient()->getCollections(operationContext(), DatabaseName::kEmpty);
+    });
 
     onFindWithMetadataCommand([this, coll1, coll2, newOpTime](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        auto opMsg = static_cast<OpMsgRequest>(request);
         auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-        ASSERT_EQ(query->getNamespaceOrUUID().nss().value_or(NamespaceString()),
-                  CollectionType::ConfigNS);
+        ASSERT_EQ(query->getNamespaceOrUUID().nss(), CollectionType::ConfigNS);
         ASSERT_BSONOBJ_EQ(query->getFilter(), BSONObj());
         ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
 
@@ -836,7 +879,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
 TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsWithDb) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    CollectionType coll1(NamespaceString{"test.coll1"},
+    CollectionType coll1(NamespaceString::createNamespaceString_forTest("test.coll1"),
                          OID::gen(),
                          Timestamp(1, 1),
                          network()->now(),
@@ -844,7 +887,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsWithDb) {
                          BSON("_id" << 1));
     coll1.setUnique(true);
 
-    CollectionType coll2(NamespaceString{"test.coll2"},
+    CollectionType coll2(NamespaceString::createNamespaceString_forTest("test.coll2"),
                          OID::gen(),
                          Timestamp(1, 1),
                          network()->now(),
@@ -852,18 +895,16 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsWithDb) {
                          BSON("_id" << 1));
     coll2.setUnique(false);
 
-    auto future =
-        launchAsync([this] { return catalogClient()->getCollections(operationContext(), "test"); });
+    auto future = launchAsync([this] {
+        return catalogClient()->getCollections(
+            operationContext(), DatabaseName::createDatabaseName_forTest(boost::none, "test"));
+    });
 
     onFindCommand([this, coll1, coll2](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        auto opMsg = static_cast<OpMsgRequest>(request);
         auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-        ASSERT_EQ(query->getNamespaceOrUUID().nss().value_or(NamespaceString()),
-                  CollectionType::ConfigNS);
+        ASSERT_EQ(query->getNamespaceOrUUID().nss(), CollectionType::ConfigNS);
         {
             BSONObjBuilder b;
             b.appendRegex(CollectionType::kNssFieldName, "^test\\.");
@@ -887,10 +928,13 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsInvalidCollectionType) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
-        ASSERT_THROWS(catalogClient()->getCollections(operationContext(), "test"), DBException);
+        ASSERT_THROWS(
+            catalogClient()->getCollections(
+                operationContext(), DatabaseName::createDatabaseName_forTest(boost::none, "test")),
+            DBException);
     });
 
-    CollectionType validColl(NamespaceString{"test.coll1"},
+    CollectionType validColl(NamespaceString::createNamespaceString_forTest("test.coll1"),
                              OID::gen(),
                              Timestamp(1, 1),
                              network()->now(),
@@ -899,14 +943,10 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsInvalidCollectionType) {
     validColl.setUnique(true);
 
     onFindCommand([this, validColl](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        auto opMsg = static_cast<OpMsgRequest>(request);
         auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-        ASSERT_EQ(query->getNamespaceOrUUID().nss().value_or(NamespaceString()),
-                  CollectionType::ConfigNS);
+        ASSERT_EQ(query->getNamespaceOrUUID().nss(), CollectionType::ConfigNS);
         {
             BSONObjBuilder b;
             b.appendRegex(CollectionType::kNssFieldName, "^test\\.");
@@ -929,8 +969,12 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsInvalidCollectionType) {
 TEST_F(ShardingCatalogClientTest, GetDatabasesForShardValid) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    DatabaseType dbt1("db1", ShardId("shard0000"), DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
-    DatabaseType dbt2("db2", ShardId("shard0000"), DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
+    DatabaseType dbt1(DatabaseName::createDatabaseName_forTest(boost::none, "db1"),
+                      ShardId("shard0000"),
+                      DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
+    DatabaseType dbt2(DatabaseName::createDatabaseName_forTest(boost::none, "db2"),
+                      ShardId("shard0000"),
+                      DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
 
     auto future = launchAsync([this] {
         return assertGet(
@@ -938,14 +982,10 @@ TEST_F(ShardingCatalogClientTest, GetDatabasesForShardValid) {
     });
 
     onFindCommand([this, dbt1, dbt2](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        auto opMsg = static_cast<OpMsgRequest>(request);
         auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-        ASSERT_EQ(query->getNamespaceOrUUID().nss().value_or(NamespaceString()),
-                  NamespaceString::kConfigDatabasesNamespace);
+        ASSERT_EQ(query->getNamespaceOrUUID().nss(), NamespaceString::kConfigDatabasesNamespace);
         ASSERT_BSONOBJ_EQ(query->getFilter(),
                           BSON(DatabaseType::kPrimaryFieldName << dbt1.getPrimary()));
         ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
@@ -959,8 +999,8 @@ TEST_F(ShardingCatalogClientTest, GetDatabasesForShardValid) {
 
     const auto& actualDbNames = future.default_timed_get();
     ASSERT_EQ(2U, actualDbNames.size());
-    ASSERT_EQ(dbt1.getName(), actualDbNames[0]);
-    ASSERT_EQ(dbt2.getName(), actualDbNames[1]);
+    ASSERT_EQ(dbt1.getDbName(), actualDbNames[0]);
+    ASSERT_EQ(dbt2.getDbName(), actualDbNames[1]);
 }
 
 TEST_F(ShardingCatalogClientTest, GetDatabasesForShardInvalidDoc) {
@@ -974,10 +1014,12 @@ TEST_F(ShardingCatalogClientTest, GetDatabasesForShardInvalidDoc) {
     });
 
     onFindCommand([](const RemoteCommandRequest& request) {
-        DatabaseType dbt1("db1", {"shard0000"}, DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
+        DatabaseType dbt1(DatabaseName::createDatabaseName_forTest(boost::none, "db1"),
+                          {"shard0000"},
+                          DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
         return vector<BSONObj>{
             dbt1.toBSON(),
-            BSON(DatabaseType::kNameFieldName << 0)  // Database name should be a string
+            BSON(DatabaseType::kDbNameFieldName << 0)  // Database name should be a string
         };
     });
 
@@ -988,20 +1030,18 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollection) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     TagsType tagA;
-    tagA.setNS(NamespaceString("TestDB.TestColl"));
+    tagA.setNS(NamespaceString::createNamespaceString_forTest("TestDB.TestColl"));
     tagA.setTag("TagA");
-    tagA.setMinKey(BSON("a" << 100));
-    tagA.setMaxKey(BSON("a" << 200));
+    tagA.setRange({BSON("a" << 100), BSON("a" << 200)});
 
     TagsType tagB;
-    tagB.setNS(NamespaceString("TestDB.TestColl"));
+    tagB.setNS(NamespaceString::createNamespaceString_forTest("TestDB.TestColl"));
     tagB.setTag("TagB");
-    tagB.setMinKey(BSON("a" << 200));
-    tagB.setMaxKey(BSON("a" << 300));
+    tagB.setRange({BSON("a" << 200), BSON("a" << 300)});
 
     auto future = launchAsync([this] {
         const auto& tags = assertGet(catalogClient()->getTagsForCollection(
-            operationContext(), NamespaceString("TestDB.TestColl")));
+            operationContext(), NamespaceString::createNamespaceString_forTest("TestDB.TestColl")));
 
         ASSERT_EQ(2U, tags.size());
 
@@ -1009,14 +1049,10 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollection) {
     });
 
     onFindCommand([this, tagA, tagB](const RemoteCommandRequest& request) {
-        ASSERT_BSONOBJ_EQ(getReplSecondaryOkMetadata(),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        auto opMsg = static_cast<OpMsgRequest>(request);
         auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
-        ASSERT_EQ(query->getNamespaceOrUUID().nss().value_or(NamespaceString()),
-                  TagsType::ConfigNS);
+        ASSERT_EQ(query->getNamespaceOrUUID().nss(), TagsType::ConfigNS);
         ASSERT_BSONOBJ_EQ(query->getFilter(), BSON(TagsType::ns("TestDB.TestColl")));
         ASSERT_BSONOBJ_EQ(query->getSort(), BSON(TagsType::min() << 1));
 
@@ -1037,7 +1073,7 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollectionNoTags) {
 
     auto future = launchAsync([this] {
         const auto& tags = assertGet(catalogClient()->getTagsForCollection(
-            operationContext(), NamespaceString("TestDB.TestColl")));
+            operationContext(), NamespaceString::createNamespaceString_forTest("TestDB.TestColl")));
 
         ASSERT_EQ(0U, tags.size());
 
@@ -1054,25 +1090,31 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollectionInvalidTag) {
 
     auto future = launchAsync([this] {
         const auto swTags = catalogClient()->getTagsForCollection(
-            operationContext(), NamespaceString("TestDB.TestColl"));
+            operationContext(), NamespaceString::createNamespaceString_forTest("TestDB.TestColl"));
 
-        ASSERT_EQUALS(ErrorCodes::NoSuchKey, swTags.getStatus());
+        ASSERT_EQUALS(ErrorCodes::IDLFailedToParse, swTags.getStatus());
     });
 
     onFindCommand([](const RemoteCommandRequest& request) {
-        TagsType tagA;
-        tagA.setNS(NamespaceString("TestDB.TestColl"));
-        tagA.setTag("TagA");
-        tagA.setMinKey(BSON("a" << 100));
-        tagA.setMaxKey(BSON("a" << 200));
+        auto tagA = [&] {
+            TagsType tag;
+            tag.setNS(NamespaceString::createNamespaceString_forTest("TestDB.TestColl"));
+            tag.setTag("TagA");
+            tag.setRange({BSON("a" << 100), BSON("a" << 200)});
+            return tag.toBSON();
+        }();
 
-        TagsType tagB;
-        tagB.setNS(NamespaceString("TestDB.TestColl"));
-        tagB.setTag("TagB");
-        tagB.setMinKey(BSON("a" << 200));
-        // Missing maxKey
+        auto tagB = [&] {
+            TagsType tag;
+            tag.setNS(NamespaceString::createNamespaceString_forTest("TestDB.TestColl"));
+            tag.setTag("TagB");
+            tag.setRange({BSON("a" << 200), BSON("a" << 300)});
+            auto serializedTag = tag.toBSON();
+            // Remove maxKey
+            return serializedTag.removeField(TagsType::max.name());
+        }();
 
-        return vector<BSONObj>{tagA.toBSON(), tagB.toBSON()};
+        return vector<BSONObj>{tagA, tagB};
     });
 
     future.default_timed_get();
@@ -1081,13 +1123,15 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollectionInvalidTag) {
 TEST_F(ShardingCatalogClientTest, UpdateDatabase) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    DatabaseType dbt("test", ShardId("shard0000"), DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
+    DatabaseType dbt(DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                     ShardId("shard0000"),
+                     DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
 
     auto future = launchAsync([this, dbt] {
         auto status = catalogClient()->updateConfigDocument(
             operationContext(),
             NamespaceString::kConfigDatabasesNamespace,
-            BSON(DatabaseType::kNameFieldName << dbt.getName()),
+            BSON(DatabaseType::kDbNameFieldName << dbt.getDbName().toString_forTest()),
             dbt.toBSON(),
             true,
             ShardingCatalogClient::kMajorityWriteConcern);
@@ -1095,12 +1139,11 @@ TEST_F(ShardingCatalogClientTest, UpdateDatabase) {
     });
 
     onCommand([dbt](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS("config", request.dbname);
+        ASSERT_EQUALS(DatabaseName::kConfig, request.dbname);
 
-        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1),
-                          rpc::TrackingMetadata::removeTrackingData(request.metadata));
+        ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1), request.metadata);
 
-        const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        const auto opMsgRequest = static_cast<OpMsgRequest>(request);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
         ASSERT_EQUALS(NamespaceString::kConfigDatabasesNamespace, updateOp.getNamespace());
 
@@ -1110,7 +1153,9 @@ TEST_F(ShardingCatalogClientTest, UpdateDatabase) {
         const auto& update = updates.front();
         ASSERT(update.getUpsert());
         ASSERT(!update.getMulti());
-        ASSERT_BSONOBJ_EQ(update.getQ(), BSON(DatabaseType::kNameFieldName << dbt.getName()));
+        ASSERT_BSONOBJ_EQ(
+            update.getQ(),
+            BSON(DatabaseType::kDbNameFieldName << dbt.getDbName().toString_forTest()));
         ASSERT_BSONOBJ_EQ(update.getU().getUpdateReplacement(), dbt.toBSON());
 
         BatchedCommandResponse response;
@@ -1128,13 +1173,15 @@ TEST_F(ShardingCatalogClientTest, UpdateConfigDocumentNonRetryableError) {
     HostAndPort host1("TestHost1");
     configTargeter()->setFindHostReturnValue(host1);
 
-    DatabaseType dbt("test", ShardId("shard0001"), DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
+    DatabaseType dbt(DatabaseName::createDatabaseName_forTest(boost::none, "test"),
+                     ShardId("shard0001"),
+                     DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
 
     auto future = launchAsync([this, dbt] {
         auto status = catalogClient()->updateConfigDocument(
             operationContext(),
             NamespaceString::kConfigDatabasesNamespace,
-            BSON(DatabaseType::kNameFieldName << dbt.getName()),
+            BSON(DatabaseType::kDbNameFieldName << dbt.getDbName().toString_forTest()),
             dbt.toBSON(),
             true,
             ShardingCatalogClient::kMajorityWriteConcern);
@@ -1164,11 +1211,12 @@ TEST_F(ShardingCatalogClientTest, RetryOnFindCommandNetworkErrorFailsAtMaxRetry)
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     auto future = launchAsync([this] {
-        ASSERT_THROWS_CODE(
-            catalogClient()->getDatabase(
-                operationContext(), "TestDB", repl::ReadConcernLevel::kMajorityReadConcern),
-            DBException,
-            ErrorCodes::HostUnreachable);
+        ASSERT_THROWS_CODE(catalogClient()->getDatabase(
+                               operationContext(),
+                               DatabaseName::createDatabaseName_forTest(boost::none, "TestDB"),
+                               repl::ReadConcernLevel::kMajorityReadConcern),
+                           DBException,
+                           ErrorCodes::HostUnreachable);
     });
 
     for (int i = 0; i < kMaxCommandRetry; ++i) {
@@ -1185,7 +1233,9 @@ TEST_F(ShardingCatalogClientTest, RetryOnFindCommandNetworkErrorSucceedsAtMaxRet
 
     auto future = launchAsync([&] {
         catalogClient()->getDatabase(
-            operationContext(), "TestDB", repl::ReadConcernLevel::kMajorityReadConcern);
+            operationContext(),
+            DatabaseName::createDatabaseName_forTest(boost::none, "TestDB"),
+            repl::ReadConcernLevel::kMajorityReadConcern);
     });
 
     for (int i = 0; i < kMaxCommandRetry - 1; ++i) {
@@ -1195,8 +1245,9 @@ TEST_F(ShardingCatalogClientTest, RetryOnFindCommandNetworkErrorSucceedsAtMaxRet
     }
 
     onFindCommand([](const RemoteCommandRequest& request) {
-        DatabaseType dbType(
-            "TestDB", ShardId("TestShard"), DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
+        DatabaseType dbType(DatabaseName::createDatabaseName_forTest(boost::none, "TestDB"),
+                            ShardId("TestShard"),
+                            DatabaseVersion(UUID::gen(), Timestamp(1, 1)));
 
         return vector<BSONObj>{dbType.toBSON()};
     });
@@ -1212,10 +1263,10 @@ TEST_F(ShardingCatalogClientTest, GetNewKeys) {
     repl::ReadConcernLevel readConcernLevel(repl::ReadConcernLevel::kMajorityReadConcern);
 
     auto future = launchAsync([this, purpose, currentTime, readConcernLevel] {
-        auto status =
-            catalogClient()->getNewKeys(operationContext(), purpose, currentTime, readConcernLevel);
-        ASSERT_OK(status.getStatus());
-        return status.getValue();
+        auto swKeys = catalogClient()->getNewInternalKeys(
+            operationContext(), purpose, currentTime, readConcernLevel);
+        ASSERT_OK(swKeys.getStatus());
+        return swKeys.getValue();
     });
 
     LogicalTime dummyTime(Timestamp(9876, 5432));
@@ -1230,9 +1281,9 @@ TEST_F(ShardingCatalogClientTest, GetNewKeys) {
 
     onFindCommand([this, key1, key2](const RemoteCommandRequest& request) {
         ASSERT_EQ("config:123", request.target.toString());
-        ASSERT_EQ("admin", request.dbname);
+        ASSERT_EQ(DatabaseName::kAdmin, request.dbname);
 
-        auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        auto opMsg = static_cast<OpMsgRequest>(request);
         auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
 
@@ -1240,11 +1291,10 @@ TEST_F(ShardingCatalogClientTest, GetNewKeys) {
             fromjson("{purpose: 'none',"
                      "expiresAt: {$gt: {$timestamp: {t: 1234, i: 5678}}}}"));
 
-        ASSERT_EQ(NamespaceString::kKeysCollectionNamespace,
-                  query->getNamespaceOrUUID().nss().value_or(NamespaceString()));
+        ASSERT_EQ(NamespaceString::kKeysCollectionNamespace, query->getNamespaceOrUUID().nss());
         ASSERT_BSONOBJ_EQ(expectedQuery, query->getFilter());
         ASSERT_BSONOBJ_EQ(BSON("expiresAt" << 1), query->getSort());
-        ASSERT_FALSE(query->getLimit().is_initialized());
+        ASSERT_FALSE(query->getLimit().has_value());
 
         checkReadConcern(request.cmdObj,
                          VectorClock::kInitialComponentTime.asTimestamp(),
@@ -1277,28 +1327,27 @@ TEST_F(ShardingCatalogClientTest, GetNewKeysWithEmptyCollection) {
     repl::ReadConcernLevel readConcernLevel(repl::ReadConcernLevel::kMajorityReadConcern);
 
     auto future = launchAsync([this, purpose, currentTime, readConcernLevel] {
-        auto status =
-            catalogClient()->getNewKeys(operationContext(), purpose, currentTime, readConcernLevel);
-        ASSERT_OK(status.getStatus());
-        return status.getValue();
+        auto swKeys = catalogClient()->getNewInternalKeys(
+            operationContext(), purpose, currentTime, readConcernLevel);
+        ASSERT_OK(swKeys.getStatus());
+        return swKeys.getValue();
     });
 
     onFindCommand([this](const RemoteCommandRequest& request) {
         ASSERT_EQ("config:123", request.target.toString());
-        ASSERT_EQ("admin", request.dbname);
+        ASSERT_EQ(DatabaseName::kAdmin, request.dbname);
 
-        auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+        auto opMsg = static_cast<OpMsgRequest>(request);
         auto query = query_request_helper::makeFromFindCommandForTests(opMsg.body);
 
         BSONObj expectedQuery(
             fromjson("{purpose: 'none',"
                      "expiresAt: {$gt: {$timestamp: {t: 1234, i: 5678}}}}"));
 
-        ASSERT_EQ(NamespaceString::kKeysCollectionNamespace,
-                  query->getNamespaceOrUUID().nss().value_or(NamespaceString()));
+        ASSERT_EQ(NamespaceString::kKeysCollectionNamespace, query->getNamespaceOrUUID().nss());
         ASSERT_BSONOBJ_EQ(expectedQuery, query->getFilter());
         ASSERT_BSONOBJ_EQ(BSON("expiresAt" << 1), query->getSort());
-        ASSERT_FALSE(query->getLimit().is_initialized());
+        ASSERT_FALSE(query->getLimit().has_value());
 
         checkReadConcern(request.cmdObj,
                          VectorClock::kInitialComponentTime.asTimestamp(),

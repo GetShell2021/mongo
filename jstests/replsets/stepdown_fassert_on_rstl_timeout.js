@@ -11,14 +11,19 @@
  *    [since deadline is beyond the RSTL fassert timeout].
  * 5. Make sure that primary node is down and that another has stepedUp
  *
- * @tags: [ requires_fcv_53 ]
+ * @tags: [
+ *   requires_fcv_53,
+ *   # TODO (SERVER-80568): Re-enable this test once redness is resolved in multiversion suites.
+ *   DISABLED_TEMPORARILY_DUE_TO_FCV_UPGRADE,
+ * ]
  */
 
-(function() {
-"use strict";
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
-load("jstests/libs/write_concern_util.js");
-load("jstests/libs/fail_point_util.js");
+// Because this test intentionally crashes the server via an fassert, we need to instruct the
+// shell to clean up the core dump that is left behind.
+TestData.cleanUpCoreDumpsFromExpectedCrash = true;
 
 var name = "interruptStepDown";
 // Set the fassert timeout to shorter than the default to avoid having a long-running test.
@@ -33,7 +38,9 @@ replSet.initiate({
         {"_id": 1, "host": nodes[1]},
         {"_id": 2, "host": nodes[2], "priority": 0}
     ]
-});
+},
+                 null,
+                 {initiateWithDefaultElectionTimeout: true});
 
 replSet.waitForState(replSet.nodes[0], ReplSetTest.State.PRIMARY);
 
@@ -80,4 +87,3 @@ bgInserter({checkExitSuccess: false});
 replSet.stop(
     primary.nodeId, undefined, {forRestart: false, allowedExitCode: MongoRunner.EXIT_ABORT});
 replSet.stopSet();
-})();

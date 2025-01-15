@@ -29,9 +29,15 @@
 
 #pragma once
 
-#include "mongo/base/status.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/status.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/drop_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 class NamespaceString;
@@ -50,24 +56,31 @@ enum class DropCollectionSystemCollectionMode {
  * Drops the collection "collectionName" and populates "reply" with statistics about what
  * was removed. Aborts in-progress index builds on the collection if two phase index builds are
  * supported. Throws if the expectedUUID does not match the UUID of the collection being dropped.
+ * When fromMigrate is set, the related oplog entry will be marked accordingly using the
+ * 'fromMigrate' field to reduce its visibility (e.g. in change streams).
  */
 Status dropCollection(OperationContext* opCtx,
                       const NamespaceString& collectionName,
                       const boost::optional<UUID>& expectedUUID,
                       DropReply* reply,
-                      DropCollectionSystemCollectionMode systemCollectionMode);
+                      DropCollectionSystemCollectionMode systemCollectionMode,
+                      bool fromMigrate = false);
 
 Status dropCollection(OperationContext* opCtx,
                       const NamespaceString& collectionName,
                       DropReply* reply,
-                      DropCollectionSystemCollectionMode systemCollectionMode);
+                      DropCollectionSystemCollectionMode systemCollectionMode,
+                      bool fromMigrate = false);
 
 /**
- * Drops the collection "collectionName" only if its uuid is not matching "expectedUUID".
+ * Drops the collection with the given namespace only if its uuid is not matching 'expectedUUID'.
+ * When 'fromMigrate' is set, the related oplog entry will be marked accordingly using the
+ * 'fromMigrate' field to reduce its visibility (e.g. in change streams).
  */
 Status dropCollectionIfUUIDNotMatching(OperationContext* opCtx,
                                        const NamespaceString& ns,
-                                       const UUID& expectedUUID);
+                                       const UUID& expectedUUID,
+                                       bool fromMigrate);
 
 /**
  * Drops the collection "collectionName". When applying a 'drop' oplog entry on a secondary, the
@@ -77,5 +90,26 @@ Status dropCollectionForApplyOps(OperationContext* opCtx,
                                  const NamespaceString& collectionName,
                                  const repl::OpTime& dropOpTime,
                                  DropCollectionSystemCollectionMode systemCollectionMode);
+
+/**
+ * If we are in a replset, every replicated collection must have an _id index. Issues a warning if
+ * one is not found.
+ *
+ * The caller must have the database locked in at least IX mode.
+ */
+void checkForIdIndexes(OperationContext* opCtx, const DatabaseName& dbName);
+
+/**
+ * Deletes all temporary collections under the specified database.
+ *
+ * The caller must have the database locked in at least IX mode.
+ */
+void clearTempCollections(OperationContext* opCtx, const DatabaseName& dbName);
+
+/**
+ * Checks that the namespace complies with naming restrictions and therefore can be dropped. It
+ * returns a Status with details of that evaluation.
+ */
+Status isDroppableCollection(OperationContext* opCtx, const NamespaceString& nss);
 
 }  // namespace mongo

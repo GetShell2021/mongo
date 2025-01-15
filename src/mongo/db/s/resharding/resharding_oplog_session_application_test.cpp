@@ -28,26 +28,69 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include <boost/optional/optional_io.hpp>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include "mongo/db/catalog_raii.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/client.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/document_value/document.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id_helpers.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/session_update_tracker.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/db/s/resharding/resharding_oplog_session_application.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -61,21 +104,23 @@ public:
         ServiceContextMongoDTest::setUp();
 
         auto serviceContext = getServiceContext();
-        {
-            auto opCtx = makeOperationContext();
-            auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(serviceContext);
-            ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
-            repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
 
-            repl::createOplog(opCtx.get());
+        auto opCtx = makeOperationContext();
+        auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(serviceContext);
+        ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
+        repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
 
-            auto storageImpl = std::make_unique<repl::StorageInterfaceImpl>();
-            repl::StorageInterface::set(serviceContext, std::move(storageImpl));
+        repl::createOplog(opCtx.get());
 
-            MongoDSessionCatalog::onStepUp(opCtx.get());
-        }
+        auto storageImpl = std::make_unique<repl::StorageInterfaceImpl>();
+        repl::StorageInterface::set(serviceContext, std::move(storageImpl));
 
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
+        MongoDSessionCatalog::set(
+            serviceContext,
+            std::make_unique<MongoDSessionCatalog>(
+                std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx.get());
+        mongoDSessionCatalog->onStepUp(opCtx.get());
     }
 
     repl::OpTime insertSessionRecord(OperationContext* opCtx,
@@ -85,14 +130,19 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, boost::none /* autocommit */, boost::none /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       boost::none /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kNone);
 
         auto opTime = [opCtx] {
             WriteUnitOfWork wuow(opCtx);
-            ScopeGuard guard{[&wuow] { wuow.commit(); }};
+            ScopeGuard guard{[&wuow] {
+                wuow.commit();
+            }};
             return repl::getNextOpTime(opCtx);
         }();
         WriteUnitOfWork wuow(opCtx);
@@ -108,7 +158,7 @@ public:
 
     void insertOp(OperationContext* opCtx, const BSONObj& oplogBson) {
         DBDirectClient client(opCtx);
-        client.insert(_oplogBufferNss.toString(), oplogBson);
+        client.insert(_oplogBufferNss, oplogBson);
     }
 
     void makeInProgressTxn(OperationContext* opCtx, LogicalSessionId lsid, TxnNumber txnNumber) {
@@ -116,10 +166,13 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       false /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kStart);
 
         txnParticipant.unstashTransactionResources(opCtx, "insert");
         txnParticipant.stashTransactionResources(opCtx);
@@ -132,10 +185,13 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       false /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kStart);
 
         txnParticipant.unstashTransactionResources(opCtx, "prepareTransaction");
 
@@ -148,8 +204,8 @@ public:
             auto opTime = repl::getNextOpTime(opCtx);
             wuow.release();
 
-            opCtx->recoveryUnit()->abortUnitOfWork();
-            opCtx->lockState()->endWriteUnitOfWork();
+            shard_role_details::getRecoveryUnit(opCtx)->abortUnitOfWork();
+            shard_role_details::getLocker(opCtx)->endWriteUnitOfWork();
 
             return opTime;
         }();
@@ -164,10 +220,13 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, false /* autocommit */, boost::none /* startTransaction */);
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       false /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kContinue);
 
         txnParticipant.unstashTransactionResources(opCtx, "abortTransaction");
         txnParticipant.abortTransaction(opCtx);
@@ -328,18 +387,21 @@ public:
         ASSERT_BSONOBJ_BINARY_EQ(flushLater[0].getObject(), sessionTxnRecord.toBSON());
     }
 
-    void checkStatementExecuted(OperationContext* opCtx,
-                                LogicalSessionId lsid,
-                                TxnNumber txnNumber,
-                                StmtId stmtId) {
+    void checkStatementExecutedAndFetchOplogEntry(OperationContext* opCtx,
+                                                  LogicalSessionId lsid,
+                                                  TxnNumber txnNumber,
+                                                  StmtId stmtId) {
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        txnParticipant.beginOrContinue(
-            opCtx, {txnNumber}, boost::none /* autocommit */, boost::none /* startTransaction */);
-        ASSERT_TRUE(bool(txnParticipant.checkStatementExecuted(opCtx, stmtId)));
+        txnParticipant.beginOrContinue(opCtx,
+                                       {txnNumber},
+                                       boost::none /* autocommit */,
+                                       TransactionParticipant::TransactionActions::kNone);
+        ASSERT_TRUE(bool(txnParticipant.checkStatementExecutedAndFetchOplogEntry(opCtx, stmtId)));
     }
 
     const NamespaceString& oplogBufferNss() {
@@ -349,8 +411,10 @@ public:
 private:
     // Used for pre/post image oplog entry lookup.
     const ShardId _donorShardId{"donor-0"};
-    const NamespaceString _oplogBufferNss{NamespaceString::kReshardingLocalOplogBufferPrefix +
-                                          _donorShardId.toString()};
+    const NamespaceString _oplogBufferNss = NamespaceString::createNamespaceString_forTest(
+        NamespaceString::kReshardingLocalOplogBufferPrefix + _donorShardId.toString());
+
+    service_context_test::ShardRoleOverride _shardRole;
 };
 
 TEST_F(ReshardingOplogSessionApplicationTest, IncomingRetryableWriteForNewSession) {
@@ -386,7 +450,8 @@ TEST_F(ReshardingOplogSessionApplicationTest, IncomingRetryableWriteForNewSessio
 
     {
         auto opCtx = makeOperationContext();
-        checkStatementExecuted(opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
+        checkStatementExecutedAndFetchOplogEntry(
+            opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
     }
 }
 
@@ -425,8 +490,10 @@ TEST_F(ReshardingOplogSessionApplicationTest, IncomingRetryableWriteForNewSessio
 
     {
         auto opCtx = makeOperationContext();
-        checkStatementExecuted(opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
-        checkStatementExecuted(opCtx.get(), lsid, incomingTxnNumber, incomingStmtId + 1);
+        checkStatementExecutedAndFetchOplogEntry(
+            opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
+        checkStatementExecutedAndFetchOplogEntry(
+            opCtx.get(), lsid, incomingTxnNumber, incomingStmtId + 1);
     }
 }
 
@@ -465,11 +532,12 @@ TEST_F(ReshardingOplogSessionApplicationTest, IncomingRetryableWriteHasHigherTxn
 
     {
         auto opCtx = makeOperationContext();
-        checkStatementExecuted(opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
-        ASSERT_THROWS_CODE(
-            checkStatementExecuted(opCtx.get(), lsid, existingTxnNumber, existingStmtId),
-            DBException,
-            ErrorCodes::TransactionTooOld);
+        checkStatementExecutedAndFetchOplogEntry(
+            opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
+        ASSERT_THROWS_CODE(checkStatementExecutedAndFetchOplogEntry(
+                               opCtx.get(), lsid, existingTxnNumber, existingStmtId),
+                           DBException,
+                           ErrorCodes::TransactionTooOld);
     }
 }
 
@@ -509,10 +577,10 @@ TEST_F(ReshardingOplogSessionApplicationTest, IncomingRetryableWriteHasLowerTxnN
 
     {
         auto opCtx = makeOperationContext();
-        ASSERT_THROWS_CODE(
-            checkStatementExecuted(opCtx.get(), lsid, incomingTxnNumber, incomingStmtId),
-            DBException,
-            ErrorCodes::TransactionTooOld);
+        ASSERT_THROWS_CODE(checkStatementExecutedAndFetchOplogEntry(
+                               opCtx.get(), lsid, incomingTxnNumber, incomingStmtId),
+                           DBException,
+                           ErrorCodes::TransactionTooOld);
     }
 }
 
@@ -552,7 +620,7 @@ TEST_F(ReshardingOplogSessionApplicationTest,
 
     {
         auto opCtx = makeOperationContext();
-        checkStatementExecuted(opCtx.get(), lsid, txnNumber, incomingStmtId);
+        checkStatementExecutedAndFetchOplogEntry(opCtx.get(), lsid, txnNumber, incomingStmtId);
     }
 }
 
@@ -707,7 +775,7 @@ TEST_F(ReshardingOplogSessionApplicationTest,
 
     // Make two in progress transactions so the one started by resharding must block.
     {
-        auto newClientOwned = getServiceContext()->makeClient("newClient");
+        auto newClientOwned = getServiceContext()->getService()->makeClient("newClient");
         AlternativeClientRegion acr(newClientOwned);
         auto newOpCtx = cc().makeOperationContext();
         makeInProgressTxn(newOpCtx.get(),
@@ -838,7 +906,8 @@ TEST_F(ReshardingOplogSessionApplicationTest, IncomingRetryableWriteHasPreImage)
 
     {
         auto opCtx = makeOperationContext();
-        checkStatementExecuted(opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
+        checkStatementExecutedAndFetchOplogEntry(
+            opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
     }
 }
 
@@ -884,7 +953,8 @@ DEATH_TEST_REGEX_F(ReshardingOplogSessionApplicationTest,
 
     {
         auto opCtx = makeOperationContext();
-        checkStatementExecuted(opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
+        checkStatementExecutedAndFetchOplogEntry(
+            opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
     }
 }
 
@@ -935,7 +1005,8 @@ TEST_F(ReshardingOplogSessionApplicationTest, IncomingRetryableWriteHasPostImage
 
     {
         auto opCtx = makeOperationContext();
-        checkStatementExecuted(opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
+        checkStatementExecutedAndFetchOplogEntry(
+            opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
     }
 }
 
@@ -982,7 +1053,8 @@ DEATH_TEST_REGEX_F(ReshardingOplogSessionApplicationTest,
 
     {
         auto opCtx = makeOperationContext();
-        checkStatementExecuted(opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
+        checkStatementExecutedAndFetchOplogEntry(
+            opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
     }
 }
 
@@ -1029,7 +1101,8 @@ TEST_F(ReshardingOplogSessionApplicationTest, IncomingRetryableWriteHasNeedsRetr
 
     {
         auto opCtx = makeOperationContext();
-        checkStatementExecuted(opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
+        checkStatementExecutedAndFetchOplogEntry(
+            opCtx.get(), lsid, incomingTxnNumber, incomingStmtId);
     }
 }
 

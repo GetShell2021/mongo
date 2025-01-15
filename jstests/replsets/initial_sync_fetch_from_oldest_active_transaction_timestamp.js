@@ -15,12 +15,9 @@
  *   uses_transactions,
  * ]
  */
-
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: 2});
 replTest.startSet();
@@ -140,7 +137,7 @@ assert.commandWorked(secondary.adminCommand(
 jsTestLog("Initial sync resumed");
 
 // Wait for the secondary to complete initial sync.
-replTest.waitForState(secondary, ReplSetTest.State.SECONDARY);
+replTest.awaitSecondaryNodes(null, [secondary]);
 replTest.awaitReplication();
 
 jsTestLog("Initial sync completed");
@@ -152,7 +149,7 @@ assert.eq(secondaryOplog.find({"ts": beginFetchingTs}).itcount(), 1);
 
 // Make sure the first transaction committed properly and is reflected after the initial sync.
 let res = secondary.getDB(dbName).getCollection(collName).findOne({_id: 2});
-assert.docEq(res, {_id: 2}, res);
+assert.docEq({_id: 2}, res);
 
 jsTestLog("Stepping up the secondary");
 
@@ -214,4 +211,3 @@ assert.commandWorked(PrepareHelpers.commitTransaction(session2, prepareTimestamp
 assert.eq(testColl.findOne({_id: 1}), {_id: 1, a: 2});
 
 replTest.stopSet();
-})();

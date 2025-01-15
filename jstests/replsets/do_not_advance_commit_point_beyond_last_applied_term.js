@@ -4,12 +4,9 @@
  * committed.
  * @tags: [requires_majority_read_concern]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/rslib.js");
-load("jstests/libs/write_concern_util.js");  // for [stop|restart]ServerReplication.
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -56,7 +53,7 @@ jsTest.log("Node B steps up in term 2 and performs a write, which is not replica
 // E:
 stopServerReplication([nodeA, nodeC, nodeD]);
 assert.commandWorked(nodeB.adminCommand({replSetStepUp: 1}));
-rst.waitForState(nodeA, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [nodeA]);
 assert.eq(nodeB, rst.getPrimary());
 assert.commandWorked(nodeB.getDB(dbName)[collName].insert({term: 2}));
 rst.waitForConfigReplication(nodeB, [nodeA, nodeB, nodeC, nodeD]);
@@ -76,6 +73,7 @@ assert.soon(() => {
 });
 assert.commandWorked(
     nodeA.getDB(dbName)[collName].insert({term: 3}, {writeConcern: {w: "majority"}}));
+rst.awaitReplication(1000, undefined, [nodeA, nodeC, nodeD], undefined, nodeA);
 assert.eq(1, nodeC.getDB(dbName)[collName].find({term: 3}).itcount());
 assert.eq(1, nodeD.getDB(dbName)[collName].find({term: 3}).itcount());
 
@@ -119,4 +117,3 @@ assert.eq(0, nodeE.getDB(dbName)[collName].find({term: 2}).itcount());
 assert.eq(1, nodeE.getDB(dbName)[collName].find({term: 3}).itcount());
 
 rst.stopSet();
-}());

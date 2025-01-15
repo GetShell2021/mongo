@@ -29,13 +29,16 @@
 
 #pragma once
 
-#include "boost/any.hpp"
-#include <cstddef>
+#include <boost/any.hpp>
+#include <boost/optional/optional.hpp>
+#include <iosfwd>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement_comparator_interface.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/util/bsoncolumn.h"
+#include "mongo/bson/column/bsoncolumn.h"
 #include "mongo/db/index/multikey_paths.h"
+#include "mongo/platform/compiler.h"
 
 namespace mongo {
 namespace timeseries {
@@ -66,7 +69,7 @@ namespace dotted_path_support {
  *   {b: 1} and {b: 2}  would be added to the set. 'arrayComponents' would be set as
  *   std::set<size_t>{1U}.
  */
-MONGO_WARN_UNUSED_RESULT_FUNCTION boost::optional<BSONColumn> extractAllElementsAlongBucketPath(
+[[nodiscard]] boost::optional<BSONColumn> extractAllElementsAlongBucketPath(
     const BSONObj& obj,
     StringData path,
     BSONElementSet& elements,

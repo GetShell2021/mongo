@@ -27,20 +27,27 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <vector>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/exec/add_fields_projection_executor.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo::projection_executor {
 namespace {
@@ -112,10 +119,6 @@ TEST(AddFieldsProjectionExecutorSpec, ThrowsOnCreationWithInvalidObjectsOrExpres
         AssertionException);
     ASSERT_THROWS(AddFieldsProjectionExecutor::create(
                       expCtx, BSON("a" << false << "b" << BSON("$unknown" << BSON_ARRAY(4 << 2)))),
-                  AssertionException);
-
-    // Empty nested objects are not allowed.
-    ASSERT_THROWS(AddFieldsProjectionExecutor::create(expCtx, BSON("a" << BSONObj())),
                   AssertionException);
 }
 
@@ -201,13 +204,16 @@ TEST(AddFieldsProjectionExecutorSerialize, SerializesToCorrectForm) {
         fromjson("{a: {$add: [\"$a\", {$const: 2}]}, b: {d: {$const: 3}}, x: {y: {$const: 4}}}"));
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation());
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
 }
 
 TEST(AddFieldsProjectionExecutorSerialize, EmptySpecSerializesToCorrectForm) {
@@ -218,7 +224,7 @@ TEST(AddFieldsProjectionExecutorSerialize, EmptySpecSerializesToCorrectForm) {
     auto expectedSerialization = Document();
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation());
 }
 
 // Verify that serialize treats the _id field as any other field: including when explicity included.
@@ -231,13 +237,16 @@ TEST(AddFieldsProjectionExecutorSerialize, AddsIdToSerializeWhenExplicitlyInclud
     auto expectedSerialization = Document(fromjson("{_id: {$const: false}}"));
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation());
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
 }
 
 // Verify that serialize treats the _id field as any other field: excluded when not explicitly
@@ -253,13 +262,16 @@ TEST(AddFieldsProjectionExecutorSerialize, OmitsIdFromSerializeWhenNotIncluded) 
     auto expectedSerialization = Document(fromjson("{a: {$const: true}}"));
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation());
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
 }
 
 // Verify that the $addFields stage optimizes expressions into simpler forms when possible.
@@ -271,13 +283,16 @@ TEST(AddFieldsProjectionExecutorOptimize, OptimizesTopLevelExpressions) {
     auto expectedSerialization = Document{{"a", Document{{"$const", 3}}}};
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation());
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
 }
 
 // Verify that the $addFields stage optimizes expressions even when they are nested.
@@ -289,13 +304,16 @@ TEST(AddFieldsProjectionExecutorOptimize, ShouldOptimizeNestedExpressions) {
     auto expectedSerialization = Document{{"a", Document{{"b", Document{{"$const", 3}}}}}};
 
     // Should be the same if we're serializing for explain or for internal use.
-    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedSerialization, addition.serializeTransformation());
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kQueryPlanner));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kQueryPlanner}));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecStats));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecStats}));
     ASSERT_DOCUMENT_EQ(expectedSerialization,
-                       addition.serializeTransformation(ExplainOptions::Verbosity::kExecAllPlans));
+                       addition.serializeTransformation(SerializationOptions{
+                           .verbosity = ExplainOptions::Verbosity::kExecAllPlans}));
 }
 
 //
@@ -621,7 +639,7 @@ TEST(AddFieldsProjectionExecutorExecutionTest, ExtractComputedProjections) {
     auto expectedAddFields = BSON("meta1" << BSON("$toUpper" << BSON_ARRAY("$meta.x")));
     ASSERT_BSONOBJ_EQ(expectedAddFields, extractedAddFields);
 
-    ASSERT_DOCUMENT_EQ(Document(fromjson("{}")), addFields.serializeTransformation(boost::none));
+    ASSERT_DOCUMENT_EQ(Document(fromjson("{}")), addFields.serializeTransformation());
 }
 
 TEST(AddFieldsProjectionExecutorExecutionTest, ExtractComputedProjectionsPrefix) {
@@ -641,7 +659,7 @@ TEST(AddFieldsProjectionExecutorExecutionTest, ExtractComputedProjectionsPrefix)
     ASSERT_BSONOBJ_EQ(expectedAddFields, extractedAddFields);
 
     ASSERT_DOCUMENT_EQ(Document(fromjson("{computed2: {$add: [\"$c\", {$const: 1}]}}")),
-                       addFields.serializeTransformation(boost::none));
+                       addFields.serializeTransformation());
 }
 
 TEST(AddFieldsProjectionExecutorExecutionTest, DoNotExtractComputedProjectionsSuffix) {
@@ -660,7 +678,7 @@ TEST(AddFieldsProjectionExecutorExecutionTest, DoNotExtractComputedProjectionsSu
 
     auto expectedResult = Document(fromjson(
         "{computed1: {$add: [\"$c\", {$const: 1}]}, meta2 : {$toUpper : [\"$myMeta.x\"]}}"));
-    ASSERT_DOCUMENT_EQ(expectedResult, addFields.serializeTransformation(boost::none));
+    ASSERT_DOCUMENT_EQ(expectedResult, addFields.serializeTransformation());
 }
 
 TEST(AddFieldsProjectionExecutorExecutionTest, DoNotExtractComputedProjectionWithReservedName) {
@@ -682,7 +700,99 @@ TEST(AddFieldsProjectionExecutorExecutionTest, DoNotExtractComputedProjectionWit
     ASSERT_BSONOBJ_EQ(expectedAddFields, extractedAddFields);
 
     ASSERT_DOCUMENT_EQ(Document(fromjson("{data: {$toUpper: [\"$myMeta.y\"]}}")),
-                       addFields.serializeTransformation(boost::none));
+                       addFields.serializeTransformation());
+}
+
+TEST(AddFieldsProjectionExecutorExecutionTest,
+     ExtractComputedProjectionShouldNotHideDependentSubFields) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    AddFieldsProjectionExecutor addFields(expCtx);
+    addFields.parse(BSON("obj"
+                         << "$myMeta"
+                         << "b" << BSON("$add" << BSON_ARRAY("$obj.a" << 1))));
+
+    const std::set<StringData> reservedNames{};
+    auto [extractedAddFields, deleteFlag] =
+        addFields.extractComputedProjections("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(extractedAddFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection =
+        Document(fromjson("{obj: '$myMeta', b: {$add: ['$obj.a', {$const: 1}]}}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, addFields.serializeTransformation());
+}
+
+TEST(AddFieldsProjectionExecutorExecutionTest,
+     ExtractComputedProjectionShouldNotHideDependentFieldsWithDottedSibling) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    AddFieldsProjectionExecutor addFields(expCtx);
+    addFields.parse(BSON("a"
+                         << "$myMeta"
+                         << "c.b"
+                         << "$a.x"));
+
+    const std::set<StringData> reservedNames{};
+    auto [extractedAddFields, deleteFlag] =
+        addFields.extractComputedProjections("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(extractedAddFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{a: '$myMeta', c: {b: '$a.x'}}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, addFields.serializeTransformation());
+}
+
+TEST(AddFieldsProjectionExecutorExecutionTest, ExtractComputedProjectionShouldNotIncludeId) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    AddFieldsProjectionExecutor addFields(expCtx);
+    addFields.parse(BSON("a" << BSON("$sum" << BSON_ARRAY("$myMeta"
+                                                          << "$_id"))));
+
+    const std::set<StringData> reservedNames{};
+    auto [extractedAddFields, deleteFlag] =
+        addFields.extractComputedProjections("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(extractedAddFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+
+    auto expectedProjection = Document(fromjson("{a: {$sum: ['$myMeta', '$_id']}}"));
+    ASSERT_DOCUMENT_EQ(expectedProjection, addFields.serializeTransformation());
+}
+
+TEST(AddFieldsProjectionExecutorExecutionTest, ProjectionSpecNameHasOldFieldName) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    AddFieldsProjectionExecutor addFields(expCtx);
+    addFields.parse(
+        fromjson("{myMeta: {$sum: ['$myMeta.first', '$myMeta.second']}, otherField: {$sum: "
+                 "['$someOtherField', 1]}}"));
+
+    const std::set<StringData> reservedNames{};
+    auto [extractedAddFields, deleteFlag] =
+        addFields.extractComputedProjections("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(extractedAddFields.nFields(), 1);
+    ASSERT_EQ(deleteFlag, false);
+    auto expectedAddFields = fromjson("{meta: {$sum: ['$meta.first', '$meta.second'] }}");
+    ASSERT_BSONOBJ_EQ(expectedAddFields, extractedAddFields);
+}
+
+TEST(AddFieldsProjectionExecutorExecutionTest,
+     ProjectionSpecNameHasOldFieldNameUsedInOtherProjectSpec) {
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    AddFieldsProjectionExecutor addFields(expCtx);
+    auto inputProjection = fromjson(
+        "{myMeta: {$sum: ['$myMeta.first', '$myMeta.second']}, otherField: {$sum: ['$myMeta', "
+        "{$const: 1}]}}");
+    addFields.parse(inputProjection);
+
+    const std::set<StringData> reservedNames{};
+    auto [extractedAddFields, deleteFlag] =
+        addFields.extractComputedProjections("myMeta", "meta", reservedNames);
+
+    ASSERT_EQ(extractedAddFields.nFields(), 0);
+    ASSERT_EQ(deleteFlag, false);
+    ASSERT_DOCUMENT_EQ(Document{inputProjection}, addFields.serializeTransformation());
 }
 
 }  // namespace

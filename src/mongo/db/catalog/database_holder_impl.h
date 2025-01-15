@@ -29,11 +29,15 @@
 
 #pragma once
 
-#include "mongo/db/catalog/database_holder.h"
+#include <boost/optional/optional.hpp>
+#include <vector>
 
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/database_name.h"
-#include "mongo/stdx/condition_variable.h"
-#include "mongo/util/concurrency/mutex.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -56,17 +60,45 @@ public:
 
     void closeAll(OperationContext* opCtx) override;
 
-    std::set<DatabaseName> getNamesWithConflictingCasing(const DatabaseName& dbName) override;
+    boost::optional<DatabaseName> getNameWithConflictingCasing(const DatabaseName& dbName) override;
 
     std::vector<DatabaseName> getNames() override;
 
-private:
-    std::set<DatabaseName> _getNamesWithConflictingCasing_inlock(const DatabaseName& dbName);
+    // This class is the owner of the Database objects opened by DatabaseHolderImpl. It contains
+    // a DatabaseName -> Database map to locate Database's by name as well as a multimap of used for
+    // efficient search of case insensitive name duplicates. The class keeps both structures
+    // synchronized, and thus, it does not allow write access to the maps individually.
+    class DBsIndex {
+    public:
+        using DBs = stdx::unordered_map<DatabaseName, std::unique_ptr<Database>>;
 
-    typedef stdx::unordered_map<DatabaseName, Database*> DBs;
-    mutable SimpleMutex _m;
-    mutable stdx::condition_variable _c;
-    DBs _dbs;
+        const DBs& viewAll() const;
+
+        Database* getOrCreate(const DatabaseName& dbName);
+
+        void erase(const DatabaseName& dbName);
+
+        boost::optional<DatabaseName> getAnyConflictingName(const DatabaseName& dbName) const;
+
+        std::pair<Database*, bool> upsert(const DatabaseName& dbName, std::unique_ptr<Database> db);
+
+    private:
+        using NormalizedDatabaseName = std::string;
+        using NormalizedDBs =
+            std::unordered_multimap<NormalizedDatabaseName, DatabaseName>;  // NOLINT
+
+        DBs _dbs;                      // Use for exact matching
+        NormalizedDBs _normalizedDBs;  // Use to locate DBs with same normalized key
+
+        static NormalizedDatabaseName normalize(const DatabaseName& dbName);
+    };
+
+private:
+    boost::optional<DatabaseName> _getNameWithConflictingCasing_inlock(const DatabaseName& dbName);
+
+    mutable stdx::mutex _m;
+
+    DatabaseHolderImpl::DBsIndex _dbs;
 };
 
 }  // namespace mongo

@@ -2,8 +2,8 @@
  * Test basic retryable write without errors by checking that the resulting collection after the
  * retry is as expected and it does not create additional oplog entries.
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function checkFindAndModifyResult(expected, toCheck) {
     assert.eq(expected.ok, toCheck.ok);
@@ -35,6 +35,7 @@ function verifyServerStatusChanges(
 
 function runTests(mainConn, priConn) {
     var lsid = UUID();
+    assert.commandWorked(mainConn.getDB("test").createCollection("user"));
 
     ////////////////////////////////////////////////////////////////////////
     // Test insert command
@@ -322,6 +323,7 @@ function runFailpointTests(mainConn, priConn) {
     // Test the 'onPrimaryTransactionalWrite' failpoint
     var lsid = UUID();
     var testDb = mainConn.getDB('TestDB');
+    assert.commandWorked(testDb.createCollection("user"));
 
     // Test connection close (default behaviour). The connection will get closed, but the
     // inserts must succeed
@@ -382,7 +384,7 @@ function runFailpointTests(mainConn, priConn) {
     assert.commandWorked(
         priConn.adminCommand({configureFailPoint: 'onPrimaryTransactionalWrite', mode: 'off'}));
 
-    var writeResult = testDb.runCommand(cmd);
+    writeResult = testDb.runCommand(cmd);
     assert.eq(2, writeResult.nModified);
 
     var collContents = testDb.user.find({}).sort({x: 1}).toArray();
@@ -545,4 +547,3 @@ runFailpointTests(st.s0, st.rs0.getPrimary());
 runMultiTests(st.s0);
 
 st.stop();
-})();

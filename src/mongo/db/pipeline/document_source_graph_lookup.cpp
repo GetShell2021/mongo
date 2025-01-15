@@ -27,73 +27,80 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/document_source_graph_lookup.h"
-
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <absl/container/node_hash_map.h>
+#include <absl/container/node_hash_set.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <iterator>
+#include <limits>
+#include <list>
 #include <memory>
 
-#include "mongo/base/init.h"
-#include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_comparator.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/pipeline/document_path_support.h"
+#include "mongo/db/pipeline/document_source_graph_lookup.h"
 #include "mongo/db/pipeline/document_source_merge_gen.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
+#include "mongo/db/pipeline/sharded_agg_helpers_targeting_policy.h"
+#include "mongo/db/pipeline/sort_reorder_helpers.h"
+#include "mongo/db/query/allowed_contexts.h"
+#include "mongo/db/query/bson/dotted_path_support.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/db/views/resolved_view.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/s/stale_exception.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
 
 namespace mongo {
 
 namespace {
 
-// Parses $graphLookup 'from' field. The 'from' field must be a string with the exception of
-// 'local.system.tenantMigration.oplogView'.
-//
-// {from: {db: "local", coll: "system.tenantMigration.oplogView"}, ...}.
+// Parses $graphLookup 'from' field. The 'from' field must be a string.
 NamespaceString parseGraphLookupFromAndResolveNamespace(const BSONElement& elem,
                                                         const DatabaseName& defaultDb) {
-    // The object syntax only works for 'local.system.tenantMigration.oplogView' which is not a user
-    // namespace so object type is omitted from the error message below.
     uassert(ErrorCodes::FailedToParse,
             str::stream() << "$graphLookup 'from' field must be a string, but found "
                           << typeName(elem.type()),
-            elem.type() == String || elem.type() == Object);
+            elem.type() == String);
 
-    if (elem.type() == BSONType::String) {
-        NamespaceString fromNss(defaultDb, elem.valueStringData());
-        uassert(ErrorCodes::InvalidNamespace,
-                str::stream() << "invalid $graphLookup namespace: " << fromNss.ns(),
-                fromNss.isValid());
-        return fromNss;
-    }
-
-    // Valdate the db and coll names.
-    auto spec = NamespaceSpec::parse({elem.fieldNameStringData()}, elem.embeddedObject());
-    // TODO SERVER-62491 Use system tenantId to construct nss.
-    auto nss = NamespaceString(spec.getDb().value_or(""), spec.getColl().value_or(""));
-    uassert(ErrorCodes::FailedToParse,
-            str::stream()
-                << "$graphLookup with syntax {from: {db:<>, coll:<>},..} is not supported for db: "
-                << nss.db() << " and coll: " << nss.coll(),
-            nss == NamespaceString::kTenantMigrationOplogView);
-    return nss;
+    NamespaceString fromNss(NamespaceStringUtil::deserialize(defaultDb, elem.valueStringData()));
+    uassert(ErrorCodes::InvalidNamespace,
+            str::stream() << "invalid $graphLookup namespace: " << fromNss.toStringForErrorMsg(),
+            fromNss.isValid());
+    return fromNss;
 }
 
 }  // namespace
 
 using boost::intrusive_ptr;
-
-namespace dps = ::mongo::dotted_path_support;
 
 std::unique_ptr<DocumentSourceGraphLookUp::LiteParsed> DocumentSourceGraphLookUp::LiteParsed::parse(
     const NamespaceString& nss, const BSONElement& spec) {
@@ -137,11 +144,26 @@ DocumentSource::GetNextResult DocumentSourceGraphLookUp::doGetNext() {
 
     performSearch();
 
+    const size_t maxOutputSize =
+        static_cast<size_t>(internalGraphLookupStageIntermediateDocumentMaxSizeBytes.load());
+    size_t totalSize = sizeof(Value) * _visited.size();
+
+    const auto& uassertTotalSize = [&]() {
+        uassert(8442700,
+                str::stream() << "Total size of the output document exceeds " << maxOutputSize
+                              << " bytes. Consider using $unwind to split the output.",
+                totalSize <= maxOutputSize);
+    };
+
+    uassertTotalSize();
     std::vector<Value> results;
+    results.reserve(_visited.size());
     while (!_visited.empty()) {
         // Remove elements one at a time to avoid consuming more memory.
         auto it = _visited.begin();
-        results.push_back(Value(it->second));
+        totalSize += it->second.getApproximateSize();
+        uassertTotalSize();
+        results.emplace_back(std::move(it->second));
         _visited.erase(it);
     }
 
@@ -210,17 +232,43 @@ void DocumentSourceGraphLookUp::doDispose() {
     _visited.clear();
 }
 
+boost::optional<ShardId> DocumentSourceGraphLookUp::computeMergeShardId() const {
+    // Note that we can only check sharding state when we're on router as we may be holding
+    // locks on mongod (which would inhibit looking up sharding state in the catalog cache).
+    if (pExpCtx->getInRouter()) {
+        // Only nominate a merging shard if the outer collection is unsharded.
+        if (!pExpCtx->getMongoProcessInterface()->isSharded(pExpCtx->getOperationContext(),
+                                                            pExpCtx->getNamespaceString())) {
+            return pExpCtx->getMongoProcessInterface()->determineSpecificMergeShard(
+                pExpCtx->getOperationContext(), _from);
+        }
+    } else {
+        auto shardId = ShardingState::get(pExpCtx->getOperationContext())->shardId();
+        // If the command is executed on a mongos, we might get an empty shardId. We should return a
+        // shardId only if it is valid (non-empty).
+        if (shardId.isValid()) {
+            return shardId;
+        } else {
+            return boost::none;
+        }
+    }
+    return boost::none;
+}
+
 bool DocumentSourceGraphLookUp::foreignShardedGraphLookupAllowed() const {
-    return feature_flags::gFeatureFlagShardedLookup.isEnabled(
-               serverGlobalParams.featureCompatibility) &&
-        !pExpCtx->opCtx->inMultiDocumentTransaction();
+    const auto fcvSnapshot = serverGlobalParams.mutableFCV.acquireFCVSnapshot();
+    return !pExpCtx->getOperationContext()->inMultiDocumentTransaction() ||
+        gFeatureFlagAllowAdditionalParticipants.isEnabled(fcvSnapshot);
 }
 
 boost::optional<DocumentSource::DistributedPlanLogic>
 DocumentSourceGraphLookUp::distributedPlanLogic() {
     // If $graphLookup into a sharded foreign collection is allowed, top-level $graphLookup
     // stages can run in parallel on the shards.
-    if (foreignShardedGraphLookupAllowed() && pExpCtx->subPipelineDepth == 0) {
+    if (foreignShardedGraphLookupAllowed() && pExpCtx->getSubPipelineDepth() == 0) {
+        if (getMergeShardId()) {
+            return DistributedPlanLogic{nullptr, this, boost::none};
+        }
         return boost::none;
     }
 
@@ -236,11 +284,13 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
             expectUnshardedCollectionInScope;
 
         const auto allowForeignSharded = foreignShardedGraphLookupAllowed();
-        if (!allowForeignSharded) {
+        if (!allowForeignSharded && !_fromExpCtx->getInRouter()) {
             // Enforce that the foreign collection must be unsharded for $graphLookup.
             expectUnshardedCollectionInScope =
-                _fromExpCtx->mongoProcessInterface->expectUnshardedCollectionInScope(
-                    _fromExpCtx->opCtx, _fromExpCtx->ns, boost::none);
+                _fromExpCtx->getMongoProcessInterface()->expectUnshardedCollectionInScope(
+                    _fromExpCtx->getOperationContext(),
+                    _fromExpCtx->getNamespaceString(),
+                    boost::none);
         }
 
         shouldPerformAnotherQuery = false;
@@ -249,9 +299,10 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
         auto cached = pExpCtx->getDocumentComparator().makeUnorderedDocumentSet();
         auto matchStage = makeMatchStageFromFrontier(&cached);
 
-        ValueUnorderedSet queried = pExpCtx->getValueComparator().makeUnorderedValueSet();
+        ValueFlatUnorderedSet queried = pExpCtx->getValueComparator().makeFlatUnorderedValueSet();
         _frontier.swap(queried);
-        _frontierUsageBytes = 0;
+        // _frontier is a flat set that has 'capacity'-many slots, each sizeof(Value) bytes.
+        _frontierUsageBytes = sizeof(Value) * _frontier.capacity();
 
         // Process cached values, populating '_frontier' for the next iteration of search.
         while (!cached.empty()) {
@@ -277,6 +328,11 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
                 : ShardTargetingPolicy::kNotAllowed;
             _variables.copyToExpCtx(_variablesParseState, _fromExpCtx.get());
 
+            // Query settings are looked up after parsing and therefore are not populated in the
+            // '_fromExpCtx' as part of DocumentSourceGraphLookUp constructor. Assign query settings
+            // to the '_fromExpCtx' by copying them from the parent query ExpressionContext.
+            _fromExpCtx->setQuerySettingsIfNotPresent(pExpCtx->getQuerySettings());
+
             std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
             try {
                 pipeline = Pipeline::makePipeline(_fromPipeline, _fromExpCtx, pipelineOpts);
@@ -289,7 +345,7 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
                 opts.attachCursorSource = false;
                 pipeline = Pipeline::makePipelineFromViewDefinition(
                     _fromExpCtx,
-                    ExpressionContext::ResolvedNamespace{e->getNamespace(), e->getPipeline()},
+                    ResolvedNamespace{e->getNamespace(), e->getPipeline()},
                     _fromPipeline,
                     opts);
 
@@ -319,13 +375,13 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
             while (auto next = pipeline->getNext()) {
                 uassert(40271,
                         str::stream()
-                            << "Documents in the '" << _from.ns()
+                            << "Documents in the '" << _from.toStringForErrorMsg()
                             << "' namespace must contain an _id for de-duplication in $graphLookup",
                         !(*next)["_id"].missing());
 
                 shouldPerformAnotherQuery =
                     addToVisitedAndFrontier(*next, depth) || shouldPerformAnotherQuery;
-                addToCache(std::move(*next), queried);
+                addToCache(*next, queried);
             }
             checkMemoryUsage();
         }
@@ -335,7 +391,7 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
              (!_maxDepth || depth <= *_maxDepth));
 
     _frontier.clear();
-    _frontierUsageBytes = 0;
+    _frontierUsageBytes = sizeof(Value) * _frontier.capacity();
 }
 
 bool DocumentSourceGraphLookUp::addToVisitedAndFrontier(Document result, long long depth) {
@@ -359,8 +415,7 @@ bool DocumentSourceGraphLookUp::addToVisitedAndFrontier(Document result, long lo
     // '_frontier'.
     document_path_support::visitAllValuesAtPath(
         result, _connectFromField, [this](const Value& nextFrontierValue) {
-            _frontier.insert(nextFrontierValue);
-            _frontierUsageBytes += nextFrontierValue.getApproximateSize();
+            frontierInsertWithMemoryTracking(nextFrontierValue);
         });
 
     // Add the object to our '_visited' list and update the size of '_visited' appropriately.
@@ -373,8 +428,21 @@ bool DocumentSourceGraphLookUp::addToVisitedAndFrontier(Document result, long lo
     return true;
 }
 
+inline void DocumentSourceGraphLookUp::frontierInsertWithMemoryTracking(Value value) {
+    auto prevCapacity = _frontier.capacity();
+    _frontier.insert(value);
+    // Track allocations internal to 'value.'
+    _frontierUsageBytes += value.getApproximateSize() - sizeof(Value);
+    // Track increased capacity in slot array, if any.
+    _frontierUsageBytes += sizeof(Value) * (_frontier.capacity() - prevCapacity);
+}
+
+void DocumentSourceGraphLookUp::frontierInsertWithMemoryTracking_forTest(Value value) {
+    frontierInsertWithMemoryTracking(value);
+}
+
 void DocumentSourceGraphLookUp::addToCache(const Document& result,
-                                           const ValueUnorderedSet& queried) {
+                                           const ValueFlatUnorderedSet& queried) {
     document_path_support::visitAllValuesAtPath(
         result, _connectToField, [this, &queried, &result](const Value& connectToValue) {
             // It is possible that 'connectToValue' is a single value, but was not queried for. For
@@ -399,8 +467,8 @@ boost::optional<BSONObj> DocumentSourceGraphLookUp::makeMatchStageFromFrontier(
 
             // If the cached value increased in size while in the cache, we don't want to underflow
             // '_frontierUsageBytes'.
-            invariant(valueSize <= _frontierUsageBytes);
-            _frontierUsageBytes -= valueSize;
+            invariant((valueSize - sizeof(Value)) <= _frontierUsageBytes);
+            _frontierUsageBytes -= (valueSize - sizeof(Value));
         } else {
             ++it;
         }
@@ -411,10 +479,11 @@ boost::optional<BSONObj> DocumentSourceGraphLookUp::makeMatchStageFromFrontier(
     // We wrap the query in a $match so that it can be parsed into a DocumentSourceMatch when
     // constructing a pipeline to execute.
 
-    // $match stages will conflate null, and undefined values. Keep track of which ones are
-    // present and eliminate documents that would match the others later.
+    // $graphLookup and regular $match semantics differ in treatment of null/missing. Regular $match
+    // stages may conflate null/missing values. Here, null only matches null.
+
+    // Keep track of whether we see null or missing in the frontier.
     bool matchNull = false;
-    bool matchUndefined = false;
     bool seenMissing = false;
     BSONObjBuilder match;
     {
@@ -434,8 +503,6 @@ boost::optional<BSONObj> DocumentSourceGraphLookUp::makeMatchStageFromFrontier(
                         for (auto&& value : _frontier) {
                             if (value.getType() == BSONType::jstNULL) {
                                 matchNull = true;
-                            } else if (value.getType() == BSONType::Undefined) {
-                                matchUndefined = true;
                             } else if (value.missing()) {
                                 seenMissing = true;
                             }
@@ -446,24 +513,9 @@ boost::optional<BSONObj> DocumentSourceGraphLookUp::makeMatchStageFromFrontier(
             }
             // We never want to see documents where the 'connectToField' is missing. Only add a
             // check for it in situations where we might match it accidentally.
-            if (matchNull || matchUndefined || seenMissing) {
+            if (matchNull || seenMissing) {
                 auto existsMatch = BSON(_connectToField.fullPath() << BSON("$exists" << true));
                 andObj << existsMatch;
-            }
-            // If matching null or undefined, make sure we don't match the other one.
-            // If seenMissing is true, we've already filtered out missing values above.
-            if (matchNull || matchUndefined) {
-                if (!matchUndefined) {
-                    auto notUndefined =
-                        BSON(_connectToField.fullPath() << BSON("$not" << BSON("$type"
-                                                                               << "undefined")));
-                    andObj << notUndefined;
-                } else if (!matchNull) {
-                    auto notUndefined =
-                        BSON(_connectToField.fullPath() << BSON("$not" << BSON("$type"
-                                                                               << "null")));
-                    andObj << notUndefined;
-                }
             }
         }
     }
@@ -479,13 +531,11 @@ void DocumentSourceGraphLookUp::performSearch() {
 
     // If _startWith evaluates to an array, treat each value as a separate starting point.
     if (startingValue.isArray()) {
-        for (auto value : startingValue.getArray()) {
-            _frontier.insert(value);
-            _frontierUsageBytes += value.getApproximateSize();
+        for (const auto& value : startingValue.getArray()) {
+            frontierInsertWithMemoryTracking(value);
         }
     } else {
-        _frontier.insert(startingValue);
-        _frontierUsageBytes += startingValue.getApproximateSize();
+        frontierInsertWithMemoryTracking(startingValue);
     }
 
     try {
@@ -495,14 +545,9 @@ void DocumentSourceGraphLookUp::performSearch() {
         // throw a custom exception.
         if (auto staleInfo = ex.extraInfo<StaleConfigInfo>(); staleInfo &&
             staleInfo->getVersionWanted() &&
-            staleInfo->getVersionWanted() != ChunkVersion::UNSHARDED()) {
+            staleInfo->getVersionWanted() != ShardVersion::UNSHARDED()) {
             uassert(3904801,
                     "Cannot run $graphLookup with a sharded foreign collection in a transaction",
-                    !feature_flags::gFeatureFlagShardedLookup.isEnabled(
-                        serverGlobalParams.featureCompatibility) ||
-                        !pExpCtx->opCtx->inMultiDocumentTransaction());
-            uassert(31428,
-                    "Cannot run $graphLookup with sharded foreign collection",
                     foreignShardedGraphLookupAllowed());
         }
         throw;
@@ -510,14 +555,39 @@ void DocumentSourceGraphLookUp::performSearch() {
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceGraphLookUp::getModifiedPaths() const {
-    std::set<std::string> modifiedPaths{_as.fullPath()};
+    OrderedPathSet modifiedPaths{_as.fullPath()};
     if (_unwind) {
-        auto pathsModifiedByUnwind = _unwind.get()->getModifiedPaths();
+        auto pathsModifiedByUnwind = _unwind.value()->getModifiedPaths();
         invariant(pathsModifiedByUnwind.type == GetModPathsReturn::Type::kFiniteSet);
         modifiedPaths.insert(pathsModifiedByUnwind.paths.begin(),
                              pathsModifiedByUnwind.paths.end());
     }
     return {GetModPathsReturn::Type::kFiniteSet, std::move(modifiedPaths), {}};
+}
+
+StageConstraints DocumentSourceGraphLookUp::constraints(Pipeline::SplitState pipeState) const {
+    // $graphLookup can execute on a mongos or a shard, so its host type requirement is 'kNone'. If
+    // it needs to execute on a specific merging shard, it can request this later.
+    StageConstraints constraints(StreamType::kStreaming,
+                                 PositionRequirement::kNone,
+                                 HostTypeRequirement::kNone,
+                                 DiskUseRequirement::kNoDiskUse,
+                                 FacetRequirement::kAllowed,
+                                 TransactionRequirement::kAllowed,
+                                 LookupRequirement::kAllowed,
+                                 UnionRequirement::kAllowed);
+
+    constraints.canSwapWithMatch = true;
+    constraints.canSwapWithSkippingOrLimitingStage = !_unwind;
+
+    // If this $graphLookup is on the merging half of the pipeline and the inner collection isn't
+    // sharded (that is, it is either unsplittable or untracked), then we should merge on the shard
+    // which owns the inner collection.
+    if (pipeState == Pipeline::SplitState::kSplitForMerge) {
+        constraints.mergeShardId = getMergeShardId();
+    }
+
+    return constraints;
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceGraphLookUp::doOptimizeAt(
@@ -536,6 +606,16 @@ Pipeline::SourceContainer::iterator DocumentSourceGraphLookUp::doOptimizeAt(
         container->erase(std::next(itr));
         return itr;
     }
+
+    // If the following stage is $sort and there is no internal $unwind, consider pushing it ahead
+    // of $graphLookup.
+    if (!_unwind) {
+        itr = tryReorderingWithSort(itr, container);
+        if (*itr != this) {
+            return itr;
+        }
+    }
+
     return std::next(itr);
 }
 
@@ -547,56 +627,73 @@ void DocumentSourceGraphLookUp::checkMemoryUsage() {
     _cache.evictDownTo(_maxMemoryUsageBytes - _frontierUsageBytes - _visitedUsageBytes);
 }
 
-void DocumentSourceGraphLookUp::serializeToArray(
-    std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
+void DocumentSourceGraphLookUp::serializeToArray(std::vector<Value>& array,
+                                                 const SerializationOptions& opts) const {
     // Do not include tenantId in serialized 'from' namespace.
-    auto fromValue = (pExpCtx->ns.db() == _from.db())
-        ? Value(_from.coll())
-        : Value(Document{{"db", _from.dbName().db()}, {"coll", _from.coll()}});
+    auto fromValue = pExpCtx->getNamespaceString().isEqualDb(_from)
+        ? Value(opts.serializeIdentifier(_from.coll()))
+        : Value(Document{
+              {"db",
+               opts.serializeIdentifier(_from.dbName().serializeWithoutTenantPrefix_UNSAFE())},
+              {"coll", opts.serializeIdentifier(_from.coll())}});
 
     // Serialize default options.
-    MutableDocument spec(DOC("from" << fromValue << "as" << _as.fullPath() << "connectToField"
-                                    << _connectToField.fullPath() << "connectFromField"
-                                    << _connectFromField.fullPath() << "startWith"
-                                    << _startWith->serialize(false)));
+    MutableDocument spec(DOC("from" << fromValue << "as" << opts.serializeFieldPath(_as)
+                                    << "connectToField" << opts.serializeFieldPath(_connectToField)
+                                    << "connectFromField"
+                                    << opts.serializeFieldPath(_connectFromField) << "startWith"
+                                    << _startWith->serialize(opts)));
 
     // depthField is optional; serialize it if it was specified.
     if (_depthField) {
-        spec["depthField"] = Value(_depthField->fullPath());
+        spec["depthField"] = Value(opts.serializeFieldPath(*_depthField));
     }
 
     if (_maxDepth) {
-        spec["maxDepth"] = Value(*_maxDepth);
+        spec["maxDepth"] = Value(opts.serializeLiteral(*_maxDepth));
     }
 
     if (_additionalFilter) {
-        spec["restrictSearchWithMatch"] = Value(*_additionalFilter);
+        if (opts.transformIdentifiers ||
+            opts.literalPolicy != LiteralSerializationPolicy::kUnchanged) {
+            auto matchExpr =
+                uassertStatusOK(MatchExpressionParser::parse(*_additionalFilter, pExpCtx));
+            spec["restrictSearchWithMatch"] = Value(matchExpr->serialize(opts));
+        } else {
+            spec["restrictSearchWithMatch"] = Value(*_additionalFilter);
+        }
     }
 
     // If we are explaining, include an absorbed $unwind inside the $graphLookup specification.
-    if (_unwind && explain) {
+    if (_unwind && opts.verbosity) {
         const boost::optional<FieldPath> indexPath = (*_unwind)->indexPath();
         spec["unwinding"] =
             Value(DOC("preserveNullAndEmptyArrays"
-                      << (*_unwind)->preserveNullAndEmptyArrays() << "includeArrayIndex"
-                      << (indexPath ? Value((*indexPath).fullPath()) : Value())));
+                      << opts.serializeLiteral((*_unwind)->preserveNullAndEmptyArrays())
+                      << "includeArrayIndex"
+                      << (indexPath ? Value(opts.serializeFieldPath(*indexPath)) : Value())));
     }
 
     array.push_back(Value(DOC(getSourceName() << spec.freeze())));
 
     // If we are not explaining, the output of this method must be parseable, so serialize our
     // $unwind into a separate stage.
-    if (_unwind && !explain) {
-        (*_unwind)->serializeToArray(array);
+    if (_unwind && !opts.verbosity) {
+        (*_unwind)->serializeToArray(array, opts);
     }
 }
 
 void DocumentSourceGraphLookUp::detachFromOperationContext() {
-    _fromExpCtx->opCtx = nullptr;
+    _fromExpCtx->setOperationContext(nullptr);
 }
 
 void DocumentSourceGraphLookUp::reattachToOperationContext(OperationContext* opCtx) {
-    _fromExpCtx->opCtx = opCtx;
+    _fromExpCtx->setOperationContext(opCtx);
+}
+
+bool DocumentSourceGraphLookUp::validateOperationContext(const OperationContext* opCtx) const {
+    return getContext()->getOperationContext() == opCtx &&
+        _fromExpCtx->getOperationContext() == opCtx;
 }
 
 DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
@@ -619,14 +716,20 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
       _additionalFilter(additionalFilter),
       _depthField(depthField),
       _maxDepth(maxDepth),
-      _frontier(pExpCtx->getValueComparator().makeUnorderedValueSet()),
+      _maxMemoryUsageBytes(internalDocumentSourceGraphLookupMaxMemoryBytes.load()),
+      _frontier(pExpCtx->getValueComparator().makeFlatUnorderedValueSet()),
       _visited(ValueComparator::kInstance.makeUnorderedValueMap<Document>()),
       _cache(pExpCtx->getValueComparator()),
       _unwind(unwindSrc),
       _variables(expCtx->variables),
       _variablesParseState(expCtx->variablesParseState.copyWith(_variables.useIdGenerator())) {
+    if (!_from.isOnInternalDb()) {
+        serviceOpCounters(expCtx->getOperationContext()).gotNestedAggregate();
+    }
+
     const auto& resolvedNamespace = pExpCtx->getResolvedNamespace(_from);
     _fromExpCtx = pExpCtx->copyForSubPipeline(resolvedNamespace.ns, resolvedNamespace.uuid);
+    _fromExpCtx->setInLookup(true);
 
     // We append an additional BSONObj to '_fromPipeline' as a placeholder for the $match stage
     // we'll eventually construct from the input document.
@@ -638,10 +741,7 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
 DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
     const DocumentSourceGraphLookUp& original,
     const boost::intrusive_ptr<ExpressionContext>& newExpCtx)
-    : DocumentSource(
-          kStageName,
-          newExpCtx ? newExpCtx
-                    : original.pExpCtx->copyWith(original.pExpCtx->ns, original.pExpCtx->uuid)),
+    : DocumentSource(kStageName, newExpCtx),
       _from(original._from),
       _as(original._as),
       _connectFromField(original._connectFromField),
@@ -654,13 +754,15 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
           original._fromExpCtx->copyWith(original.pExpCtx->getResolvedNamespace(_from).ns,
                                          original.pExpCtx->getResolvedNamespace(_from).uuid)),
       _fromPipeline(original._fromPipeline),
-      _frontier(pExpCtx->getValueComparator().makeUnorderedValueSet()),
+      _maxMemoryUsageBytes(internalDocumentSourceGraphLookupMaxMemoryBytes.load()),
+      _frontier(pExpCtx->getValueComparator().makeFlatUnorderedValueSet()),
       _visited(ValueComparator::kInstance.makeUnorderedValueMap<Document>()),
       _cache(pExpCtx->getValueComparator()),
       _variables(original._variables),
       _variablesParseState(original._variablesParseState.copyWith(_variables.useIdGenerator())) {
     if (original._unwind) {
-        _unwind = static_cast<DocumentSourceUnwind*>(original._unwind.get()->clone().get());
+        _unwind =
+            static_cast<DocumentSourceUnwind*>(original._unwind.value()->clone(pExpCtx).get());
     }
 }
 
@@ -741,18 +843,16 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
 
         if (argName == "from" || argName == "as" || argName == "connectFromField" ||
             argName == "depthField" || argName == "connectToField") {
-            // All remaining arguments to $graphLookup are expected to be strings or
-            // {db: "local", coll: "system.tenantMigration.oplogView"}.
-            // 'local.system.tenantMigration.oplogView' is not a user namespace so object
-            // type is omitted from the error message below.
+            // All remaining arguments to $graphLookup are expected to be strings.
             uassert(40103,
                     str::stream() << "expected string as argument for " << argName
                                   << ", found: " << typeName(argument.type()),
-                    argument.type() == String || argument.type() == Object);
+                    argument.type() == String);
         }
 
         if (argName == "from") {
-            from = parseGraphLookupFromAndResolveNamespace(argument, expCtx->ns.dbName());
+            from = parseGraphLookupFromAndResolveNamespace(argument,
+                                                           expCtx->getNamespaceString().dbName());
         } else if (argName == "as") {
             as = argument.String();
         } else if (argName == "connectFromField") {
@@ -768,7 +868,7 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
         }
     }
 
-    const bool isMissingRequiredField = from.ns().empty() || as.empty() || !startWith ||
+    const bool isMissingRequiredField = from.isEmpty() || as.empty() || !startWith ||
         connectFromField.empty() || connectToField.empty();
 
     uassert(40105,
@@ -798,10 +898,11 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::clone(
 
 void DocumentSourceGraphLookUp::addInvolvedCollections(
     stdx::unordered_set<NamespaceString>* collectionNames) const {
-    collectionNames->insert(_fromExpCtx->ns);
+    collectionNames->insert(_fromExpCtx->getNamespaceString());
     auto introspectionPipeline = Pipeline::parse(_fromPipeline, _fromExpCtx);
     for (auto&& stage : introspectionPipeline->getSources()) {
         stage->addInvolvedCollections(collectionNames);
     }
 }
+
 }  // namespace mongo

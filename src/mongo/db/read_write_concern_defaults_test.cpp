@@ -27,17 +27,33 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <variant>
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/repl_server_parameters_gen.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/db/vector_clock_test_fixture.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source_mock.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace {
@@ -45,17 +61,17 @@ namespace {
 class ReadWriteConcernDefaultsTest : public ServiceContextTest {
 protected:
     void createDefaults(bool isImplicitWCMajority) {
-        ReadWriteConcernDefaults::create(getServiceContext(), _lookupMock.getFetchDefaultsFn());
-        auto& rwcd = ReadWriteConcernDefaults::get(getServiceContext());
+        ReadWriteConcernDefaults::create(getService(), _lookupMock.getFetchDefaultsFn());
+        auto& rwcd = ReadWriteConcernDefaults::get(getService());
         rwcd.setImplicitDefaultWriteConcernMajority(isImplicitWCMajority);
     }
 
     ReadWriteConcernDefaults::RWConcernDefaultAndTime getDefault() {
-        return ReadWriteConcernDefaults::get(getServiceContext()).getDefault(_opCtx);
+        return ReadWriteConcernDefaults::get(getService()).getDefault(_opCtx);
     }
 
     bool isCWWCSet() {
-        return ReadWriteConcernDefaults::get(getServiceContext()).isCWWCSet(_opCtx);
+        return ReadWriteConcernDefaults::get(getService()).isCWWCSet(_opCtx);
     }
 
     ReadWriteConcernDefaultsLookupMock _lookupMock;
@@ -100,9 +116,9 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithAbsentCWRWCWithImplicitWC
     ASSERT(defaults.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kImplicit);
 
     ASSERT(defaults.getDefaultWriteConcern());
-    ASSERT(stdx::holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(WriteConcernOptions::kMajority,
-              stdx::get<std::string>(defaults.getDefaultWriteConcern()->w));
+              get<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT(!defaults.getUpdateOpTime());
     ASSERT(!defaults.getUpdateWallClockTime());
     ASSERT_EQ(Date_t(), defaults.localUpdateWallClockTime());
@@ -146,9 +162,9 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithCWRWCNeverSetWithImplicit
     ASSERT(defaults.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kImplicit);
 
     ASSERT(defaults.getDefaultWriteConcern());
-    ASSERT(stdx::holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(WriteConcernOptions::kMajority,
-              stdx::get<std::string>(defaults.getDefaultWriteConcern()->w));
+              get<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT(!defaults.getUpdateOpTime());
     ASSERT(!defaults.getUpdateWallClockTime());
     ASSERT_GT(defaults.localUpdateWallClockTime(), Date_t());
@@ -197,9 +213,9 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithUnsetCWRWCWithImplicitWCM
     ASSERT(defaults.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kImplicit);
 
     ASSERT(defaults.getDefaultWriteConcern());
-    ASSERT(stdx::holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(WriteConcernOptions::kMajority,
-              stdx::get<std::string>(defaults.getDefaultWriteConcern()->w));
+              get<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(Timestamp(1, 2), *defaults.getUpdateOpTime());
     ASSERT_EQ(1234, defaults.getUpdateWallClockTime()->toMillisSinceEpoch());
     ASSERT_GT(defaults.localUpdateWallClockTime(), Date_t());
@@ -235,7 +251,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithCWRWCNotSetThenSetWithImp
     newDefaults.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(1234));
     _lookupMock.setLookupCallReturnValue(std::move(newDefaults));
 
-    ReadWriteConcernDefaults::get(getServiceContext()).invalidate();
+    ReadWriteConcernDefaults::get(getService()).invalidate();
     ASSERT(isCWWCSet());
     auto defaults = getDefault();
     ASSERT(defaults.getDefaultReadConcern()->getLevel() ==
@@ -243,8 +259,8 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithCWRWCNotSetThenSetWithImp
     ASSERT(defaults.getDefaultReadConcernSource());
     ASSERT(defaults.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kGlobal);
 
-    ASSERT(stdx::holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(4, stdx::get<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT_EQ(4, get<int64_t>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(Timestamp(1, 2), *defaults.getUpdateOpTime());
     ASSERT_EQ(1234, defaults.getUpdateWallClockTime()->toMillisSinceEpoch());
     ASSERT_GT(defaults.localUpdateWallClockTime(), Date_t());
@@ -265,9 +281,9 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithCWRWCNotSetThenSetWithImp
     ASSERT(oldDefaults.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kImplicit);
 
     ASSERT(oldDefaults.getDefaultWriteConcern());
-    ASSERT(stdx::holds_alternative<std::string>(oldDefaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<std::string>(oldDefaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(WriteConcernOptions::kMajority,
-              stdx::get<std::string>(oldDefaults.getDefaultWriteConcern()->w));
+              get<std::string>(oldDefaults.getDefaultWriteConcern()->w));
     ASSERT(!oldDefaults.getUpdateOpTime());
     ASSERT(!oldDefaults.getUpdateWallClockTime());
     ASSERT_GT(oldDefaults.localUpdateWallClockTime(), Date_t());
@@ -283,7 +299,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithCWRWCNotSetThenSetWithImp
     newDefaults.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(1234));
     _lookupMock.setLookupCallReturnValue(std::move(newDefaults));
 
-    ReadWriteConcernDefaults::get(getServiceContext()).invalidate();
+    ReadWriteConcernDefaults::get(getService()).invalidate();
     ASSERT(isCWWCSet());
     auto defaults = getDefault();
     ASSERT(defaults.getDefaultReadConcern()->getLevel() ==
@@ -291,8 +307,8 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithCWRWCNotSetThenSetWithImp
     ASSERT(defaults.getDefaultReadConcernSource());
     ASSERT(defaults.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kGlobal);
 
-    ASSERT(stdx::holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(4, stdx::get<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT_EQ(4, get<int64_t>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(Timestamp(1, 2), *defaults.getUpdateOpTime());
     ASSERT_EQ(1234, defaults.getUpdateWallClockTime()->toMillisSinceEpoch());
     ASSERT_GT(defaults.localUpdateWallClockTime(), Date_t());
@@ -319,8 +335,8 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithSetCWRWCWithImplicitWCW1)
     ASSERT(defaults.getDefaultReadConcernSource());
     ASSERT(defaults.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kGlobal);
 
-    ASSERT(stdx::holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(4, stdx::get<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT_EQ(4, get<int64_t>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(Timestamp(1, 2), *defaults.getUpdateOpTime());
     ASSERT_EQ(1234, defaults.getUpdateWallClockTime()->toMillisSinceEpoch());
     ASSERT_GT(defaults.localUpdateWallClockTime(), Date_t());
@@ -347,8 +363,8 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithSetCWRWCWithImplicitWCMaj
     ASSERT(defaults.getDefaultReadConcernSource());
     ASSERT(defaults.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kGlobal);
 
-    ASSERT(stdx::holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(4, stdx::get<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT_EQ(4, get<int64_t>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(Timestamp(1, 2), *defaults.getUpdateOpTime());
     ASSERT_EQ(1234, defaults.getUpdateWallClockTime()->toMillisSinceEpoch());
     ASSERT_GT(defaults.localUpdateWallClockTime(), Date_t());
@@ -376,9 +392,9 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWriteConcernSourceImplicitWit
 
     // The default write concern source should be set to implicit if wc.usedDefaultConstructedWC is
     // true
-    ASSERT(stdx::holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(WriteConcernOptions::kMajority,
-              stdx::get<std::string>(defaults.getDefaultWriteConcern()->w));
+              get<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(Timestamp(1, 2), *defaults.getUpdateOpTime());
     ASSERT_EQ(1234, defaults.getUpdateWallClockTime()->toMillisSinceEpoch());
     ASSERT_GT(defaults.localUpdateWallClockTime(), Date_t());
@@ -415,7 +431,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithSetAndUnSetCWRCWithImplic
     newDefaults2.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(1234));
     _lookupMock.setLookupCallReturnValue(std::move(newDefaults2));
 
-    ReadWriteConcernDefaults::get(getServiceContext()).refreshIfNecessary(_opCtx);
+    ReadWriteConcernDefaults::get(getService()).refreshIfNecessary(_opCtx);
 
     ASSERT(!isCWWCSet());
     defaults = getDefault();
@@ -452,9 +468,9 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithSetAndUnSetCWRCWithImplic
     ASSERT(defaults.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kGlobal);
 
     ASSERT(defaults.getDefaultWriteConcern());
-    ASSERT(stdx::holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(WriteConcernOptions::kMajority,
-              stdx::get<std::string>(defaults.getDefaultWriteConcern()->w));
+              get<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(Timestamp(1, 2), *defaults.getUpdateOpTime());
     ASSERT_EQ(1234, defaults.getUpdateWallClockTime()->toMillisSinceEpoch());
     ASSERT_GT(defaults.localUpdateWallClockTime(), Date_t());
@@ -466,7 +482,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithSetAndUnSetCWRCWithImplic
     newDefaults2.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(1234));
     _lookupMock.setLookupCallReturnValue(std::move(newDefaults2));
 
-    ReadWriteConcernDefaults::get(getServiceContext()).refreshIfNecessary(_opCtx);
+    ReadWriteConcernDefaults::get(getService()).refreshIfNecessary(_opCtx);
 
     ASSERT(!isCWWCSet());
     defaults = getDefault();
@@ -477,9 +493,9 @@ TEST_F(ReadWriteConcernDefaultsTest, TestGetDefaultWithSetAndUnSetCWRCWithImplic
     ASSERT(defaults.getDefaultReadConcernSource());
     ASSERT(defaults.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kImplicit);
 
-    ASSERT(stdx::holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(WriteConcernOptions::kMajority,
-              stdx::get<std::string>(defaults.getDefaultWriteConcern()->w));
+              get<std::string>(defaults.getDefaultWriteConcern()->w));
     ASSERT_EQ(Timestamp(1, 3), *defaults.getUpdateOpTime());
     ASSERT_EQ(1234, defaults.getUpdateWallClockTime()->toMillisSinceEpoch());
     ASSERT_GT(defaults.localUpdateWallClockTime(), Date_t());
@@ -577,7 +593,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestInvalidate) {
     newDefaults2.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(5678));
     _lookupMock.setLookupCallReturnValue(std::move(newDefaults2));
 
-    ReadWriteConcernDefaults::get(getServiceContext()).invalidate();
+    ReadWriteConcernDefaults::get(getService()).invalidate();
     ASSERT(isCWWCSet());
     auto defaults2 = getDefault();
     ASSERT(defaults2.getDefaultReadConcern()->getLevel() ==
@@ -585,8 +601,8 @@ TEST_F(ReadWriteConcernDefaultsTest, TestInvalidate) {
     ASSERT(defaults2.getDefaultReadConcernSource());
     ASSERT(defaults2.getDefaultReadConcernSource() == DefaultReadConcernSourceEnum::kGlobal);
 
-    ASSERT(stdx::holds_alternative<int64_t>(defaults2.getDefaultWriteConcern()->w));
-    ASSERT_EQ(4, stdx::get<int64_t>(defaults2.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<int64_t>(defaults2.getDefaultWriteConcern()->w));
+    ASSERT_EQ(4, get<int64_t>(defaults2.getDefaultWriteConcern()->w));
     ASSERT_EQ(Timestamp(3, 4), *defaults2.getUpdateOpTime());
     ASSERT_EQ(5678, defaults2.getUpdateWallClockTime()->toMillisSinceEpoch());
     ASSERT_GT(defaults2.localUpdateWallClockTime(), Date_t());
@@ -595,7 +611,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestInvalidate) {
 
 TEST_F(ReadWriteConcernDefaultsTest, TestRefreshDefaultsWithEmptyCacheAndAbsentDefaults) {
     createDefaults(false /* isImplicitWCMajority */);
-    ReadWriteConcernDefaults::get(getServiceContext()).refreshIfNecessary(_opCtx);
+    ReadWriteConcernDefaults::get(getService()).refreshIfNecessary(_opCtx);
 
     ASSERT(!isCWWCSet());
     auto defaults = getDefault();
@@ -621,7 +637,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestRefreshDefaultsWithEmptyCacheAndSetDefa
     newDefaults.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(1234));
     _lookupMock.setLookupCallReturnValue(std::move(newDefaults));
 
-    ReadWriteConcernDefaults::get(getServiceContext()).refreshIfNecessary(_opCtx);
+    ReadWriteConcernDefaults::get(getService()).refreshIfNecessary(_opCtx);
 
     ASSERT(!isCWWCSet());
     auto defaults = getDefault();
@@ -650,7 +666,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestRefreshDefaultsWithHigherEpoch) {
     newDefaults2.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(5678));
     _lookupMock.setLookupCallReturnValue(std::move(newDefaults2));
 
-    ReadWriteConcernDefaults::get(getServiceContext()).refreshIfNecessary(_opCtx);
+    ReadWriteConcernDefaults::get(getService()).refreshIfNecessary(_opCtx);
 
     ASSERT(!isCWWCSet());
     auto defaults2 = getDefault();
@@ -677,7 +693,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestRefreshDefaultsWithLowerEpoch) {
     newDefaults2.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(5678));
     _lookupMock.setLookupCallReturnValue(std::move(newDefaults2));
 
-    ReadWriteConcernDefaults::get(getServiceContext()).refreshIfNecessary(_opCtx);
+    ReadWriteConcernDefaults::get(getService()).refreshIfNecessary(_opCtx);
 
     auto defaults2 = getDefault();
     ASSERT_EQ(Timestamp(10, 20), *defaults2.getUpdateOpTime());
@@ -705,7 +721,7 @@ TEST_F(ReadWriteConcernDefaultsTest, TestRefreshDefaultsWithHigherEpochNoRWCChan
     _lookupMock.setLookupCallReturnValue(std::move(newDefaults2));
 
     startCapturingLogMessages();
-    ReadWriteConcernDefaults::get(getServiceContext()).refreshIfNecessary(_opCtx);
+    ReadWriteConcernDefaults::get(getService()).refreshIfNecessary(_opCtx);
 
     ASSERT(!isCWWCSet());
     auto defaults2 = getDefault();
@@ -724,8 +740,8 @@ TEST_F(ReadWriteConcernDefaultsTest, TestRefreshDefaultsWithHigherEpochNoRWCChan
  */
 class ReadWriteConcernDefaultsTestWithClusterTime : public VectorClockTestFixture {
 public:
-    virtual ~ReadWriteConcernDefaultsTestWithClusterTime() {
-        ReadWriteConcernDefaults::get(getServiceContext()).invalidate();
+    ~ReadWriteConcernDefaultsTestWithClusterTime() override {
+        ReadWriteConcernDefaults::get(getService()).invalidate();
     }
 
 protected:
@@ -740,8 +756,8 @@ protected:
         // default read concern source is not saved on disk.
         ASSERT(!defaults.getDefaultReadConcernSource());
 
-        ASSERT(stdx::holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
-        ASSERT_EQ(4, stdx::get<int64_t>(defaults.getDefaultWriteConcern()->w));
+        ASSERT(holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
+        ASSERT_EQ(4, get<int64_t>(defaults.getDefaultWriteConcern()->w));
         ASSERT(defaults.getUpdateOpTime());
         ASSERT(defaults.getUpdateWallClockTime());
         // Default write concern source is not saved on disk.
@@ -759,8 +775,8 @@ protected:
     ReadWriteConcernDefaultsLookupMock _lookupMock;
 
     ReadWriteConcernDefaults& _rwcd{[&]() -> ReadWriteConcernDefaults& {
-        ReadWriteConcernDefaults::create(getServiceContext(), _lookupMock.getFetchDefaultsFn());
-        return ReadWriteConcernDefaults::get(getServiceContext());
+        ReadWriteConcernDefaults::create(getService(), _lookupMock.getFetchDefaultsFn());
+        return ReadWriteConcernDefaults::get(getService());
     }()};
 };
 
@@ -840,8 +856,8 @@ TEST_F(ReadWriteConcernDefaultsTestWithClusterTime,
            repl::ReadConcernLevel::kMajorityReadConcern);
     ASSERT(!defaults.getDefaultReadConcernSource());
 
-    ASSERT(stdx::holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(5, stdx::get<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT_EQ(5, get<int64_t>(defaults.getDefaultWriteConcern()->w));
     ASSERT_LT(*oldDefaults.getUpdateOpTime(), *defaults.getUpdateOpTime());
     ASSERT_LT(*oldDefaults.getUpdateWallClockTime(), *defaults.getUpdateWallClockTime());
     // Default write concern source is not saved on disk.
@@ -910,8 +926,8 @@ TEST_F(ReadWriteConcernDefaultsTestWithClusterTime,
            defaults.getDefaultReadConcern()->getLevel());
     ASSERT(!defaults.getDefaultReadConcernSource());
 
-    ASSERT(stdx::holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(5, stdx::get<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT_EQ(5, get<int64_t>(defaults.getDefaultWriteConcern()->w));
     ASSERT_LT(*oldDefaults.getUpdateOpTime(), *defaults.getUpdateOpTime());
     ASSERT_LT(*oldDefaults.getUpdateWallClockTime(), *defaults.getUpdateWallClockTime());
     // Default write concern source is not saved on disk.
@@ -952,8 +968,8 @@ TEST_F(ReadWriteConcernDefaultsTestWithClusterTime,
         uassertStatusOK(WriteConcernOptions::parse(BSON("w" << 5))));
     ASSERT(newDefaults.getDefaultReadConcern()->getLevel() ==
            defaults.getDefaultReadConcern()->getLevel());
-    ASSERT(stdx::holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(5, stdx::get<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
+    ASSERT_EQ(5, get<int64_t>(defaults.getDefaultWriteConcern()->w));
     // Default write concern source is not saved on disk.
     ASSERT(!defaults.getDefaultWriteConcernSource());
 
@@ -961,8 +977,8 @@ TEST_F(ReadWriteConcernDefaultsTestWithClusterTime,
     _rwcd.refreshIfNecessary(operationContext());
     newDefaults = _rwcd.getDefault(operationContext());
     ASSERT(newDefaults.getDefaultWriteConcern());
-    ASSERT(stdx::holds_alternative<int64_t>(newDefaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(5, stdx::get<int64_t>(newDefaults.getDefaultWriteConcern()->w));
+    ASSERT(holds_alternative<int64_t>(newDefaults.getDefaultWriteConcern()->w));
+    ASSERT_EQ(5, get<int64_t>(newDefaults.getDefaultWriteConcern()->w));
     // Default write concern source is calculated through 'getDefault'.
     ASSERT(newDefaults.getDefaultWriteConcernSource() == DefaultWriteConcernSourceEnum::kGlobal);
 }
@@ -1033,57 +1049,29 @@ TEST_F(ReadWriteConcernDefaultsTestWithClusterTime,
 }
 
 TEST_F(ReadWriteConcernDefaultsTestWithClusterTime,
-       TestGenerateNewCWRWCToBeSavedOnDiskValidSetWriteConcernWithOnlyJ) {
-    auto oldDefaults = setupOldDefaults();
-    auto defaults = _rwcd.generateNewCWRWCToBeSavedOnDisk(
-        operationContext(),
-        boost::none,
-        uassertStatusOK(WriteConcernOptions::parse(BSON("j" << true))));
-    ASSERT(oldDefaults.getDefaultReadConcern()->getLevel() ==
-           defaults.getDefaultReadConcern()->getLevel());
-    ASSERT(!defaults.getDefaultReadConcernSource());
-    ASSERT(stdx::holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(1, stdx::get<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(WriteConcernOptions::kNoTimeout, defaults.getDefaultWriteConcern()->wTimeout);
-    ASSERT(WriteConcernOptions::SyncMode::JOURNAL == defaults.getDefaultWriteConcern()->syncMode);
-    ASSERT_LT(*oldDefaults.getUpdateOpTime(), *defaults.getUpdateOpTime());
-    ASSERT_LT(*oldDefaults.getUpdateWallClockTime(), *defaults.getUpdateWallClockTime());
-    // Default write concern source is not saved on disk.
-    ASSERT(!defaults.getDefaultWriteConcernSource());
+       TestGenerateNewCWRWCToBeSavedOnDiskInvalidSetWriteConcernWithoutWField) {
+    setupOldDefaults();
+    ASSERT_THROWS_CODE(_rwcd.generateNewCWRWCToBeSavedOnDisk(
+                           operationContext(),
+                           boost::none,
+                           uassertStatusOK(WriteConcernOptions::parse(BSON("j" << true)))),
+                       AssertionException,
+                       ErrorCodes::BadValue);
 
-    _lookupMock.setLookupCallReturnValue(std::move(defaults));
-    _rwcd.refreshIfNecessary(operationContext());
-    auto newDefaults = _rwcd.getDefault(operationContext());
-    ASSERT_LT(oldDefaults.localUpdateWallClockTime(), newDefaults.localUpdateWallClockTime());
-    // Default write concern source is calculated through 'getDefault'.
-    ASSERT(newDefaults.getDefaultWriteConcernSource() == DefaultWriteConcernSourceEnum::kGlobal);
-}
+    ASSERT_THROWS_CODE(_rwcd.generateNewCWRWCToBeSavedOnDisk(
+                           operationContext(),
+                           boost::none,
+                           uassertStatusOK(WriteConcernOptions::parse(BSON("wtimeout" << 12345)))),
+                       AssertionException,
+                       ErrorCodes::BadValue);
 
-TEST_F(ReadWriteConcernDefaultsTestWithClusterTime,
-       TestGenerateNewCWRWCToBeSavedOnDiskValidSetWriteConcernWithOnlyWtimeout) {
-    auto oldDefaults = setupOldDefaults();
-    auto defaults = _rwcd.generateNewCWRWCToBeSavedOnDisk(
-        operationContext(),
-        boost::none,
-        uassertStatusOK(WriteConcernOptions::parse(BSON("wtimeout" << 12345))));
-    ASSERT(oldDefaults.getDefaultReadConcern()->getLevel() ==
-           defaults.getDefaultReadConcern()->getLevel());
-    ASSERT(!defaults.getDefaultReadConcernSource());
-    ASSERT(stdx::holds_alternative<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(1, stdx::get<int64_t>(defaults.getDefaultWriteConcern()->w));
-    ASSERT_EQ(Milliseconds(12345), defaults.getDefaultWriteConcern()->wTimeout);
-    ASSERT(WriteConcernOptions::SyncMode::UNSET == defaults.getDefaultWriteConcern()->syncMode);
-    ASSERT_LT(*oldDefaults.getUpdateOpTime(), *defaults.getUpdateOpTime());
-    ASSERT_LT(*oldDefaults.getUpdateWallClockTime(), *defaults.getUpdateWallClockTime());
-    // Default write concern source is not saved on disk.
-    ASSERT(!defaults.getDefaultWriteConcernSource());
-
-    _lookupMock.setLookupCallReturnValue(std::move(defaults));
-    _rwcd.refreshIfNecessary(operationContext());
-    auto newDefaults = _rwcd.getDefault(operationContext());
-    ASSERT_LT(oldDefaults.localUpdateWallClockTime(), newDefaults.localUpdateWallClockTime());
-    // Default write concern source is calculated through 'getDefault'.
-    ASSERT(newDefaults.getDefaultWriteConcernSource() == DefaultWriteConcernSourceEnum::kGlobal);
+    ASSERT_THROWS_CODE(
+        _rwcd.generateNewCWRWCToBeSavedOnDisk(
+            operationContext(),
+            boost::none,
+            uassertStatusOK(WriteConcernOptions::parse(BSON("j" << true << "wtimeout" << 12345)))),
+        AssertionException,
+        ErrorCodes::BadValue);
 }
 
 TEST_F(ReadWriteConcernDefaultsTestWithClusterTime, TestRefreshDefaultsWithDeletedDefaults) {

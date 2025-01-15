@@ -28,16 +28,42 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <utility>
+#include <vector>
 
+#include <fmt/format.h>
+
+#include "mongo/base/counter.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/rpc/unique_message.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/timer.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -55,7 +81,7 @@ public:
         const auto commandResponse = _client.runCommand([&] {
             write_ops::InsertCommandRequest insertOp(nss);
             insertOp.setDocuments({doc});
-            return insertOp.serialize({});
+            return insertOp.serialize();
         }());
 
         auto status = getStatusFromWriteCommandReply(commandResponse->getCommandReply());
@@ -84,11 +110,12 @@ TEST_F(ReshardingCollectionTest, TestWritesToTempReshardingCollection) {
     SimpleClient client(operationContext());
     auto uuid = UUID::gen();
 
-    auto tempNss = NamespaceString{"{}.system.resharding.{}"_format("test", uuid.toString())};
+    auto tempNss = NamespaceString::createNamespaceString_forTest(
+        "{}.system.resharding.{}"_format("test", uuid.toString()));
     ASSERT_OK(client.insert(tempNss, BSON("x" << 5)));
 
-    auto chunksNss = NamespaceString{
-        "config.cache.chunks.{}.system.resharding.{}"_format("test", uuid.toString())};
+    auto chunksNss = NamespaceString::createNamespaceString_forTest(
+        "config.cache.chunks.{}.system.resharding.{}"_format("test", uuid.toString()));
     ASSERT_OK(client.insert(chunksNss, BSON("X" << 5)));
 }
 
@@ -102,18 +129,18 @@ TEST_F(ReshardingCollectionTest, TestWritesToTempReshardingCollectionStressTest)
         stdx::thread thread([&]() {
             Timer timer;
             while (timer.elapsed() < Seconds(2)) {
-                ThreadClient threadClient(getGlobalServiceContext());
+                ThreadClient threadClient(getGlobalServiceContext()->getService());
                 auto opCtx = Client::getCurrent()->makeOperationContext();
                 invariant(opCtx);
                 SimpleClient client(opCtx.get());
                 auto uuid = UUID::gen();
 
-                auto tempNss =
-                    NamespaceString{"{}.system.resharding.{}"_format("test", uuid.toString())};
+                auto tempNss = NamespaceString::createNamespaceString_forTest(
+                    "{}.system.resharding.{}"_format("test", uuid.toString()));
                 ASSERT_OK(client.insert(tempNss, BSON("x" << 5)));
 
-                auto chunksNss = NamespaceString{
-                    "config.cache.chunks.{}.system.resharding.{}"_format("test", uuid.toString())};
+                auto chunksNss = NamespaceString::createNamespaceString_forTest(
+                    "config.cache.chunks.{}.system.resharding.{}"_format("test", uuid.toString()));
                 ASSERT_OK(client.insert(chunksNss, BSON("X" << 5)));
                 iterations.increment();
             }
@@ -124,7 +151,7 @@ TEST_F(ReshardingCollectionTest, TestWritesToTempReshardingCollectionStressTest)
         t.join();
     }
 
-    LOGV2(5930701, "Stress test completed", "iterations"_attr = iterations);
+    LOGV2(5930701, "Stress test completed", "iterations"_attr = iterations.get());
 }
 
 }  // namespace

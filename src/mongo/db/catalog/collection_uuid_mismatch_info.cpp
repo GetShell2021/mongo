@@ -29,8 +29,19 @@
 
 #include "mongo/db/catalog/collection_uuid_mismatch_info.h"
 
-#include "mongo/base/init.h"
+#include <boost/none.hpp>
+#include <boost/type_traits/decay.hpp>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/util/database_name_util.h"
 
 namespace mongo {
 namespace {
@@ -45,14 +56,16 @@ constexpr StringData kActualCollectionFieldName = "actualCollection"_sd;
 std::shared_ptr<const ErrorExtraInfo> CollectionUUIDMismatchInfo::parse(const BSONObj& obj) {
     auto actualNamespace = obj[kActualCollectionFieldName];
     return std::make_shared<CollectionUUIDMismatchInfo>(
-        obj[kDbFieldName].str(),
+        // Deserialize db name object from a string which is formated for error messages.
+        DatabaseNameUtil::deserializeForErrorMsg(obj[kDbFieldName].str()),
         UUID::parse(obj[kCollectionUUIDFieldName]).getValue(),
         obj[kExpectedCollectionFieldName].str(),
         actualNamespace.isNull() ? boost::none : boost::make_optional(actualNamespace.str()));
 }
 
 void CollectionUUIDMismatchInfo::serialize(BSONObjBuilder* builder) const {
-    builder->append(kDbFieldName, _db);
+    // Serialize to the extra error message of a an error Status.
+    builder->append(kDbFieldName, _dbName.toStringForErrorMsg());
     _collectionUUID.appendToBuilder(builder, kCollectionUUIDFieldName);
     builder->append(kExpectedCollectionFieldName, _expectedCollection);
     if (_actualCollection) {

@@ -30,12 +30,25 @@
 
 #include "mongo/db/repl/topology_version_observer.h"
 
-#include "mongo/base/status_with.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "cxxabi.h"
+#include <mutex>
+#include <type_traits>
+#include <utility>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
@@ -87,7 +100,7 @@ void TopologyVersionObserver::shutdown() noexcept {
 
         // If we are still running, attempt to kill any opCtx
         if (_workerOpCtx) {
-            stdx::lock_guard clientLk(*_workerOpCtx->getClient());
+            ClientLock clientLk(_workerOpCtx->getClient());
             _serviceContext->killOperation(clientLk, _workerOpCtx, ErrorCodes::ShutdownInProgress);
         }
 
@@ -116,7 +129,7 @@ std::shared_ptr<const HelloResponse> TopologyVersionObserver::getCached() noexce
 
     // Acquires the lock to avoid potential races with `_workerThreadBody()`.
     // Atomics cannot be used here as `shared_ptr` cannot be atomically updated.
-    stdx::lock_guard<Mutex> lk(_mutex);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _cache;
 }
 
@@ -176,7 +189,13 @@ void TopologyVersionObserver::_cacheHelloResponse(
 
 void TopologyVersionObserver::_workerThreadBody() noexcept try {
     invariant(_serviceContext);
-    ThreadClient tc(kTopologyVersionObserverName, _serviceContext);
+    ThreadClient tc(kTopologyVersionObserverName,
+                    _serviceContext->getService(ClusterRole::ShardServer));
+
+    // This thread may be interrupted by replication state changes and this is safe because
+    // _cacheHelloResponse is the only place where an opCtx is used and already has logic for
+    // handling exceptions. Any logic added to this thread that uses the opCtx must be able to
+    // handle interrupts.
 
     auto getTopologyVersion = [&]() -> boost::optional<TopologyVersion> {
         // Only the observer thread updates `_cache`, thus there is no need to hold the lock before

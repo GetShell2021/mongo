@@ -4,10 +4,7 @@
  * @tags: [requires_fcv_60]
  */
 
-(function() {
-'use strict';
-
-load('jstests/libs/fail_point_util.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 1, name: jsTestName()});
 rst.startSet();
@@ -37,4 +34,3 @@ checkLog.containsJson(secondary, 6351912);
 
 jsTestLog("Done with test.");
 rst.stopSet();
-})();

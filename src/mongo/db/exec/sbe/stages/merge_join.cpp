@@ -27,12 +27,19 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <tuple>
 
-#include "mongo/db/exec/sbe/stages/merge_join.h"
+#include <absl/container/inlined_vector.h>
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
 
-#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/stages/merge_join.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -78,7 +85,7 @@ MergeJoinStage::MergeJoinStage(std::unique_ptr<PlanStage> outer,
                                std::vector<value::SortDirection> sortDirs,
                                PlanNodeId planNodeId,
                                bool participateInTrialRunTracking)
-    : PlanStage("mj"_sd, planNodeId, participateInTrialRunTracking),
+    : PlanStage("mj"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
       _outerKeys(std::move(outerKeys)),
       _outerProjects(std::move(outerProjects)),
       _innerKeys(std::move(innerKeys)),
@@ -106,7 +113,7 @@ std::unique_ptr<PlanStage> MergeJoinStage::clone() const {
                                             _innerProjects,
                                             _dirs,
                                             _commonStats.nodeId,
-                                            _participateInTrialRunTracking);
+                                            participateInTrialRunTracking());
 }
 
 void MergeJoinStage::prepare(CompileCtx& ctx) {
@@ -325,13 +332,13 @@ void MergeJoinStage::close() {
 }
 
 void MergeJoinStage::doSaveState(bool relinquishCursor) {
-    if (!slotsAccessible() || !relinquishCursor) {
+    if (!relinquishCursor) {
         return;
     }
 
     // We only have to save shallow non-owning materialized rows.
-    prepareForYielding(_currentOuterKey);
-    prepareForYielding(_currentInnerKey);
+    prepareForYielding(_currentOuterKey, true);
+    prepareForYielding(_currentInnerKey, true);
 }
 
 std::unique_ptr<PlanStageStats> MergeJoinStage::getStats(bool includeDebugInfo) const {

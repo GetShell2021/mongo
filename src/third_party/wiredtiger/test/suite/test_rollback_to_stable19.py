@@ -27,7 +27,7 @@
 # OTHER DEALINGS IN THE SOFTWARE.
 
 from helper import simulate_crash_restart
-from test_rollback_to_stable01 import test_rollback_to_stable_base
+from rollback_to_stable_util import test_rollback_to_stable_base
 from wiredtiger import stat, WT_NOTFOUND
 from wtdataset import SimpleDataSet
 from wtscenario import make_scenarios
@@ -56,7 +56,7 @@ class test_rollback_to_stable19(test_rollback_to_stable_base):
 
     def conn_config(self):
         config = 'cache_size=50MB,statistics=(all),eviction_dirty_trigger=10,' \
-                 'eviction_updates_trigger=10'
+                 'eviction_updates_trigger=10,verbose=(rts:5)'
         if self.in_memory:
             config += ',in_memory=true'
         return config
@@ -100,10 +100,10 @@ class test_rollback_to_stable19(test_rollback_to_stable_base):
         evict_cursor.set_key(1)
         if self.value_format == '8t':
             # In FLCS deleted values read back as 0.
-            self.assertEquals(evict_cursor.search(), 0)
-            self.assertEquals(evict_cursor.get_value(), 0)
+            self.assertEqual(evict_cursor.search(), 0)
+            self.assertEqual(evict_cursor.get_value(), 0)
         else:
-            self.assertEquals(evict_cursor.search(), WT_NOTFOUND)
+            self.assertEqual(evict_cursor.search(), WT_NOTFOUND)
         evict_cursor.reset()
         evict_cursor.close()
         self.session.commit_transaction()
@@ -113,10 +113,10 @@ class test_rollback_to_stable19(test_rollback_to_stable_base):
         cursor2 = self.session.open_cursor(uri)
         cursor2.set_key(1)
         if self.value_format == '8t':
-            self.assertEquals(cursor2.search(), 0)
-            self.assertEquals(cursor2.get_value(), 0)
+            self.assertEqual(cursor2.search(), 0)
+            self.assertEqual(cursor2.get_value(), 0)
         else:
-            self.assertEquals(cursor2.search(), WT_NOTFOUND)
+            self.assertEqual(cursor2.search(), WT_NOTFOUND)
         self.session.commit_transaction()
         cursor2.close()
 
@@ -201,10 +201,10 @@ class test_rollback_to_stable19(test_rollback_to_stable_base):
         evict_cursor.set_key(1)
         if self.value_format == '8t':
             # In FLCS deleted values read back as 0.
-            self.assertEquals(evict_cursor.search(), 0)
-            self.assertEquals(evict_cursor.get_value(), 0)
+            self.assertEqual(evict_cursor.search(), 0)
+            self.assertEqual(evict_cursor.get_value(), 0)
         else:
-            self.assertEquals(evict_cursor.search(), WT_NOTFOUND)
+            self.assertEqual(evict_cursor.search(), WT_NOTFOUND)
         evict_cursor.reset()
         evict_cursor.close()
         self.session.commit_transaction()
@@ -214,10 +214,10 @@ class test_rollback_to_stable19(test_rollback_to_stable_base):
         cursor2 = self.session.open_cursor(uri)
         cursor2.set_key(1)
         if self.value_format == '8t':
-            self.assertEquals(cursor2.search(), 0)
-            self.assertEquals(cursor2.get_value(), 0)
+            self.assertEqual(cursor2.search(), 0)
+            self.assertEqual(cursor2.get_value(), 0)
         else:
-            self.assertEquals(cursor2.search(), WT_NOTFOUND)
+            self.assertEqual(cursor2.search(), WT_NOTFOUND)
         self.session.commit_transaction()
         cursor2.close()
 
@@ -253,6 +253,3 @@ class test_rollback_to_stable19(test_rollback_to_stable_base):
         else:
             self.assertGreater(hs_removed, 0)
             self.assertGreater(upd_aborted, 0)
-
-if __name__ == '__main__':
-    wttest.run()

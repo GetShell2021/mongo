@@ -27,23 +27,40 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/scripting/mozjs/objectwrapper.h"
-
+#include <boost/move/utility_core.hpp>
 #include <js/Array.h>
-#include <js/Conversions.h>
+#include <js/Class.h>
+#include <js/Object.h>
+#include <js/PropertySpec.h>
 #include <js/ValueArray.h>
-
 #include <jsapi.h>
+#include <new>
+#include <tuple>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+#include <js/AllocPolicy.h>
+#include <js/CallAndConstruct.h>
+#include <js/CallArgs.h>
+#include <js/GCVector.h>
+#include <js/Id.h>
+#include <js/RootingAPI.h>
+#include <js/TypeDecls.h>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/scripting/mozjs/bson.h"
+#include "mongo/scripting/mozjs/dbref.h"
 #include "mongo/scripting/mozjs/idwrapper.h"
 #include "mongo/scripting/mozjs/implscope.h"
+#include "mongo/scripting/mozjs/objectwrapper.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
+#include "mongo/scripting/mozjs/wraptype.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace mozjs {
@@ -337,12 +354,12 @@ StringData ObjectWrapper::Key::toStringData(JSContext* cx, JSStringWrapper* jsst
     }
 
     if (rid.isInt()) {
-        *jsstr = JSStringWrapper(JSID_TO_INT(rid));
+        *jsstr = JSStringWrapper(rid.toInt());
         return jsstr->toStringData();
     }
 
     if (rid.isString()) {
-        *jsstr = JSStringWrapper(cx, JSID_TO_STRING(rid));
+        *jsstr = JSStringWrapper(cx, rid.toString());
         return jsstr->toStringData();
     }
 
@@ -530,6 +547,13 @@ void ObjectWrapper::rename(Key from, const char* to) {
     setValue(from, undefValue);
 }
 
+void ObjectWrapper::renameAndDeleteProperty(Key from, const char* to) {
+    JS::RootedValue value(_context);
+    getValue(from, &value);
+    setValue(to, value);
+    from.del(_context, _object);
+}
+
 bool ObjectWrapper::hasField(Key key) {
     return key.has(_context, _object);
 }
@@ -697,7 +721,7 @@ ObjectWrapper::WriteFieldRecursionFrame::WriteFieldRecursionFrame(JSContext* cx,
 
         JS::RootedId rid(cx);
         for (uint32_t i = 0; i < length; i++) {
-            rid.set(INT_TO_JSID(i));
+            rid.set(JS::PropertyKey::Int(i));
             ids.infallibleAppend(rid);
         }
     } else {

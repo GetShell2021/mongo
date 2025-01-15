@@ -29,16 +29,18 @@
 
 #include "mongo/db/pipeline/change_stream_test_helpers.h"
 
+#include <set>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
 #include "mongo/db/exec/document_value/document.h"
-#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/exec/document_value/value_comparator.h"
-#include "mongo/db/matcher/schema/expression_internal_schema_object_match.h"
-#include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/change_stream_rewrite_helpers.h"
-#include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo::change_stream_test_helper {
@@ -53,6 +55,7 @@ LogicalSessionFromClient testLsid() {
     static const UUID* uuid = new UUID(UUID::gen());
     LogicalSessionFromClient lsid{};
     lsid.setId(*uuid);
+    lsid.setUid(SHA256Block{});
     return lsid;
 }
 
@@ -75,13 +78,13 @@ Document makeResumeTokenWithEventId(Timestamp ts,
                                     ImplicitValue eventIdentifier,
                                     ResumeTokenData::FromInvalidate fromInvalidate,
                                     size_t txnOpIndex) {
-    ResumeTokenData tokenData;
-    tokenData.clusterTime = ts;
-    tokenData.eventIdentifier = eventIdentifier;
-    tokenData.fromInvalidate = fromInvalidate;
-    tokenData.txnOpIndex = txnOpIndex;
-    if (!uuid.missing())
-        tokenData.uuid = uuid.getUuid();
+    auto optionalUuid = uuid.missing() ? boost::none : boost::make_optional(uuid.getUuid());
+    ResumeTokenData tokenData{ts,
+                              ResumeTokenData::kDefaultTokenVersion,
+                              txnOpIndex,
+                              optionalUuid,
+                              eventIdentifier,
+                              fromInvalidate};
     return ResumeToken(tokenData).toDocument();
 }
 
@@ -98,20 +101,19 @@ repl::OplogEntry makeOplogEntry(repl::OpTypeEnum opType,
                                 OperationSessionInfo sessionInfo,
                                 boost::optional<repl::OpTime> prevOpTime,
                                 boost::optional<repl::OpTime> preImageOpTime) {
-    long long hash = 1LL;
     return {repl::DurableOplogEntry(opTime ? *opTime : kDefaultOpTime,  // optime
-                                    hash,                               // hash
                                     opType,                             // opType
                                     nss,                                // namespace
                                     uuid,                               // uuid
                                     fromMigrate,                        // fromMigrate
-                                    repl::OplogEntry::kOplogVersion,    // version
-                                    object,                             // o
-                                    object2,                            // o2
-                                    sessionInfo,                        // sessionInfo
-                                    boost::none,                        // upsert
-                                    Date_t(),                           // wall clock time
-                                    {},                                 // statement ids
+                                    boost::none,                      // checkExistenceForDiffInsert
+                                    repl::OplogEntry::kOplogVersion,  // version
+                                    object,                           // o
+                                    object2,                          // o2
+                                    sessionInfo,                      // sessionInfo
+                                    boost::none,                      // upsert
+                                    Date_t(),                         // wall clock time
+                                    {},                               // statement ids
                                     prevOpTime,  // optime of previous write within same transaction
                                     preImageOpTime,  // pre-image optime
                                     boost::none,     // post-image optime

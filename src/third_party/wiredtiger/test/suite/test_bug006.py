@@ -43,6 +43,8 @@ class test_bug006(wttest.WiredTigerTestCase):
     ])
 
     def test_bug006(self):
+        if 'tiered' in self.hook_names:
+            self.skipTest("negative tests for session APIs like drop do not work in tiered storage")
         uri = self.uri + self.name
         self.session.create(uri, 'value_format=S,key_format=S')
         cursor = self.session.open_cursor(uri, None)
@@ -53,26 +55,15 @@ class test_bug006(wttest.WiredTigerTestCase):
         self.assertRaises(
             wiredtiger.WiredTigerError, lambda: self.session.drop(uri, None))
         self.assertRaises(
-            wiredtiger.WiredTigerError,
-            lambda: self.session.rename(uri, self.uri + "new", None))
-        self.assertRaises(
             wiredtiger.WiredTigerError, lambda: self.session.salvage(uri, None))
-        self.assertRaises(
-            wiredtiger.WiredTigerError, lambda: self.session.upgrade(uri, None))
         self.assertRaises(
             wiredtiger.WiredTigerError, lambda: self.session.verify(uri, None))
 
         cursor.close()
 
         # Table operations should succeed, the cursor is closed.
-        self.renameUntilSuccess(self.session, uri, self.uri + "new")
-        self.renameUntilSuccess(self.session, self.uri + "new", uri)
-        self.session.salvage(uri, None)
+        self.salvageUntilSuccess(self.session, uri)
         self.session.truncate(uri, None, None, None)
-        self.upgradeUntilSuccess(self.session, uri)
         self.verifyUntilSuccess(self.session, uri)
 
         self.dropUntilSuccess(self.session, uri)
-
-if __name__ == '__main__':
-    wttest.run()

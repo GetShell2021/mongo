@@ -19,12 +19,12 @@
  * 14. Assert that original primary is now a secondary
  *
  */
-(function() {
-'use strict';
-
-load("jstests/libs/write_concern_util.js");  // for stopReplicationOnSecondaries,
-                                             // restartServerReplication,
-                                             // restartReplSetReplication
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    restartReplSetReplication,
+    restartServerReplication,
+    stopReplicationOnSecondaries,
+} from "jstests/libs/write_concern_util.js";
 
 var name = 'stepdown_needs_electable_secondary';
 
@@ -138,9 +138,8 @@ assertStepDownSucceeds(primary);
 
 // Make sure that original primary has transitioned to SECONDARY state
 jsTestLog("Wait for PRIMARY " + primary.host + " to completely step down.");
-replTest.waitForState(primary, ReplSetTest.State.SECONDARY);
+replTest.awaitSecondaryNodes(null, [primary]);
 
 // Disable all fail points for clean shutdown
 restartReplSetReplication(replTest);
 replTest.stopSet();
-}());

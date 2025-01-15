@@ -29,10 +29,29 @@
 
 #pragma once
 
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 typedef unsigned long long ScriptingFunction;
@@ -75,8 +94,8 @@ public:
     }
 
     virtual void externalSetup() = 0;
-    virtual void setLocalDB(StringData localDBName) {
-        _localDBName = localDBName.toString();
+    virtual void setLocalDB(const DatabaseName& localDBName) {
+        _localDBName = localDBName;
     }
 
     virtual BSONObj getObject(const char* field) = 0;
@@ -107,6 +126,8 @@ public:
     virtual void rename(const char* from, const char* to) = 0;
 
     virtual std::string getError() = 0;
+
+    virtual std::string getBaseURL() const = 0;
 
     virtual bool hasOutOfMemoryException() = 0;
 
@@ -177,6 +198,7 @@ public:
                           int timeoutMs = 0);
 
     void execCoreFiles();
+    void execPrelude();
 
     virtual void loadStored(OperationContext* opCtx, bool ignoreNotConnected = false);
 
@@ -203,7 +225,7 @@ protected:
 
     virtual ScriptingFunction _createFunction(const char* code) = 0;
 
-    std::string _localDBName;
+    DatabaseName _localDBName;
     int64_t _loadedVersion;
     std::set<std::string> _storedNames;
     static AtomicWord<long long> _lastVersion;
@@ -212,13 +234,15 @@ protected:
     bool _lastRetIsNativeCode;  // v8 only: set to true if eval'd script returns a native func
 };
 
+enum class ExecutionEnvironment { Server, TestRunner };
+
 class ScriptEngine : public KillOpListenerInterface {
     ScriptEngine(const ScriptEngine&) = delete;
     ScriptEngine& operator=(const ScriptEngine&) = delete;
 
 public:
-    ScriptEngine(bool disableLoadStored);
-    virtual ~ScriptEngine();
+    ScriptEngine();
+    ~ScriptEngine() override = default;
 
     virtual Scope* newScope() {
         return createScope();
@@ -245,12 +269,13 @@ public:
     virtual int getJSHeapLimitMB() const = 0;
     virtual void setJSHeapLimitMB(int limit) = 0;
 
+    virtual std::string getLoadPath() const = 0;
+    virtual void setLoadPath(const std::string& loadPath) = 0;
+
     /**
-     * Calls the constructor for the Global ScriptEngine. 'disableLoadStored' causes future calls to
-     * the function Scope::loadStored(), which would otherwise load stored procedures, to be
-     * ignored.
+     * Calls the constructor for the Global ScriptEngine.
      */
-    static void setup(bool disableLoadStored = true);
+    static void setup(ExecutionEnvironment environment);
     static void dropScopeCache();
 
     /** gets a scope from the pool or a new one if pool is empty
@@ -260,9 +285,13 @@ public:
      * @return the scope
      */
     std::unique_ptr<Scope> getPooledScope(OperationContext* opCtx,
-                                          const std::string& db,
+                                          const DatabaseName& db,
                                           const std::string& scopeType);
 
+    using ScopeCallback = void (*)(Scope&);
+    ScopeCallback getScopeInitCallback() {
+        return _scopeInitCallback;
+    };
     void setScopeInitCallback(void (*func)(Scope&)) {
         _scopeInitCallback = func;
     }
@@ -276,11 +305,10 @@ public:
 
     // engine implementation may either respond to interrupt events or
     // poll for interrupts.  the interrupt functions must not wait indefinitely on a lock.
-    virtual void interrupt(unsigned opId) {}
-    virtual void interruptAll() {}
+    void interrupt(ClientLock&, OperationContext*) override {}
+    void interruptAll(ServiceContextLock&) override {}
 
     static std::string getInterpreterVersionString();
-    const bool _disableLoadStored;
 
 protected:
     virtual Scope* createScope() = 0;

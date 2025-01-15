@@ -27,13 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/record_store_test_harness.h"
-
+#include <memory>
+#include <string>
 
 #include "mongo/db/storage/record_store.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/storage/record_store_test_harness.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -49,17 +49,6 @@ TEST(RecordStoreTestHarness, RecordStoreName) {
     {
         const char* name = rs->name();
         ASSERT(name != nullptr && name[0] != '\0');
-    }
-}
-
-// Verify that the namespace of the record store is nonempty.
-TEST(RecordStoreTestHarness, Namespace) {
-    const auto harnessHelper(newRecordStoreHarnessHelper());
-    unique_ptr<RecordStore> rs(harnessHelper->newRecordStore());
-
-    {
-        string ns = rs->ns();
-        ASSERT(ns[0] != '\0');
     }
 }
 

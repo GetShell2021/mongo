@@ -29,17 +29,25 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
+// IWYU pragma: no_include "boost/intrusive/detail/iterator.hpp"
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <memory>
+
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/query/classic_plan_cache.h"
-#include "mongo/db/query/plan_cache_indexability.h"
-#include "mongo/db/query/plan_cache_invalidator.h"
-#include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/db/update_index_data.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache_indexability.h"
+#include "mongo/db/query/plan_cache/plan_cache_invalidator.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 
+class IndexCatalogEntry;
 class IndexDescriptor;
 class OperationContext;
+struct PlanSummaryStats;
+class UpdateIndexData;
 
 /**
  * Query information for a particular point-in-time view of a collection.
@@ -58,37 +66,32 @@ public:
     static CollectionQueryInfo& get(Collection* collection) {
         return CollectionQueryInfo::getCollectionQueryInfo(collection);
     }
+    /**
+     * Populate the outData structure using the index keys found in the index definition.
+     */
+    static void computeUpdateIndexData(const IndexCatalogEntry* entry,
+                                       const IndexAccessMethod* accessMethod,
+                                       UpdateIndexData* outData);
 
     /**
      * Gets the PlanCache for this collection.
      */
-    PlanCache* getPlanCache() const {
-        return &_planCacheState->classicPlanCache;
-    }
+    PlanCache* getPlanCache() const;
 
     /**
      * Gets the number of the current collection version used for Plan Cache invalidation.
      */
-    size_t getPlanCacheInvalidatorVersion() const {
-        return _planCacheState->planCacheInvalidator.versionNumber();
-    }
+    size_t getPlanCacheInvalidatorVersion() const;
 
     /**
      * Gets the "indexability discriminators" used in the PlanCache for generating plan cache keys.
      */
-    const PlanCacheIndexabilityState& getPlanCacheIndexabilityState() const {
-        return _planCacheState->planCacheIndexabilityState;
-    }
-
-    /* get set of index keys for this namespace.  handy to quickly check if a given
-       field is indexed (Note it might be a secondary component of a compound index.)
-    */
-    const UpdateIndexData& getIndexKeys(OperationContext* opCtx) const;
+    const PlanCacheIndexabilityState& getPlanCacheIndexabilityState() const;
 
     /**
      * Builds internal cache state based on the current state of the Collection's IndexCatalog.
      */
-    void init(OperationContext* opCtx, const CollectionPtr& coll);
+    void init(OperationContext* opCtx, Collection* coll);
 
     /**
      * Rebuilds cached index information. Must be called when an index is modified or an index is
@@ -96,7 +99,7 @@ public:
      *
      * Must be called under exclusive collection lock.
      */
-    void rebuildIndexData(OperationContext* opCtx, const CollectionPtr& coll);
+    void rebuildIndexData(OperationContext* opCtx, const Collection* coll);
 
     /**
      * Removes all cached query plans after ensuring that the PlanCache is uniquely owned. The
@@ -112,9 +115,15 @@ public:
      */
     void clearQueryCacheForSetMultikey(const CollectionPtr& coll) const;
 
+    /**
+     * Notify of a query so as to record statistics. The first overload records the statistics
+     * from the given PlanSummaryStats while the second records stats previously stored in the
+     * OpDebug.
+     */
     void notifyOfQuery(OperationContext* opCtx,
                        const CollectionPtr& coll,
                        const PlanSummaryStats& summaryStats) const;
+    void notifyOfQuery(const CollectionPtr& coll, const OpDebug& debug) const;
 
 private:
     /**
@@ -126,7 +135,7 @@ private:
     struct PlanCacheState {
         PlanCacheState();
 
-        PlanCacheState(OperationContext* opCtx, const CollectionPtr& collection);
+        PlanCacheState(OperationContext* opCtx, const Collection* collection);
 
         /**
          * Clears classic and SBE cache entries with the current collection version.
@@ -145,12 +154,7 @@ private:
         PlanCacheIndexabilityState planCacheIndexabilityState;
     };
 
-    void computeIndexKeys(OperationContext* opCtx, const CollectionPtr& coll);
-    void updatePlanCacheIndexEntries(OperationContext* opCtx, const CollectionPtr& coll);
-
-    // ---  index keys cache
-    bool _keysComputed;
-    UpdateIndexData _indexedPaths;
+    void updatePlanCacheIndexEntries(OperationContext* opCtx, const Collection* coll);
 
     std::shared_ptr<PlanCacheState> _planCacheState;
 };

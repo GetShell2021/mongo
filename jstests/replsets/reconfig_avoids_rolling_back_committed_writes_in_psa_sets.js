@@ -18,17 +18,16 @@
  * ]
  */
 
-(function() {
-"use strict";
-load("jstests/replsets/rslib.js");
-load("jstests/libs/write_concern_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {checkWriteConcernTimedOut} from "jstests/libs/write_concern_util.js";
+import {assertVoteCount} from "jstests/replsets/rslib.js";
 
 const rst = new ReplSetTest({
     name: jsTestName(),
     nodes: [{}, {}, {rsConfig: {arbiterOnly: true}}],
 });
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const collName = jsTestName();
 const primary = rst.getPrimary();
@@ -131,4 +130,3 @@ assert.eq(rst.nodes[0].getDB("test")[collName].find({a: 3}).itcount(), 1);
 assert.eq(rst.nodes[1].getDB("test")[collName].find({a: 3}).itcount(), 1);
 
 rst.stopSet();
-})();

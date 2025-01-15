@@ -3,10 +3,9 @@
  * previous config to be committed in the current config even if we are exiting a config that was
  * installed via a 'force' reconfig.
  */
-(function() {
-"use strict";
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
+import {isConfigCommitted, reconnect} from "jstests/replsets/rslib.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -42,7 +41,7 @@ singleNodeConfig.version++;
 
 jsTestLog("Force reconfig down to a single node.");
 assert.commandWorked(primary.adminCommand({replSetReconfig: singleNodeConfig, force: true}));
-assert(isConfigCommitted(primary));
+assert.soon(() => isConfigCommitted(primary));
 
 jsTestLog("Do a write on primary and commit it in the current config.");
 assert.commandWorked(coll.insert({x: 1}, {writeConcern: {w: "majority"}}));
@@ -74,8 +73,7 @@ assert.soon(() => isConfigCommitted(primary));
 // Now that we can commit the op in the new config, reconfig should succeed.
 twoNodeConfig.version = rst.getReplSetConfigFromNode().version + 1;
 assert.commandWorked(primary.adminCommand({replSetReconfig: twoNodeConfig}));
-assert(isConfigCommitted(primary));
+assert.soon(() => isConfigCommitted(primary));
 rst.awaitReplication();
 
 rst.stopSet();
-}());

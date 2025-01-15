@@ -1,10 +1,13 @@
 /**
  * Tests successful dns health check.
  *
- *  @tags: [multiversion_incompatible]
+ *  @tags: [
+ *    multiversion_incompatible,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const kWaitForCompletedChecksCount = 30;
 const kWaitForPassedChecksCount = 10;
@@ -13,7 +16,6 @@ const kMonitoringIntervalMs = 200;
 const params = {
     setParameter: {
         healthMonitoringIntensities: tojson({values: [{type: "dns", intensity: "critical"}]}),
-        featureFlagHealthMonitoring: true,
         healthMonitoringIntervals:
             tojson({values: [{type: "dns", interval: kMonitoringIntervalMs}]})
     }
@@ -67,4 +69,3 @@ assert.soon(() => {
 });
 
 st.stop();
-})();

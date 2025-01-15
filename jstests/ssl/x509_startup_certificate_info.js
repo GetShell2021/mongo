@@ -1,10 +1,7 @@
 // Test for logging of certificate information
-// @tags: [live_record_incompatible]
 
-(function() {
-'use strict';
-
-load("jstests/ssl/libs/ssl_helpers.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {determineSSLProvider} from "jstests/ssl/libs/ssl_helpers.js";
 
 const CA_CERT = "jstests/libs/ca.pem";
 const SERVER_CERT = "jstests/libs/server.pem";
@@ -41,8 +38,7 @@ function runTest(checkMongos,
         var st = new ShardingTest({
             shards: 1,
             mongos: 1,
-            other:
-                {configOptions: opts, mongosOptions: opts, shardOptions: opts, useHostname: false}
+            other: {configOptions: opts, mongosOptions: opts, rsOptions: opts, useHostname: false}
         });
         mongo = st.s;
     } else {
@@ -78,7 +74,7 @@ function runTest(checkMongos,
 function runTests(checkMongos) {
     runTest(checkMongos,
             {
-                sslMode: 'requireSSL',
+                tlsMode: 'requireTLS',
                 tlsCertificateKeyFile: SERVER_CERT,
                 tlsCAFile: CA_CERT,
                 tlsClusterFile: CLUSTER_CERT,
@@ -94,7 +90,7 @@ function runTests(checkMongos) {
 
     runTest(checkMongos,
             {
-                sslMode: 'requireSSL',
+                tlsMode: 'requireTLS',
                 tlsCertificateKeyFile: SERVER_CERT,
                 tlsCAFile: CA_CERT,
                 tlsClusterFile: CLUSTER_CERT,
@@ -108,10 +104,10 @@ function runTests(checkMongos) {
 
     runTest(checkMongos,
             {
-                sslMode: 'requireSSL',
+                tlsMode: 'requireTLS',
                 tlsCertificateKeyFile: SERVER_CERT,
-                sslCAFile: CA_CERT,
-                sslCRLFile: CRL_FILE,
+                tlsCAFile: CA_CERT,
+                tlsCRLFile: CRL_FILE,
             },
             true,
             false,
@@ -123,4 +119,3 @@ function runTests(checkMongos) {
 
 // runTests(true);
 runTests(false);
-})();

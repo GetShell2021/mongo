@@ -9,11 +9,9 @@
  * ]
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/parallelTester.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 /*
  * Runs moveChunk on the host to move the chunk to the given shard.
@@ -41,11 +39,12 @@ const dbName = "test";
 const collName = "foo";
 const ns = dbName + "." + collName;
 
-let st = new ShardingTest({shards: 2});
-let testColl = st.s.getDB(dbName).getCollection(collName);
+let st = new ShardingTest(
+    {shards: 2, configOptions: {setParameter: {enableShardedIndexConsistencyCheck: false}}});
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
+let testColl = st.s.getDB(dbName).getCollection(collName);
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 
 let donorShard = st.shard0;
@@ -64,13 +63,14 @@ let moveChunkThread =
 moveChunkThread.start();
 
 moveChunkHangAtStep5FailPoint.wait();
-assert.commandWorked(
-    donorPrimary.adminCommand({replSetStepDown: 5 /* stepDownSecs */, force: true}));
+donorReplSetTest.freeze(donorPrimary);
 
 moveChunkHangAtStep5FailPoint.off();
 moveChunkThread.join();
 
 metadataRefreshFailPoint.wait();
+donorReplSetTest.unfreeze(donorPrimary);
+donorReplSetTest.awaitNodesAgreeOnPrimary();
 
 jsTest.log("Verify that the donor has the migration coordinator doc and range deletion task doc");
 assert.eq(1, getNumMigrationCoordinatorDocs(donorShard, ns));
@@ -98,4 +98,3 @@ assert.soon(() => {
 });
 
 st.stop();
-})();

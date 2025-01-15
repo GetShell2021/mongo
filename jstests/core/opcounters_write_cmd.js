@@ -1,16 +1,23 @@
 // Test that opcounters get incremented properly.
 // @tags: [
+//   # unrecognized command "invalid" is not allowed with security tolen.
+//   not_allowed_with_signed_security_token,
 //   uses_multiple_connections,
 //   assumes_standalone_mongod,
+//   # The config fuzzer may run logical session cache refreshes in the background, which modifies
+//   # some serverStatus metrics read in this test.
+//   does_not_support_config_fuzzer,
+//   inspects_command_opcounters,
 //   does_not_support_repeated_reads,
 // ]
-
-(function() {
-'use strict';
 
 var mongo = new Mongo(db.getMongo().host);
 
 var newdb = mongo.getDB(db.toString());
+
+// Deletes in the system.profile collection can interfere with the opcounters tests below.
+newdb.setProfilingLevel(0);
+newdb.system.profile.drop();
 
 var t = newdb.opcounters;
 var opCounters;
@@ -122,6 +129,20 @@ assert.throws(function() {
 });
 assert.eq(opCounters.query + 1, newdb.serverStatus().opcounters.query);
 
+t.drop();
+t.insert([{_id: 0}, {_id: 1}, {_id: 2}]);
+
+opCounters = newdb.serverStatus().opcounters;
+t.aggregate({$match: {_id: 1}});
+assert.eq(opCounters.query + 1, newdb.serverStatus().opcounters.query);
+
+// Query, with error.
+opCounters = newdb.serverStatus().opcounters;
+assert.throws(function() {
+    t.aggregate({$match: {$invalidOp: 1}});
+});
+assert.eq(opCounters.query + 1, newdb.serverStatus().opcounters.query);
+
 //
 // 5. Getmore.
 //
@@ -197,4 +218,3 @@ assert.eq(opCounters.command + 8,
           newdb.serverStatus().opcounters.command);  // "serverStatus" counted
 assert.eq(null, newdb.serverStatus().metrics.commands.invalid);
 assert.eq(metricsObj['<UNKNOWN>'] + 1, newdb.serverStatus().metrics.commands['<UNKNOWN>']);
-})();

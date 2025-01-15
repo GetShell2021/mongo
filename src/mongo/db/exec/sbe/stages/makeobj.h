@@ -29,14 +29,42 @@
 
 #pragma once
 
+#include <cstddef>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <absl/container/inlined_vector.h>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/util/string_listset.h"
 
 namespace mongo::sbe {
-
 enum class MakeObjFieldBehavior { drop, keep };
 
-enum class MakeObjOutputType { object, bsonObject };
+struct MakeObjOutputType {
+    struct Object {
+        static constexpr StringData stageName = "mkobj"_sd;
+        typedef value::OwnedValueAccessor OutputAccessorType;
+    };
+
+    struct BsonObject {
+        static constexpr StringData stageName = "mkbson"_sd;
+        typedef value::BSONObjValueAccessor OutputAccessorType;
+    };
+};
 
 /**
  * Base stage for creating a bsonObject or object.
@@ -53,7 +81,7 @@ enum class MakeObjOutputType { object, bsonObject };
  *       [projectedField_1 = slot_1, ..., projectedField_n = slot_n]
  *       forceNewObj returnOldObject childStage
  */
-template <MakeObjOutputType O>
+template <typename O>
 class MakeObjStageBase final : public PlanStage {
 public:
     using FieldBehavior = MakeObjFieldBehavior;
@@ -98,8 +126,8 @@ public:
                      value::SlotId objSlot,
                      boost::optional<value::SlotId> rootSlot,
                      boost::optional<FieldBehavior> fieldBehavior,
-                     std::set<std::string> fields,
-                     std::set<std::string> projectFields,
+                     OrderedPathSet fields,
+                     OrderedPathSet projectFields,
                      value::SlotVector projectVars,
                      bool forceNewObject,
                      bool returnOldObject,
@@ -120,28 +148,31 @@ public:
 
 protected:
     void doSaveState(bool relinquishCursor) final;
+    bool shouldOptimizeSaveState(size_t) const final {
+        return true;
+    }
 
 private:
     void projectField(value::Object* obj, size_t idx);
     void projectField(UniqueBSONObjBuilder* bob, size_t idx);
 
-    bool isFieldProjectedOrRestricted(const StringMapHashedKey& key) const {
-        bool foundKey = false;
-        bool projected = false;
-        bool restricted = false;
+    std::pair<bool, size_t> lookupField(StringData sv) const {
+        auto pos = _fieldNames.findPos(sv);
 
-        if (!_allFieldsMap.empty()) {
-            if (auto it = _allFieldsMap.find(key); it != _allFieldsMap.end()) {
-                foundKey = true;
-                projected = it->second != std::numeric_limits<size_t>::max();
-                restricted = *_fieldBehavior != FieldBehavior::keep;
-            }
+        if (pos == StringListSet::npos) {
+            return {false, pos};
+        } else if (pos < _fields.size()) {
+            return {true, std::numeric_limits<size_t>::max()};
+        } else {
+            return {true, pos - _fields.size()};
         }
-        if (!foundKey) {
-            restricted = *_fieldBehavior == FieldBehavior::keep;
-        }
+    }
 
-        return projected || restricted;
+    StringListSet buildFieldNames(const std::vector<std::string>& fields,
+                                  const std::vector<std::string>& projectFields) {
+        auto names = fields;
+        names.insert(names.end(), projectFields.begin(), projectFields.end());
+        return StringListSet(std::move(names));
     }
 
     void produceObject();
@@ -151,21 +182,21 @@ private:
     const boost::optional<FieldBehavior> _fieldBehavior;
     const std::vector<std::string> _fields;
     const std::vector<std::string> _projectFields;
+    const StringListSet _fieldNames;
     const value::SlotVector _projectVars;
     const bool _forceNewObject;
     const bool _returnOldObject;
 
-    StringMap<size_t> _allFieldsMap;
-
     std::vector<std::pair<std::string, value::SlotAccessor*>> _projects;
+    absl::InlinedVector<char, 64> _visited;
 
-    value::OwnedValueAccessor _obj;
+    typename O::OutputAccessorType _obj;
 
     value::SlotAccessor* _root{nullptr};
 
     bool _compiled{false};
 };
 
-using MakeObjStage = MakeObjStageBase<MakeObjOutputType::object>;
-using MakeBsonObjStage = MakeObjStageBase<MakeObjOutputType::bsonObject>;
+using MakeObjStage = MakeObjStageBase<MakeObjOutputType::Object>;
+using MakeBsonObjStage = MakeObjStageBase<MakeObjOutputType::BsonObject>;
 }  // namespace mongo::sbe

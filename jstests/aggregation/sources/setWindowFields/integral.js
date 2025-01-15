@@ -1,10 +1,8 @@
 /**
  * Test the behavior of $integral.
  */
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/window_function_helpers.js");
+import "jstests/libs/query/sbe_assert_error_override.js";
+import {documentBounds} from "jstests/aggregation/extras/window_function_helpers.js";
 
 const coll = db.setWindowFields_integral;
 
@@ -115,9 +113,9 @@ function explainUnit(unit) {
         }
     });
 }
-assert.commandFailedWithCode(explainUnit('year'), 5490704);
-assert.commandFailedWithCode(explainUnit('quarter'), 5490704);
-assert.commandFailedWithCode(explainUnit('month'), 5490704);
+assert.commandFailedWithCode(explainUnit('year'), 5490710);
+assert.commandFailedWithCode(explainUnit('quarter'), 5490710);
+assert.commandFailedWithCode(explainUnit('month'), 5490710);
 assert.commandWorked(explainUnit('week'));
 assert.commandWorked(explainUnit('day'));
 assert.commandWorked(explainUnit('hour'));
@@ -271,4 +269,3 @@ assert.sameMembers(runRangeBasedIntegral([-6, 6]), [
     // Empty window.
     {time: ISODate("2020-01-01T00:00:18.000Z"), y: 6.8, integral: 0.0},
 ]);
-})();

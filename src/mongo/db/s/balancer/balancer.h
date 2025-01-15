@@ -29,22 +29,37 @@
 
 #pragma once
 
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/s/balancer/auto_merger_policy.h"
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy.h"
-#include "mongo/db/s/balancer/balancer_random.h"
-#include "mongo/platform/mutex.h"
+#include "mongo/db/s/balancer/balancer_policy.h"
+#include "mongo/db/s/balancer/cluster_statistics.h"
+#include "mongo/db/s/balancer/move_unsharded_policy.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/request_types/balancer_collection_status_gen.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
 #include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
 class ChunkType;
 class ClusterStatistics;
+
 class BalancerCommandsScheduler;
 class BalancerDefragmentationPolicy;
-class ClusterChunksResizePolicy;
 class MigrationSecondaryThrottleOptions;
 class OperationContext;
 class ServiceContext;
@@ -70,42 +85,44 @@ public:
     static Balancer* get(OperationContext* operationContext);
 
     Balancer();
-    ~Balancer();
+    ~Balancer() override;
 
     /**
      * Invoked when the config server primary enters the 'PRIMARY' state and is invoked while the
-     * caller is holding the global X lock. Kicks off the main balancer thread and returns
-     * immediately. Auto-balancing (if enabled) should commence shortly, and manual migrations will
-     * be processed and run.
+     * caller is holding the global X lock. Kicks off the main balancer thread (which will in turn
+     * instantiate a secondary worker and the CommandsScheduler) and returns immediately.
+     * Auto-balancing (if enabled) should commence shortly, and manual migrations will be processed
+     * and run.
      *
-     * Must only be called if the balancer is in the stopped state (i.e., just constructed or
-     * waitForBalancerToStop has been called before). Any code in this call must not try to acquire
-     * any locks or to wait on operations, which acquire locks.
+     * Must only be called if the balancer thread set is in the Terminated state (i.e., just
+     * constructed or joinTermination() has been called before).
+     * Any code in this call must not try to acquire any locks or to wait on operations, which
+     * acquire locks.
      */
-    void initiateBalancer(OperationContext* opCtx);
+    void initiate(OperationContext* opCtx);
 
     /**
      * Invoked when this node which is currently serving as a 'PRIMARY' steps down and is invoked
-     * while the global X lock is held. Requests the main balancer thread to stop and returns
-     * immediately without waiting for it to terminate. Once the balancer has stopped, manual
-     * migrations will be rejected.
+     * while the global X lock is held. Requests to the hierarchy of balancer threads to leave and
+     * returns immediately without waiting for them to terminate. (Once the termination is complete,
+     * manual migrations will be rejected).
      *
      * This method might be called multiple times in succession, which is what happens as a result
      * of incomplete transition to primary so it is resilient to that.
      *
-     * The waitForBalancerToStop method must be called afterwards in order to wait for the main
+     * The joinTermination() method must be called afterwards in order to wait for the main
      * balancer thread to terminate and to allow initiateBalancer to be called again.
      */
-    void interruptBalancer();
+    void requestTermination();
 
     /**
      * Invoked when a node on its way to becoming a primary finishes draining and is about to
-     * acquire the global X lock in order to allow writes. Waits for the balancer thread to
-     * terminate and primes the balancer so that initiateBalancer can be called.
+     * acquire the global X lock in order to allow writes. Waits for the hierarchy of balancer
+     * threads to terminate and primes the balancer so that initiateBalancer can be called.
      *
      * This must not be called while holding any locks!
      */
-    void waitForBalancerToStop();
+    void joinTermination();
 
     /**
      * Potentially blocking method, which will return immediately if the balancer is not running a
@@ -113,32 +130,6 @@ public:
      * context's deadline is exceeded, it will throw an ExceededTimeLimit exception.
      */
     void joinCurrentRound(OperationContext* opCtx);
-
-    /**
-     * Blocking call, which requests the balancer to move a single chunk to a more appropriate
-     * shard, in accordance with the active balancer policy. It is not guaranteed that the chunk
-     * will actually move because it may already be at the best shard. An error will be returned if
-     * the attempt to find a better shard or the actual migration fail for any reason.
-     */
-    Status rebalanceSingleChunk(OperationContext* opCtx,
-                                const NamespaceString& nss,
-                                const ChunkType& chunk);
-
-    /**
-     * Blocking call, which requests the balancer to move a single chunk to the specified location
-     * in accordance with the active balancer policy. An error will be returned if the attempt to
-     * move fails for any reason.
-     *
-     * NOTE: This call disregards the balancer enabled/disabled status and will proceed with the
-     *       move regardless. If should be used only for user-initiated moves.
-     */
-    Status moveSingleChunk(OperationContext* opCtx,
-                           const NamespaceString& nss,
-                           const ChunkType& chunk,
-                           const ShardId& newShardId,
-                           const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                           bool waitForDelete,
-                           bool forceJumbo);
 
     /**
      * Blocking call, which requests the balancer to move a range to the specified location
@@ -170,12 +161,6 @@ public:
     void abortCollectionDefragmentation(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
-     * Asynchronously requests the resize of all the chunks defined in the cluster, so that
-     * the "Collection Max Chunk Size" constraint existing in FCV 5.0 is enforced.
-     */
-    SharedSemiFuture<void> applyLegacyChunkSizeConstraintsOnClusterData(OperationContext* opCtx);
-
-    /**
      * Returns if a given collection is draining due to a removed shard, has chunks on an invalid
      * zone or the number of chunks is imbalanced across the cluster
      */
@@ -186,24 +171,45 @@ private:
     static constexpr int kMaxOutstandingStreamingOperations = 50;
 
     /**
-     * Possible runtime states of the balancer. The comments indicate the allowed next state.
+     * Possible runtime states of the set of threads instantiated by the balancer.
+     * The diagram below depicts the allowed transitions.
+     * Terminated --> Running --> Terminating
+     *    ^            /          /
+     *    |           /          /
+     *     \---------------------
      */
-    enum State {
-        kStopped,   // kRunning
-        kRunning,   // kStopping | kStopped
-        kStopping,  // kStopped
+    enum class ThreadSetState {
+        // There is no worker thread instantiated by the balancer
+        Terminated,
+        // The balancer is initiliasing its worker threads (or they are all already active)
+        Running,
+        // A request to terminate all the balancer worker threads is ongoing
+        Terminating,
+    };
+
+    struct MigrationStats {
+        int unshardedCollections{0};
+        int rebalancedChunks{0};
+        int defragmentedChunks{0};
     };
 
     /**
      * ReplicaSetAwareService entry points.
      */
     void onStartup(OperationContext* opCtx) final {}
-    void onInitialDataAvailable(OperationContext* opCtx, bool isMajorityDataAvailable) final {}
-    void onShutdown() final {}
+    void onSetCurrentConfig(OperationContext* opCtx) final {}
+    void onConsistentDataAvailable(OperationContext* opCtx,
+                                   bool isMajority,
+                                   bool isRollback) final {}
+    void onRollbackBegin() final {}
+    void onShutdown() final;
     void onStepUpBegin(OperationContext* opCtx, long long term) final;
     void onStepUpComplete(OperationContext* opCtx, long long term) final;
     void onStepDown() final;
     void onBecomeArbiter() final;
+    inline std::string getServiceName() const final {
+        return "Balancer";
+    }
 
     /**
      * The main balancer loop, which runs in a separate thread.
@@ -216,9 +222,9 @@ private:
     void _consumeActionStreamLoop();
 
     /**
-     * Checks whether the balancer main thread has been requested to stop.
+     * Checks whether the balancer is going through a termination sequence of its threads.
      */
-    bool _stopRequested();
+    bool _terminationRequested();
 
     /**
      * Signals the beginning and end of a balancing round.
@@ -239,13 +245,8 @@ private:
     bool _checkOIDs(OperationContext* opCtx);
 
     /**
-     * Iterates through all chunks in all collections. If the collection is the sessions collection,
-     * checks if the number of chunks is greater than or equal to the configured minimum number of
-     * chunks for the sessions collection (minNumChunksForSessionsCollection). If it isn't,
-     * calculates split points that evenly partition the key space into N ranges (where N is
-     * minNumChunksForSessionsCollection rounded up the next power of 2), and splits any chunks that
-     * straddle those split points. If the collection is any other collection, splits any chunks
-     * that straddle tag boundaries.
+     * Iterates through all chunks in all collections, except for the sessions collection, splitting
+     * any chunks that straddle zone boundaries.
      */
     Status _splitChunksIfNeeded(OperationContext* opCtx);
 
@@ -253,17 +254,28 @@ private:
      * Schedules migrations for the specified set of chunks and returns how many chunks were
      * successfully processed.
      */
-    int _moveChunks(OperationContext* opCtx,
-                    const MigrateInfoVector& chunksToRebalance,
-                    const MigrateInfoVector& chunksToDefragment);
+    MigrationStats _doMigrations(OperationContext* opCtx,
+                                 const MigrateInfoVector& unshardedToMove,
+                                 const MigrateInfoVector& chunksToRebalance,
+                                 const MigrateInfoVector& chunksToDefragment);
 
     void _onActionsStreamPolicyStateUpdate();
 
-    // Protects the state below
-    Mutex _mutex = MONGO_MAKE_LATCH("Balancer::_mutex");
+    /**
+     * To be invoked on completion of an action requested to by an ActionStream policy to
+     * update the policy state (which will generate follow-up actions based on the received
+     * outcome).
+     */
+    void _applyStreamingActionResponseToPolicy(const BalancerStreamAction& action,
+                                               const BalancerStreamActionResponse& response,
+                                               ActionsStreamPolicy* policy);
 
-    // Indicates the current state of the balancer
-    State _state{kStopped};
+    // Protects the state below
+    stdx::mutex _mutex;
+
+    // Indicates the current state of the worker threads instantiated by the balancer
+    // (_thread, _actionStreamConsumerThread and _commandScheduler)
+    ThreadSetState _threadSetState{ThreadSetState::Terminated};
 
     // The main balancer threads
     stdx::thread _thread;
@@ -277,7 +289,7 @@ private:
 
     AtomicWord<int> _outstandingStreamingOps{0};
 
-    AtomicWord<bool> _newInfoOnStreamingActions{true};
+    AtomicWord<bool> _actionStreamsStateUpdated{true};
 
     // Indicates whether the balancer is currently executing a balancer round
     bool _inBalancerRound{false};
@@ -289,13 +301,10 @@ private:
     // changes (in particular, state/balancer round and number of balancer rounds).
     stdx::condition_variable _condVar;
 
-    stdx::condition_variable _defragmentationCondVar;
+    stdx::condition_variable _actionStreamCondVar;
 
-    // Number of moved chunks in last round
-    int _balancedLastTime;
-
-    // Source of randomness when metadata needs to be randomized.
-    BalancerRandomSource _random;
+    // Number of migrations in last round
+    MigrationStats _balancedLastTime;
 
     // Source for cluster statistics. Depends on the source of randomness above so it should be
     // created after it and destroyed before it.
@@ -309,8 +318,11 @@ private:
 
     std::unique_ptr<BalancerDefragmentationPolicy> _defragmentationPolicy;
 
-    // TODO  SERVER-65332 remove logic bound to this policy object When kLastLTS is 6.0
-    std::unique_ptr<ClusterChunksResizePolicy> _clusterChunksResizePolicy;
+    std::unique_ptr<AutoMergerPolicy> _autoMergerPolicy;
+
+    std::unique_ptr<MoveUnshardedPolicy> _moveUnshardedPolicy;
+
+    stdx::unordered_set<NamespaceString> _imbalancedCollectionsCache;
 };
 
 }  // namespace mongo

@@ -7,11 +7,6 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fixture_helpers.js");
-
 const collName = jsTest.name();
 const coll = db[collName];
 
@@ -53,17 +48,11 @@ let pipelineLookup = [
             as: "joinedField"
 	}}];
 
-const isShardedLookupEnabled =
-    db.adminCommand({getParameter: 1, featureFlagShardedLookup: 1}).featureFlagShardedLookup.value;
-if (!FixtureHelpers.isMongos(db) || isShardedLookupEnabled) {
-    const lookupRes = geo2.aggregate(pipelineLookup).toArray();
-    assert.eq(lookupRes.length, 2);
-    // Make sure the computed distance uses the location field in the current document in the outer
-    // collection.
-    assert.neq(lookupRes[0].joinedField[0].distance, lookupRes[1].joinedField[0].distance);
-} else {
-    jsTestLog("Skipping test with $lookup in sharded environment if sharded lookup is not enabled");
-}
+const lookupRes = geo2.aggregate(pipelineLookup).toArray();
+assert.eq(lookupRes.length, 2);
+// Make sure the computed distance uses the location field in the current document in the outer
+// collection.
+assert.neq(lookupRes[0].joinedField[0].distance, lookupRes[1].joinedField[0].distance);
 
 // With legacy geometry.
 
@@ -82,4 +71,3 @@ assert.commandFailedWithCode(err, 5860401);
 err = assert.throws(() => coll.aggregate([{$geoNear: {near: "$$pt", distanceField: "distance"}}],
                                          {let : {pt: "abc"}}));
 assert.commandFailedWithCode(err, 5860401);
-}());

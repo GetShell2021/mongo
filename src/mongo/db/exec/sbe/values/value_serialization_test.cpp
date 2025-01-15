@@ -27,12 +27,30 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/exec/sbe/values/bson.h"
-#include "mongo/db/exec/sbe/values/slot.h"
-#include "mongo/db/query/sbe_stage_builder_helpers.h"
-#include "mongo/unittest/unittest.h"
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/exec/sbe/values/row.h"
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/stage_builder/sbe/gen_helpers.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/bufreader.h"
+#include "mongo/util/shared_buffer.h"
 
 namespace mongo::sbe {
 /**
@@ -116,6 +134,17 @@ TEST(ValueSerializeForSorter, Serialize) {
     auto [oidTag, oidVal] = value::makeCopyObjectId({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
     testData->push_back(oidTag, oidVal);
 
+    auto [arrayMultiSetTag, arrayMultiSetVal] = value::makeNewArrayMultiSet();
+    object->push_back("mset", arrayMultiSetTag, arrayMultiSetVal);
+
+    value::ArrayMultiSet* arrayMultiSet = value::getArrayMultiSetView(arrayMultiSetVal);
+    arrayMultiSet->push_back(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(6));
+    arrayMultiSet->push_back(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(6));
+    arrayMultiSet->push_back(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(7));
+
+    auto [msetTag, msetVal] = value::makeCopyArrayMultiSet(*arrayMultiSet);
+    testData->push_back(msetTag, msetVal);
+
     uint8_t byteArray[] = {8, 7, 6, 5, 4, 3, 2, 1};
     auto bson =
         BSON("obj" << BSON("a" << 1 << "b" << 2) << "arr" << BSON_ARRAY(1 << 2 << 3)  //
@@ -142,11 +171,11 @@ TEST(ValueSerializeForSorter, Serialize) {
                          value::bitcastFrom<const char*>(bson["binDataDeprecated"].value()));
     testData->push_back(bsonBinDataDeprecatedTag, bsonBinDataDeprecatedVal);
 
-    KeyString::Builder keyStringBuilder(KeyString::Version::V1);
+    key_string::Builder keyStringBuilder(key_string::Version::V1);
     keyStringBuilder.appendNumberLong(1);
     keyStringBuilder.appendNumberLong(2);
     keyStringBuilder.appendNumberLong(3);
-    auto [keyStringTag, keyStringVal] = value::makeCopyKeyString(keyStringBuilder.getValueCopy());
+    auto [keyStringTag, keyStringVal] = value::makeKeyString(keyStringBuilder.getValueCopy());
     testData->push_back(keyStringTag, keyStringVal);
 
     auto [plainCodeTag, plainCodeVal] =
@@ -184,6 +213,15 @@ TEST(ValueSerializeForSorter, Serialize) {
         value::makeNewBsonCodeWScope("", BSON("b" << 2 << "c" << BSON_ARRAY(3 << 4)).objdata());
     testData->push_back(cwsTag3, cwsVal3);
 
+    value::MultiMap map{};
+    map.insert({value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(1)},
+               {value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(2)});
+    map.insert({value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(3)},
+               {value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(4)});
+
+    auto [mapTag, mapVal] = value::makeCopyMultiMap(map);
+    testData->push_back(mapTag, mapVal);
+
     value::MaterializedRow originalRow{testData->size()};
     for (size_t i = 0; i < testData->size(); i++) {
         auto [tag, value] = testData->getAt(i);
@@ -209,7 +247,7 @@ protected:
             sourceRow.reset(idx++, false, tag, val);
         }
 
-        KeyString::Builder kb{KeyString::Version::kLatestVersion};
+        key_string::Builder kb{key_string::Version::kLatestVersion};
         sourceRow.serializeIntoKeyString(kb);
 
         auto ks = kb.getValueCopy();
@@ -266,6 +304,30 @@ TEST_F(ValueSerializeForKeyString, SbeArray) {
     testData->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(3.0));
 
     runTest({{testDataTag, testDataVal}});
+}
+
+TEST_F(ValueSerializeForKeyString, ArraySet) {
+    auto [tag, val] = sbe::value::makeNewArraySet();
+    sbe::value::ValueGuard guard{tag, val};
+    auto* arraySet = sbe::value::getArraySetView(val);
+
+    arraySet->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(1));
+    arraySet->push_back(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(2));
+    arraySet->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(3.0));
+
+    runTest({{tag, val}});
+}
+
+TEST_F(ValueSerializeForKeyString, ArrayMultiSet) {
+    auto [tag, val] = sbe::value::makeNewArrayMultiSet();
+    sbe::value::ValueGuard guard{tag, val};
+    auto* arrayMultiSet = sbe::value::getArrayMultiSetView(val);
+
+    arrayMultiSet->push_back(value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(1));
+    arrayMultiSet->push_back(value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(1));
+    arrayMultiSet->push_back(value::TypeTags::NumberDouble, value::bitcastFrom<double>(2.0));
+
+    runTest({{tag, val}});
 }
 
 TEST_F(ValueSerializeForKeyString, DateTime) {
@@ -376,13 +438,13 @@ TEST_F(ValueSerializeForKeyString, BsonBinData) {
 }
 
 TEST_F(ValueSerializeForKeyString, KeyString) {
-    KeyString::Builder keyStringBuilder(KeyString::Version::V1);
+    key_string::Builder keyStringBuilder(key_string::Version::V1);
     keyStringBuilder.appendNumberLong(1);
     keyStringBuilder.appendNumberLong(2);
     keyStringBuilder.appendNumberLong(3);
     keyStringBuilder.appendString("aaa");
     auto ks = keyStringBuilder.getValueCopy();
-    auto [keyStringTag, keyStringVal] = value::makeCopyKeyString(ks);
+    auto [keyStringTag, keyStringVal] = value::makeKeyString(ks);
     sbe::value::ValueGuard testGuard{keyStringTag, keyStringVal};
 
     runTest({{keyStringTag, keyStringVal}});
@@ -441,5 +503,31 @@ TEST_F(ValueSerializeForKeyString, BsonCodeWScope) {
     sbe::value::ValueGuard testDataGuard3{cwsTag3, cwsVal3};
 
     runTest({{cwsTag1, cwsVal1}, {cwsTag2, cwsVal2}, {cwsTag3, cwsVal3}});
+}
+
+// Test that roundtripping through KeyString works for a wide row. KeyStrings used in indexes are
+// typically constrained in the number of components they can have, since we limit compound indexes
+// to at most 32 components. But roundtripping rows wider than 32 still needs to work.
+//
+// This test was originally designed to reproduce SERVER-76321.
+TEST_F(ValueSerializeForKeyString, RoundtripWideRow) {
+    std::vector<std::pair<sbe::value::TypeTags, sbe::value::Value>> row;
+    for (int32_t i = 0; i < 40; ++i) {
+        row.emplace_back(sbe::value::TypeTags::NumberInt32, sbe::value::bitcastFrom<int32_t>(i));
+    }
+    runTest(row);
+}
+
+// Test that roundtripping through KeyString works for ObjectIdType: ObjectId; bsonObjectId.
+TEST_F(ValueSerializeForKeyString, RoundtripObjectIdType) {
+    auto [objectIdTag, objectIdVal] = value::makeNewObjectId();
+
+    auto oid = OID::gen();
+    auto obj = BSON("" << oid);
+    auto oidStorage = obj.firstElement().value();
+
+    sbe::value::ValueGuard testDataGuard{objectIdTag, objectIdVal};
+    runTest({{objectIdTag, objectIdVal},
+             {value::TypeTags::bsonObjectId, value::bitcastFrom<const char*>(oidStorage)}});
 }
 }  // namespace mongo::sbe

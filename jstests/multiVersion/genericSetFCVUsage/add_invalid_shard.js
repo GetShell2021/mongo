@@ -2,9 +2,8 @@
  * Test that adding invalid or duplicate shards will fail.
  *
  */
-(function() {
-
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 1});
 
@@ -101,4 +100,3 @@ assert.commandFailedWithCode(st.admin.runCommand({addshard: st.s.host}),
                              ErrorCodes.IllegalOperation);
 
 st.stop();
-})();

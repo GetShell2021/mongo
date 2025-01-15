@@ -30,10 +30,38 @@
 
 #include "mongo/db/s/set_allow_migrations_coordinator.h"
 
-#include "mongo/db/commands.h"
-#include "mongo/logv2/log.h"
+#include <boost/smart_ptr.hpp>
+#include <string>
+#include <tuple>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/s/forwardable_operation_metadata.h"
+#include "mongo/db/s/sharding_logging.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_collection_gen.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/namespace_string_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -54,7 +82,7 @@ void SetAllowMigrationsCoordinator::checkIfOptionsConflict(const BSONObj& doc) c
     // If we have two set allow migrations on the same namespace, then the arguments must be the
     // same.
     const auto otherDoc = SetAllowMigrationsCoordinatorDocument::parse(
-        IDLParserErrorContext("SetAllowMigrationsCoordinatorDocument"), doc);
+        IDLParserContext("SetAllowMigrationsCoordinatorDocument"), doc);
 
     uassert(ErrorCodes::ConflictingOperationInProgress,
             "Another set allow migrations with different arguments is already running for the same "
@@ -72,52 +100,48 @@ void SetAllowMigrationsCoordinator::appendCommandInfo(BSONObjBuilder* cmdInfoBui
 ExecutorFuture<void> SetAllowMigrationsCoordinator::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancellationToken& token) noexcept {
-    return ExecutorFuture<void>(**executor)
-        .then([this, anchor = shared_from_this()] {
-            auto opCtxHolder = cc().makeOperationContext();
-            auto* opCtx = opCtxHolder.get();
-            getForwardableOpMetadata().setOn(opCtx);
+    return ExecutorFuture<void>(**executor).then([this, anchor = shared_from_this()] {
+        auto opCtxHolder = cc().makeOperationContext();
+        auto* opCtx = opCtxHolder.get();
+        getForwardableOpMetadata().setOn(opCtx);
 
-            uassert(ErrorCodes::NamespaceNotSharded,
-                    "Collection must be sharded so migrations can be blocked",
-                    isCollectionSharded(opCtx, nss()));
+        uassert(ErrorCodes::NamespaceNotSharded,
+                "Collection must be sharded so migrations can be blocked",
+                isCollectionSharded(opCtx, nss()));
 
-            const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+        const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
-            BatchedCommandRequest updateRequest([&]() {
-                write_ops::UpdateCommandRequest updateOp(CollectionType::ConfigNS);
-                updateOp.setUpdates({[&] {
-                    write_ops::UpdateOpEntry entry;
-                    entry.setQ(BSON(CollectionType::kNssFieldName << nss().ns()));
-                    if (_allowMigrations) {
-                        entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(BSON(
-                            "$unset" << BSON(CollectionType::kPermitMigrationsFieldName << true))));
-                    } else {
-                        entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(BSON(
-                            "$set" << BSON(CollectionType::kPermitMigrationsFieldName << false))));
-                    }
-                    entry.setMulti(false);
-                    return entry;
-                }()});
-                return updateOp;
-            }());
+        BatchedCommandRequest updateRequest([&]() {
+            write_ops::UpdateCommandRequest updateOp(CollectionType::ConfigNS);
+            updateOp.setUpdates({[&] {
+                write_ops::UpdateOpEntry entry;
+                entry.setQ(BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(
+                                    nss(), SerializationContext::stateDefault())));
+                if (_allowMigrations) {
+                    entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(BSON(
+                        "$unset" << BSON(CollectionType::kPermitMigrationsFieldName << true))));
+                } else {
+                    entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(
+                        BSON("$set" << BSON(CollectionType::kPermitMigrationsFieldName << false))));
+                }
+                entry.setMulti(false);
+                return entry;
+            }()});
+            return updateOp;
+        }());
 
-            updateRequest.setWriteConcern(ShardingCatalogClient::kMajorityWriteConcern.toBSON());
+        auto response =
+            configShard->runBatchWriteCommand(opCtx,
+                                              Milliseconds(defaultConfigCommandTimeoutMS.load()),
+                                              updateRequest,
+                                              ShardingCatalogClient::kMajorityWriteConcern,
+                                              Shard::RetryPolicy::kIdempotent);
 
-            auto response = configShard->runBatchWriteCommand(opCtx,
-                                                              Shard::kDefaultConfigCommandTimeout,
-                                                              updateRequest,
-                                                              Shard::RetryPolicy::kIdempotent);
+        uassertStatusOK(response.toStatus());
 
-            uassertStatusOK(response.toStatus());
-        })
-        .onError([this, anchor = shared_from_this()](const Status& status) {
-            LOGV2_ERROR(5622700,
-                        "Error running set allow migrations",
-                        "namespace"_attr = nss(),
-                        "error"_attr = redact(status));
-            return status;
-        });
+        ShardingLogging::get(opCtx)->logChange(
+            opCtx, "setPermitMigrations", nss(), BSON("permitMigrations" << _allowMigrations));
+    });
 }
 
 }  // namespace mongo

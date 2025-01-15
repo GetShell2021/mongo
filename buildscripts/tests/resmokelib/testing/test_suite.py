@@ -1,11 +1,12 @@
 """Unit tests for the resmokelib.testing.suite module."""
+
 import unittest
 
 from mock import MagicMock
 
 from buildscripts.resmokelib.testing import suite as under_test
 
-# pylint: disable=missing-docstring,protected-access
+# pylint: disable=protected-access
 from buildscripts.resmokelib.testing.testcases.interface import TestCase
 
 

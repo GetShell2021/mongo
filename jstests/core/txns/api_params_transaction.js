@@ -1,18 +1,15 @@
 /**
  * Tests passing API parameters into transaction-continuing commands.
+ *
  * @tags: [
+ *   # The test runs commands that are not allowed with security token: endSession.
+ *   not_allowed_with_signed_security_token,
  *   uses_api_parameters,
  *   uses_transactions,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fixture_helpers.js");  // For FixtureHelpers.isMongos().
-load(
-    "jstests/libs/auto_retry_transaction_in_sharding.js");  // For
-                                                            // retryOnceOnTransientAndRestartTxnOnMongos().
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
 
 const dbName = jsTestName();
 const collName = "test";
@@ -65,16 +62,20 @@ for (const txnInitiatingParams of apiParamCombos) {
                 }
             }
 
-            session.startTransaction();
-            retryOnceOnTransientAndRestartTxnOnMongos(session, () => {
-                assert.commandWorked(sessionDb.runCommand(addApiParams(
-                    {insert: collName, documents: [{}, {}, {}]}, txnInitiatingParams)));
+            withRetryOnTransientTxnError(
+                () => {
+                    session.startTransaction();
+                    assert.commandWorked(sessionDb.runCommand(addApiParams(
+                        {insert: collName, documents: [{}, {}, {}]}, txnInitiatingParams)));
 
-                /*
-                 * Check "insert" with API params in a transaction.
-                 */
-                checkCommand(sessionDb, {insert: collName, documents: [{}]});
-            }, {});
+                    /*
+                     * Check "insert" with API params in a transaction.
+                     */
+                    checkCommand(sessionDb, {insert: collName, documents: [{}]});
+                },
+                () => {
+                    session.abortTransaction_forTesting();
+                });
 
             /*
              * Check "commitTransaction" or "abortTransaction".
@@ -103,4 +104,3 @@ for (const txnInitiatingParams of apiParamCombos) {
         }
     }
 }
-})();

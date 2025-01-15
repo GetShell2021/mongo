@@ -27,32 +27,66 @@
  *    it in the license file.
  */
 
+#include <absl/container/node_hash_map.h>
 #include <boost/optional.hpp>
 #include <functional>
+#include <mutex>
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_field.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_cache_noop.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_noop.h"
-#include "mongo/db/op_observer_registry.h"
-#include "mongo/db/repl/primary_only_service_test_fixture.h"
+#include "mongo/db/keypattern.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
 #include "mongo/db/s/resharding/resharding_op_observer.h"
-#include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding/resharding_service_test_helpers.h"
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
-#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/executor/mock_async_rpc.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_collection_gen.h"
+#include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/resharding/resharding_coordinator_service_conflicting_op_in_progress_info.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/unordered_map.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/clock_source_mock.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -61,22 +95,10 @@ namespace {
 
 using CoordinatorStateTransitionController =
     resharding_service_test_helpers::StateTransitionController<CoordinatorStateEnum>;
-using OpObserverForTest =
-    resharding_service_test_helpers::OpObserverForTest<CoordinatorStateEnum,
-                                                       ReshardingCoordinatorDocument>;
+using OpObserverForTest = resharding_service_test_helpers::
+    StateTransitionControllerOpObserver<CoordinatorStateEnum, ReshardingCoordinatorDocument>;
 using PauseDuringStateTransitions =
     resharding_service_test_helpers::PauseDuringStateTransitions<CoordinatorStateEnum>;
-
-class CoordinatorOpObserverForTest : public OpObserverForTest {
-public:
-    CoordinatorOpObserverForTest(std::shared_ptr<CoordinatorStateTransitionController> controller)
-        : OpObserverForTest(std::move(controller),
-                            NamespaceString::kConfigReshardingOperationsNamespace) {}
-
-    CoordinatorStateEnum getState(const ReshardingCoordinatorDocument& coordinatorDoc) override {
-        return coordinatorDoc.getState();
-    }
-};
 
 class ExternalStateForTest : public ReshardingCoordinatorExternalState {
     ParticipantShardsAndChunks calculateParticipantShardsAndChunks(
@@ -99,32 +121,29 @@ class ExternalStateForTest : public ReshardingCoordinatorExternalState {
         return ParticipantShardsAndChunks(
             {coordinatorDoc.getDonorShards(), coordinatorDoc.getRecipientShards(), initialChunks});
     }
-
-    void sendCommandToShards(OperationContext* opCtx,
-                             StringData dbName,
-                             const BSONObj& command,
-                             const std::vector<ShardId>& shardIds,
-                             const std::shared_ptr<executor::TaskExecutor>& executor) override {}
 };
 
 class ReshardingCoordinatorServiceForTest : public ReshardingCoordinatorService {
 public:
     explicit ReshardingCoordinatorServiceForTest(ServiceContext* serviceContext)
-        : ReshardingCoordinatorService(serviceContext) {}
+        : ReshardingCoordinatorService(serviceContext), _serviceContext(serviceContext) {}
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override {
         return std::make_shared<ReshardingCoordinator>(
             this,
-            ReshardingCoordinatorDocument::parse(
-                IDLParserErrorContext("ReshardingCoordinatorStateDoc"), std::move(initialState)),
-            std::make_shared<ExternalStateForTest>());
+            ReshardingCoordinatorDocument::parse(IDLParserContext("ReshardingCoordinatorStateDoc"),
+                                                 initialState),
+            std::make_shared<ExternalStateForTest>(),
+            _serviceContext);
     }
+
+private:
+    ServiceContext* _serviceContext;
 };
 
-class ReshardingCoordinatorServiceTest : public ConfigServerTestFixture {
+class ReshardingCoordinatorServiceTest : service_context_test::WithSetupTransportLayer,
+                                         public ConfigServerTestFixture {
 public:
-    using ReshardingCoordinator = ReshardingCoordinatorService::ReshardingCoordinator;
-
     std::unique_ptr<repl::PrimaryOnlyService> makeService(ServiceContext* serviceContext) {
         return std::make_unique<ReshardingCoordinatorServiceForTest>(serviceContext);
     }
@@ -133,38 +152,42 @@ public:
         ConfigServerTestFixture::setUp();
 
         ShardType shard0;
-        shard0.setName("shard0000");
-        shard0.setHost("shard0000:1234");
+        shard0.setName(shardId0.toString());
+        shard0.setHost(shardId0.toString() + ":1234");
         ShardType shard1;
-        shard1.setName("shard0001");
-        shard1.setHost("shard0001:1234");
+        shard1.setName(shardId1.toString());
+        shard1.setHost(shardId1.toString() + ":1234");
         setupShards({shard0, shard1});
 
         auto opCtx = operationContext();
         DBDirectClient client(opCtx);
-        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns());
-        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace.ns(),
+        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace);
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
                              {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
-        client.createCollection(NamespaceString::kConfigReshardingOperationsNamespace.ns());
-        client.createCollection(CollectionType::ConfigNS.ns());
+        client.createCollection(NamespaceString::kConfigReshardingOperationsNamespace);
+        client.createCollection(CollectionType::ConfigNS);
 
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
         TransactionCoordinatorService::get(operationContext())
-            ->onShardingInitialization(operationContext(), true);
+            ->initializeIfNeeded(operationContext(), /* term */ 1);
 
         _controller = std::make_shared<CoordinatorStateTransitionController>();
         WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
 
         repl::createOplog(opCtx);
 
+        auto asyncRPCMock = std::make_unique<async_rpc::NoopMockAsyncRPCRunner>();
+        async_rpc::detail::AsyncRPCRunner::set(getServiceContext(), std::move(asyncRPCMock));
+
         _opObserverRegistry =
             dynamic_cast<OpObserverRegistry*>(getServiceContext()->getOpObserver());
         invariant(_opObserverRegistry);
 
         _opObserverRegistry->addObserver(std::make_unique<ReshardingOpObserver>());
-        _opObserverRegistry->addObserver(
-            std::make_unique<CoordinatorOpObserverForTest>(_controller));
-
+        _opObserverRegistry->addObserver(std::make_unique<OpObserverForTest>(
+            _controller,
+            NamespaceString::kConfigReshardingOperationsNamespace,
+            [](const ReshardingCoordinatorDocument& stateDoc) { return stateDoc.getState(); }));
         _registry = repl::PrimaryOnlyServiceRegistry::get(getServiceContext());
         auto service = makeService(getServiceContext());
         auto serviceName = service->getServiceName();
@@ -179,7 +202,7 @@ public:
     void tearDown() override {
         globalFailPointRegistry().disableAllFailpoints();
 
-        TransactionCoordinatorService::get(operationContext())->onStepDown();
+        TransactionCoordinatorService::get(operationContext())->interrupt();
         WaitForMajorityService::get(getServiceContext()).shutDown();
         ConfigServerTestFixture::tearDown();
         _registry->onShutdown();
@@ -190,44 +213,68 @@ public:
     }
 
     ReshardingCoordinatorDocument makeCoordinatorDoc(
-        CoordinatorStateEnum state, boost::optional<Timestamp> fetchTimestamp = boost::none) {
+        CoordinatorStateEnum state,
+        UUID reshardingUUID,
+        NamespaceString originalNss,
+        NamespaceString tempNss,
+        const ShardKeyPattern& newShardKey,
+        const std::vector<ShardId>& donorShardIds,
+        const std::vector<ShardId>& recipientShardIds,
+        boost::optional<Timestamp> fetchTimestamp = boost::none) {
         CommonReshardingMetadata meta(
-            _reshardingUUID, _originalNss, UUID::gen(), _tempNss, _newShardKey.toBSON());
+            reshardingUUID, originalNss, UUID::gen(), tempNss, newShardKey.toBSON());
         meta.setStartTime(getServiceContext()->getFastClockSource()->now());
 
-        ReshardingCoordinatorDocument doc(state,
-                                          {DonorShardEntry(ShardId("shard0000"), {})},
-                                          {RecipientShardEntry(ShardId("shard0001"), {})});
+        std::vector<DonorShardEntry> donorShards;
+        std::transform(donorShardIds.begin(),
+                       donorShardIds.end(),
+                       std::back_inserter(donorShards),
+                       [](auto shardId) {
+                           return DonorShardEntry{shardId, {}};
+                       });
+
+        std::vector<RecipientShardEntry> recipientShards;
+        std::transform(recipientShardIds.begin(),
+                       recipientShardIds.end(),
+                       std::back_inserter(recipientShards),
+                       [](auto shardId) {
+                           return RecipientShardEntry{shardId, {}};
+                       });
+
+        ReshardingCoordinatorDocument doc(state, donorShards, recipientShards);
         doc.setCommonReshardingMetadata(meta);
         resharding::emplaceCloneTimestampIfExists(doc, cloneTimestamp);
         return doc;
     }
 
-    std::shared_ptr<ReshardingCoordinatorService::ReshardingCoordinator> getCoordinator(
+    std::shared_ptr<ReshardingCoordinator> getCoordinator(
         OperationContext* opCtx, repl::PrimaryOnlyService::InstanceID instanceId) {
         auto coordinator = getCoordinatorIfExists(opCtx, instanceId);
         ASSERT_TRUE(bool(coordinator));
         return coordinator;
     }
 
-    std::shared_ptr<ReshardingCoordinatorService::ReshardingCoordinator> getCoordinatorIfExists(
+    std::shared_ptr<ReshardingCoordinator> getCoordinatorIfExists(
         OperationContext* opCtx, repl::PrimaryOnlyService::InstanceID instanceId) {
-        auto coordinatorOpt = ReshardingCoordinatorService::ReshardingCoordinator::lookup(
-            opCtx, _service, instanceId);
-        if (!coordinatorOpt) {
-            return nullptr;
-        }
-
-        auto coordinator = *coordinatorOpt;
-        return coordinator ? coordinator : nullptr;
+        auto [coordinatorOpt, _] = ReshardingCoordinator::lookup(opCtx, _service, instanceId);
+        return coordinatorOpt ? *coordinatorOpt : nullptr;
     }
 
     ReshardingCoordinatorDocument getCoordinatorDoc(OperationContext* opCtx) {
         DBDirectClient client(opCtx);
 
         auto doc = client.findOne(NamespaceString::kConfigReshardingOperationsNamespace, BSONObj{});
-        IDLParserErrorContext errCtx("reshardingCoordFromTest");
+        IDLParserContext errCtx("reshardingCoordFromTest");
         return ReshardingCoordinatorDocument::parse(errCtx, doc);
+    }
+
+    CollectionType getTemporaryCollectionCatalogEntry(
+        OperationContext* opCtx, const ReshardingCoordinatorDocument& coordinatorDoc) {
+        DBDirectClient client(opCtx);
+        auto doc = client.findOne(CollectionType::ConfigNS,
+                                  BSON(CollectionType::kNssFieldName
+                                       << coordinatorDoc.getTempReshardingNss().ns_forTest()));
+        return CollectionType{std::move(doc)};
     }
 
     void replaceCoordinatorDoc(OperationContext* opCtx,
@@ -236,8 +283,7 @@ public:
 
         const BSONObj query(BSON(ReshardingCoordinatorDocument::kReshardingUUIDFieldName
                                  << newDoc.getReshardingUUID()));
-        client.update(
-            NamespaceString::kConfigReshardingOperationsNamespace.ns(), {}, newDoc.toBSON());
+        client.update(NamespaceString::kConfigReshardingOperationsNamespace, {}, newDoc.toBSON());
     }
 
     void waitUntilCommittedCoordinatorDocReach(OperationContext* opCtx,
@@ -255,13 +301,16 @@ public:
         }
     }
 
-    void makeDonorsReadyToDonate(OperationContext* opCtx) {
+    void makeDonorsReadyToDonateWithAssert(OperationContext* opCtx) {
         auto coordDoc = getCoordinatorDoc(opCtx);
+        ASSERT_NE(coordDoc.getStartTime(), Date_t::min());
 
         auto donorShards = coordDoc.getDonorShards();
         DonorShardContext donorCtx;
         donorCtx.setState(DonorStateEnum::kDonatingInitialData);
         donorCtx.setMinFetchTimestamp(cloneTimestamp);
+        donorCtx.setBytesToClone(totalApproxBytesToClone / donorShards.size());
+        donorCtx.setDocumentsToClone(totalApproxDocumentsToClone / donorShards.size());
         for (auto& shard : donorShards) {
             shard.setMutableState(donorCtx);
         }
@@ -270,8 +319,9 @@ public:
         replaceCoordinatorDoc(opCtx, coordDoc);
     }
 
-    void makeRecipientsFinishedCloning(OperationContext* opCtx) {
+    void makeRecipientsFinishedCloningWithAssert(OperationContext* opCtx) {
         auto coordDoc = getCoordinatorDoc(opCtx);
+        ASSERT_NE(coordDoc.getMetrics()->getDocumentCopy()->getStart(), Date_t::min());
 
         auto shards = coordDoc.getRecipientShards();
         RecipientShardContext ctx;
@@ -284,8 +334,10 @@ public:
         replaceCoordinatorDoc(opCtx, coordDoc);
     }
 
-    void makeRecipientsBeInStrictConsistency(OperationContext* opCtx) {
+    void makeRecipientsBeInStrictConsistencyWithAssert(OperationContext* opCtx) {
         auto coordDoc = getCoordinatorDoc(opCtx);
+        ASSERT_LTE(coordDoc.getMetrics()->getOplogApplication()->getStart(),
+                   coordDoc.getMetrics()->getOplogApplication()->getStop());
 
         auto shards = coordDoc.getRecipientShards();
         RecipientShardContext ctx;
@@ -298,8 +350,7 @@ public:
         replaceCoordinatorDoc(opCtx, coordDoc);
     }
 
-    void makeDonorsProceedToDone(OperationContext* opCtx) {
-        auto coordDoc = getCoordinatorDoc(opCtx);
+    void makeDonorsProceedToDone(OperationContext* opCtx, ReshardingCoordinatorDocument coordDoc) {
         auto donorShards = coordDoc.getDonorShards();
         DonorShardContext donorCtx;
         donorCtx.setState(DonorStateEnum::kDone);
@@ -311,8 +362,21 @@ public:
         replaceCoordinatorDoc(opCtx, coordDoc);
     }
 
-    void makeRecipientsProceedToDone(OperationContext* opCtx) {
+    void makeDonorsProceedToDone(OperationContext* opCtx) {
         auto coordDoc = getCoordinatorDoc(opCtx);
+        makeDonorsProceedToDone(opCtx, coordDoc);
+    }
+
+    void makeDonorsProceedToDoneWithAssert(OperationContext* opCtx) {
+        auto coordDoc = getCoordinatorDoc(opCtx);
+        ASSERT_LTE(coordDoc.getMetrics()->getDocumentCopy()->getStart(),
+                   coordDoc.getMetrics()->getDocumentCopy()->getStop());
+
+        makeDonorsProceedToDone(opCtx, coordDoc);
+    }
+
+    void makeRecipientsProceedToDone(OperationContext* opCtx,
+                                     ReshardingCoordinatorDocument coordDoc) {
         auto shards = coordDoc.getRecipientShards();
         RecipientShardContext ctx;
         ctx.setState(RecipientStateEnum::kDone);
@@ -321,6 +385,35 @@ public:
         }
         coordDoc.setRecipientShards(shards);
 
+        replaceCoordinatorDoc(opCtx, coordDoc);
+    }
+
+    void makeRecipientsProceedToDone(OperationContext* opCtx) {
+        auto coordDoc = getCoordinatorDoc(opCtx);
+        makeRecipientsProceedToDone(opCtx, coordDoc);
+    }
+
+    void makeRecipientsProceedToDoneWithAssert(OperationContext* opCtx) {
+        auto coordDoc = getCoordinatorDoc(opCtx);
+        ASSERT_LTE(coordDoc.getMetrics()->getDocumentCopy()->getStart(),
+                   coordDoc.getMetrics()->getDocumentCopy()->getStop());
+        makeRecipientsProceedToDone(opCtx, coordDoc);
+    }
+
+    void makeRecipientsReturnErrorWithAssert(OperationContext* opCtx) {
+        auto coordDoc = getCoordinatorDoc(opCtx);
+        ASSERT_NE(coordDoc.getMetrics()->getDocumentCopy()->getStart(), Date_t::min());
+        auto shards = coordDoc.getRecipientShards();
+        RecipientShardContext ctx;
+        ctx.setState(RecipientStateEnum::kError);
+        Status abortReasonStatus{ErrorCodes::SnapshotUnavailable, "test simulated error"};
+        resharding::emplaceTruncatedAbortReasonIfExists(ctx, abortReasonStatus);
+
+        for (auto& shard : shards) {
+            shard.setMutableState(ctx);
+        }
+
+        coordDoc.setRecipientShards(shards);
         replaceCoordinatorDoc(opCtx, coordDoc);
     }
 
@@ -346,7 +439,7 @@ public:
                                 std::move(uuid),
                                 shardKey);
         if (reshardingFields)
-            collType.setReshardingFields(std::move(reshardingFields.get()));
+            collType.setReshardingFields(std::move(reshardingFields.value()));
 
         if (coordinatorDoc.getState() == CoordinatorStateEnum::kDone ||
             coordinatorDoc.getState() == CoordinatorStateEnum::kAborting) {
@@ -360,11 +453,41 @@ public:
     ReshardingCoordinatorDocument insertStateAndCatalogEntries(
         CoordinatorStateEnum state,
         OID epoch,
-        boost::optional<Timestamp> fetchTimestamp = boost::none) {
+        const std::vector<ShardId>& donorShardIds,
+        const std::vector<ShardId>& recipientShardIds,
+        const boost::optional<Timestamp>& fetchTimestamp = boost::none) {
+        return insertStateAndCatalogEntries(state,
+                                            epoch,
+                                            _reshardingUUID,
+                                            _originalNss,
+                                            _tempNss,
+                                            _newShardKey,
+                                            donorShardIds,
+                                            recipientShardIds,
+                                            fetchTimestamp);
+    }
+
+    ReshardingCoordinatorDocument insertStateAndCatalogEntries(
+        CoordinatorStateEnum state,
+        OID epoch,
+        UUID reshardingUUID,
+        NamespaceString originalNss,
+        NamespaceString tempNss,
+        const ShardKeyPattern& newShardKey,
+        const std::vector<ShardId>& donorShardIds,
+        const std::vector<ShardId>& recipientShardIds,
+        const boost::optional<Timestamp>& fetchTimestamp = boost::none) {
         auto opCtx = operationContext();
         DBDirectClient client(opCtx);
 
-        auto coordinatorDoc = makeCoordinatorDoc(state, fetchTimestamp);
+        auto coordinatorDoc = makeCoordinatorDoc(state,
+                                                 reshardingUUID,
+                                                 originalNss,
+                                                 tempNss,
+                                                 newShardKey,
+                                                 donorShardIds,
+                                                 recipientShardIds,
+                                                 fetchTimestamp);
 
         TypeCollectionReshardingFields reshardingFields(coordinatorDoc.getReshardingUUID());
         reshardingFields.setState(coordinatorDoc.getState());
@@ -379,12 +502,12 @@ public:
             reshardingFields,
             std::move(epoch),
             opCtx->getServiceContext()->getPreciseClockSource()->now());
-        client.insert(CollectionType::ConfigNS.ns(), originalNssCatalogEntry.toBSON());
+        client.insert(CollectionType::ConfigNS, originalNssCatalogEntry.toBSON());
 
-        DatabaseType dbDoc(coordinatorDoc.getSourceNss().db().toString(),
+        DatabaseType dbDoc(coordinatorDoc.getSourceNss().dbName(),
                            coordinatorDoc.getDonorShards().front().getId(),
                            DatabaseVersion{UUID::gen(), Timestamp(1, 1)});
-        client.insert(NamespaceString::kConfigDatabasesNamespace.ns(), dbDoc.toBSON());
+        client.insert(NamespaceString::kConfigDatabasesNamespace, dbDoc.toBSON());
 
         return coordinatorDoc;
     }
@@ -394,11 +517,11 @@ public:
         DBDirectClient client(opCtx);
 
         for (const auto& chunk : chunks) {
-            client.insert(ChunkType::ConfigNS.ns(), chunk.toConfigBSON());
+            client.insert(NamespaceString::kConfigsvrChunksNamespace, chunk.toConfigBSON());
         }
 
         for (const auto& zone : zones) {
-            client.insert(TagsType::ConfigNS.ns(), zone.toBSON());
+            client.insert(TagsType::ConfigNS, zone.toBSON());
         }
     }
 
@@ -406,34 +529,34 @@ public:
                                       OID epoch,
                                       const Timestamp& timestamp,
                                       const ShardKeyPattern& shardKey,
-                                      std::vector<OID> ids) {
+                                      const std::vector<ShardId>& shardIds) {
         auto chunkRanges =
             _newShardKey.isShardKey(shardKey.toBSON()) ? _newChunkRanges : _oldChunkRanges;
+        ASSERT_GTE(chunkRanges.size(), shardIds.size());
 
-        // Create two chunks, one on each shard with the given namespace and epoch
+        int currentIndex = 0;
+        auto getNextShardId = [&] {
+            return shardIds[currentIndex++ % shardIds.size()];
+        };
+
+        // Use round-robin to distribute chunks among the given shards.
         ChunkVersion version({epoch, timestamp}, {1, 0});
-        ChunkType chunk1(uuid, chunkRanges[0], version, ShardId("shard0000"));
-        chunk1.setName(ids[0]);
+        ChunkType chunk1(uuid, chunkRanges[0], version, getNextShardId());
+        chunk1.setName(OID::gen());
         version.incMinor();
-        ChunkType chunk2(uuid, chunkRanges[1], version, ShardId("shard0001"));
-        chunk2.setName(ids[1]);
+        ChunkType chunk2(uuid, chunkRanges[1], version, getNextShardId());
+        chunk2.setName(OID::gen());
 
         return std::vector<ChunkType>{chunk1, chunk2};
     }
 
-    // Returns the chunk for the donor shard.
-    ChunkType makeAndInsertChunksForDonorShard(const UUID& uuid,
-                                               OID epoch,
-                                               const Timestamp& timestamp,
-                                               const ShardKeyPattern& shardKey,
-                                               std::vector<OID> ids) {
-        auto chunks = makeChunks(uuid, epoch, timestamp, shardKey, ids);
-
-        // Only the chunk corresponding to shard0000 is stored as a donor in the coordinator state
-        // document constructed.
-        auto donorChunk = chunks[0];
-        insertChunkAndZoneEntries(chunks, {});
-        return donorChunk;
+    void makeAndInsertChunksForDonorShard(const UUID& uuid,
+                                          OID epoch,
+                                          const Timestamp& timestamp,
+                                          const ShardKeyPattern& shardKey,
+                                          const std::vector<ShardId> shardIds) {
+        auto chunks = makeChunks(uuid, epoch, timestamp, shardKey, shardIds);
+        insertChunkAndZoneEntries(std::move(chunks), {});
     }
 
     void stepUp(OperationContext* opCtx) {
@@ -448,7 +571,7 @@ public:
 
         ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
         ASSERT_OK(replCoord->updateTerm(opCtx, _term));
-        replCoord->setMyLastAppliedOpTimeAndWallTime({newOpTime, {}});
+        replCoord->setMyLastAppliedOpTimeAndWallTimeForward({newOpTime, {}});
 
         _registry->onStepUpComplete(opCtx, _term);
     }
@@ -464,15 +587,15 @@ public:
         auto serviceCtx = opCtx->getServiceContext();
         for (ServiceContext::LockedClientsCursor cursor(serviceCtx);
              Client* client = cursor.next();) {
-            stdx::lock_guard<Client> lk(*client);
-            if (client->isFromSystemConnection() && !client->canKillSystemOperationInStepdown(lk)) {
+            if (!client->canKillOperationInStepdown()) {
                 continue;
             }
 
+            ClientLock lk(client);
             OperationContext* toKill = client->getOperationContext();
 
             if (toKill && !toKill->isKillPending() && toKill->getOpID() != opCtx->getOpID()) {
-                auto locker = toKill->lockState();
+                auto locker = shard_role_details::getLocker(toKill);
                 if (toKill->shouldAlwaysInterruptAtStepDownOrUp() ||
                     locker->wasGlobalLockTakenInModeConflictingWithWrites()) {
                     serviceCtx->killOperation(lk, toKill);
@@ -486,7 +609,7 @@ public:
              Client* client = cursor.next();) {
             invariant(client);
 
-            stdx::lock_guard<Client> lk(*client);
+            ClientLock lk(client);
             if (auto opCtx = client->getOperationContext()) {
                 StringData desc(client->desc());
 
@@ -500,19 +623,66 @@ public:
     }
 
     auto initializeAndGetCoordinator() {
-        auto doc = insertStateAndCatalogEntries(CoordinatorStateEnum::kUnused, _originalEpoch);
-        auto opCtx = operationContext();
-        auto donorChunk = makeAndInsertChunksForDonorShard(_originalUUID,
-                                                           _originalEpoch,
-                                                           _originalTimestamp,
-                                                           _oldShardKey,
-                                                           std::vector{OID::gen(), OID::gen()});
+        return initializeAndGetCoordinator(
+            _reshardingUUID, _originalNss, _tempNss, _newShardKey, _originalUUID, _oldShardKey);
+    }
 
-        auto initialChunks = makeChunks(_reshardingUUID,
+    std::shared_ptr<ReshardingCoordinator> initializeAndGetCoordinator(
+        UUID reshardingUUID,
+        NamespaceString originalNss,
+        NamespaceString tempNss,
+        const ShardKeyPattern& newShardKey,
+        UUID originalUUID,
+        const ShardKeyPattern& oldShardKey) {
+        auto donorShardIds = getShardIds();
+        auto recipientShardIds = getShardIds();
+        return initializeAndGetCoordinator(reshardingUUID,
+                                           originalNss,
+                                           tempNss,
+                                           newShardKey,
+                                           originalUUID,
+                                           oldShardKey,
+                                           donorShardIds,
+                                           recipientShardIds);
+    }
+
+    std::shared_ptr<ReshardingCoordinator> initializeAndGetCoordinator(
+        UUID reshardingUUID,
+        NamespaceString originalNss,
+        NamespaceString tempNss,
+        const ShardKeyPattern& newShardKey,
+        UUID originalUUID,
+        const ShardKeyPattern& oldShardKey,
+        const std::vector<ShardId>& donorShardIds,
+        const std::vector<ShardId>& recipientShardIds,
+        const std::set<ShardId>& recipientShardIdsNoInitialChunks = {},
+        const boost::optional<Timestamp>& fetchTimestamp = boost::none) {
+        auto doc = insertStateAndCatalogEntries(CoordinatorStateEnum::kUnused,
+                                                _originalEpoch,
+                                                reshardingUUID,
+                                                originalNss,
+                                                tempNss,
+                                                newShardKey,
+                                                donorShardIds,
+                                                recipientShardIds,
+                                                fetchTimestamp);
+        auto opCtx = operationContext();
+
+        makeAndInsertChunksForDonorShard(
+            originalUUID, _originalEpoch, _originalTimestamp, oldShardKey, donorShardIds);
+
+        std::vector<ShardId> recipientShardIdsForInitialChunks;
+        std::copy_if(
+            recipientShardIds.begin(),
+            recipientShardIds.end(),
+            std::back_inserter(recipientShardIdsForInitialChunks),
+            [&](auto shardId) { return !recipientShardIdsNoInitialChunks.contains(shardId); });
+
+        auto initialChunks = makeChunks(reshardingUUID,
                                         _tempEpoch,
                                         _tempTimestamp,
-                                        _newShardKey,
-                                        std::vector{OID::gen(), OID::gen()});
+                                        newShardKey,
+                                        recipientShardIdsForInitialChunks);
 
         std::vector<ReshardedChunk> presetReshardedChunks;
         for (const auto& chunk : initialChunks) {
@@ -530,7 +700,17 @@ public:
         runReshardingToCompletion(TransitionFunctionMap{});
     }
 
-    void runReshardingToCompletion(const TransitionFunctionMap& transitionFunctions) {
+    void runReshardingToCompletion(
+        const TransitionFunctionMap& transitionFunctions,
+        std::unique_ptr<PauseDuringStateTransitions> stateTransitionsGuard = nullptr,
+        const std::vector<CoordinatorStateEnum> states = {CoordinatorStateEnum::kPreparingToDonate,
+                                                          CoordinatorStateEnum::kCloning,
+                                                          CoordinatorStateEnum::kApplying,
+                                                          CoordinatorStateEnum::kBlockingWrites,
+                                                          CoordinatorStateEnum::kCommitting},
+        const boost::optional<std::vector<ShardId>> donorShardIds = boost::none,
+        const boost::optional<std::vector<ShardId>> recipientShardIds = boost::none,
+        const std::set<ShardId> recipientShardIdsNoInitialChunks = {}) {
         auto runFunctionForState = [&](CoordinatorStateEnum state) {
             auto it = transitionFunctions.find(state);
             if (it == transitionFunctions.end()) {
@@ -539,51 +719,94 @@ public:
             it->second();
         };
 
-        const std::vector<CoordinatorStateEnum> states{CoordinatorStateEnum::kPreparingToDonate,
-                                                       CoordinatorStateEnum::kCloning,
-                                                       CoordinatorStateEnum::kApplying,
-                                                       CoordinatorStateEnum::kBlockingWrites,
-                                                       CoordinatorStateEnum::kCommitting};
-        PauseDuringStateTransitions stateTransitionsGuard{controller(), states};
+        if (!stateTransitionsGuard) {
+            stateTransitionsGuard =
+                std::make_unique<PauseDuringStateTransitions>(controller(), states);
+        }
 
         auto opCtx = operationContext();
-        auto coordinator = initializeAndGetCoordinator();
+        auto coordinator =
+            initializeAndGetCoordinator(_reshardingUUID,
+                                        _originalNss,
+                                        _tempNss,
+                                        _newShardKey,
+                                        _originalUUID,
+                                        _oldShardKey,
+                                        donorShardIds ? *donorShardIds : getShardIds(),
+                                        recipientShardIds ? *recipientShardIds : getShardIds(),
+                                        recipientShardIdsNoInitialChunks);
 
-        stateTransitionsGuard.wait(CoordinatorStateEnum::kPreparingToDonate);
-        runFunctionForState(CoordinatorStateEnum::kPreparingToDonate);
-        stateTransitionsGuard.unset(CoordinatorStateEnum::kPreparingToDonate);
-        waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kPreparingToDonate);
-        makeDonorsReadyToDonate(opCtx);
+        for (const auto state : states) {
+            stateTransitionsGuard->wait(state);
+            runFunctionForState(state);
+            stateTransitionsGuard->unset(state);
+            waitUntilCommittedCoordinatorDocReach(opCtx, state);
 
-        stateTransitionsGuard.wait(CoordinatorStateEnum::kCloning);
-        runFunctionForState(CoordinatorStateEnum::kCloning);
-        stateTransitionsGuard.unset(CoordinatorStateEnum::kCloning);
-        waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kCloning);
-
-        makeRecipientsFinishedCloning(opCtx);
-        stateTransitionsGuard.wait(CoordinatorStateEnum::kApplying);
-        runFunctionForState(CoordinatorStateEnum::kApplying);
-        stateTransitionsGuard.unset(CoordinatorStateEnum::kApplying);
-        waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kApplying);
-
-        coordinator->onOkayToEnterCritical();
-        stateTransitionsGuard.wait(CoordinatorStateEnum::kBlockingWrites);
-        runFunctionForState(CoordinatorStateEnum::kBlockingWrites);
-        stateTransitionsGuard.unset(CoordinatorStateEnum::kBlockingWrites);
-        waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kBlockingWrites);
-
-        makeRecipientsBeInStrictConsistency(opCtx);
-
-        stateTransitionsGuard.wait(CoordinatorStateEnum::kCommitting);
-        runFunctionForState(CoordinatorStateEnum::kCommitting);
-        stateTransitionsGuard.unset(CoordinatorStateEnum::kCommitting);
-
-        waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kCommitting);
-
-        makeDonorsProceedToDone(opCtx);
-        makeRecipientsProceedToDone(opCtx);
-
+            switch (state) {
+                case CoordinatorStateEnum::kPreparingToDonate:
+                    makeDonorsReadyToDonateWithAssert(opCtx);
+                    break;
+                case CoordinatorStateEnum::kCloning:
+                    makeRecipientsFinishedCloningWithAssert(opCtx);
+                    break;
+                case CoordinatorStateEnum::kApplying:
+                    coordinator->onOkayToEnterCritical();
+                    break;
+                case CoordinatorStateEnum::kBlockingWrites:
+                    makeRecipientsBeInStrictConsistencyWithAssert(opCtx);
+                    break;
+                case CoordinatorStateEnum::kCommitting:
+                    makeDonorsProceedToDoneWithAssert(opCtx);
+                    makeRecipientsProceedToDoneWithAssert(opCtx);
+                    break;
+                default:
+                    break;
+            }
+        }
         coordinator->getCompletionFuture().get(opCtx);
+    }
+
+    void runReshardingToCompletionAssertToCopyMetrics(
+        const std::vector<ShardId>& donorShardIds,
+        const std::vector<ShardId>& recipientShardIds,
+        const std::set<ShardId>& recipientShardIdsNoInitialChunks) {
+        long numRecipientsToClone =
+            recipientShardIds.size() - recipientShardIdsNoInitialChunks.size();
+        long expectedApproxBytesToClone = totalApproxBytesToClone / numRecipientsToClone;
+        long expectedApproxDocumentsToClone = totalApproxDocumentsToClone / numRecipientsToClone;
+
+        auto checkPersistentStates = [&] {
+            auto opCtx = operationContext();
+            auto coordinatorDoc = getCoordinatorDoc(opCtx);
+            if (coordinatorDoc.getState() >= CoordinatorStateEnum::kCloning) {
+                ASSERT_EQ(*coordinatorDoc.getApproxBytesToCopy(), expectedApproxBytesToClone);
+                ASSERT_EQ(*coordinatorDoc.getApproxDocumentsToCopy(),
+                          expectedApproxDocumentsToClone);
+
+                auto collectionDoc = getTemporaryCollectionCatalogEntry(opCtx, coordinatorDoc);
+                auto recipientFields = collectionDoc.getReshardingFields()->getRecipientFields();
+                ASSERT_EQ(*recipientFields->getApproxBytesToCopy(), expectedApproxBytesToClone);
+                ASSERT_EQ(*recipientFields->getApproxDocumentsToCopy(),
+                          expectedApproxDocumentsToClone);
+            }
+        };
+
+        auto transitionFunctions =
+            TransitionFunctionMap{{CoordinatorStateEnum::kCloning, checkPersistentStates},
+                                  {CoordinatorStateEnum::kApplying, checkPersistentStates},
+                                  {CoordinatorStateEnum::kBlockingWrites, checkPersistentStates},
+                                  {CoordinatorStateEnum::kCommitting, checkPersistentStates}};
+        auto states = {CoordinatorStateEnum::kPreparingToDonate,
+                       CoordinatorStateEnum::kCloning,
+                       CoordinatorStateEnum::kApplying,
+                       CoordinatorStateEnum::kBlockingWrites,
+                       CoordinatorStateEnum::kCommitting};
+        runReshardingToCompletion(transitionFunctions,
+                                  nullptr /* stateTransitionsGuard */,
+                                  states,
+                                  donorShardIds,
+                                  recipientShardIds,
+                                  recipientShardIdsNoInitialChunks);
     }
 
     repl::PrimaryOnlyService* _service = nullptr;
@@ -594,12 +817,13 @@ public:
 
     repl::PrimaryOnlyServiceRegistry* _registry = nullptr;
 
-    NamespaceString _originalNss = NamespaceString("db.foo");
+    NamespaceString _originalNss = NamespaceString::createNamespaceString_forTest("db.foo");
     UUID _originalUUID = UUID::gen();
     OID _originalEpoch = OID::gen();
     Timestamp _originalTimestamp = Timestamp(1);
 
-    NamespaceString _tempNss = NamespaceString("db.system.resharding." + _originalUUID.toString());
+    NamespaceString _tempNss = NamespaceString::createNamespaceString_forTest(
+        "db.system.resharding." + _originalUUID.toString());
     UUID _reshardingUUID = UUID::gen();
     OID _tempEpoch = OID::gen();
     Timestamp _tempTimestamp = Timestamp(2);
@@ -620,9 +844,18 @@ public:
     RAIIServerParameterControllerForTest serverParamController{
         "reshardingMinimumOperationDurationMillis", 0};
 
-    const std::vector<ShardId> _recipientShards = {{"shard0001"}};
-
     long long _term = 0;
+
+protected:
+    std::vector<ShardId> getShardIds() const {
+        return {shardId0, shardId1};
+    }
+
+    const ShardId shardId0{"shard0000"};
+    const ShardId shardId1{"shard0001"};
+
+    const long totalApproxBytesToClone = 10000;
+    const long totalApproxDocumentsToClone = 100;
 };
 
 TEST_F(ReshardingCoordinatorServiceTest, ReshardingCoordinatorSuccessfullyTransitionsTokDone) {
@@ -630,8 +863,9 @@ TEST_F(ReshardingCoordinatorServiceTest, ReshardingCoordinatorSuccessfullyTransi
 }
 
 TEST_F(ReshardingCoordinatorServiceTest, ReshardingCoordinatorTransitionsTokDoneWithInterrupt) {
-
-    const auto interrupt = [this] { killAllReshardingCoordinatorOps(); };
+    const auto interrupt = [this] {
+        killAllReshardingCoordinatorOps();
+    };
     runReshardingToCompletion(
         TransitionFunctionMap{{CoordinatorStateEnum::kPreparingToDonate, interrupt},
                               {CoordinatorStateEnum::kCloning, interrupt},
@@ -664,25 +898,20 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpDuringInitializing) {
                                                       CoordinatorStateEnum::kPreparingToDonate};
 
     auto opCtx = operationContext();
-    auto pauseBeforeInsertCoordinatorDoc =
-        globalFailPointRegistry().find("pauseBeforeInsertCoordinatorDoc");
-    auto timesEnteredFailPoint = pauseBeforeInsertCoordinatorDoc->setMode(FailPoint::alwaysOn, 0);
+    auto pauseAfterInsertCoordinatorDoc =
+        globalFailPointRegistry().find("pauseAfterInsertCoordinatorDoc");
+    auto timesEnteredFailPoint = pauseAfterInsertCoordinatorDoc->setMode(FailPoint::alwaysOn, 0);
 
-    auto doc = insertStateAndCatalogEntries(CoordinatorStateEnum::kUnused, _originalEpoch);
-    doc.setRecipientShards({});
-    doc.setDonorShards({});
+    auto donorShardIds = getShardIds();
+    auto recipientShardIds = getShardIds();
+    auto doc = insertStateAndCatalogEntries(
+        CoordinatorStateEnum::kUnused, _originalEpoch, donorShardIds, recipientShardIds);
 
-    auto donorChunk = makeAndInsertChunksForDonorShard(_originalUUID,
-                                                       _originalEpoch,
-                                                       _originalTimestamp,
-                                                       _oldShardKey,
-                                                       std::vector{OID::gen(), OID::gen()});
+    makeAndInsertChunksForDonorShard(
+        _originalUUID, _originalEpoch, _originalTimestamp, _oldShardKey, donorShardIds);
 
-    auto initialChunks = makeChunks(_reshardingUUID,
-                                    _tempEpoch,
-                                    _tempTimestamp,
-                                    _newShardKey,
-                                    std::vector{OID::gen(), OID::gen()});
+    auto initialChunks =
+        makeChunks(_reshardingUUID, _tempEpoch, _tempTimestamp, _newShardKey, recipientShardIds);
 
     std::vector<ReshardedChunk> presetReshardedChunks;
     for (const auto& chunk : initialChunks) {
@@ -695,13 +924,12 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpDuringInitializing) {
     auto instanceId =
         BSON(ReshardingCoordinatorDocument::kReshardingUUIDFieldName << doc.getReshardingUUID());
 
-    pauseBeforeInsertCoordinatorDoc->waitForTimesEntered(timesEnteredFailPoint + 1);
+    pauseAfterInsertCoordinatorDoc->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     auto coordinator = getCoordinator(opCtx, instanceId);
     stepDown(opCtx);
-    pauseBeforeInsertCoordinatorDoc->setMode(FailPoint::off, 0);
-    ASSERT_EQ(coordinator->getCompletionFuture().getNoThrow(),
-              ErrorCodes::InterruptedDueToReplStateChange);
+    pauseAfterInsertCoordinatorDoc->setMode(FailPoint::off, 0);
+    ASSERT_EQ(coordinator->getCompletionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
 
     coordinator.reset();
     stepUp(opCtx);
@@ -718,8 +946,7 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpDuringInitializing) {
     ASSERT_FALSE(newObserver->awaitAllRecipientsDone().isReady());
 
     stepDown(opCtx);
-    ASSERT_EQ(newCoordinator->getCompletionFuture().getNoThrow(),
-              ErrorCodes::InterruptedDueToReplStateChange);
+    ASSERT_EQ(newCoordinator->getCompletionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
 }
 
 /**
@@ -736,19 +963,16 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpEachTransition) {
         CoordinatorStateEnum::kCommitting};
     PauseDuringStateTransitions stateTransitionsGuard{controller(), coordinatorStates};
 
-    auto doc = insertStateAndCatalogEntries(CoordinatorStateEnum::kUnused, _originalEpoch);
+    auto donorShardIds = getShardIds();
+    auto recipientShardIds = getShardIds();
+    auto doc = insertStateAndCatalogEntries(
+        CoordinatorStateEnum::kUnused, _originalEpoch, donorShardIds, recipientShardIds);
     auto opCtx = operationContext();
-    auto donorChunk = makeAndInsertChunksForDonorShard(_originalUUID,
-                                                       _originalEpoch,
-                                                       _originalTimestamp,
-                                                       _oldShardKey,
-                                                       std::vector{OID::gen(), OID::gen()});
+    makeAndInsertChunksForDonorShard(
+        _originalUUID, _originalEpoch, _originalTimestamp, _oldShardKey, donorShardIds);
 
-    auto initialChunks = makeChunks(_reshardingUUID,
-                                    _tempEpoch,
-                                    _tempTimestamp,
-                                    _newShardKey,
-                                    std::vector{OID::gen(), OID::gen()});
+    auto initialChunks =
+        makeChunks(_reshardingUUID, _tempEpoch, _tempTimestamp, _newShardKey, recipientShardIds);
 
     std::vector<ReshardedChunk> presetReshardedChunks;
     for (const auto& chunk : initialChunks) {
@@ -770,12 +994,12 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpEachTransition) {
 
         switch (state) {
             case CoordinatorStateEnum::kCloning: {
-                makeDonorsReadyToDonate(opCtx);
+                makeDonorsReadyToDonateWithAssert(opCtx);
                 break;
             }
 
             case CoordinatorStateEnum::kApplying: {
-                makeRecipientsFinishedCloning(opCtx);
+                makeRecipientsFinishedCloningWithAssert(opCtx);
                 break;
             }
 
@@ -786,7 +1010,7 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpEachTransition) {
             }
 
             case CoordinatorStateEnum::kCommitting: {
-                makeRecipientsBeInStrictConsistency(opCtx);
+                makeRecipientsBeInStrictConsistencyWithAssert(opCtx);
                 break;
             }
 
@@ -798,8 +1022,7 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpEachTransition) {
 
         stepDown(opCtx);
 
-        ASSERT_EQ(coordinator->getCompletionFuture().getNoThrow(),
-                  ErrorCodes::InterruptedDueToReplStateChange);
+        ASSERT_EQ(coordinator->getCompletionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
 
         coordinator.reset();
 
@@ -817,8 +1040,8 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpEachTransition) {
         waitUntilCommittedCoordinatorDocReach(opCtx, state);
     }
 
-    makeDonorsProceedToDone(opCtx);
-    makeRecipientsProceedToDone(opCtx);
+    makeDonorsProceedToDoneWithAssert(opCtx);
+    makeRecipientsProceedToDoneWithAssert(opCtx);
 
     // Join the coordinator if it has not yet been cleaned up.
     if (auto coordinator = getCoordinatorIfExists(opCtx, instanceId)) {
@@ -829,7 +1052,7 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpEachTransition) {
         DBDirectClient client(opCtx);
 
         // config.chunks should have been moved to the new UUID
-        FindCommandRequest findRequest{ChunkType::ConfigNS};
+        FindCommandRequest findRequest{NamespaceString::kConfigsvrChunksNamespace};
         findRequest.setFilter(BSON(ChunkType::collectionUUID() << doc.getReshardingUUID()));
         auto chunkCursor = client.find(std::move(findRequest));
         std::vector<ChunkType> foundChunks;
@@ -844,7 +1067,7 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpEachTransition) {
         std::vector<ChunkType> foundCollections;
         auto collection =
             client.findOne(CollectionType::ConfigNS,
-                           BSON(CollectionType::kNssFieldName << doc.getSourceNss().ns()));
+                           BSON(CollectionType::kNssFieldName << doc.getSourceNss().ns_forTest()));
 
         ASSERT_EQUALS(collection.isEmpty(), false);
         ASSERT_EQUALS(
@@ -853,20 +1076,65 @@ TEST_F(ReshardingCoordinatorServiceTest, StepDownStepUpEachTransition) {
     }
 }
 
-TEST_F(ReshardingCoordinatorServiceTest, ReshardingCoordinatorFailsIfMigrationNotAllowed) {
-    auto doc = insertStateAndCatalogEntries(CoordinatorStateEnum::kUnused, _originalEpoch);
-    auto opCtx = operationContext();
-    auto donorChunk = makeAndInsertChunksForDonorShard(_originalUUID,
-                                                       _originalEpoch,
-                                                       _originalTimestamp,
-                                                       _oldShardKey,
-                                                       std::vector{OID::gen(), OID::gen()});
+TEST_F(ReshardingCoordinatorServiceTest, ReportForCurrentOpAfterCompletion) {
+    auto pauseAfterInsertCoordinatorDoc =
+        globalFailPointRegistry().find("pauseAfterInsertCoordinatorDoc");
+    auto timesEnteredFailPoint = pauseAfterInsertCoordinatorDoc->setMode(FailPoint::alwaysOn);
 
-    auto initialChunks = makeChunks(_reshardingUUID,
-                                    _tempEpoch,
-                                    _tempTimestamp,
-                                    _newShardKey,
-                                    std::vector{OID::gen(), OID::gen()});
+    auto coordinator = initializeAndGetCoordinator();
+    auto instanceId =
+        BSON(ReshardingCoordinatorDocument::kReshardingUUIDFieldName << _reshardingUUID);
+
+    // Wait until we know we've inserted the coordinator doc, but before the coordinator contacts
+    // any participants so that the coordinator does not have to "wait" for participants to abort
+    // before finishing aborting itself
+    pauseAfterInsertCoordinatorDoc->waitForTimesEntered(timesEnteredFailPoint + 1);
+
+    // Force a failover, and wait for the state machine to fulfill the completion promise. At this
+    // point, the resharding metrics will have been unregistered from the cumulative metrics.
+    stepDown(operationContext());
+    pauseAfterInsertCoordinatorDoc->setMode(FailPoint::off);
+    ASSERT_EQ(coordinator->getCompletionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
+
+    // Now call step up. The old coordinator object has not yet been destroyed because we still hold
+    // a shared pointer to it ('coordinator') - this can happen in production after a failover if a
+    // state machine is slow to clean up. Wait for the coordinator to have started, but again don't
+    // let it move to a state where it contacts participants.
+    auto pauseBeforeCTHolderInitialization =
+        globalFailPointRegistry().find("pauseBeforeCTHolderInitialization");
+    timesEnteredFailPoint = pauseBeforeCTHolderInitialization->setMode(FailPoint::alwaysOn);
+
+    stepUp(operationContext());
+    pauseBeforeCTHolderInitialization->waitForTimesEntered(timesEnteredFailPoint + 1);
+
+    // Assert that the old coordinator object will return a currentOp report, because the resharding
+    // metrics still exist on the coordinator object itelf.
+    ASSERT(coordinator->reportForCurrentOp(
+        MongoProcessInterface::CurrentOpConnectionsMode::kExcludeIdle,
+        MongoProcessInterface::CurrentOpSessionsMode::kIncludeIdle));
+
+    // Ensure a new coordinator can start and register resharding metrics, despite the "zombie"
+    // state machine still existing.
+    auto newCoordinator = getCoordinator(operationContext(), instanceId);
+    ASSERT_NE(coordinator, newCoordinator);
+
+    // No need to finish the resharding op, so we just cancel the op.
+    newCoordinator->abort(true /* skipQuiescePeriod */);
+    pauseBeforeCTHolderInitialization->setMode(FailPoint::off);
+    newCoordinator->getCompletionFuture().wait();
+}
+
+TEST_F(ReshardingCoordinatorServiceTest, ReshardingCoordinatorFailsIfMigrationNotAllowed) {
+    auto donorShardIds = getShardIds();
+    auto recipientShardIds = getShardIds();
+    auto doc = insertStateAndCatalogEntries(
+        CoordinatorStateEnum::kUnused, _originalEpoch, donorShardIds, recipientShardIds);
+    auto opCtx = operationContext();
+    makeAndInsertChunksForDonorShard(
+        _originalUUID, _originalEpoch, _originalTimestamp, _oldShardKey, donorShardIds);
+
+    auto initialChunks =
+        makeChunks(_reshardingUUID, _tempEpoch, _tempTimestamp, _newShardKey, recipientShardIds);
 
     std::vector<ReshardedChunk> presetReshardedChunks;
     for (const auto& chunk : initialChunks) {
@@ -877,8 +1145,8 @@ TEST_F(ReshardingCoordinatorServiceTest, ReshardingCoordinatorFailsIfMigrationNo
 
     {
         DBDirectClient client(opCtx);
-        client.update(CollectionType::ConfigNS.ns(),
-                      BSON(CollectionType::kNssFieldName << _originalNss.ns()),
+        client.update(CollectionType::ConfigNS,
+                      BSON(CollectionType::kNssFieldName << _originalNss.ns_forTest()),
                       BSON("$set" << BSON(CollectionType::kAllowMigrationsFieldName << false)));
     }
 
@@ -888,10 +1156,253 @@ TEST_F(ReshardingCoordinatorServiceTest, ReshardingCoordinatorFailsIfMigrationNo
     // Check that reshardCollection keeps allowMigrations setting intact.
     {
         DBDirectClient client(opCtx);
-        CollectionType collDoc(client.findOne(
-            CollectionType::ConfigNS, BSON(CollectionType::kNssFieldName << _originalNss.ns())));
+        CollectionType collDoc(
+            client.findOne(CollectionType::ConfigNS,
+                           BSON(CollectionType::kNssFieldName << _originalNss.ns_forTest())));
         ASSERT_FALSE(collDoc.getAllowMigrations());
     }
+}
+
+TEST_F(ReshardingCoordinatorServiceTest, MultipleReshardingOperationsFail) {
+    const std::vector<CoordinatorStateEnum> states = {CoordinatorStateEnum::kPreparingToDonate,
+                                                      CoordinatorStateEnum::kCloning,
+                                                      CoordinatorStateEnum::kApplying,
+                                                      CoordinatorStateEnum::kBlockingWrites,
+                                                      CoordinatorStateEnum::kCommitting};
+
+    auto stateTransitionsGuard =
+        std::make_unique<PauseDuringStateTransitions>(controller(), states);
+    auto coordinator = initializeAndGetCoordinator();
+
+    // Asserts that a resharding op with same namespace and same shard key fails with
+    // ReshardingCoordinatorServiceConflictingOperationInProgress
+    ASSERT_THROWS_WITH_CHECK(
+        initializeAndGetCoordinator(
+            UUID::gen(), _originalNss, _tempNss, _newShardKey, UUID::gen(), _oldShardKey),
+        DBException,
+        [&](const DBException& ex) {
+            ASSERT_EQ(ex.code(),
+                      ErrorCodes::ReshardingCoordinatorServiceConflictingOperationInProgress);
+            ASSERT_EQ(ex.extraInfo<ReshardingCoordinatorServiceConflictingOperationInProgressInfo>()
+                          ->getInstance(),
+                      coordinator);
+        });
+
+    // Asserts that a resharding op with different namespace and different shard key fails with
+    // ConflictingOperationInProgress.
+    ASSERT_THROWS_CODE(
+        initializeAndGetCoordinator(UUID::gen(),
+                                    NamespaceString::createNamespaceString_forTest("db.moo"),
+                                    NamespaceString::createNamespaceString_forTest(
+                                        "db.system.resharding." + UUID::gen().toString()),
+                                    ShardKeyPattern(BSON("shardKeyV1" << 1)),
+                                    UUID::gen(),
+                                    ShardKeyPattern(BSON("shardKeyV2" << 1))),
+        DBException,
+        ErrorCodes::ConflictingOperationInProgress);
+
+    // Asserts that a resharding op with same namespace and different shard key fails with
+    // ConflictingOperationInProgress.
+    ASSERT_THROWS_CODE(
+        initializeAndGetCoordinator(UUID::gen(),
+                                    _originalNss,
+                                    NamespaceString::createNamespaceString_forTest(
+                                        "db.system.resharding." + UUID::gen().toString()),
+                                    ShardKeyPattern(BSON("shardKeyV1" << 1)),
+                                    UUID::gen(),
+                                    _oldShardKey),
+        DBException,
+        ErrorCodes::ConflictingOperationInProgress);
+
+    runReshardingToCompletion(TransitionFunctionMap{}, std::move(stateTransitionsGuard));
+}
+
+TEST_F(ReshardingCoordinatorServiceTest, SuccessfullyAbortReshardOperationImmediately) {
+    auto pauseBeforeCTHolderInitialization =
+        globalFailPointRegistry().find("pauseBeforeCTHolderInitialization");
+    auto timesEnteredFailPoint = pauseBeforeCTHolderInitialization->setMode(FailPoint::alwaysOn, 0);
+    auto coordinator = initializeAndGetCoordinator();
+    coordinator->abort();
+    pauseBeforeCTHolderInitialization->waitForTimesEntered(timesEnteredFailPoint + 1);
+    pauseBeforeCTHolderInitialization->setMode(FailPoint::off, 0);
+    coordinator->getCompletionFuture().wait();
+}
+
+TEST_F(ReshardingCoordinatorServiceTest, CoordinatorReturnsErrorCode) {
+    const std::vector<CoordinatorStateEnum> states = {CoordinatorStateEnum::kPreparingToDonate,
+                                                      CoordinatorStateEnum::kCloning,
+                                                      CoordinatorStateEnum::kAborting};
+
+    PauseDuringStateTransitions stateTransitionsGuard{controller(), states};
+
+    auto opCtx = operationContext();
+    auto coordinator = initializeAndGetCoordinator();
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kPreparingToDonate);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kPreparingToDonate);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kPreparingToDonate);
+
+    makeDonorsReadyToDonateWithAssert(opCtx);
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kCloning);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kCloning);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kCloning);
+
+    makeRecipientsReturnErrorWithAssert(opCtx);
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kAborting);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kAborting);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kAborting);
+
+    makeRecipientsProceedToDone(opCtx);
+    makeDonorsProceedToDone(opCtx);
+
+    ASSERT_THROWS_CODE(coordinator->getCompletionFuture().get(opCtx),
+                       DBException,
+                       ErrorCodes::SnapshotUnavailable);
+}
+
+TEST_F(ReshardingCoordinatorServiceTest, CoordinatorReturnsErrorCodeAfterRestart) {
+    const std::vector<CoordinatorStateEnum> states = {CoordinatorStateEnum::kPreparingToDonate,
+                                                      CoordinatorStateEnum::kCloning,
+                                                      CoordinatorStateEnum::kAborting};
+
+    PauseDuringStateTransitions stateTransitionsGuard{controller(), states};
+
+    auto opCtx = operationContext();
+    auto coordinator = initializeAndGetCoordinator();
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kPreparingToDonate);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kPreparingToDonate);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kPreparingToDonate);
+
+    makeDonorsReadyToDonateWithAssert(opCtx);
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kCloning);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kCloning);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kCloning);
+
+
+    makeRecipientsReturnErrorWithAssert(opCtx);
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kAborting);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kAborting);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kAborting);
+
+
+    stepDown(opCtx);
+    ASSERT_THROWS_WITH_CHECK(
+        coordinator->getCompletionFuture().get(), DBException, [&](const DBException& ex) {
+            ASSERT_TRUE(ex.code() == ErrorCodes::CallbackCanceled ||
+                        ex.code() == ErrorCodes::InterruptedDueToReplStateChange);
+        });
+
+    coordinator.reset();
+    stepUp(opCtx);
+
+    makeRecipientsProceedToDone(opCtx);
+    makeDonorsProceedToDone(opCtx);
+
+    auto instanceId =
+        BSON(ReshardingCoordinatorDocument::kReshardingUUIDFieldName << _reshardingUUID);
+    coordinator = getCoordinator(opCtx, instanceId);
+
+    ASSERT_THROWS_CODE(coordinator->getCompletionFuture().get(opCtx),
+                       DBException,
+                       ErrorCodes::SnapshotUnavailable);
+}
+
+TEST_F(ReshardingCoordinatorServiceTest, ZeroNumRecipientShardsNoInitialChunks) {
+    auto donorShardIds = getShardIds();
+    auto recipientShardIds = getShardIds();
+    std::set<ShardId> recipientShardIdsNoInitialChunks = {};
+    runReshardingToCompletionAssertToCopyMetrics(
+        donorShardIds, recipientShardIds, recipientShardIdsNoInitialChunks);
+}
+
+TEST_F(ReshardingCoordinatorServiceTest, NonZeroNumRecipientShardsNoInitialChunks) {
+    auto donorShardIds = getShardIds();
+    auto recipientShardIds = getShardIds();
+    std::set<ShardId> recipientShardIdsNoInitialChunks = {shardId0};
+    runReshardingToCompletionAssertToCopyMetrics(
+        donorShardIds, recipientShardIds, recipientShardIdsNoInitialChunks);
+}
+
+TEST_F(ReshardingCoordinatorServiceTest, CoordinatorHonorsCriticalSectionTimeoutAfterStepUp) {
+    const std::vector<CoordinatorStateEnum> states = {
+        CoordinatorStateEnum::kPreparingToDonate,
+        CoordinatorStateEnum::kCloning,
+        CoordinatorStateEnum::kApplying,
+        CoordinatorStateEnum::kBlockingWrites,
+        CoordinatorStateEnum::kAborting,
+    };
+
+    PauseDuringStateTransitions stateTransitionsGuard{controller(), states};
+
+    auto opCtx = operationContext();
+
+    auto coordinator = initializeAndGetCoordinator(_reshardingUUID,
+                                                   _originalNss,
+                                                   _tempNss,
+                                                   _newShardKey,
+                                                   _originalUUID,
+                                                   _oldShardKey,
+                                                   getShardIds(),
+                                                   getShardIds());
+    auto instanceId =
+        BSON(ReshardingCoordinatorDocument::kReshardingUUIDFieldName << _reshardingUUID);
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kPreparingToDonate);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kPreparingToDonate);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kPreparingToDonate);
+
+    makeDonorsReadyToDonateWithAssert(opCtx);
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kCloning);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kCloning);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kCloning);
+
+    makeRecipientsFinishedCloningWithAssert(opCtx);
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kApplying);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kApplying);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kApplying);
+
+    coordinator->onOkayToEnterCritical();
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kBlockingWrites);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kBlockingWrites);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kBlockingWrites);
+
+    stepDown(opCtx);
+
+    coordinator.reset();
+
+    // Reset the critical section timeout to earlier time to guarantee timeout event.
+    auto coordDoc = getCoordinatorDoc(opCtx);
+    auto coordDocNewTime = coordDoc;
+    auto expiresAt = coordDoc.getCriticalSectionExpiresAt();
+    auto now = Date_t::now();
+    invariant(expiresAt && expiresAt.value() > now);
+    LOGV2_DEBUG(9697800, 5, "Resetting critical section expiry time", "expiresAt"_attr = now);
+    coordDocNewTime.setCriticalSectionExpiresAt(now);
+    replaceCoordinatorDoc(opCtx, coordDocNewTime);
+
+    stepUp(opCtx);
+
+    instanceId = BSON(ReshardingCoordinatorDocument::kReshardingUUIDFieldName << _reshardingUUID);
+    coordinator = getCoordinator(opCtx, instanceId);
+
+    stateTransitionsGuard.wait(CoordinatorStateEnum::kAborting);
+    stateTransitionsGuard.unset(CoordinatorStateEnum::kAborting);
+    waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kAborting);
+
+    makeRecipientsProceedToDone(opCtx);
+    makeDonorsProceedToDone(opCtx);
+
+    ASSERT_THROWS_CODE(coordinator->getCompletionFuture().get(opCtx),
+                       DBException,
+                       ErrorCodes::ReshardingCriticalSectionTimeout);
 }
 
 }  // namespace

@@ -1,17 +1,11 @@
 /**
  * Test that fetching oplog from a new sync source that is in quiesce mode fails to establish a
  * connection, causing the server to reenter sync source selection.
- *
- * @tags: [
- *   live_record_incompatible,
- * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/write_concern_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const rst = new ReplSetTest({
     name: "new_sync_source_in_quiesce_mode",
@@ -29,7 +23,7 @@ assert.commandWorked(syncSource.adminCommand({
     mode: "alwaysOn",
     data: {hostAndPort: rst.nodes[0].host}
 }));
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const primary = rst.getPrimary();
 // The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
@@ -65,4 +59,3 @@ rst.awaitSecondaryNodes();
 
 jsTestLog("Finish test.");
 rst.stopSet();
-})();

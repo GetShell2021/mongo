@@ -27,12 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <exception>
+#include <ostream>
 #include <string>
 
+#include <boost/filesystem/path.hpp>
+#include <boost/filesystem/path_traits.hpp>
+#include <fmt/format.h>
+
+#include "mongo/base/string_data.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/unittest/golden_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/golden_test_base.h"
+#include "mongo/unittest/test_info.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo::unittest {
@@ -87,14 +95,22 @@ TEST(GoldenSelfTest, GoldenTestContextGetPath) {
 
         {
             TestInfo testInfo(badName, "TestName"_sd, __FILE__, __LINE__);
-            GoldenTestContext ctx(&goldenTestConfig, &testInfo, false);
-            ASSERT_THROWS([&] { ctx.getTestPath(); }(), TestAssertionFailureException);
+            ASSERT_THROWS(
+                [&] {
+                    GoldenTestContext ctx(&goldenTestConfig, &testInfo, false);
+                    ctx.getTestPath();
+                }(),
+                AssertionException);
         }
 
         {
             TestInfo testInfo("SuiteName"_sd, badName, __FILE__, __LINE__);
-            GoldenTestContext ctx(&goldenTestConfig, &testInfo, false);
-            ASSERT_THROWS([&] { ctx.getTestPath(); }(), TestAssertionFailureException);
+            ASSERT_THROWS(
+                [&] {
+                    GoldenTestContext ctx(&goldenTestConfig, &testInfo, false);
+                    ctx.getTestPath();
+                }(),
+                AssertionException);
         }
     }
 }

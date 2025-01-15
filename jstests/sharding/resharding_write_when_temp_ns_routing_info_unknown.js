@@ -7,12 +7,9 @@
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/auto_retry_transaction_in_sharding.js");
-load("jstests/libs/discover_topology.js");
-load("jstests/sharding/libs/resharding_test_fixture.js");
+import {withTxnAndAutoRetryOnMongos} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
 
 const reshardingTest = new ReshardingTest();
 reshardingTest.setup();
@@ -39,9 +36,9 @@ const testCases = [
                                           .getCollection(sourceCollection.getName());
 
             const docToInsert = {_id: 0, oldKey: 5, newKey: 15};
-            session.startTransaction();
-            assert.commandWorked(sessionCollection.insert(docToInsert));
-            assert.commandWorked(session.commitTransaction_forTesting());
+            withTxnAndAutoRetryOnMongos(session, () => {
+                assert.commandWorked(sessionCollection.insert(docToInsert));
+            });
             assert.eq(sourceCollection.findOne({_id: 0}), docToInsert);
         },
     },
@@ -60,12 +57,10 @@ const testCases = [
             assert.commandWorked(sessionCollectionB.insert({a: 1}));
 
             const docToInsert = {_id: 0, oldKey: 5, newKey: 15};
-            session.startTransaction();
             withTxnAndAutoRetryOnMongos(session, () => {
                 assert.commandWorked(sessionCollectionB.insert({a: 2}));
                 assert.commandWorked(sessionCollection.insert(docToInsert));
             });
-            assert.commandWorked(session.commitTransaction_forTesting());
             assert.eq(sourceCollection.findOne({_id: 0}), docToInsert);
         },
     }
@@ -111,4 +106,3 @@ for (const {desc, ns, opFn} of testCases) {
 }
 
 reshardingTest.teardown();
-})();

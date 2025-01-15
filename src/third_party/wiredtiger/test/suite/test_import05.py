@@ -103,7 +103,7 @@ class test_import05(test_import_base):
         # Copy over the datafiles for the object we want to import.
         self.copy_file(original_db_file, '.', newdir)
 
-        # Contruct the config string.
+        # Construct the config string.
         if self.repair:
             if self.global_ts == 'stable':
                 import_config = 'import=(enabled,repair=true,compare_timestamp=stable_timestamp)'
@@ -138,8 +138,8 @@ class test_import05(test_import_base):
         # The table we're importing had an operation past this point so we're still expecting an
         # error.
         if self.global_ts == 'stable':
-            self.conn.set_timestamp('stable_timestamp=' + self.timestamp_str(self.ts[-1] - 1))   
-        else: 
+            self.conn.set_timestamp('stable_timestamp=' + self.timestamp_str(self.ts[-1] - 1))
+        else:
             self.conn.set_timestamp('oldest_timestamp=' + self.timestamp_str(self.ts[-1] - 1))
 
         # If our latest operation was an insert, we're expecting it to complain about the aggregated
@@ -154,7 +154,7 @@ class test_import05(test_import_base):
         # Now place global timestamp equal to the last insert/delete we made. This should succeed
         # since all of our aggregated timestamps are now equal to or behind the global timestamp.
         if self.global_ts == 'stable':
-            self.conn.set_timestamp('stable_timestamp=' + self.timestamp_str(self.ts[-1]))   
-        else: 
+            self.conn.set_timestamp('stable_timestamp=' + self.timestamp_str(self.ts[-1]))
+        else:
             self.conn.set_timestamp('oldest_timestamp=' + self.timestamp_str(self.ts[-1]))
         self.session.create(uri, import_config)

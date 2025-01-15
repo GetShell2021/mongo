@@ -27,20 +27,48 @@
  *    it in the license file.
  */
 
-
 #include "mongo/db/s/balancer_stats_registry.h"
 
+#include <algorithm>
+#include <boost/smart_ptr.hpp>
+#include <mutex>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/dbclient_cursor.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
-#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/range_deleter_service.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
-#include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/scopeguard.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 
 namespace mongo {
 namespace {
@@ -48,34 +76,7 @@ namespace {
 const auto balancerStatsRegistryDecorator =
     ServiceContext::declareDecoration<BalancerStatsRegistry>();
 
-/**
- * Constructs the default options for the private thread pool used for asyncronous initialization
- */
-ThreadPool::Options makeDefaultThreadPoolOptions() {
-    ThreadPool::Options options;
-    options.poolName = "BalancerStatsRegistry";
-    options.minThreads = 0;
-    options.maxThreads = 1;
-    return options;
-}
 }  // namespace
-
-ScopedRangeDeleterLock::ScopedRangeDeleterLock(OperationContext* opCtx)
-    // TODO SERVER-62491 Use system tenantId for DBLock
-    : _configLock(opCtx, DatabaseName(boost::none, NamespaceString::kConfigDb), MODE_IX),
-      _rangeDeletionLock(opCtx, NamespaceString::kRangeDeletionNamespace, MODE_X) {}
-
-// Take DB and Collection lock in mode IX as well as collection UUID lock to serialize with
-// operations that take the above version of the ScopedRangeDeleterLock such as FCV downgrade and
-// BalancerStatsRegistry initialization.
-ScopedRangeDeleterLock::ScopedRangeDeleterLock(OperationContext* opCtx, const UUID& collectionUuid)
-    // TODO SERVER-62491 Use system tenantId for DBLock
-    : _configLock(opCtx, DatabaseName(boost::none, NamespaceString::kConfigDb), MODE_IX),
-      _rangeDeletionLock(opCtx, NamespaceString::kRangeDeletionNamespace, MODE_IX),
-      _collectionUuidLock(Lock::ResourceLock(
-          opCtx->lockState(),
-          ResourceId(RESOURCE_MUTEX, "RangeDeleterCollLock::" + collectionUuid.toString()),
-          MODE_X)) {}
 
 const ReplicaSetAwareServiceRegistry::Registerer<BalancerStatsRegistry>
     balancerStatsRegistryRegisterer("BalancerStatsRegistry");
@@ -90,26 +91,38 @@ BalancerStatsRegistry* BalancerStatsRegistry::get(OperationContext* opCtx) {
 }
 
 void BalancerStatsRegistry::onStartup(OperationContext* opCtx) {
-    _threadPool = std::make_shared<ThreadPool>(makeDefaultThreadPoolOptions());
+    _threadPool = std::make_shared<ThreadPool>([] {
+        ThreadPool::Options options;
+        options.poolName = "BalancerStatsRegistry";
+        options.minThreads = 0;
+        options.maxThreads = 1;
+        return options;
+    }());
     _threadPool->startup();
 }
 
 void BalancerStatsRegistry::onStepUpComplete(OperationContext* opCtx, long long term) {
+    // Different threads can trigger ReplicationCoordinator events concurrently.
+    stdx::lock_guard lk{_mutex};
+
+    if (!_threadPool || _state.load() == State::kTerminating) {
+        // The registry service has already been shut down.
+        return;
+    }
+
     dassert(_state.load() == State::kSecondary);
     _state.store(State::kPrimaryIdle);
 
-    if (!feature_flags::gOrphanTracking.isEnabled(serverGlobalParams.featureCompatibility)) {
-        // If future flag is disabled do not initialize the registry
-        return;
-    }
-    initializeAsync(opCtx);
+    _initializeAsync(opCtx);
 }
 
-void BalancerStatsRegistry::initializeAsync(OperationContext* opCtx) {
+void BalancerStatsRegistry::_initializeAsync(OperationContext* opCtx) {
     ExecutorFuture<void>(_threadPool)
         .then([this] {
+            // TODO(SERVER-74658): Please revisit if this thread could be made killable.
             ThreadClient tc("BalancerStatsRegistry::asynchronousInitialization",
-                            getGlobalServiceContext());
+                            getGlobalServiceContext()->getService(ClusterRole::ShardServer),
+                            ClientOperationKillableByStepdown{false});
 
             {
                 stdx::lock_guard lk{_stateMutex};
@@ -133,9 +146,13 @@ void BalancerStatsRegistry::initializeAsync(OperationContext* opCtx) {
 
             LOGV2_DEBUG(6419601, 2, "Initializing BalancerStatsRegistry");
             try {
-                // Lock the range deleter to prevent
-                // concurrent modifications of orphans count
-                ScopedRangeDeleterLock rangeDeleterLock(opCtx);
+                // Lock the range deleter to prevent concurrent modifications of orphans count
+                ScopedRangeDeleterLock rangeDeleterLock(opCtx, LockMode::MODE_S);
+                // The collection lock is needed to serialize with direct writes to
+                // config.rangeDeletions
+                AutoGetCollection rangeDeletionLock(
+                    opCtx, NamespaceString::kRangeDeletionNamespace, MODE_S);
+
                 // Load current ophans count from disk
                 _loadOrphansCount(opCtx);
                 LOGV2_DEBUG(6419602, 2, "Completed BalancerStatsRegistry initialization");
@@ -153,7 +170,7 @@ void BalancerStatsRegistry::initializeAsync(OperationContext* opCtx) {
         .getAsync([](auto) {});
 }
 
-void BalancerStatsRegistry::terminate() {
+void BalancerStatsRegistry::_terminate(stdx::unique_lock<stdx::mutex>& lock) {
     {
         stdx::lock_guard lk{_stateMutex};
         _state.store(State::kTerminating);
@@ -163,14 +180,13 @@ void BalancerStatsRegistry::terminate() {
         }
     }
 
-    // Wait for the  asynchronous initialization to complete
+    // Wait for the asynchronous initialization to complete. Drop the lock to avoid deadlocks.
+    lock.unlock();
     _threadPool->waitForIdle();
+    lock.lock();
 
-    {
-        // Clear the stats
-        stdx::lock_guard lk{_mutex};
-        _collStatsMap.clear();
-    }
+    // Clear the stats
+    _collStatsMap.clear();
 
     dassert(_state.load() == State::kTerminating);
     _state.store(State::kPrimaryIdle);
@@ -178,9 +194,33 @@ void BalancerStatsRegistry::terminate() {
 }
 
 void BalancerStatsRegistry::onStepDown() {
-    // TODO SERVER-65817 inline the terminate() function
-    terminate();
+    // Different threads can trigger ReplicationCoordinator events concurrently.
+    stdx::unique_lock lk{_mutex};
+
+    if (!_threadPool || _state.load() == State::kTerminating) {
+        // The registry service has already been shut down.
+        return;
+    }
+
+    _terminate(lk);
     _state.store(State::kSecondary);
+}
+
+void BalancerStatsRegistry::onShutdown() {
+    // Different threads can trigger ReplicationCoordinator events concurrently.
+    stdx::unique_lock lk{_mutex};
+
+    if (!_threadPool || _state.load() == State::kTerminating) {
+        // The registry service was never started (the startup event was not notified so the thread
+        // pool was not initialized) or has already been shut down (the shutdown event can be
+        // notified more than once).
+        return;
+    }
+
+    _terminate(lk);
+    _threadPool->shutdown();
+    _threadPool->join();
+    _threadPool.reset();
 }
 
 long long BalancerStatsRegistry::getCollNumOrphanDocs(const UUID& collectionUUID) const {
@@ -225,10 +265,11 @@ long long BalancerStatsRegistry::getCollNumOrphanDocsFromDiskIfNeeded(
         invariant(!cursor->more());
         auto numOrphans = res.getField("count");
         invariant(numOrphans);
-        return numOrphans.exactNumberLong();
+        // Never return a negative number of orphans. It may transiently happen for a negative
+        // number of orphans to be tracked on disk, see SERVER-74842 for details
+        return std::max(0LL, numOrphans.exactNumberLong());
     }
 }
-
 
 void BalancerStatsRegistry::onRangeDeletionTaskInsertion(const UUID& collectionUUID,
                                                          long long numOrphanDocs) {
@@ -249,7 +290,8 @@ void BalancerStatsRegistry::onRangeDeletionTaskDeletion(const UUID& collectionUU
     stdx::lock_guard lk{_mutex};
     auto collStatsIt = _collStatsMap.find(collectionUUID);
     if (collStatsIt == _collStatsMap.end()) {
-        LOGV2_ERROR(6419612,
+        LOGV2_DEBUG(6419612,
+                    1,
                     "Couldn't find cached range deletion tasks count during decrese attempt",
                     "collectionUUID"_attr = collectionUUID,
                     "numOrphanDocs"_attr = numOrphanDocs);
@@ -262,7 +304,8 @@ void BalancerStatsRegistry::onRangeDeletionTaskDeletion(const UUID& collectionUU
 
     if (stats.numRangeDeletionTasks <= 0) {
         if (MONGO_unlikely(stats.numRangeDeletionTasks < 0)) {
-            LOGV2_ERROR(6419613,
+            LOGV2_DEBUG(6419613,
+                        1,
                         "Cached count of range deletion tasks became negative. Resetting it to 0",
                         "collectionUUID"_attr = collectionUUID,
                         "numRangeDeletionTasks"_attr = stats.numRangeDeletionTasks,
@@ -297,9 +340,12 @@ void BalancerStatsRegistry::updateOrphansCount(const UUID& collectionUUID, long 
         stats.numOrphanDocs += delta;
 
         if (stats.numOrphanDocs < 0) {
-            // This should happen only in case of direct manipulation of range deletion tasks
-            // documents or direct writes into orphaned ranges
-            LOGV2_ERROR(6419611,
+            // This could happen in case of direct manipulation of range deletion tasks documents or
+            // direct writes into orphaned ranges, but also in some other benign situations.
+            // numOrphanDocs is a best-effort counter, miscounting or even being negative in some
+            // scenarios is expected.
+            LOGV2_DEBUG(6419611,
+                        1,
                         "Cached orphan documents count became negative, resetting it to 0",
                         "collectionUUID"_attr = collectionUUID,
                         "numOrphanDocs"_attr = stats.numOrphanDocs,
@@ -309,7 +355,6 @@ void BalancerStatsRegistry::updateOrphansCount(const UUID& collectionUUID, long 
         }
     }
 }
-
 
 void BalancerStatsRegistry::_loadOrphansCount(OperationContext* opCtx) {
     static constexpr auto kNumOrphanDocsLabel = "numOrphanDocs"_sd;
@@ -347,7 +392,8 @@ void BalancerStatsRegistry::_loadOrphansCount(OperationContext* opCtx) {
             auto numRangeDeletionTasks = collObj[kNumRangeDeletionTasksLabel].exactNumberLong();
             invariant(numRangeDeletionTasks > 0);
             if (orphanCount < 0) {
-                LOGV2_ERROR(6419621,
+                LOGV2_DEBUG(6419621,
+                            1,
                             "Found negative orphan count in range deletion task documents",
                             "collectionUUID"_attr = collUUID,
                             "numOrphanDocs"_attr = orphanCount,

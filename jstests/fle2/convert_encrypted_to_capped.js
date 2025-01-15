@@ -2,19 +2,16 @@
 
 /**
  * @tags: [
- * requires_fcv_60,
  * assumes_unsharded_collection,
  * requires_non_retryable_commands,
- * assumes_against_mongod_not_mongos
+ * assumes_against_mongod_not_mongos,
+ * requires_fcv_70
  * ]
  */
-load("jstests/fle2/libs/encrypted_client_util.js");
-
-(function() {
-'use strict';
+import {isFLE2ReplicationEnabled} from "jstests/fle2/libs/encrypted_client_util.js";
 
 if (!isFLE2ReplicationEnabled()) {
-    return;
+    quit();
 }
 
 const dbTest = db.getSiblingDB('convert_encrypted_to_capped_db');
@@ -42,4 +39,3 @@ assert.commandFailedWithCode(
     dbTest.runCommand({cloneCollectionAsCapped: "basic", toCollection: "capped", size: 100000}),
     6367302,
     "Clone encrypted collection as capped passed");
-}());

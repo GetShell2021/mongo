@@ -2,10 +2,8 @@
  * Tests that initial sync survives a network error during each stage of the cloning process,
  * except for the query stage.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const testName = "initial_sync_survives_network_error.js";
 const rst = new ReplSetTest({name: testName, nodes: 1, useBridge: true});
@@ -95,6 +93,5 @@ jsTestLog("Releasing the final cloner failpoint.");
 afterStageFailPoint.off();
 jsTestLog("Waiting for initial sync to complete.");
 // Wait for initial sync to complete.
-rst.waitForState(secondary, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [secondary]);
 rst.stopSet();
-})();

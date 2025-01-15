@@ -9,18 +9,17 @@
  *   5. Downgrade binaries and FCV of the cluster to an old version
  *   6. Verify the data consistency after the downgrade procedure
  */
+import "jstests/multiVersion/libs/multi_cluster.js";
 
-(function() {
-'use strict';
-
-load('jstests/multiVersion/libs/multi_cluster.js');  // For upgradeCluster
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = jsTestName();
 
 function setupClusterAndDatabase(binVersion) {
     const st = new ShardingTest({
         mongos: 1,
-        config: 1,
+        config: 2,
         shards: 2,
         other: {
             mongosOptions: {binVersion: binVersion},
@@ -29,7 +28,12 @@ function setupClusterAndDatabase(binVersion) {
                 binVersion: binVersion,
             },
             rs: {nodes: 2},
-        }
+        },
+        // By default, our test infrastructure sets the election timeout to a very high value (24
+        // hours). For this test, we need a shorter election timeout because it relies on nodes
+        // running an election when they do not detect an active primary. Therefore, we are setting
+        // the electionTimeoutMillis to its default value.
+        initiateWithDefaultElectionTimeout: true
     });
     st.configRS.awaitReplication();
 
@@ -64,19 +68,54 @@ function checkConfigAndShardsFCV(expectedFCV) {
     }
 }
 
+// TODO(SERVER-77873): Remove checkReshardingActiveIndex; once the feature flag is removed the
+// check will be incorrect.
+function checkReshardingActiveIndex() {
+    const getActiveIndex = (node) => {
+        const indexes = st.configRS.getPrimary().getDB("config").reshardingOperations.getIndexes();
+        return indexes.find((index) => (index.name == "ReshardingCoordinatorActiveIndex"));
+    };
+    let activeIndex = getActiveIndex(st.configRS.getPrimary());
+    if (FeatureFlagUtil.isPresentAndEnabled(st.s, "ReshardingImprovements")) {
+        assert(
+            !activeIndex,
+            "With ReshardingImprovements enabled, the config.reshardingOperations ReshardingCoordinatorActiveIndex is present but should not be.");
+    }
+    // Since downgrading does not restore the index, we don't check for the index's presence
+    // until we force a step-up (re-initializing the coordinator)
+
+    st.configRS.awaitReplication();
+    assert.commandWorked(st.configRS.getSecondary().adminCommand({replSetStepUp: 1}));
+    st.configRS.waitForPrimaryOnlyServices(st.configRS.getPrimary());
+    activeIndex = getActiveIndex(st.configRS.getPrimary());
+    if (FeatureFlagUtil.isPresentAndEnabled(st.s, "ReshardingImprovements")) {
+        assert(
+            !activeIndex,
+            "With ReshardingImprovements enabled, the config.reshardingOperations ReshardingCoordinatorActiveIndex is present but should not be, after step-up.");
+    } else {
+        assert(
+            activeIndex,
+            "With ReshardingImprovements disabled, the config.reshardingOperations ReshardingCoordinatorActiveIndex is not present but should be, after step-up.");
+        assert(activeIndex.unique,
+               "The config.reshardingOperations ReshardingCoordinatorActiveIndex is not unique");
+    }
+}
+
 function checkClusterBeforeUpgrade(fcv) {
     checkConfigAndShardsFCV(fcv);
+    checkReshardingActiveIndex();
 }
 
 function checkClusterAfterBinaryUpgrade() {
-    // To implement in the future, if necessary.
 }
 
 function checkClusterAfterFCVUpgrade(fcv) {
     checkConfigAndShardsFCV(fcv);
+    checkReshardingActiveIndex();
 }
 
 function checkClusterAfterFCVDowngrade() {
+    checkReshardingActiveIndex();
 }
 
 function checkClusterAfterBinaryDowngrade(fcv) {
@@ -101,7 +140,8 @@ for (const oldVersion of [lastLTSFCV, lastContinuousFCV]) {
     checkClusterAfterBinaryUpgrade();
 
     jsTest.log('Upgrading FCV to ' + latestFCV);
-    assert.commandWorked(st.s.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+    assert.commandWorked(
+        st.s.adminCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
 
     checkClusterAfterFCVUpgrade(latestFCV);
 
@@ -109,7 +149,8 @@ for (const oldVersion of [lastLTSFCV, lastContinuousFCV]) {
     // Setting and testing cluster using old binaries in old FCV mode
 
     jsTest.log('Downgrading FCV to ' + oldVersion);
-    assert.commandWorked(st.s.adminCommand({setFeatureCompatibilityVersion: oldVersion}));
+    assert.commandWorked(
+        st.s.adminCommand({setFeatureCompatibilityVersion: oldVersion, confirm: true}));
 
     checkClusterAfterFCVDowngrade();
 
@@ -120,4 +161,3 @@ for (const oldVersion of [lastLTSFCV, lastContinuousFCV]) {
 
     st.stop();
 }
-})();

@@ -30,17 +30,25 @@
 
 #include "mongo/db/record_id_helpers.h"
 
+#include <cstdint>
 #include <limits>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/bson/bson_validate.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/key_string/key_string.h"
 #include "mongo/logv2/redaction.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/debug_util.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
@@ -60,20 +68,21 @@ StatusWith<RecordId> keyForOptime(const Timestamp& opTime, const KeyFormat keyFo
             if (opTime.getInc() > uint32_t(std::numeric_limits<int32_t>::max()))
                 return {ErrorCodes::BadValue, "ts inc too high"};
 
-            const auto out = RecordId(opTime.getSecs(), opTime.getInc());
+            auto out = RecordId(opTime.getSecs(), opTime.getInc());
             if (out <= RecordId::minLong())
                 return {ErrorCodes::BadValue, "ts too low"};
             if (out >= RecordId::maxLong())
                 return {ErrorCodes::BadValue, "ts too high"};
-
-            return out;
+            return {std::move(out)};
         }
         case KeyFormat::String: {
-            KeyString::Builder keyBuilder(KeyString::Version::kLatestVersion);
+            key_string::Builder keyBuilder(key_string::Version::kLatestVersion);
             keyBuilder.appendTimestamp(opTime);
-            return RecordId(keyBuilder.getBuffer(), keyBuilder.getSize());
+            return RecordId(keyBuilder.getView());
         }
-        default: { MONGO_UNREACHABLE_TASSERT(6521004); }
+        default: {
+            MONGO_UNREACHABLE_TASSERT(6521004);
+        }
     }
 
     MONGO_UNREACHABLE_TASSERT(6521005);
@@ -86,8 +95,9 @@ StatusWith<RecordId> keyForOptime(const Timestamp& opTime, const KeyFormat keyFo
 StatusWith<RecordId> extractKeyOptime(const char* data, int len) {
     // Use the latest BSON validation version. Oplog entries are allowed to contain decimal data
     // even if decimal is disabled.
-    if (kDebugBuild)
-        invariant(validateBSON(data, len).isOK());
+    if (kDebugBuild) {
+        invariantStatusOK(validateBSON(data, len));
+    }
 
     const BSONObj obj(data);
     const BSONElement elem = obj["ts"];
@@ -124,9 +134,9 @@ RecordId keyForElem(const BSONElement& elem) {
     // Intentionally discard the TypeBits since the type information will be stored in the cluster
     // key of the original document. The consequence of this behavior is that cluster key values
     // that compare similarly, but are of different types may not be used concurrently.
-    KeyString::Builder keyBuilder(KeyString::Version::kLatestVersion);
+    key_string::Builder keyBuilder(key_string::Version::kLatestVersion);
     keyBuilder.appendBSONElement(elem);
-    return RecordId(keyBuilder.getBuffer(), keyBuilder.getSize());
+    return RecordId(keyBuilder.getView());
 }
 
 RecordId keyForObj(const BSONObj& obj) {
@@ -134,26 +144,26 @@ RecordId keyForObj(const BSONObj& obj) {
 }
 
 RecordId keyForOID(OID oid) {
-    KeyString::Builder keyBuilder(KeyString::Version::kLatestVersion);
+    key_string::Builder keyBuilder(key_string::Version::kLatestVersion);
     keyBuilder.appendOID(oid);
-    return RecordId(keyBuilder.getBuffer(), keyBuilder.getSize());
+    return RecordId(keyBuilder.getView());
 }
 
 RecordId keyForDate(Date_t date) {
-    KeyString::Builder keyBuilder(KeyString::Version::kLatestVersion);
+    key_string::Builder keyBuilder(key_string::Version::kLatestVersion);
     keyBuilder.appendDate(date);
-    return RecordId(keyBuilder.getBuffer(), keyBuilder.getSize());
+    return RecordId(keyBuilder.getView());
 }
 
-void appendToBSONAs(RecordId rid, BSONObjBuilder* builder, StringData fieldName) {
+void appendToBSONAs(const RecordId& rid, BSONObjBuilder* builder, StringData fieldName) {
     rid.withFormat([&](RecordId::Null) { builder->appendNull(fieldName); },
                    [&](int64_t val) { builder->append(fieldName, val); },
                    [&](const char* str, int len) {
-                       KeyString::appendSingleFieldToBSONAs(str, len, fieldName, builder);
+                       key_string::appendSingleFieldToBSONAs(str, len, fieldName, builder);
                    });
 }
 
-BSONObj toBSONAs(RecordId rid, StringData fieldName) {
+BSONObj toBSONAs(const RecordId& rid, StringData fieldName) {
     BSONObjBuilder builder;
     appendToBSONAs(rid, &builder, fieldName);
     return builder.obj();
@@ -173,12 +183,24 @@ RecordId reservedIdFor(ReservationId res, KeyFormat keyFormat) {
         return RecordId(kMinReservedLong);
     } else {
         invariant(keyFormat == KeyFormat::String);
-        constexpr char reservation[] = {kReservedStrPrefix, 0};
-        return RecordId(reservation, sizeof(reservation));
+        constexpr char reservation[] = {
+            kReservedStrPrefix, static_cast<char>(ReservationId::kWildcardMultikeyMetadataId)};
+        return RecordId(reservation);
     }
 }
 
-bool isReserved(RecordId id) {
+RecordId maxRecordId(KeyFormat keyFormat) {
+    if (keyFormat == KeyFormat::Long) {
+        return RecordId::maxLong();
+    } else {
+        invariant(keyFormat == KeyFormat::String);
+        constexpr char reservation[] = {
+            kReservedStrPrefix, static_cast<char>(ReservationId::kWildcardMultikeyMetadataId)};
+        return RecordId(reservation);
+    }
+}
+
+bool isReserved(const RecordId& id) {
     if (id.isNull()) {
         return false;
     }
@@ -186,8 +208,7 @@ bool isReserved(RecordId id) {
         return id.getLong() >= kMinReservedLong && id.getLong() < RecordId::kMaxRepr;
     }
     // All RecordId strings that start with FF are considered reserved.
-    auto strData = id.getStr();
-    return strData.rawData()[0] == kReservedStrPrefix;
+    return id.getStr()[0] == kReservedStrPrefix;
 }
 
 }  // namespace record_id_helpers

@@ -26,9 +26,9 @@ Libdeps Graph Enums.
 
 These are used for attributing data across the build scripts and analyzer scripts.
 """
-from enum import Enum, auto
-from pathlib import Path
+
 import json
+from enum import Enum, auto
 
 import networkx
 
@@ -62,11 +62,15 @@ class DependsReportTypes(Enum):
     """Enums for the different type of depends reports to perform on a graph."""
 
     DIRECT_DEPENDS = auto()
+    PROGRAM_DEPENDS = auto()
     COMMON_DEPENDS = auto()
     EXCLUDE_DEPENDS = auto()
     GRAPH_PATHS = auto()
     CRITICAL_EDGES = auto()
     IN_DEGREE_ONE = auto()
+    SYMBOL_DEPENDS = auto()
+    EFFICIENCY = auto()
+    BAZEL_CONV_CANDIDATES = auto()
 
 
 class LinterTypes(Enum):
@@ -74,6 +78,7 @@ class LinterTypes(Enum):
 
     ALL = auto()
     PUBLIC_UNUSED = auto()
+    EFFICIENCY_LINT = auto()
 
 
 class EdgeProps(Enum):
@@ -109,13 +114,13 @@ class LibdepsGraph(networkx.DiGraph):
         """Convert graphs deptypes from json string to dict, and return requested value."""
 
         if not self._deptypes:
-            self._deptypes = json.loads(self.graph.get('deptypes', "{}"))
-            if self.graph['graph_schema_version'] == 1:
+            self._deptypes = json.loads(self.graph.get("deptypes", "{}"))
+            if self.graph["graph_schema_version"] == 1:
                 # get and set the legacy values
-                self._deptypes['Global'] = self._deptypes.get('Global', 0)
-                self._deptypes['Public'] = self._deptypes.get('Public', 1)
-                self._deptypes['Private'] = self._deptypes.get('Private', 2)
-                self._deptypes['Interface'] = self._deptypes.get('Interface', 3)
+                self._deptypes["Global"] = self._deptypes.get("Global", 0)
+                self._deptypes["Public"] = self._deptypes.get("Public", 1)
+                self._deptypes["Private"] = self._deptypes.get("Private", 2)
+                self._deptypes["Interface"] = self._deptypes.get("Interface", 3)
 
         return self._deptypes[deptype]
 
@@ -123,9 +128,10 @@ class LibdepsGraph(networkx.DiGraph):
         """Get a graph view of direct nonprivate edges."""
 
         def filter_direct_nonprivate_edges(n1, n2):
-            return (self[n1][n2].get(EdgeProps.direct.name) and
-                    (self[n1][n2].get(EdgeProps.visibility.name) == self.get_deptype('Public') or
-                     self[n1][n2].get(EdgeProps.visibility.name) == self.get_deptype('Interface')))
+            return self[n1][n2].get(EdgeProps.direct.name) and (
+                self[n1][n2].get(EdgeProps.visibility.name) == self.get_deptype("Public")
+                or self[n1][n2].get(EdgeProps.visibility.name) == self.get_deptype("Interface")
+            )
 
         return networkx.subgraph_view(self, filter_edge=filter_direct_nonprivate_edges)
 
@@ -148,7 +154,7 @@ class LibdepsGraph(networkx.DiGraph):
         """
 
         if value is None:
-            value = ('progressbar' in globals())
+            value = "progressbar" in globals()
 
         if self._progressbar:
             return self._progressbar
@@ -156,12 +162,14 @@ class LibdepsGraph(networkx.DiGraph):
         if value:
 
             def get_progress_bar(title, *args):
-                custom_bar = progressbar.ProgressBar(widgets=[
-                    title,
-                    progressbar.Counter(format='[%(value)d/%(max_value)d]'),
-                    progressbar.Timer(format=" Time: %(elapsed)s "),
-                    progressbar.Bar(marker='>', fill=' ', left='|', right='|')
-                ])
+                custom_bar = progressbar.ProgressBar(
+                    widgets=[
+                        title,
+                        progressbar.Counter(format="[%(value)d/%(max_value)d]"),
+                        progressbar.Timer(format=" Time: %(elapsed)s "),
+                        progressbar.Bar(marker=">", fill=" ", left="|", right="|"),
+                    ]
+                )
                 return custom_bar(*args)
 
             self._progressbar = get_progress_bar

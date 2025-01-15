@@ -28,13 +28,21 @@
  */
 #pragma once
 
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <type_traits>
+#include <utility>
 
+#include "mongo/base/status.h"
 #include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/out_of_line_executor.h"
 
@@ -68,7 +76,10 @@ public:
             // Hold the lock for as long as the Guard is around. This forces other consumers to
             // queue behind the Guard.
             _strand->_mutex.lock();
+            MONGO_COMPILER_DIAGNOSTIC_PUSH
+            MONGO_COMPILER_DIAGNOSTIC_IGNORED_TRANSITIONAL("-Wstringop-overflow")
             _strand->_isBound.store(true);
+            MONGO_COMPILER_DIAGNOSTIC_POP
 
             _strand->_setCurrent();
         }
@@ -197,7 +208,7 @@ private:
 
     Client* const _clientPtr;
 
-    stdx::mutex _mutex;  // NOLINT
+    stdx::mutex _mutex;
 
     // Once we have stdx::atomic::wait(), we can get rid of the mutex in favor of this variable.
     AtomicWord<bool> _isBound{false};

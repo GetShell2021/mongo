@@ -26,8 +26,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef METRICS_MONITOR_H
-#define METRICS_MONITOR_H
+#pragma once
 
 #include <memory>
 #include <string>
@@ -46,10 +45,10 @@ namespace test_harness {
  * relevant to the given workload.
  */
 class metrics_monitor : public component {
-    public:
+public:
     static void get_stat(scoped_cursor &, int, int64_t *);
 
-    public:
+public:
     metrics_monitor(const std::string &test_name, configuration *config, database &database);
     virtual ~metrics_monitor() = default;
 
@@ -61,7 +60,7 @@ class metrics_monitor : public component {
     void do_work() override final;
     void finish() override final;
 
-    private:
+private:
     scoped_session _session;
     scoped_cursor _cursor;
     const std::string _test_name;
@@ -69,5 +68,3 @@ class metrics_monitor : public component {
     database &_database;
 };
 } // namespace test_harness
-
-#endif

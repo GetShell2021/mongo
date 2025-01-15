@@ -5,8 +5,7 @@
  *
  * @tags: [requires_majority_read_concern]
  */
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 function printStatus() {
     var primaryStatus;
@@ -29,8 +28,7 @@ function log(arg) {
 }
 // Set up a set and grab things for later.
 var name = "read_committed_on_secondary";
-var replTest =
-    new ReplSetTest({name: name, nodes: 3, nodeOptions: {enableMajorityReadConcern: ''}});
+var replTest = new ReplSetTest({name: name, nodes: 3});
 replTest.startSet();
 var nodes = replTest.nodeList();
 var config = {
@@ -74,7 +72,7 @@ function doDirtyRead(lastOp) {
     log("doing dirty read for lastOp:" + tojson(lastOp));
     var res = collSecondary.runCommand('find', {
         "readConcern": {"level": "local", "afterOpTime": lastOp},
-        "maxTimeMS": replTest.kDefaultTimeoutMS
+        "maxTimeMS": replTest.timeoutMS
     });
     assert.commandWorked(res);
     log("done doing dirty read.");
@@ -85,7 +83,7 @@ function doCommittedRead(lastOp) {
     log("doing committed read for optime: " + tojson(lastOp));
     var res = collSecondary.runCommand('find', {
         "readConcern": {"level": "majority", "afterOpTime": lastOp},
-        "maxTimeMS": replTest.kDefaultTimeoutMS
+        "maxTimeMS": replTest.timeoutMS
     });
     assert.commandWorked(res);
     log("done doing committed read.");
@@ -132,4 +130,3 @@ log(replTest.status());
 assert.eq(doCommittedRead(op2), 2);
 log("test success!");
 replTest.stopSet();
-}());

@@ -31,10 +31,29 @@
 #pragma once
 
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <ostream>
+#include <s2cellid.h>
+#include <string>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/geo/geometry_container.h"
 #include "mongo/db/geo/geoparser.h"
+#include "mongo/db/geo/shapes.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_visitor.h"
+#include "mongo/db/matcher/match_details.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -73,7 +92,8 @@ private:
     // e.g.
     // { "$intersect" : { "$geometry" : { "type" : "Point", "coordinates": [ 40, 5 ] } } }
     Status parseQuery(const BSONObj& obj);
-
+    BSONObj redactGeoExpression(const BSONObj& obj,
+                                boost::optional<StringData> literalArgsReplacement);
     // Name of the field in the query.
     std::string field;
     std::shared_ptr<GeometryContainer> geoContainer;
@@ -83,16 +103,16 @@ private:
 class GeoMatchExpression : public LeafMatchExpression {
 
 public:
-    GeoMatchExpression(StringData path,
+    GeoMatchExpression(boost::optional<StringData> path,
                        const GeoExpression* query,
                        const BSONObj& rawObj,
                        clonable_ptr<ErrorAnnotation> annotation = nullptr);
-    GeoMatchExpression(StringData path,
+    GeoMatchExpression(boost::optional<StringData> path,
                        std::shared_ptr<const GeoExpression> query,
                        const BSONObj& rawObj,
                        clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    virtual ~GeoMatchExpression() {}
+    ~GeoMatchExpression() override {}
     static bool contains(const GeometryContainer& queryGeom,
                          const GeoExpression::Predicate& queryPredicate,
                          bool skipValidation,
@@ -104,13 +124,15 @@ public:
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
     bool matchesGeoContainer(const GeometryContainer&) const;
 
-    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const override;
 
-    BSONObj getSerializedRightHandSide() const final;
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
 
-    virtual bool equivalent(const MatchExpression* other) const;
+    bool equivalent(const MatchExpression* other) const override;
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const;
+    std::unique_ptr<MatchExpression> clone() const override;
 
     void setCanSkipValidation(bool val) {
         _canSkipValidation = val;
@@ -134,7 +156,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     // The original geo specification provided by the user.
@@ -143,6 +167,9 @@ private:
     // Share ownership of our query with all of our clones
     std::shared_ptr<const GeoExpression> _query;
     bool _canSkipValidation;
+
+    template <typename H>
+    friend class MatchExpressionHashVisitor;
 };
 
 
@@ -191,12 +218,14 @@ private:
 
 class GeoNearMatchExpression : public LeafMatchExpression {
 public:
-    GeoNearMatchExpression(StringData path, const GeoNearExpression* query, const BSONObj& rawObj);
-    GeoNearMatchExpression(StringData path,
+    GeoNearMatchExpression(boost::optional<StringData> path,
+                           const GeoNearExpression* query,
+                           const BSONObj& rawObj);
+    GeoNearMatchExpression(boost::optional<StringData> path,
                            std::shared_ptr<const GeoNearExpression> query,
                            const BSONObj& rawObj);
 
-    virtual ~GeoNearMatchExpression() {}
+    ~GeoNearMatchExpression() override {}
 
     /**
      * Stub implementation that should never be called, since geoNear execution requires an
@@ -204,13 +233,15 @@ public:
      */
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
-    virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
+    void debugString(StringBuilder& debug, int indentationLevel = 0) const override;
 
-    BSONObj getSerializedRightHandSide() const final;
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const SerializationOptions& opts = {},
+                                       bool includePath = true) const final;
 
-    virtual bool equivalent(const MatchExpression* other) const;
+    bool equivalent(const MatchExpression* other) const override;
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const;
+    std::unique_ptr<MatchExpression> clone() const override;
 
     const GeoNearExpression& getData() const {
         return *_query;
@@ -226,7 +257,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     // The original geo specification provided by the user.
@@ -234,6 +267,9 @@ private:
 
     // Share ownership of our query with all of our clones
     std::shared_ptr<const GeoNearExpression> _query;
+
+    template <typename H>
+    friend class MatchExpressionHashVisitor;
 };
 
 /**
@@ -243,11 +279,13 @@ private:
  */
 class TwoDPtInAnnulusExpression : public LeafMatchExpression {
 public:
-    TwoDPtInAnnulusExpression(const R2Annulus& annulus, StringData twoDPath)
+    TwoDPtInAnnulusExpression(const R2Annulus& annulus, boost::optional<StringData> twoDPath)
         : LeafMatchExpression(INTERNAL_2D_POINT_IN_ANNULUS, twoDPath), _annulus(annulus) {}
 
-    void serialize(BSONObjBuilder* out, bool includePath) const final {
-        out->append("TwoDPtInAnnulusExpression", true);
+    void serialize(BSONObjBuilder* out,
+                   const SerializationOptions& opts = {},
+                   bool includePath = true) const final {
+        out->append("$TwoDPtInAnnulusExpression", true);
     }
 
     bool matchesSingleElement(const BSONElement& e, MatchDetails* details = nullptr) const final {
@@ -265,7 +303,9 @@ public:
     // These won't be called.
     //
 
-    BSONObj getSerializedRightHandSide() const final {
+    void appendSerializedRightHandSide(BSONObjBuilder* bob,
+                                       const SerializationOptions& opts = {},
+                                       bool includePath = true) const final {
         MONGO_UNREACHABLE;
     }
 
@@ -278,7 +318,7 @@ public:
         return false;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         MONGO_UNREACHABLE;
         return nullptr;
     }
@@ -291,9 +331,15 @@ public:
         visitor->visit(this);
     }
 
+    R2Annulus getAnnulus() const {
+        return _annulus;
+    }
+
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     R2Annulus _annulus;

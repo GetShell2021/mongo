@@ -37,7 +37,9 @@
 #include "mongo/db/exec/plan_stats_visitor.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/query/eof_node_type.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/query/query_stats/data_bearing_node_metrics.h"
 #include "mongo/db/query/record_id_bound.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/db/record_id.h"
@@ -45,6 +47,15 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+
+class PlanStage;
+/**
+ * The type which represents a unique identifier for PlanStages across all enumerated plans for a
+ * query. It is implemented as a typedef to PlanStage* as a convenience, since that is guarenteed to
+ * be unique, but this pointer is never intended to be dereferenced as this type may exist after the
+ * underlying PlanStage has been destroyed.
+ */
+using PlanStageKey = const PlanStage*;
 
 /**
  * The interface all specific-to-stage stats provide.
@@ -67,8 +78,11 @@ struct SpecificStats {
 struct CommonStats {
     CommonStats() = delete;
 
-    CommonStats(const char* type)
+    CommonStats(const char* type) : CommonStats(type, nullptr /*originalPlanStage*/) {}
+
+    CommonStats(const char* type, PlanStageKey originalPlanStage)
         : stageTypeStr(type),
+          planStage(originalPlanStage),
           works(0),
           yields(0),
           unyields(0),
@@ -83,6 +97,9 @@ struct CommonStats {
     }
     // String giving the type of the stage. Not owned.
     const char* stageTypeStr;
+
+    // Store an identifier to the plan stage which this object is describing.
+    PlanStageKey planStage;
 
     // Count calls into the stage.
     size_t works;
@@ -103,16 +120,8 @@ struct CommonStats {
     //
     // The field must be populated when running explain or when running with the profiler on. It
     // must also be populated when multi planning, in order to gather stats stored in the plan
-    // cache.
-    boost::optional<long long> executionTimeMillis;
-
-    // TODO: have some way of tracking WSM sizes (or really any series of #s).  We can measure
-    // the size of our inputs and the size of our outputs.  We can do a lot with the WS here.
-
-    // TODO: once we've picked a plan, collect different (or additional) stats for display to
-    // the user, eg. time_t totalTimeSpent;
-
-    // TODO: keep track of the total yield time / fetch time done for a plan.
+    // cache. This struct includes the execution time and its precision/unit.
+    QueryExecTime executionTime;
 
     bool failed;
     bool isEOF;
@@ -188,7 +197,7 @@ private:
     BasePlanStageStats& operator=(const BasePlanStageStats<C, T>&) = delete;
 };
 
-using PlanStageStats = BasePlanStageStats<CommonStats, StageType>;
+using PlanStageStats = BasePlanStageStats<mongo::CommonStats, StageType>;
 
 struct AndHashStats : public SpecificStats {
     AndHashStats() = default;
@@ -197,7 +206,7 @@ struct AndHashStats : public SpecificStats {
         return std::make_unique<AndHashStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return container_size_helper::estimateObjectSizeInBytes(mapAfterChild) + sizeof(*this);
     }
 
@@ -231,7 +240,7 @@ struct AndSortedStats : public SpecificStats {
         return std::make_unique<AndSortedStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return container_size_helper::estimateObjectSizeInBytes(failedAnd) + sizeof(*this);
     }
 
@@ -254,7 +263,7 @@ struct CachedPlanStats : public SpecificStats {
         return std::make_unique<CachedPlanStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -276,7 +285,7 @@ struct CollectionScanStats : public SpecificStats {
         return std::make_unique<CollectionScanStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -311,7 +320,7 @@ struct CountStats : public SpecificStats {
         return std::make_unique<CountStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -349,7 +358,7 @@ struct CountScanStats : public SpecificStats {
         return specific;
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return container_size_helper::estimateObjectSizeInBytes(
                    multiKeyPaths,
                    [](const auto& keyPath) {
@@ -406,7 +415,7 @@ struct DeleteStats : public SpecificStats {
         return std::make_unique<DeleteStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -419,6 +428,7 @@ struct DeleteStats : public SpecificStats {
     }
 
     size_t docsDeleted = 0u;
+    size_t bytesDeleted = 0u;
 };
 
 struct BatchedDeleteStats : public DeleteStats {
@@ -446,7 +456,7 @@ struct DistinctScanStats : public SpecificStats {
         return specific;
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return container_size_helper::estimateObjectSizeInBytes(
                    multiKeyPaths,
                    [](const auto& keyPath) {
@@ -468,6 +478,10 @@ struct DistinctScanStats : public SpecificStats {
 
     // How many keys did we look at while distinct-ing?
     size_t keysExamined = 0;
+    // The total number of full documents touched by the embedded fetch stage, if one exists.
+    size_t docsExamined = 0;
+    // How many chunk skips were performed while distinct-ing?
+    size_t chunkSkips = 0;
 
     BSONObj keyPattern;
 
@@ -486,6 +500,10 @@ struct DistinctScanStats : public SpecificStats {
     bool isPartial = false;
     bool isSparse = false;
     bool isUnique = false;
+    bool isShardFiltering = false;
+    bool isFetching = false;
+    // TODO SERVER-92983: Remove once feature flag is removed.
+    bool isShardFilteringDistinctScanEnabled = false;
 
     // >1 if we're traversing the index forwards and <1 if we're traversing it backwards.
     int direction = 1;
@@ -501,7 +519,7 @@ struct FetchStats : public SpecificStats {
         return std::make_unique<FetchStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -527,7 +545,7 @@ struct IDHackStats : public SpecificStats {
         return std::make_unique<IDHackStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return indexName.capacity() + sizeof(*this);
     }
 
@@ -553,7 +571,7 @@ struct ReturnKeyStats : public SpecificStats {
         return std::make_unique<ReturnKeyStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -588,7 +606,7 @@ struct IndexScanStats : public SpecificStats {
         return specific;
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return container_size_helper::estimateObjectSizeInBytes(
                    multiKeyPaths,
                    [](const auto& keyPath) {
@@ -656,7 +674,7 @@ struct LimitStats : public SpecificStats {
         return std::make_unique<LimitStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -678,7 +696,7 @@ struct MockStats : public SpecificStats {
         return std::make_unique<MockStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -698,7 +716,7 @@ struct MultiPlanStats : public SpecificStats {
         return std::make_unique<MultiPlanStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -709,6 +727,8 @@ struct MultiPlanStats : public SpecificStats {
     void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
         visitor->visit(this);
     }
+
+    boost::optional<std::string> replanReason;
 };
 
 struct OrStats : public SpecificStats {
@@ -718,7 +738,7 @@ struct OrStats : public SpecificStats {
         return std::make_unique<OrStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -741,7 +761,7 @@ struct ProjectionStats : public SpecificStats {
         return std::make_unique<ProjectionStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return projObj.objsize() + sizeof(*this);
     }
 
@@ -762,11 +782,11 @@ struct SortStats : public SpecificStats {
     SortStats(uint64_t limit, uint64_t maxMemoryUsageBytes)
         : limit(limit), maxMemoryUsageBytes(maxMemoryUsageBytes) {}
 
-    std::unique_ptr<SpecificStats> clone() const {
+    std::unique_ptr<SpecificStats> clone() const override {
         return std::make_unique<SortStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sortPattern.objsize() + sizeof(*this);
     }
 
@@ -794,11 +814,17 @@ struct SortStats : public SpecificStats {
     // disk use is allowed.
     uint64_t totalDataSizeBytes = 0u;
 
+    // The amount of memory that is currently being used, even prior to being sorted.
+    uint64_t memoryUsageBytes = 0u;
+
     // The number of keys that we've sorted.
     uint64_t keysSorted = 0u;
 
     // The number of times that we spilled data to disk during the execution of this query.
     uint64_t spills = 0u;
+
+    // The maximum size of the spill file written to disk, or 0 if no spilling occurred.
+    uint64_t spilledDataStorageSize = 0u;
 };
 
 struct MergeSortStats : public SpecificStats {
@@ -808,7 +834,7 @@ struct MergeSortStats : public SpecificStats {
         return std::make_unique<MergeSortStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sortPattern.objsize() + sizeof(*this);
     }
 
@@ -834,7 +860,7 @@ struct ShardingFilterStats : public SpecificStats {
         return std::make_unique<ShardingFilterStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -856,7 +882,7 @@ struct SkipStats : public SpecificStats {
         return std::make_unique<SkipStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -892,7 +918,7 @@ struct NearStats : public SpecificStats {
         return std::make_unique<NearStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return container_size_helper::estimateObjectSizeInBytes(intervalStats) +
             keyPattern.objsize() + indexName.capacity() + sizeof(*this);
     }
@@ -919,7 +945,7 @@ struct UpdateStats : public SpecificStats {
         return std::make_unique<UpdateStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return objInserted.objsize() + sizeof(*this);
     }
 
@@ -952,7 +978,7 @@ struct TextMatchStats : public SpecificStats {
         return std::make_unique<TextMatchStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return parsedTextQuery.objsize() + indexPrefix.objsize() + indexName.capacity() +
             sizeof(*this);
     }
@@ -985,7 +1011,7 @@ struct TextOrStats : public SpecificStats {
         return std::make_unique<TextOrStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -1005,7 +1031,7 @@ struct TrialStats : public SpecificStats {
         return std::make_unique<TrialStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -1032,7 +1058,7 @@ struct GroupStats : public SpecificStats {
         return std::make_unique<GroupStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -1047,8 +1073,18 @@ struct GroupStats : public SpecificStats {
     // Tracks an estimate of the total size of all documents output by the group stage in bytes.
     size_t totalOutputDataSizeBytes = 0;
 
+    // The size of the file spilled to disk. Note that this is not the same as the number of bytes
+    // spilled to disk, as any data spilled to disk will be compressed before being written to a
+    // file.
+    uint64_t spilledDataStorageSize = 0u;
+
+    // The number of bytes evicted from memory and spilled to disk.
+    uint64_t numBytesSpilledEstimate = 0u;
+
     // The number of times that we spilled data to disk while grouping the data.
     uint64_t spills = 0u;
+
+    uint64_t spilledRecords = 0u;
 };
 
 struct DocumentSourceCursorStats : public SpecificStats {
@@ -1056,7 +1092,7 @@ struct DocumentSourceCursorStats : public SpecificStats {
         return std::make_unique<DocumentSourceCursorStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this) +
             (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
     }
@@ -1072,12 +1108,34 @@ struct DocumentSourceCursorStats : public SpecificStats {
     PlanSummaryStats planSummaryStats;
 };
 
+struct DocumentSourceMergeCursorsStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<DocumentSourceMergeCursorsStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    PlanSummaryStats planSummaryStats;
+    query_stats::DataBearingNodeMetrics dataBearingNodeMetrics;
+};
+
 struct DocumentSourceLookupStats : public SpecificStats {
     std::unique_ptr<SpecificStats> clone() const final {
         return std::make_unique<DocumentSourceLookupStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this) +
             (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
     }
@@ -1099,7 +1157,7 @@ struct UnionWithStats final : public SpecificStats {
         return std::make_unique<UnionWithStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this) +
             (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
     }
@@ -1121,7 +1179,7 @@ struct DocumentSourceFacetStats : public SpecificStats {
         return std::make_unique<DocumentSourceFacetStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this) +
             (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
     }
@@ -1143,7 +1201,7 @@ struct UnpackTimeseriesBucketStats final : public SpecificStats {
         return std::make_unique<UnpackTimeseriesBucketStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -1158,12 +1216,46 @@ struct UnpackTimeseriesBucketStats final : public SpecificStats {
     size_t nBucketsUnpacked = 0u;
 };
 
+struct TimeseriesModifyStats final : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<TimeseriesModifyStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return objInserted.objsize() + sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    std::string opType;
+    BSONObj bucketFilter;
+    BSONObj residualFilter;
+    size_t nBucketsUnpacked = 0u;
+    size_t nMeasurementsMatched = 0u;
+    size_t nMeasurementsModified = 0u;
+
+    // Will be 1 if this is an {upsert: true} update that did an insert, 0 otherwise.
+    size_t nMeasurementsUpserted = 0u;
+
+    // The object that was inserted. This is an empty document if no insert was performed.
+    BSONObj objInserted;
+
+    // True iff this is a $mod update.
+    bool isModUpdate;
+};
+
 struct SampleFromTimeseriesBucketStats final : public SpecificStats {
     std::unique_ptr<SpecificStats> clone() const final {
         return std::make_unique<SampleFromTimeseriesBucketStats>(*this);
     }
 
-    uint64_t estimateObjectSizeInBytes() const {
+    uint64_t estimateObjectSizeInBytes() const override {
         return sizeof(*this);
     }
 
@@ -1178,5 +1270,91 @@ struct SampleFromTimeseriesBucketStats final : public SpecificStats {
     size_t nBucketsDiscarded = 0u;
     size_t dupsTested = 0u;
     size_t dupsDropped = 0u;
+};
+
+struct SpoolStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const override {
+        return std::make_unique<SpoolStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // The maximum number of bytes of memory we're willing to use during execution of the spool. If
+    // this limit is exceeded and 'allowDiskUse' is false, the query will fail at execution time. If
+    // 'allowDiskUse' is true, the data will be spilled to disk.
+    uint64_t maxMemoryUsageBytes = 0u;
+
+    // The maximum number of bytes of disk space we're willing to use during execution of the spool,
+    // if 'allowDiskUse' is true.
+    uint64_t maxDiskUsageBytes = 0u;
+
+    // The amount of data we've spooled in bytes.
+    uint64_t totalDataSizeBytes = 0u;
+
+    // The number of times that we spilled data to disk during the execution of this query.
+    uint64_t spills = 0u;
+
+    // The maximum size of the spill file written to disk, or 0 if no spilling occurred.
+    uint64_t spilledDataStorageSize = 0u;
+
+    // The number of individual records spilled to disk.
+    uint64_t spilledRecords = 0u;
+
+    // The amount of data that has been spilled to the spill file, or 0 if no spilling occurred.
+    uint64_t spilledUncompressedDataSize = 0u;
+};
+
+struct EofStats : public SpecificStats {
+    EofStats(eof_node::EOFType type) : type(type) {}
+
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<EofStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this);
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    eof_node::EOFType type;
+};
+
+struct DocumentSourceIdLookupStats : public SpecificStats {
+    std::unique_ptr<SpecificStats> clone() const final {
+        return std::make_unique<DocumentSourceIdLookupStats>(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const override {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void acceptVisitor(PlanStatsConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(PlanStatsMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    // Tracks the cumulative summary stats for the idLookup sub-pipeline.
+    PlanSummaryStats planSummaryStats;
 };
 }  // namespace mongo

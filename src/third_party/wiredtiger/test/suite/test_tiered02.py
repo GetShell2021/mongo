@@ -106,7 +106,7 @@ class test_tiered02(wttest.WiredTigerTestCase, TieredConfigMixin):
         self.progress('checkpoint')
         self.session.checkpoint()
         self.progress('flush_tier')
-        self.session.flush_tier(None)
+        self.session.checkpoint('flush_tier=(enabled)')
         self.confirm_flush()
         ds.check()
 
@@ -131,7 +131,7 @@ class test_tiered02(wttest.WiredTigerTestCase, TieredConfigMixin):
         self.session.checkpoint()
 
         self.progress('flush_tier')
-        self.session.flush_tier(None)
+        self.session.checkpoint('flush_tier=(enabled)')
         self.progress('flush_tier complete')
         self.confirm_flush()
 
@@ -143,7 +143,7 @@ class test_tiered02(wttest.WiredTigerTestCase, TieredConfigMixin):
         self.progress('checkpoint')
         self.session.checkpoint()
         self.progress('flush_tier')
-        self.session.flush_tier(None)
+        self.session.checkpoint('flush_tier=(enabled)')
         self.confirm_flush()
 
         self.progress('Create simple data set (200)')
@@ -176,6 +176,3 @@ class test_tiered02(wttest.WiredTigerTestCase, TieredConfigMixin):
         self.session.checkpoint()
         self.confirm_flush(increase=False)
         self.progress('END TEST')
-
-if __name__ == '__main__':
-    wttest.run()

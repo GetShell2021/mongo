@@ -4,10 +4,9 @@
  *
  * @tags: [uses_change_streams, requires_replication]
  */
-(function() {
-"use strict";
+import "jstests/multiVersion/libs/multi_cluster.js";
 
-load("jstests/multiVersion/libs/multi_cluster.js");  // For upgradeCluster.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Checking UUID consistency uses cached connections, which are not valid across restarts or
 // stepdowns.
@@ -24,12 +23,21 @@ const st = new ShardingTest({
         binVersion: "latest",
         setParameter: {logComponentVerbosity: '{command: {verbosity: 2}}'}
     },
-    other: {mongosOptions: {binVersion: "latest"}}
+    other: {
+        configOptions:
+            {setParameter: {reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000}},
+        mongosOptions: {binVersion: "latest"}
+    },
+    // By default, our test infrastructure sets the election timeout to a very high value (24
+    // hours). For this test, we need a shorter election timeout because it relies on nodes running
+    // an election when they do not detect an active primary. Therefore, we are setting the
+    // electionTimeoutMillis to its default value.
+    initiateWithDefaultElectionTimeout: true
 });
 
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 let shardedColl = st.s.getDB(dbName)[collName];
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 assert.commandWorked(st.s.adminCommand({shardCollection: shardedColl.getFullName(), key: {sk: 1}}));
 
 const largeStr = '*'.repeat(512);
@@ -163,7 +171,7 @@ const standardTestCases = [
         generateOpLogEntry: function(coll) {
             assert.commandWorked(coll.insert({sk: 2, a: 1}));
             assert.commandWorked(coll.getDB().adminCommand(
-                {reshardCollection: coll.getFullName(), key: {sk: 1, a: 1}}));
+                {reshardCollection: coll.getFullName(), key: {sk: 1, a: 1}, numInitialChunks: 1}));
         }
     }
 ];
@@ -340,8 +348,8 @@ function runTests(downgradeVersion) {
     jsTestLog("Running test with 'downgradeVersion': " + downgradeVersion);
     const downgradeFCV = downgradeVersion === "last-lts" ? lastLTSFCV : lastContinuousFCV;
     // Downgrade the entire cluster to the 'downgradeVersion' binVersion.
-    assert.commandWorked(
-        st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: downgradeFCV}));
+    assert.commandWorked(st.s.getDB(dbName).adminCommand(
+        {setFeatureCompatibilityVersion: downgradeFCV, confirm: true}));
     st.downgradeCluster(downgradeVersion);
 
     // Refresh our reference to the sharded collection post-downgrade.
@@ -357,9 +365,9 @@ runTests('last-continuous');
 
 // Upgrade the entire cluster back to the latest version.
 st.upgradeCluster('latest', {waitUntilStable: true});
-assert.commandWorked(st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+assert.commandWorked(
+    st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: latestFCV, confirm: true}));
 
 // Test resuming change streams after downgrading the cluster to 'last-lts'.
 runTests('last-lts');
 st.stop();
-}());

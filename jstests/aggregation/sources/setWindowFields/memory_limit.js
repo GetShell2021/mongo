@@ -1,14 +1,16 @@
 /**
  * Test that DocumentSourceSetWindowFields errors when using more than the perscribed amount of
  * data. Memory checks are per node, so only test when the data is all in one place.
+ *
+ * @tags: [
+ *   not_allowed_with_signed_security_token,
+ * ]
  */
 
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-load("jstests/libs/fixture_helpers.js");                         // For FixtureHelpers.isMongos.
-load("jstests/noPassthrough/libs/server_parameter_helpers.js");  // For setParameterOnAllHosts.
-load("jstests/libs/discover_topology.js");                       // For findNonConfigNodes.
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {setParameterOnAllHosts} from "jstests/noPassthrough/libs/server_parameter_helpers.js";
 
 const coll = db[jsTestName()];
 coll.drop();
@@ -61,6 +63,10 @@ assert.commandWorked(coll.runCommand({
     allowDiskUse: false
 }));
 
+setParameterOnAllHosts(nonConfigNodes,
+                       "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+                       (perDocSize * docsPerPartition) + 1024);
+
 // Test that the query fails with a window function that stores documents.
 assert.commandFailedWithCode(coll.runCommand({
     aggregate: coll.getName(),
@@ -74,8 +80,7 @@ assert.commandFailedWithCode(coll.runCommand({
     cursor: {},
     allowDiskUse: false
 }),
-                             5414201);
+                             [5643011, 5414201]);
 // Reset limit for other tests.
 setParameterOnAllHosts(
     nonConfigNodes, "internalDocumentSourceSetWindowFieldsMaxMemoryBytes", 100 * 1024 * 1024);
-})();

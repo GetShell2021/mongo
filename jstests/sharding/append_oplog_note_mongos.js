@@ -2,13 +2,13 @@
  * Tests that the 'appendOplogNote' command on mongos correctly performs a no-op write on each
  * shard and advances the $clusterTime.
  *
- * @tags: [requires_fcv_60]
+ * Expects a particular oplog entry to be the latest in a shard's oplog, but if the shard is the
+ * config server, background writes, like to config.mongos, can break its assumption.
+ * @tags: [config_shard_incompatible]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function checkOplogEntry(actualOplogEntry) {
     const {op, o} = actualOplogEntry;
@@ -75,4 +75,3 @@ assert.eq(shardOneAfter.members[0].optime.ts, lastEntryShardOne.ts);
 assert.eq(shardTwoAfter.members[0].optime.ts, lastEntryShardTwo.ts);
 
 st.stop();
-}());

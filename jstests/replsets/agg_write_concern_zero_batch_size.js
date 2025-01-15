@@ -1,10 +1,8 @@
 // Tests that an aggregate sent with batchSize: 0 will still obey the write concern sent on the
 // original request, even though the writes happen in the getMore.
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/merge_helpers.js");  // For withEachKindOfWriteStage.
-load("jstests/libs/write_concern_util.js");           // For [stop|restart]ServerReplication.
+import {withEachKindOfWriteStage} from "jstests/aggregation/extras/merge_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 // Start a replica set with two nodes: one with the default configuration and one with priority
 // zero to ensure we don't have any elections.
@@ -44,7 +42,7 @@ try {
 
         const getMoreResponse = assert.commandFailedWithCode(
             testDB.runCommand({getMore: response.cursor.id, collection: source.getName()}),
-            ErrorCodes.WriteConcernFailed);
+            ErrorCodes.WriteConcernTimeout);
 
         // Test the same thing but using the shell helpers.
         let error = assert.throws(
@@ -72,4 +70,3 @@ try {
 }
 
 rst.stopSet();
-}());

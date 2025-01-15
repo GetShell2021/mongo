@@ -29,16 +29,36 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <functional>
+#include <list>
 #include <memory>
+#include <mutex>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/shard_id.h"
-#include "mongo/util/concurrency/mutex.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/future.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -85,12 +105,12 @@ public:
         auto pf = makePromiseFuture<ReturnType>();
         auto taskCompletionPromise = std::make_shared<Promise<ReturnType>>(std::move(pf.promise));
         try {
-            stdx::unique_lock<Latch> ul(_mutex);
+            stdx::unique_lock<stdx::mutex> ul(_mutex);
             uassertStatusOK(_shutdownStatus);
 
             auto scheduledWorkHandle = uassertStatusOK(_executor->scheduleWorkAt(
                 when,
-                [ this, task = std::forward<Callable>(task), taskCompletionPromise ](
+                [this, task = std::forward<Callable>(task), taskCompletionPromise](
                     const executor::TaskExecutor::CallbackArgs& args) mutable noexcept {
                     taskCompletionPromise->setWith([&] {
                         {
@@ -99,7 +119,10 @@ public:
                             uassertStatusOK(args.status);
                         }
 
-                        ThreadClient tc("TransactionCoordinator", _serviceContext);
+                        // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+                        ThreadClient tc("TransactionCoordinator",
+                                        _serviceContext->getService(ClusterRole::ShardServer),
+                                        ClientOperationKillableByStepdown{false});
 
                         auto uniqueOpCtxIter = [&] {
                             stdx::lock_guard lk(_mutex);
@@ -126,7 +149,7 @@ public:
 
             return std::move(pf.future).tapAll(
                 [this, it = std::move(it)](StatusOrStatusWith<ReturnType> s) {
-                    stdx::lock_guard<Latch> lg(_mutex);
+                    stdx::lock_guard<stdx::mutex> lg(_mutex);
                     _activeHandles.erase(it);
                     _notifyAllTasksComplete(lg);
                 });
@@ -178,6 +201,10 @@ public:
 private:
     using ChildIteratorsList = std::list<AsyncWorkScheduler*>;
 
+    AsyncWorkScheduler(ServiceContext* serviceContext,
+                       AsyncWorkScheduler* parent,
+                       WithLock withParentLock);
+
     // A targeted host and the shard object used to target it. The shard object is passed through
     // resolved so the caller can avoid a potentially blocking "ShardRegistry::getShard" call.
     struct HostAndShard {
@@ -188,10 +215,11 @@ private:
     /**
      * Finds the host and port for a shard id, returning it and the shard object used for targeting.
      */
-    Future<HostAndShard> _targetHostAsync(const ShardId& shardId,
-                                          const ReadPreferenceSetting& readPref,
-                                          OperationContextFn operationContextFn =
-                                              [](OperationContext*) {});
+    Future<HostAndShard> _targetHostAsync(
+        const ShardId& shardId,
+        const ReadPreferenceSetting& readPref,
+        OperationContextFn operationContextFn = [](OperationContext*) {},
+        BSONObj commandObj = BSONObj());
 
     /**
      * Returns true when all the registered child schedulers, op contexts and handles have joined.
@@ -213,11 +241,11 @@ private:
 
     // If this work scheduler was constructed through 'makeChildScheduler', points to the parent
     // scheduler and contains the iterator from the parent, which needs to be removed on destruction
-    AsyncWorkScheduler* _parent{nullptr};
+    AsyncWorkScheduler* const _parent;
     ChildIteratorsList::iterator _itToRemove;
 
     // Mutex to protect the shared state below
-    Mutex _mutex = MONGO_MAKE_LATCH("AsyncWorkScheduler::_mutex");
+    stdx::mutex _mutex;
 
     // If shutdown() is called, this contains the first status that was passed to it and is an
     // indication that no more operations can be scheduled
@@ -301,7 +329,7 @@ Future<GlobalResult> collect(std::vector<Future<IndividualResult>>&& futures,
          * The first few fields have fixed values.           *
          ******************************************************/
         // Protects all state in the SharedBlock.
-        Mutex mutex = MONGO_MAKE_LATCH("SharedBlock::mutex");
+        stdx::mutex mutex;
 
         // If any response returns an error prior to a response setting shouldStopIteration to
         // ShouldStopIteration::kYes, the promise will be set with that error rather than the global
@@ -339,7 +367,7 @@ Future<GlobalResult> collect(std::vector<Future<IndividualResult>>&& futures,
     for (auto&& localFut : futures) {
         std::move(localFut)
             .then([sharedBlock](IndividualResult res) {
-                stdx::unique_lock<Latch> lk(sharedBlock->mutex);
+                stdx::unique_lock<stdx::mutex> lk(sharedBlock->mutex);
                 if (sharedBlock->shouldStopIteration == ShouldStopIteration::kNo &&
                     sharedBlock->status.isOK()) {
                     sharedBlock->shouldStopIteration =
@@ -347,14 +375,14 @@ Future<GlobalResult> collect(std::vector<Future<IndividualResult>>&& futures,
                 }
             })
             .onError([sharedBlock](Status s) {
-                stdx::unique_lock<Latch> lk(sharedBlock->mutex);
+                stdx::unique_lock<stdx::mutex> lk(sharedBlock->mutex);
                 if (sharedBlock->shouldStopIteration == ShouldStopIteration::kNo &&
                     sharedBlock->status.isOK()) {
                     sharedBlock->status = s;
                 }
             })
             .getAsync([sharedBlock](Status s) {
-                stdx::unique_lock<Latch> lk(sharedBlock->mutex);
+                stdx::unique_lock<stdx::mutex> lk(sharedBlock->mutex);
                 sharedBlock->numOutstandingResponses--;
                 if (sharedBlock->numOutstandingResponses == 0) {
                     // Unlock before emplacing the result in case any continuations do expensive

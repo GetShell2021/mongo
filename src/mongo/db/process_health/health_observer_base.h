@@ -28,10 +28,28 @@
  */
 #pragma once
 
-#include "mongo/db/process_health/health_observer.h"
+#include <memory>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/status.h"
 #include "mongo/db/process_health/deadline_future.h"
+#include "mongo/db/process_health/fault_manager_config.h"
+#include "mongo/db/process_health/health_check_status.h"
+#include "mongo/db/process_health/health_observer.h"
 #include "mongo/db/service_context.h"
+#include "mongo/executor/task_executor.h"
+#include "mongo/platform/random.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/cancellation.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
+#include "mongo/util/hierarchical_acquisition.h"
+#include "mongo/util/tick_source.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace process_health {
@@ -44,7 +62,7 @@ namespace process_health {
 class HealthObserverBase : public HealthObserver {
 public:
     explicit HealthObserverBase(ServiceContext* svcCtx);
-    virtual ~HealthObserverBase() = default;
+    ~HealthObserverBase() override = default;
 
     ClockSource* clockSource() const {
         return _svcCtx->getPreciseClockSource();
@@ -105,8 +123,7 @@ protected:
 
     ServiceContext* const _svcCtx;
 
-    mutable Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(1), "HealthObserverBase::_mutex");
+    mutable stdx::mutex _mutex;
 
     // Indicates if there any check running to prevent running checks concurrently.
     bool _currentlyRunningHealthCheck = false;

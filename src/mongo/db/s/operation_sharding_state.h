@@ -29,12 +29,16 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/status.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/database_version.h"
+#include "mongo/s/shard_version.h"
 #include "mongo/util/future.h"
 #include "mongo/util/string_map.h"
 
@@ -49,8 +53,10 @@ class ScopedSetShardRole {
 public:
     ScopedSetShardRole(OperationContext* opCtx,
                        NamespaceString nss,
-                       boost::optional<ChunkVersion> shardVersion,
+                       boost::optional<ShardVersion> shardVersion,
                        boost::optional<DatabaseVersion> databaseVersion);
+    ScopedSetShardRole(const ScopedSetShardRole&) = delete;
+    ScopedSetShardRole(ScopedSetShardRole&&);
     ~ScopedSetShardRole();
 
 private:
@@ -58,8 +64,26 @@ private:
 
     NamespaceString _nss;
 
-    boost::optional<ChunkVersion> _shardVersion;
+    boost::optional<ShardVersion> _shardVersion;
     boost::optional<DatabaseVersion> _databaseVersion;
+};
+
+// Stashes the shard role for the given namespace.
+// DON'T USE unless you understand very well what you're doing.
+class ScopedStashShardRole {
+public:
+    ScopedStashShardRole(OperationContext* opCtx, const NamespaceString& nss);
+
+    ScopedStashShardRole(const ScopedSetShardRole&) = delete;
+    ScopedStashShardRole(ScopedSetShardRole&&) = delete;
+
+    ~ScopedStashShardRole();
+
+private:
+    OperationContext* _opCtx;
+    NamespaceString _nss;
+    boost::optional<ShardVersion> _stashedShardVersion;
+    boost::optional<DatabaseVersion> _stashedDatabaseVersion;
 };
 
 /**
@@ -67,8 +91,6 @@ private:
  * from mongos as a command parameter.
  *
  * The metadata for a particular operation can be retrieved using the get() method.
- *
- * Note: This only supports storing the version for a single namespace.
  */
 class OperationShardingState {
     OperationShardingState(const OperationShardingState&) = delete;
@@ -91,16 +113,29 @@ public:
     static bool isComingFromRouter(OperationContext* opCtx);
 
     /**
+     * Similar to 'isComingFromRouter()' but also considers '_treatAsFromRouter'. This should be
+     * used when an operation intentionally skips setting shard versions but still wants to tell if
+     * it's sent from a router.
+     */
+    static bool shouldBeTreatedAsFromRouter(OperationContext* opCtx);
+
+    /**
      * NOTE: DO NOT ADD any new usages of this class without including someone from the Sharding
      * Team on the code review.
      *
      * Instantiating this object on the stack indicates to the storage execution subsystem that it
      * is allowed to create any collection in this context and that the caller will be responsible
-     * for notifying the shard Sharding sybsystem of the collection creation.
+     * for notifying the shard Sharding subsystem of the collection creation. Note that in most of
+     * cases the CollectionShardingRuntime associated to that nss will be set as UNSHARDED. However,
+     * there are some scenarios in which it is required to set is as UNKNOWN: that's the reason why
+     * the constructor has the 'forceCSRAsUnknownAfterCollectionCreation' parameter. You can find
+     * more information about how the CSR is modified in ShardServerOpObserver::onCreateCollection.
      */
     class ScopedAllowImplicitCollectionCreate_UNSAFE {
     public:
-        ScopedAllowImplicitCollectionCreate_UNSAFE(OperationContext* opCtx);
+        /* Please read the comment associated to this class */
+        ScopedAllowImplicitCollectionCreate_UNSAFE(
+            OperationContext* opCtx, bool forceCSRAsUnknownAfterCollectionCreation = false);
         ~ScopedAllowImplicitCollectionCreate_UNSAFE();
 
     private:
@@ -113,7 +148,7 @@ public:
      */
     static void setShardRole(OperationContext* opCtx,
                              const NamespaceString& nss,
-                             const boost::optional<ChunkVersion>& shardVersion,
+                             const boost::optional<ShardVersion>& shardVersion,
                              const boost::optional<DatabaseVersion>& dbVersion);
 
     /**
@@ -121,29 +156,13 @@ public:
      * operation. Documents in chunks which did not belong on this shard at this shard version
      * will be filtered out.
      */
-    boost::optional<ChunkVersion> getShardVersion(const NamespaceString& nss);
-
-    /**
-     * Returns true if the client sent a databaseVersion for any namespace.
-     */
-    bool hasDbVersion() const;
+    boost::optional<ShardVersion> getShardVersion(const NamespaceString& nss);
 
     /**
      * If 'db' matches the 'db' in the namespace the client sent versions for, returns the database
      * version sent by the client (if any), else returns boost::none.
      */
-    boost::optional<DatabaseVersion> getDbVersion(StringData dbName) const;
-
-    /**
-     * This method implements a best-effort attempt to wait for the critical section to complete
-     * before returning to the router at the previous step in order to prevent it from busy spinning
-     * while the critical section is in progress.
-     *
-     * All waits for migration critical section should go through this code path, because it also
-     * accounts for transactions and locking.
-     */
-    static Status waitForCriticalSectionToComplete(OperationContext* opCtx,
-                                                   SharedSemiFuture<void> critSecSignal) noexcept;
+    boost::optional<DatabaseVersion> getDbVersion(const DatabaseName& dbName) const;
 
     /**
      * Stores the failed status in _shardingOperationFailedStatus.
@@ -161,20 +180,36 @@ public:
      */
     boost::optional<Status> resetShardingOperationFailedStatus();
 
+    void setTreatAsFromRouter(bool treatAsFromRouter = true) {
+        _treatAsFromRouter = treatAsFromRouter;
+    }
+
+    bool shouldSkipDirectConnectionChecks() {
+        return _shouldSkipDirectConnectionChecks;
+    }
+
+    void setShouldSkipDirectShardConnectionChecks(bool skipDirectConnectionChecks = true) {
+        _shouldSkipDirectConnectionChecks = skipDirectConnectionChecks;
+    }
+
 private:
     friend class ScopedSetShardRole;
+    friend class ScopedStashShardRole;
     friend class ShardServerOpObserver;  // For access to _allowCollectionCreation below
 
     // Specifies whether the request is allowed to create database/collection implicitly
     bool _allowCollectionCreation{false};
+    // Specifies whether the CollectionShardingRuntime should be set as unknown after collection
+    // creation
+    bool _forceCSRAsUnknownAfterCollectionCreation{false};
 
     // Stores the shard version expected for each collection that will be accessed
     struct ShardVersionTracker {
-        ShardVersionTracker(ChunkVersion v) : v(v) {}
+        ShardVersionTracker(ShardVersion v) : v(v) {}
         ShardVersionTracker(ShardVersionTracker&&) = default;
         ShardVersionTracker(const ShardVersionTracker&) = delete;
         ShardVersionTracker& operator=(const ShardVersionTracker&) = delete;
-        ChunkVersion v;
+        ShardVersion v;
         int recursion{0};
     };
     StringMap<ShardVersionTracker> _shardVersions;
@@ -188,11 +223,19 @@ private:
         DatabaseVersion v;
         int recursion{0};
     };
-    StringMap<DatabaseVersionTracker> _databaseVersions;
+    stdx::unordered_map<DatabaseName, DatabaseVersionTracker> _databaseVersions;
 
     // This value can only be set when a rerouting exception occurs during a write operation, and
     // must be handled before this object gets destructed.
     boost::optional<Status> _shardingOperationFailedStatus;
+
+    // Set when the operation comes from a router but intentionally skips setting the database or
+    // the shard version.
+    bool _treatAsFromRouter{false};
+
+    // Set when an operation wishes to entirely skip direct shard connection checks. This should be
+    // false in almost all situations.
+    bool _shouldSkipDirectConnectionChecks{false};
 };
 
 }  // namespace mongo

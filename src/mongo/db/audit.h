@@ -34,12 +34,32 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
 #include <functional>
+#include <set>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user.h"
-#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/util/functional.h"
 
@@ -51,6 +71,7 @@ class BSONObjBuilder;
 class Client;
 class NamespaceString;
 class OperationContext;
+
 class OpObserverRegistry;
 class ServiceContext;
 class StringData;
@@ -66,6 +87,7 @@ namespace audit {
 extern std::function<void(OperationContext*)> initializeManager;
 extern std::function<void(OpObserverRegistry*)> opObserverRegistrar;
 extern std::function<void(ServiceContext*)> initializeSynchronizeJob;
+extern std::function<void()> shutdownSynchronizeJob;
 
 /**
  * Struct that temporarily stores client information when an audit hook
@@ -111,25 +133,16 @@ public:
     using Appender = unique_function<void(BSONObjBuilder*)>;
 
     AuthenticateEvent(StringData mechanism,
-                      StringData db,
-                      StringData user,
+                      const UserName& user,
                       Appender appender,
                       ErrorCodes::Error result)
-        : _mechanism(mechanism),
-          _db(db),
-          _user(user),
-          _appender(std::move(appender)),
-          _result(result) {}
+        : _mechanism(mechanism), _user(user), _appender(std::move(appender)), _result(result) {}
 
     StringData getMechanism() const {
         return _mechanism;
     }
 
-    StringData getDatabase() const {
-        return _db;
-    }
-
-    StringData getUser() const {
+    const UserName& getUser() const {
         return _user;
     }
 
@@ -143,8 +156,7 @@ public:
 
 private:
     StringData _mechanism;
-    StringData _db;
-    StringData _user;
+    UserName _user;
 
     Appender _appender;
 
@@ -202,7 +214,7 @@ void logDropUser(Client* client, const UserName& username);
 /**
  * Logs the result of a dropAllUsersFromDatabase command.
  */
-void logDropAllUsersFromDatabase(Client* client, StringData dbname);
+void logDropAllUsersFromDatabase(Client* client, const DatabaseName& dbname);
 
 /**
  * Logs the result of a updateUser command.
@@ -254,7 +266,7 @@ void logDropRole(Client* client, const RoleName& role);
 /**
  * Logs the result of a dropAllRolesForDatabase command.
  */
-void logDropAllRolesFromDatabase(Client* client, StringData dbname);
+void logDropAllRolesFromDatabase(Client* client, const DatabaseName& dbname);
 
 /**
  * Logs the result of a grantRolesToRole command.
@@ -308,7 +320,8 @@ void logShutdown(Client* client);
 void logLogout(Client* client,
                StringData reason,
                const BSONArray& initialUsers,
-               const BSONArray& updatedUsers);
+               const BSONArray& updatedUsers,
+               const boost::optional<Date_t>& loginTime);
 
 /**
  * Logs the result of a createIndex command.
@@ -330,7 +343,7 @@ void logCreateCollection(Client* client, const NamespaceString& nsname);
  */
 void logCreateView(Client* client,
                    const NamespaceString& nsname,
-                   StringData viewOn,
+                   const NamespaceString& viewOn,
                    BSONArray pipeline,
                    ErrorCodes::Error code);
 
@@ -342,7 +355,7 @@ void logImportCollection(Client* client, const NamespaceString& nsname);
 /**
  * Logs the result of a createDatabase command.
  */
-void logCreateDatabase(Client* client, StringData dbname);
+void logCreateDatabase(Client* client, const DatabaseName& dbname);
 
 
 /**
@@ -360,14 +373,14 @@ void logDropCollection(Client* client, const NamespaceString& nsname);
  */
 void logDropView(Client* client,
                  const NamespaceString& nsname,
-                 StringData viewOn,
+                 const NamespaceString& viewOn,
                  const std::vector<BSONObj>& pipeline,
                  ErrorCodes::Error code);
 
 /**
  * Logs the result of a dropDatabase command.
  */
-void logDropDatabase(Client* client, StringData dbname);
+void logDropDatabase(Client* client, const DatabaseName& dbname);
 
 /**
  * Logs a collection rename event.
@@ -384,7 +397,7 @@ void logEnableSharding(Client* client, StringData dbname);
 /**
  * Logs the result of a addShard command.
  */
-void logAddShard(Client* client, StringData name, const std::string& servers, long long maxSize);
+void logAddShard(Client* client, StringData name, const std::string& servers);
 
 /**
  * Logs the result of a removeShard command.
@@ -394,12 +407,17 @@ void logRemoveShard(Client* client, StringData shardname);
 /**
  * Logs the result of a shardCollection command.
  */
-void logShardCollection(Client* client, StringData ns, const BSONObj& keyPattern, bool unique);
+void logShardCollection(Client* client,
+                        const NamespaceString& ns,
+                        const BSONObj& keyPattern,
+                        bool unique);
 
 /**
  * Logs the result of a refineCollectionShardKey event.
  */
-void logRefineCollectionShardKey(Client* client, StringData ns, const BSONObj& keyPattern);
+void logRefineCollectionShardKey(Client* client,
+                                 const NamespaceString& ns,
+                                 const BSONObj& keyPattern);
 
 /**
  * Logs an insert of a potentially security sensitive record.
@@ -420,23 +438,35 @@ void logRemoveOperation(Client* client, const NamespaceString& nss, const BSONOb
  * Logs values of cluster server parameters requested via getClusterParameter.
  */
 void logGetClusterParameter(
-    Client* client,
-    const stdx::variant<std::string, std::vector<std::string>>& requestedParameters);
+    Client* client, const std::variant<std::string, std::vector<std::string>>& requestedParameters);
 
 /**
- * Logs old and new value of cluster server parameter when it is updated via setClusterParameter.
+ * Logs old and new value of given tenant's cluster server parameter when it is updated via
+ * setClusterParameter.
  */
-void logSetClusterParameter(Client* client, const BSONObj& oldValue, const BSONObj& newValue);
+void logSetClusterParameter(Client* client,
+                            const BSONObj& oldValue,
+                            const BSONObj& newValue,
+                            const boost::optional<TenantId>& tenantId);
 
 /**
- * Logs old and new value of cluster server parameter when it gets updated in-memory in response to
- * some on-disk change. This may be due to setClusterParameter or a replication event such as
- * rollback.
+ * Logs old and new value of given tenant's cluster server parameter when it gets updated in-memory
+ * in response to some on-disk change. This may be due to setClusterParameter or a replication event
+ * such as rollback.
  */
 void logUpdateCachedClusterParameter(Client* client,
                                      const BSONObj& oldValue,
-                                     const BSONObj& newValue);
+                                     const BSONObj& newValue,
+                                     const boost::optional<TenantId>& tenantId);
 
+/**
+ * Logs details of log file being rotated out to the file that is being rotated
+ * in
+ */
+void logRotateLog(Client* client,
+                  const Status& logStatus,
+                  const std::vector<Status>& errors,
+                  const std::string& suffix);
 
 }  // namespace audit
 }  // namespace mongo

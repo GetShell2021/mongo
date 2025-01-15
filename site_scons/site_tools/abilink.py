@@ -21,7 +21,6 @@
 #
 
 import SCons
-import subprocess
 
 # TODO: Make a SUFF variable for the suffix to write to
 # TODO: Prevent using abilink when -gsplit-dwarf is in play, since it doesn't work
@@ -79,16 +78,16 @@ def _add_scanner(builder):
 def _add_action(builder):
     actions = builder.action
     builder.action = actions + SCons.Action.Action(
-        "$ABIDW --no-show-locs $TARGET | md5sum > ${TARGET}.abidw")
+        "$ABIDW --no-show-locs $TARGET | md5sum > ${TARGET}.abidw"
+    )
 
 
 def exists(env):
-    result = _detect(env) != None
+    result = _detect(env) is not None
     return result
 
 
 def generate(env):
-
     if not exists(env):
         return
 

@@ -1,9 +1,12 @@
-/*
- *  @tags: [multiversion_incompatible]
+/**
+ * @tags: [
+ *   multiversion_incompatible,
+ *   # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *   embedded_router_incompatible,
+ * ]
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 let CUSTOM_INTERVAL = 1337;
 let CUSTOM_DEADLINE = 5;
@@ -155,4 +158,3 @@ result = st.s1.adminCommand({"getParameter": 1, "progressMonitor": 1});
 assert.eq(result.progressMonitor.deadline, CUSTOM_DEADLINE + 1);
 assert.eq(result.progressMonitor.interval, CUSTOM_INTERVAL);
 st.stop();
-}());

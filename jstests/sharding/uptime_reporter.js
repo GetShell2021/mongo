@@ -1,11 +1,14 @@
 /**
  * Test that mongos creation time is reported once and only once.
  *
- * @tags: [requires_fcv_52]
+ * @tags: [
+ *   requires_fcv_52,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 1});
 
@@ -32,4 +35,3 @@ assert.soon(function() {
         docNext.ping.toString() != docInitial.ping.toString();
 }, "uptime reporter test timed out on update", undefined, 1000);
 st.stop();
-})();

@@ -3,21 +3,20 @@
  * inhibit chunk migration for the data that existed before the rules were applied.
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallel_shell_helpers.js');
-load("jstests/sharding/libs/create_sharded_collection_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {CreateShardedCollectionUtil} from "jstests/sharding/libs/create_sharded_collection_util.js";
 
 const st = new ShardingTest({mongos: 1, shards: 2, rs: {nodes: 3}});
 const dbName = "test";
 const collName = "foo";
 const ns = "test.foo";
+
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 const testColl = st.s.getCollection(ns);
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 CreateShardedCollectionUtil.shardCollectionWithChunks(testColl, {x: 1}, [
     {min: {x: MinKey}, max: {x: 50}, shard: st.shard0.shardName},
     {min: {x: 50}, max: {x: MaxKey}, shard: st.shard0.shardName},
@@ -64,4 +63,3 @@ assert.eq(125,
 assert.eq(175, testColl.find().itcount(), "Number of total documents is incorrect");
 
 st.stop();
-})();

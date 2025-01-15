@@ -10,6 +10,8 @@
  * 9: check we get a new primary within 30 seconds
  */
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 var w = 0;
 var wait = function(f) {
     w++;
@@ -49,7 +51,7 @@ var config = {
         {"_id": 2, "host": nodes[2], "arbiterOnly": true}
     ]
 };
-var r = replTest.initiate(config);
+var r = replTest.initiate(config, null, {initiateWithDefaultElectionTimeout: true});
 
 replTest.awaitNodesAgreeOnPrimary();
 

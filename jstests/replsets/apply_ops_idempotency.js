@@ -1,24 +1,10 @@
-(function() {
-'use strict';
-
-load('jstests/noPassthrough/libs/index_build.js');
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const debug = 0;
 
 let rst = new ReplSetTest({name: "applyOpsIdempotency", nodes: 1});
 rst.startSet();
 rst.initiate();
-
-/**
- * Returns true if this database contains any drop-pending collections.
- */
-function containsDropPendingCollection(mydb) {
-    const res =
-        assert.commandWorked(mydb.runCommand("listCollections", {includePendingDrops: true}));
-    const collectionInfos = res.cursor.firstBatch;
-    const collectionNames = collectionInfos.map(c => c.name);
-    return Boolean(collectionNames.find(c => c.indexOf('system.drop.') == 0));
-}
 
 /**
  *  Apply ops on mydb, asserting success.
@@ -32,11 +18,6 @@ function assertApplyOpsWorks(testdbs, ops) {
             printjson({applyOps: ops, res});
         }
 
-        // Wait for any drop-pending collections to be removed by the reaper before proceeding.
-        assert.soon(function() {
-            return !testdbs.find(mydb => containsDropPendingCollection(mydb));
-        });
-
         // If the entire operation succeeded, we're done.
         if (res.ok == 1)
             return res;
@@ -46,7 +27,8 @@ function assertApplyOpsWorks(testdbs, ops) {
             ops.shift();
 
         // These errors are expected when replaying operations and should be ignored.
-        if (res.code == ErrorCodes.NamespaceNotFound || res.code == ErrorCodes.DuplicateKey) {
+        if (res.code == ErrorCodes.NamespaceNotFound || res.code == ErrorCodes.DuplicateKey ||
+            res.code == ErrorCodes.UnknownError) {
             ops.shift();
             continue;
         }
@@ -147,16 +129,19 @@ var tests = {
         assert.commandWorked(x.insert({_id: 1, x: 1}));
         assert.commandWorked(y.insert({_id: 1, y: 1}));
 
-        assert.commandWorked(
-            mydb.adminCommand({renameCollection: x.getFullName(), to: z.getFullName()}));
+        assert.commandWorked(mydb.adminCommand(
+            {renameCollection: x.getFullName(), to: z.getFullName()}));  // across databases
         assert.commandWorked(z.insert({_id: 2, x: 2}));
         assert.commandWorked(x.insert({_id: 2, x: false}));
         assert.commandWorked(y.insert({y: 2}));
 
+        assert.commandWorked(mydb.adminCommand({
+            renameCollection: y.getFullName(),
+            to: x.getFullName(),
+            dropTarget: true
+        }));  // within database
         assert.commandWorked(mydb.adminCommand(
-            {renameCollection: y.getFullName(), to: x.getFullName(), dropTarget: true}));
-        assert.commandWorked(
-            mydb.adminCommand({renameCollection: z.getFullName(), to: y.getFullName()}));
+            {renameCollection: z.getFullName(), to: y.getFullName()}));  // across databases
         return [mydb, otherdb];
     },
     renameCollectionAcrossDatabasesWithDropAndConvertToCapped: (db1) => {
@@ -218,7 +203,8 @@ function testIdempotency(primary, testFun, testName) {
     let ops = oplog
                   .find({
                       op: {$ne: 'n'},
-                      ns: new RegExp('^' + mydb.getName()),
+                      // admin.$cmd needed for cross-db rename applyOps
+                      ns: new RegExp('^' + mydb.getName() + "|^admin\.[$]cmd$"),
                       'o.startIndexBuild': {$exists: false},
                       'o.abortIndexBuild': {$exists: false},
                       'o.commitIndexBuild': {$exists: false},
@@ -248,4 +234,3 @@ for (let f in tests)
     testIdempotency(rst.getPrimary(), tests[f], f);
 
 rst.stopSet();
-})();

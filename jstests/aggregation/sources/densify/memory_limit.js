@@ -3,15 +3,12 @@
  * @tags: [
  *   # Needed as $densify is a 51 feature.
  *   requires_fcv_51,
+ *   not_allowed_with_signed_security_token,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");                     // For arrayEq.
-load("jstests/noPassthrough/libs/server_parameter_helpers.js");  // For setParameterOnAllHosts.
-load("jstests/libs/discover_topology.js");                       // For findNonConfigNodes.
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {setParameterOnAllHosts} from "jstests/noPassthrough/libs/server_parameter_helpers.js";
 
 const origParamValue = assert.commandWorked(db.adminCommand({
     getParameter: 1,
@@ -54,4 +51,3 @@ assert.commandWorked(db.runCommand({aggregate: coll.getName(), pipeline: [pipeli
 setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
                        "internalDocumentSourceDensifyMaxMemoryBytes",
                        origParamValue);
-})();

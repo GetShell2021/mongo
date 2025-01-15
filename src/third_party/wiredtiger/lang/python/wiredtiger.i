@@ -31,6 +31,7 @@
  *	The SWIG interface file defining the wiredtiger python API.
  */
 %include <pybuffer.i>
+%include <cstring.i>
 
 %define DOCSTRING
 "Python wrappers around the WiredTiger C API
@@ -605,6 +606,8 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %exception __wt_connection::is_new;
 %exception __wt_connection::search_near;
 %exception __wt_session::get_rollback_reason;
+%exception __wt_session::get_last_error;
+%exception __wt_session::strerror;
 %exception __wt_cursor::_set_key;
 %exception __wt_cursor::_set_key_str;
 %exception __wt_cursor::_set_value;
@@ -626,6 +629,9 @@ COMPARE_NOTFOUND_OK(__wt_cursor::_search_near)
 %ignore __wt_modify::offset;
 %ignore __wt_modify::size;
 
+/* Replace get_raw_key_value method with a Python equivalent */
+%ignore __wt_cursor::get_raw_key_value;
+
 /* Next, override methods that return integers via arguments. */
 %ignore __wt_cursor::compare(WT_CURSOR *, WT_CURSOR *, int *);
 %ignore __wt_cursor::equals(WT_CURSOR *, WT_CURSOR *, int *);
@@ -642,8 +648,10 @@ OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, search_near, (self))
 %typemap(in,numinputs=0) (char **datap, int *sizep) (char *data, int size) { $1 = &data; $2 = &size; }
 %typemap(in,numinputs=0) (char **charp, int *sizep) (char *data, int size) { $1 = &data; $2 = &size; }
 %typemap(in,numinputs=0) (char **metadatap, int *metadatasizep, char **datap, int *datasizep) (char *metadata, int metadatasize, char *data, int datasize) { $1 = &metadata; $2 = &metadatasize; $3 = &data; $4 = &datasize; }
+%typemap(in,numinputs=0) (char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) (char *key_data, int key_size, char *value_data, int value_size) { $1 = &key_data; $2 = &key_size; $3 = &value_data; $4 = &value_size; }
 %typemap(frearg) (char **datap, int *sizep) "";
 %typemap(frearg) (char **metadatap, int *metadatasizep, char **datap, int *datasizep) "";
+%typemap(frearg) (char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) "";
 %typemap(argout) (char **charp, int *sizep) {
 	if (*$1)
 		$result = PyUnicode_FromStringAndSize(*$1, *$2);
@@ -660,7 +668,21 @@ OVERRIDE_METHOD(__wt_cursor, WT_CURSOR, search_near, (self))
 		metadata = PyBytes_FromStringAndSize(*$1, *$2);
 		$result = metadata;
 		data = PyBytes_FromStringAndSize(*$3, *$4);
-		$result = SWIG_Python_AppendOutput($result, data);
+		$result = SWIG_AppendOutput($result, data);
+	} else {
+		SWIG_exception_fail(SWIG_AttributeError, "invalid pointer argument");
+	}
+}
+
+%typemap(argout)(char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) (
+    PyObject *key_data, PyObject *value_data) {
+	if (*$1 && *$3) {
+		key_data = PyBytes_FromStringAndSize(*$1, *$2);
+		$result = key_data;
+		value_data = PyBytes_FromStringAndSize(*$3, *$4);
+		$result = SWIG_AppendOutput($result, value_data);
+	} else {
+		SWIG_exception_fail(SWIG_AttributeError, "invalid pointer argument");
 	}
 }
 
@@ -770,6 +792,18 @@ typedef int int_void;
 		if (ret == 0)
 			ret = wiredtiger_struct_unpack($self->session,
 			    k.data, k.size, "q", recnop);
+		return (ret);
+	}
+
+	int_void _get_raw_key_value(char **key_datap, int *key_sizep, char **value_datap, int *value_sizep) {
+		WT_ITEM k, v;
+		int ret = $self->get_raw_key_value($self, &k, &v);
+		if (ret == 0) {
+			*key_datap = (char *)k.data;
+			*key_sizep = (int)k.size;
+			*value_datap = (char *)v.data;
+			*value_sizep = (int)v.size;
+		}
 		return (ret);
 	}
 
@@ -918,6 +952,17 @@ typedef int int_void;
 			return metadata + data
 		else:
 			return unpack(self.value_format, self._get_value())
+
+	def get_raw_key_value(self):
+		'''get_raw_key_value(self) -> object
+
+		@copydoc WT_CURSOR::get_raw_key_value
+		Returns a tuple containing both the key and the value.'''
+
+		result = self._get_raw_key_value()
+		keys = unpack(self.key_format, result[0])
+		values = unpack(self.value_format, result[1])
+		return (keys[0], values[0])
 
 	def set_key(self, *args):
 		'''set_key(self) -> None
@@ -1198,7 +1243,6 @@ int standalone_build();
 %ignore __wt_data_source;
 %ignore __wt_encryptor;
 %ignore __wt_event_handler;
-%ignore __wt_extractor;
 %ignore __wt_item;
 %ignore __wt_lsn;
 
@@ -1206,7 +1250,6 @@ int standalone_build();
 %ignore __wt_connection::add_compressor;
 %ignore __wt_connection::add_data_source;
 %ignore __wt_connection::add_encryptor;
-%ignore __wt_connection::add_extractor;
 %ignore __wt_connection::get_extension_api;
 %ignore __wt_session::log_printf;
 
@@ -1223,6 +1266,7 @@ OVERRIDE_METHOD(__wt_session, WT_SESSION, log_printf, (self, msg))
 
 /* Convert 'int *' to output args for wiredtiger_version */
 %apply int *OUTPUT { int * };
+%cstring_output_allocate(char **, );
 
 %rename(Cursor) __wt_cursor;
 %rename(Modify) __wt_modify;

@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/session/logical_session_id_gen.h"
 
 namespace mongo {
 
@@ -52,7 +53,9 @@ private:
     using OplogEntry = repl::OplogEntry;
 
 public:
-    ReshardingOplogBatchPreparer(std::unique_ptr<CollatorInterface> defaultCollator);
+    ReshardingOplogBatchPreparer(std::size_t oplogBatchTaskCount,
+                                 std::unique_ptr<CollatorInterface> defaultCollator,
+                                 bool isCapped = false);
 
     using OplogBatchToPrepare = std::vector<OplogEntry>;
     using OplogBatchToApply = std::vector<const OplogEntry*>;
@@ -101,11 +104,13 @@ private:
                                         const OplogEntry* op,
                                         WriterVectors& writerVectors) const;
 
-    void _appendOpToWriterVector(std::uint32_t hash,
+    void _appendOpToWriterVector(size_t hash,
                                  const OplogEntry* op,
                                  WriterVectors& writerVectors) const;
 
+    const std::size_t _oplogBatchTaskCount;
     const std::unique_ptr<CollatorInterface> _defaultCollator;
+    const bool _isCapped;
 };
 
 }  // namespace mongo

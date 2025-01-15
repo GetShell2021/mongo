@@ -29,9 +29,16 @@
 
 #include "mongo/executor/connection_pool_test_fixture.h"
 
-#include "mongo/util/assert_util.h"
-
+#include <boost/move/utility_core.hpp>
+#include <functional>
 #include <memory>
+#include <type_traits>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/util/assert_util.h"
 
 
 namespace mongo {
@@ -75,7 +82,9 @@ void TimerImpl::fireIfNecessary() {
 
     for (auto&& x : timers) {
         if (_timers.count(x) && (x->_expiration <= x->now())) {
-            auto execCB = [cb = std::move(x->_cb)](auto&&) mutable { std::move(cb)(); };
+            auto execCB = [cb = std::move(x->_cb)](auto&&) mutable {
+                std::move(cb)();
+            };
             auto global = x->_global;
             _timers.erase(x);
             global->_executor->schedule(std::move(execCB));
@@ -187,7 +196,7 @@ void ConnectionImpl::setup(Milliseconds timeout, SetupCallback cb, std::string) 
 
     _timer.setTimeout(timeout, [this] {
         auto setupCb = std::move(_setupCallback);
-        setupCb(this, Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, "timeout"));
+        setupCb(this, Status(ErrorCodes::HostUnreachable, "timeout"));
     });
 
     _setupQueue.push_back(this);
@@ -202,7 +211,7 @@ void ConnectionImpl::refresh(Milliseconds timeout, RefreshCallback cb) {
 
     _timer.setTimeout(timeout, [this] {
         auto refreshCb = std::move(_refreshCallback);
-        refreshCb(this, Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, "timeout"));
+        refreshCb(this, Status(ErrorCodes::HostUnreachable, "timeout"));
     });
 
     _refreshQueue.push_back(this);
@@ -236,11 +245,17 @@ Date_t PoolImpl::now() {
 }
 
 void PoolImpl::setNow(Date_t now) {
+    if (_now) {
+        // If we're not initializing the virtual clock, advance the fast clock source as well.
+        Milliseconds diff = now - *_now;
+        _fastClockSource.advance(diff);
+    }
     _now = now;
     TimerImpl::fireIfNecessary();
 }
 
 boost::optional<Date_t> PoolImpl::_now;
+ClockSourceMock PoolImpl::_fastClockSource;
 
 }  // namespace connection_pool_test_details
 }  // namespace executor

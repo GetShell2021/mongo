@@ -27,47 +27,71 @@
  *    it in the license file.
  */
 
-#include "mongo/base/error_codes.h"
-#include "mongo/platform/basic.h"
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <fmt/format.h>
+#include <iostream>
+#include <memory>
 #include <string>
-#include <third_party/murmurhash3/MurmurHash3.h>
-#include <unordered_map>
 #include <vector>
 
-#include "boost/smart_ptr/intrusive_ptr.hpp"
+#include <absl/container/node_hash_map.h>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/base/data_range.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/secure_allocator.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
 #include "mongo/bson/json.h"
+#include "mongo/crypto/aead_encryption.h"
 #include "mongo/crypto/encryption_fields_gen.h"
 #include "mongo/crypto/fle_crypto.h"
 #include "mongo/crypto/fle_field_schema_gen.h"
+#include "mongo/crypto/fle_stats_gen.h"
 #include "mongo/crypto/fle_tags.h"
+#include "mongo/crypto/symmetric_key.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
+#include "mongo/db/catalog/clustered_collection_util.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/client.h"
 #include "mongo/db/fle_crud.h"
 #include "mongo/db/fle_query_interface_mock.h"
-#include "mongo/db/matcher/schema/encrypt_schema_gen.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/write_ops_gen.h"
-#include "mongo/db/ops/write_ops_parsers.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/idl/idl_parser.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/random.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/shell/kms_gen.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/hex.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/murmur3.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -102,9 +126,26 @@ const FLEUserKey& getUserKey() {
 
 class TestKeyVault : public FLEKeyVault {
 public:
-    TestKeyVault() : _random(123456) {}
+    TestKeyVault() : _random(123456), _localKey(getLocalKey()) {}
+
+    static SymmetricKey getLocalKey() {
+        const uint8_t buf[]{0x32, 0x78, 0x34, 0x34, 0x2b, 0x78, 0x64, 0x75, 0x54, 0x61, 0x42, 0x42,
+                            0x6b, 0x59, 0x31, 0x36, 0x45, 0x72, 0x35, 0x44, 0x75, 0x41, 0x44, 0x61,
+                            0x67, 0x68, 0x76, 0x53, 0x34, 0x76, 0x77, 0x64, 0x6b, 0x67, 0x38, 0x74,
+                            0x70, 0x50, 0x70, 0x33, 0x74, 0x7a, 0x36, 0x67, 0x56, 0x30, 0x31, 0x41,
+                            0x31, 0x43, 0x77, 0x62, 0x44, 0x39, 0x69, 0x74, 0x51, 0x32, 0x48, 0x46,
+                            0x44, 0x67, 0x50, 0x57, 0x4f, 0x70, 0x38, 0x65, 0x4d, 0x61, 0x43, 0x31,
+                            0x4f, 0x69, 0x37, 0x36, 0x36, 0x4a, 0x7a, 0x58, 0x5a, 0x42, 0x64, 0x42,
+                            0x64, 0x62, 0x64, 0x4d, 0x75, 0x72, 0x64, 0x6f, 0x6e, 0x4a, 0x31, 0x64};
+
+        return SymmetricKey(&buf[0], sizeof(buf), 0, SymmetricKeyId("test"), 0);
+    }
 
     KeyMaterial getKey(const UUID& uuid) override;
+    BSONObj getEncryptedKey(const UUID& uuid) override;
+    SymmetricKey& getKMSLocalKey() override {
+        return _localKey;
+    }
 
     uint64_t getCount() const {
         return _dynamicKeys.size();
@@ -113,6 +154,7 @@ public:
 private:
     PseudoRandom _random;
     stdx::unordered_map<UUID, KeyMaterial, UUID::Hash> _dynamicKeys;
+    SymmetricKey _localKey;
 };
 
 KeyMaterial TestKeyVault::getKey(const UUID& uuid) {
@@ -133,11 +175,34 @@ KeyMaterial TestKeyVault::getKey(const UUID& uuid) {
     }
 }
 
+KeyStoreRecord makeKeyStoreRecord(UUID id, ConstDataRange cdr) {
+    KeyStoreRecord ksr;
+    ksr.set_id(id);
+    auto now = Date_t::now();
+    ksr.setCreationDate(now);
+    ksr.setUpdateDate(now);
+    ksr.setStatus(0);
+    ksr.setKeyMaterial(cdr);
+
+    LocalMasterKey mk;
+
+    ksr.setMasterKey(mk.toBSON());
+    return ksr;
+}
+
+BSONObj TestKeyVault::getEncryptedKey(const UUID& uuid) {
+    auto dek = getKey(uuid);
+
+    std::vector<std::uint8_t> ciphertext(crypto::aeadCipherOutputLength(dek->size()));
+
+    uassertStatusOK(crypto::aeadEncryptLocalKMS(_localKey, *dek, {ciphertext}));
+
+    return makeKeyStoreRecord(uuid, ciphertext).toBSON();
+}
+
 UUID fieldNameToUUID(StringData field) {
-    std::array<uint8_t, UUID::kNumBytes> buf;
-
-    MurmurHash3_x86_128(field.rawData(), field.size(), 123456, buf.data());
-
+    std::array<char, UUID::kNumBytes> buf;
+    murmur3(field, 123456 /*seed*/, buf);
     return UUID::fromCDR(buf);
 }
 
@@ -145,20 +210,34 @@ std::string fieldNameFromInt(uint64_t i) {
     return "field" + std::to_string(i);
 }
 
+int32_t getTestSeed() {
+    static std::unique_ptr<mongo::PseudoRandom> rnd;
+    if (!rnd.get()) {
+        auto seed = SecureRandom().nextInt64();
+        rnd = std::make_unique<mongo::PseudoRandom>(seed);
+        std::cout << "FLE TEST SEED: " << seed << std::endl;
+    }
+
+    return rnd->nextInt32();
+}
+
 class FleCrudTest : public ServiceContextMongoDTest {
 protected:
-    void setUp();
-    void tearDown();
+    void setUp() override;
+    void tearDown() override;
 
     void createCollection(const NamespaceString& ns);
 
-    void assertDocumentCounts(uint64_t edc, uint64_t esc, uint64_t ecc, uint64_t ecoc);
+    void assertDocumentCounts(uint64_t edc, uint64_t esc, uint64_t ecoc);
 
     void testValidateEncryptedFieldInfo(BSONObj obj, bool bypassValidation);
 
     void testValidateTags(BSONObj obj);
 
-    void doSingleInsert(int id, BSONElement element, bool bypassDocumentValidation = false);
+    void doSingleInsert(int id,
+                        BSONElement element,
+                        Fle2AlgorithmInt alg,
+                        bool bypassDocumentValidation = false);
     void doSingleInsert(int id, BSONObj obj, bool bypassDocumentValidation = false);
 
     void doSingleInsertWithContention(
@@ -166,32 +245,29 @@ protected:
     void doSingleInsertWithContention(
         int id, BSONObj obj, int64_t cm, uint64_t cf, EncryptedFieldConfig efc);
 
-    void doSingleDelete(int id);
+    void doSingleDelete(int id, Fle2AlgorithmInt alg);
 
-    void doSingleUpdate(int id, BSONElement element);
+    void doSingleUpdate(int id, BSONElement element, Fle2AlgorithmInt alg);
     void doSingleUpdate(int id, BSONObj obj);
-    void doSingleUpdateWithUpdateDoc(int id, BSONObj update);
-    void doSingleUpdateWithUpdateDoc(int id, const write_ops::UpdateModification& modification);
+    void doSingleUpdateWithUpdateDoc(int id, BSONObj update, Fle2AlgorithmInt alg);
+    void doSingleUpdateWithUpdateDoc(int id,
+                                     const write_ops::UpdateModification& modification,
+                                     Fle2AlgorithmInt);
 
-    void doFindAndModify(write_ops::FindAndModifyCommandRequest& request);
+    void doFindAndModify(write_ops::FindAndModifyCommandRequest& request, Fle2AlgorithmInt alg);
 
     using ValueGenerator = std::function<std::string(StringData fieldName, uint64_t row)>;
 
     void doSingleWideInsert(int id, uint64_t fieldCount, ValueGenerator func);
 
-    void validateDocument(int id, boost::optional<BSONObj> doc);
+    void validateDocument(int id, boost::optional<BSONObj> doc, Fle2AlgorithmInt alg);
 
     ESCDerivedFromDataToken getTestESCDataToken(BSONObj obj);
-    ECCDerivedFromDataToken getTestECCDataToken(BSONObj obj);
     EDCDerivedFromDataToken getTestEDCDataToken(BSONObj obj);
 
     ESCTwiceDerivedTagToken getTestESCToken(BSONElement value);
     ESCTwiceDerivedTagToken getTestESCToken(BSONObj obj);
     ESCTwiceDerivedTagToken getTestESCToken(StringData name, StringData value);
-
-    ECCDerivedFromDataTokenAndContentionFactorToken getTestECCToken(BSONElement value);
-
-    ECCDocument getECCDocument(ECCDerivedFromDataTokenAndContentionFactorToken token, int position);
 
     void assertECOCDocumentCountByField(StringData fieldName, uint64_t expect);
 
@@ -212,10 +288,12 @@ protected:
 
     TestKeyVault _keyVault;
 
-    NamespaceString _edcNs{"test.edc"};
-    NamespaceString _escNs{"test.esc"};
-    NamespaceString _eccNs{"test.ecc"};
-    NamespaceString _ecocNs{"test.ecoc"};
+    NamespaceString _edcNs =
+        NamespaceString::createNamespaceString_forTest("test.enxcol_.coll.edc");
+    NamespaceString _escNs =
+        NamespaceString::createNamespaceString_forTest("test.enxcol_.coll.esc");
+    NamespaceString _ecocNs =
+        NamespaceString::createNamespaceString_forTest("test.enxcol_.coll.ecoc");
 };
 
 void FleCrudTest::setUp() {
@@ -234,7 +312,6 @@ void FleCrudTest::setUp() {
 
     createCollection(_edcNs);
     createCollection(_escNs);
-    createCollection(_eccNs);
     createCollection(_ecocNs);
 }
 
@@ -246,8 +323,20 @@ void FleCrudTest::tearDown() {
 void FleCrudTest::createCollection(const NamespaceString& ns) {
     CollectionOptions collectionOptions;
     collectionOptions.uuid = UUID::gen();
+
+    // Make the state collections clustered sometimes, allows us to ensure the tags reading code can
+    // handle clustered and non-clustered state collections
+    if (ns != _edcNs) {
+        auto seed = getTestSeed();
+        if (seed % 2 == 0) {
+            collectionOptions.clusteredIndex = clustered_util::makeDefaultClusteredIdIndex();
+        }
+    }
+
     auto statusCC = _storage->createCollection(
-        _opCtx.get(), NamespaceString(ns.db(), ns.coll()), collectionOptions);
+        _opCtx.get(),
+        NamespaceString::createNamespaceString_forTest(ns.dbName(), ns.coll()),
+        collectionOptions);
     ASSERT_OK(statusCC);
 }
 
@@ -257,41 +346,26 @@ ConstDataRange toCDR(BSONElement element) {
 
 ESCDerivedFromDataToken FleCrudTest::getTestESCDataToken(BSONObj obj) {
     auto element = obj.firstElement();
-    auto c1token = FLELevel1TokenGenerator::generateCollectionsLevel1Token(
-        _keyVault.getIndexKeyById(indexKeyId).key);
-    auto escToken = FLECollectionTokenGenerator::generateESCToken(c1token);
-    return FLEDerivedFromDataTokenGenerator::generateESCDerivedFromDataToken(escToken,
-                                                                             toCDR(element));
-}
-
-ECCDerivedFromDataToken FleCrudTest::getTestECCDataToken(BSONObj obj) {
-    auto element = obj.firstElement();
-    auto c1token = FLELevel1TokenGenerator::generateCollectionsLevel1Token(
-        _keyVault.getIndexKeyById(indexKeyId).key);
-    auto eccToken = FLECollectionTokenGenerator::generateECCToken(c1token);
-    return FLEDerivedFromDataTokenGenerator::generateECCDerivedFromDataToken(eccToken,
-                                                                             toCDR(element));
+    auto c1token = CollectionsLevel1Token::deriveFrom(_keyVault.getIndexKeyById(indexKeyId).key);
+    auto escToken = ESCToken::deriveFrom(c1token);
+    return ESCDerivedFromDataToken::deriveFrom(escToken, toCDR(element));
 }
 
 EDCDerivedFromDataToken FleCrudTest::getTestEDCDataToken(BSONObj obj) {
     auto element = obj.firstElement();
-    auto c1token = FLELevel1TokenGenerator::generateCollectionsLevel1Token(
-        _keyVault.getIndexKeyById(indexKeyId).key);
-    auto edcToken = FLECollectionTokenGenerator::generateEDCToken(c1token);
-    return FLEDerivedFromDataTokenGenerator::generateEDCDerivedFromDataToken(edcToken,
-                                                                             toCDR(element));
+    auto c1token = CollectionsLevel1Token::deriveFrom(_keyVault.getIndexKeyById(indexKeyId).key);
+    auto edcToken = EDCToken::deriveFrom(c1token);
+    return EDCDerivedFromDataToken::deriveFrom(edcToken, toCDR(element));
 }
 
 ESCTwiceDerivedTagToken FleCrudTest::getTestESCToken(BSONElement element) {
-    auto c1token = FLELevel1TokenGenerator::generateCollectionsLevel1Token(
-        _keyVault.getIndexKeyById(indexKeyId).key);
-    auto escToken = FLECollectionTokenGenerator::generateESCToken(c1token);
-    auto escDataToken =
-        FLEDerivedFromDataTokenGenerator::generateESCDerivedFromDataToken(escToken, toCDR(element));
-    auto escContentionToken = FLEDerivedFromDataTokenAndContentionFactorTokenGenerator::
-        generateESCDerivedFromDataTokenAndContentionFactorToken(escDataToken, 0);
+    auto c1token = CollectionsLevel1Token::deriveFrom(_keyVault.getIndexKeyById(indexKeyId).key);
+    auto escToken = ESCToken::deriveFrom(c1token);
+    auto escDataToken = ESCDerivedFromDataToken::deriveFrom(escToken, toCDR(element));
+    auto escContentionToken =
+        ESCDerivedFromDataTokenAndContentionFactorToken::deriveFrom(escDataToken, 0);
 
-    return FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedTagToken(escContentionToken);
+    return ESCTwiceDerivedTagToken::deriveFrom(escContentionToken);
 }
 
 ESCTwiceDerivedTagToken FleCrudTest::getTestESCToken(BSONObj obj) {
@@ -305,38 +379,14 @@ ESCTwiceDerivedTagToken FleCrudTest::getTestESCToken(StringData name, StringData
 
     UUID keyId = fieldNameToUUID(name);
 
-    auto c1token = FLELevel1TokenGenerator::generateCollectionsLevel1Token(
-        _keyVault.getIndexKeyById(keyId).key);
-    auto escToken = FLECollectionTokenGenerator::generateESCToken(c1token);
+    auto c1token = CollectionsLevel1Token::deriveFrom(_keyVault.getIndexKeyById(keyId).key);
+    auto escToken = ESCToken::deriveFrom(c1token);
 
-    auto escDataToken =
-        FLEDerivedFromDataTokenGenerator::generateESCDerivedFromDataToken(escToken, toCDR(element));
-    auto escContentionToken = FLEDerivedFromDataTokenAndContentionFactorTokenGenerator::
-        generateESCDerivedFromDataTokenAndContentionFactorToken(escDataToken, 0);
+    auto escDataToken = ESCDerivedFromDataToken::deriveFrom(escToken, toCDR(element));
+    auto escContentionToken =
+        ESCDerivedFromDataTokenAndContentionFactorToken::deriveFrom(escDataToken, 0);
 
-    return FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedTagToken(escContentionToken);
-}
-
-ECCDerivedFromDataTokenAndContentionFactorToken FleCrudTest::getTestECCToken(BSONElement element) {
-    auto c1token = FLELevel1TokenGenerator::generateCollectionsLevel1Token(
-        _keyVault.getIndexKeyById(indexKeyId).key);
-    auto eccToken = FLECollectionTokenGenerator::generateECCToken(c1token);
-    auto eccDataToken =
-        FLEDerivedFromDataTokenGenerator::generateECCDerivedFromDataToken(eccToken, toCDR(element));
-    return FLEDerivedFromDataTokenAndContentionFactorTokenGenerator::
-        generateECCDerivedFromDataTokenAndContentionFactorToken(eccDataToken, 0);
-}
-
-ECCDocument FleCrudTest::getECCDocument(ECCDerivedFromDataTokenAndContentionFactorToken token,
-                                        int position) {
-
-    auto tag = FLETwiceDerivedTokenGenerator::generateECCTwiceDerivedTagToken(token);
-    auto value = FLETwiceDerivedTokenGenerator::generateECCTwiceDerivedValueToken(token);
-
-    BSONObj doc = _queryImpl->getById(_eccNs, ECCCollection::generateId(tag, position));
-    ASSERT_FALSE(doc.isEmpty());
-
-    return uassertStatusOK(ECCCollection::decryptDocument(value, doc));
+    return ESCTwiceDerivedTagToken::deriveFrom(escContentionToken);
 }
 
 void FleCrudTest::assertECOCDocumentCountByField(StringData fieldName, uint64_t expect) {
@@ -364,12 +414,12 @@ std::vector<char> FleCrudTest::generatePlaceholder(UUID keyId, BSONElement value
     return v;
 }
 
-EncryptedFieldConfig getTestEncryptedFieldConfig() {
+EncryptedFieldConfig getTestEncryptedFieldConfig(
+    Fle2AlgorithmInt alg = Fle2AlgorithmInt::kEquality) {
 
-    constexpr auto schema = R"({
-    "escCollection": "esc",
-    "eccCollection": "ecc",
-    "ecocCollection": "ecoc",
+    constexpr auto schemaV2 = R"({
+    "escCollection": "enxcol_.coll.esc",
+    "ecocCollection": "enxcol_.coll.ecoc",
     "fields": [
         {
             "keyId":
@@ -385,13 +435,57 @@ EncryptedFieldConfig getTestEncryptedFieldConfig() {
     ]
 })";
 
-    return EncryptedFieldConfig::parse(IDLParserErrorContext("root"), fromjson(schema));
+    constexpr auto rangeSchemaV2 = R"({
+    "escCollection": "enxcol_.coll.esc",
+    "ecocCollection": "enxcol_.coll.ecoc",
+    "fields": [
+        {
+            "keyId":
+                            {
+                                "$uuid": "12345678-1234-9876-1234-123456789012"
+                            }
+                        ,
+            "path": "encrypted",
+            "bsonType": "int",
+            "queries": {"queryType": "range", "min": 0, "max": 15, "sparsity": 1, "trimFactor": 0}
+
+        }
+    ]
+})";
+
+    if (alg == Fle2AlgorithmInt::kEquality) {
+        return EncryptedFieldConfig::parse(IDLParserContext("root"), fromjson(schemaV2));
+    }
+    return EncryptedFieldConfig::parse(IDLParserContext("root"), fromjson(rangeSchemaV2));
 }
 
-void FleCrudTest::assertDocumentCounts(uint64_t edc, uint64_t esc, uint64_t ecc, uint64_t ecoc) {
+void parseEncryptedInvalidFieldConfig(StringData esc, StringData ecoc) {
+
+    auto invalidCollectionNameSchema =
+        // "{" +
+        fmt::format("{{\"escCollection\": \"{}\", \"ecocCollection\": \"{}\", ", esc, ecoc) +
+        R"(
+        "fields": [
+            {
+                "keyId":
+                                {
+                                    "$uuid": "12345678-1234-9876-1234-123456789012"
+                                }
+                            ,
+                "path": "encrypted",
+                "bsonType": "int",
+                "queries": {"queryType": "range", "min": 0, "max": 15, "sparsity": 1, "trimFactor": 0}
+
+            }
+        ]
+    })";
+
+    EncryptedFieldConfig::parse(IDLParserContext("root"), fromjson(invalidCollectionNameSchema));
+}
+
+void FleCrudTest::assertDocumentCounts(uint64_t edc, uint64_t esc, uint64_t ecoc) {
     ASSERT_EQ(_queryImpl->countDocuments(_edcNs), edc);
     ASSERT_EQ(_queryImpl->countDocuments(_escNs), esc);
-    ASSERT_EQ(_queryImpl->countDocuments(_eccNs), ecc);
     ASSERT_EQ(_queryImpl->countDocuments(_ecocNs), ecoc);
 }
 
@@ -422,15 +516,14 @@ void FleCrudTest::doSingleWideInsert(int id, uint64_t fieldCount, ValueGenerator
 }
 
 
-void FleCrudTest::validateDocument(int id, boost::optional<BSONObj> doc) {
+void FleCrudTest::validateDocument(int id, boost::optional<BSONObj> doc, Fle2AlgorithmInt alg) {
 
     auto doc1 = BSON("_id" << id);
     auto updatedDoc = _queryImpl->getById(_edcNs, doc1.firstElement());
 
     std::cout << "Updated Doc: " << updatedDoc << std::endl;
 
-    auto efc = getTestEncryptedFieldConfig();
-    FLEClientCrypto::validateDocument(updatedDoc, efc, &_keyVault);
+    auto efc = getTestEncryptedFieldConfig(alg);
 
     // Decrypt document
     auto decryptedDoc = FLEClientCrypto::decryptDocument(updatedDoc, &_keyVault);
@@ -443,15 +536,41 @@ void FleCrudTest::validateDocument(int id, boost::optional<BSONObj> doc) {
     }
 }
 
-// Use different keys for index and user
-std::vector<char> generateSinglePlaceholder(BSONElement value, int64_t cm = 0) {
-    FLE2EncryptionPlaceholder ep;
+BSONObj generateFLE2RangeInsertSpec(BSONElement value) {
+    FLE2RangeInsertSpec spec;
+    spec.setValue(value);
 
-    ep.setAlgorithm(mongo::Fle2AlgorithmInt::kEquality);
+    auto lowerDoc = BSON("lb" << 0);
+    spec.setMinBound(boost::optional<IDLAnyType>(lowerDoc.firstElement()));
+    auto upperDoc = BSON("ub" << 15);
+
+    spec.setMaxBound(boost::optional<IDLAnyType>(upperDoc.firstElement()));
+    spec.setTrimFactor(0);
+    auto specDoc = BSON("s" << spec.toBSON());
+
+    return specDoc;
+}
+
+// Use different keys for index and user
+std::vector<char> generateSinglePlaceholder(BSONElement value,
+                                            Fle2AlgorithmInt alg = Fle2AlgorithmInt::kEquality,
+                                            int64_t cm = 0) {
+    FLE2EncryptionPlaceholder ep;
+    ep.setAlgorithm(alg);
     ep.setUserKeyId(userKeyId);
     ep.setIndexKeyId(indexKeyId);
-    ep.setValue(value);
     ep.setType(mongo::Fle2PlaceholderType::kInsert);
+
+    // Keep definition outside of conditional to keep it alive until serialization.
+    BSONObj temp;
+    if (alg == Fle2AlgorithmInt::kRange) {
+        temp = generateFLE2RangeInsertSpec(value);
+        ep.setValue(temp.firstElement());
+        ep.setSparsity(1);
+    } else {
+        ep.setValue(value);
+    }
+
     ep.setMaxContentionCounter(cm);
 
     BSONObj obj = ep.toBSON();
@@ -472,8 +591,11 @@ void FleCrudTest::testValidateTags(BSONObj obj) {
     FLEClientCrypto::validateTagsArray(obj);
 }
 
-void FleCrudTest::doSingleInsert(int id, BSONElement element, bool bypassDocumentValidation) {
-    auto buf = generateSinglePlaceholder(element);
+void FleCrudTest::doSingleInsert(int id,
+                                 BSONElement element,
+                                 Fle2AlgorithmInt alg,
+                                 bool bypassDocumentValidation) {
+    auto buf = generateSinglePlaceholder(element, alg);
     BSONObjBuilder builder;
     builder.append("_id", id);
     builder.append("counter", 1);
@@ -486,18 +608,18 @@ void FleCrudTest::doSingleInsert(int id, BSONElement element, bool bypassDocumen
 
     auto serverPayload = EDCServerCollection::getEncryptedFieldInfo(result);
 
-    auto efc = getTestEncryptedFieldConfig();
+    auto efc = getTestEncryptedFieldConfig(alg);
 
     uassertStatusOK(processInsert(_queryImpl.get(), _edcNs, serverPayload, efc, 0, result, false));
 }
 
 void FleCrudTest::doSingleInsert(int id, BSONObj obj, bool bypassDocumentValidation) {
-    doSingleInsert(id, obj.firstElement());
+    doSingleInsert(id, obj.firstElement(), Fle2AlgorithmInt::kEquality);
 }
 
 void FleCrudTest::doSingleInsertWithContention(
     int id, BSONElement element, int64_t cm, uint64_t cf, EncryptedFieldConfig efc) {
-    auto buf = generateSinglePlaceholder(element, cm);
+    auto buf = generateSinglePlaceholder(element, Fle2AlgorithmInt::kEquality, cm);
     BSONObjBuilder builder;
     builder.append("_id", id);
     builder.append("counter", 1);
@@ -520,11 +642,11 @@ void FleCrudTest::doSingleInsertWithContention(
 }
 
 void FleCrudTest::doSingleUpdate(int id, BSONObj obj) {
-    doSingleUpdate(id, obj.firstElement());
+    doSingleUpdate(id, obj.firstElement(), Fle2AlgorithmInt::kEquality);
 }
 
-void FleCrudTest::doSingleUpdate(int id, BSONElement element) {
-    auto buf = generateSinglePlaceholder(element);
+void FleCrudTest::doSingleUpdate(int id, BSONElement element, Fle2AlgorithmInt alg) {
+    auto buf = generateSinglePlaceholder(element, alg);
     BSONObjBuilder builder;
     builder.append("$inc", BSON("counter" << 1));
     builder.append("$set",
@@ -532,22 +654,25 @@ void FleCrudTest::doSingleUpdate(int id, BSONElement element) {
     auto clientDoc = builder.obj();
     auto result = FLEClientCrypto::transformPlaceholders(clientDoc, &_keyVault);
 
-    doSingleUpdateWithUpdateDoc(id, result);
+    doSingleUpdateWithUpdateDoc(id, result, alg);
 }
 
-void FleCrudTest::doSingleUpdateWithUpdateDoc(int id, BSONObj update) {
+void FleCrudTest::doSingleUpdateWithUpdateDoc(int id, BSONObj update, Fle2AlgorithmInt alg) {
     doSingleUpdateWithUpdateDoc(
         id,
-        write_ops::UpdateModification(update, write_ops::UpdateModification::ClassicTag{}, false));
+        write_ops::UpdateModification(update, write_ops::UpdateModification::ModifierUpdateTag{}),
+        alg);
 }
 
 void FleCrudTest::doSingleUpdateWithUpdateDoc(int id,
-                                              const write_ops::UpdateModification& modification) {
+                                              const write_ops::UpdateModification& modification,
+                                              Fle2AlgorithmInt alg) {
 
-    auto efc = getTestEncryptedFieldConfig();
-    auto doc = EncryptionInformationHelpers::encryptionInformationSerializeForDelete(
-        _edcNs, efc, &_keyVault);
-    auto ei = EncryptionInformation::parse(IDLParserErrorContext("test"), doc);
+    auto efc = getTestEncryptedFieldConfig(alg);
+
+    auto doc = EncryptionInformationHelpers::encryptionInformationSerialize(_edcNs, efc);
+
+    auto ei = EncryptionInformation::parse(IDLParserContext("test"), doc);
 
     write_ops::UpdateOpEntry entry;
     entry.setQ(BSON("_id" << id));
@@ -557,24 +682,22 @@ void FleCrudTest::doSingleUpdateWithUpdateDoc(int id,
     updateRequest.setUpdates({entry});
     updateRequest.getWriteCommandRequestBase().setEncryptionInformation(ei);
 
-
-    std::unique_ptr<CollatorInterface> collator;
-    auto expCtx = make_intrusive<ExpressionContext>(_opCtx.get(),
-                                                    std::move(collator),
-                                                    updateRequest.getNamespace(),
-                                                    updateRequest.getLegacyRuntimeConstants(),
-                                                    updateRequest.getLet());
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(_opCtx.get())
+                      .ns(updateRequest.getNamespace())
+                      .runtimeConstants(updateRequest.getLegacyRuntimeConstants())
+                      .letParameters(updateRequest.getLet())
+                      .build();
     processUpdate(_queryImpl.get(), expCtx, updateRequest);
 }
 
-void FleCrudTest::doSingleDelete(int id) {
+void FleCrudTest::doSingleDelete(int id, Fle2AlgorithmInt alg) {
 
-    auto efc = getTestEncryptedFieldConfig();
+    auto efc = getTestEncryptedFieldConfig(alg);
 
-    auto doc = EncryptionInformationHelpers::encryptionInformationSerializeForDelete(
-        _edcNs, efc, &_keyVault);
+    auto doc = EncryptionInformationHelpers::encryptionInformationSerialize(_edcNs, efc);
 
-    auto ei = EncryptionInformation::parse(IDLParserErrorContext("test"), doc);
+    auto ei = EncryptionInformation::parse(IDLParserContext("test"), doc);
 
     write_ops::DeleteOpEntry entry;
     entry.setQ(BSON("_id" << id));
@@ -584,37 +707,37 @@ void FleCrudTest::doSingleDelete(int id) {
     deleteRequest.setDeletes({entry});
     deleteRequest.getWriteCommandRequestBase().setEncryptionInformation(ei);
 
-    std::unique_ptr<CollatorInterface> collator;
-    auto expCtx = make_intrusive<ExpressionContext>(_opCtx.get(),
-                                                    std::move(collator),
-                                                    deleteRequest.getNamespace(),
-                                                    deleteRequest.getLegacyRuntimeConstants(),
-                                                    deleteRequest.getLet());
-
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(_opCtx.get())
+                      .ns(deleteRequest.getNamespace())
+                      .runtimeConstants(deleteRequest.getLegacyRuntimeConstants())
+                      .letParameters(deleteRequest.getLet())
+                      .build();
     processDelete(_queryImpl.get(), expCtx, deleteRequest);
 }
 
-void FleCrudTest::doFindAndModify(write_ops::FindAndModifyCommandRequest& request) {
-    auto efc = getTestEncryptedFieldConfig();
-    auto doc = EncryptionInformationHelpers::encryptionInformationSerializeForDelete(
-        _edcNs, efc, &_keyVault);
-    auto ei = EncryptionInformation::parse(IDLParserErrorContext("test"), doc);
+void FleCrudTest::doFindAndModify(write_ops::FindAndModifyCommandRequest& request,
+                                  Fle2AlgorithmInt alg) {
+    auto efc = getTestEncryptedFieldConfig(alg);
+
+    auto doc = EncryptionInformationHelpers::encryptionInformationSerialize(_edcNs, efc);
+
+    auto ei = EncryptionInformation::parse(IDLParserContext("test"), doc);
 
     request.setEncryptionInformation(ei);
-
-    std::unique_ptr<CollatorInterface> collator;
-    auto expCtx = make_intrusive<ExpressionContext>(_opCtx.get(),
-                                                    std::move(collator),
-                                                    request.getNamespace(),
-                                                    request.getLegacyRuntimeConstants(),
-                                                    request.getLet());
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(_opCtx.get())
+                      .ns(request.getNamespace())
+                      .runtimeConstants(request.getLegacyRuntimeConstants())
+                      .letParameters(request.getLet())
+                      .build();
     processFindAndModify(expCtx, _queryImpl.get(), request);
 }
 
 class CollectionReader : public FLEStateCollectionReader {
 public:
     CollectionReader(std::string&& coll, FLEQueryInterfaceMock& queryImpl)
-        : _coll(NamespaceString(coll)), _queryImpl(queryImpl) {}
+        : _coll(NamespaceString::createNamespaceString_forTest(coll)), _queryImpl(queryImpl) {}
 
     uint64_t getDocumentCount() const override {
         return _queryImpl.countDocuments(_coll);
@@ -625,6 +748,10 @@ public:
         return _queryImpl.getById(_coll, doc.firstElement());
     }
 
+    ECStats getStats() const override {
+        return ECStats();
+    }
+
 private:
     NamespaceString _coll;
     FLEQueryInterfaceMock& _queryImpl;
@@ -632,27 +759,26 @@ private:
 
 class FleTagsTest : public FleCrudTest {
 protected:
-    void setUp() {
+    void setUp() override {
         FleCrudTest::setUp();
     }
-    void tearDown() {
+    void tearDown() override {
         FleCrudTest::tearDown();
     }
-    std::vector<PrfBlock> readTagsWithContention(BSONObj obj, uint64_t contention = 0) {
+
+    std::vector<std::vector<FLEEdgeCountInfo>> getCountInfoSets(BSONObj obj, uint64_t cm = 0) {
         auto s = getTestESCDataToken(obj);
-        auto c = getTestECCDataToken(obj);
         auto d = getTestEDCDataToken(obj);
-        auto esc = CollectionReader("test.esc", *_queryImpl);
-        auto ecc = CollectionReader("test.ecc", *_queryImpl);
-        return mongo::fle::readTagsWithContention(esc, ecc, s, c, d, contention, 100, {});
+        auto nssEsc = NamespaceString::createNamespaceString_forTest("test.enxcol_.coll.esc");
+        return mongo::fle::getCountInfoSets(_queryImpl.get(), nssEsc, s, d, cm);
     }
+
     std::vector<PrfBlock> readTags(BSONObj obj, uint64_t cm = 0) {
         auto s = getTestESCDataToken(obj);
-        auto c = getTestECCDataToken(obj);
         auto d = getTestEDCDataToken(obj);
-        auto esc = CollectionReader("test.esc", *_queryImpl);
-        auto ecc = CollectionReader("test.ecc", *_queryImpl);
-        return mongo::fle::readTags(esc, ecc, s, c, d, cm);
+        auto nssEsc = NamespaceString::createNamespaceString_forTest("test.enxcol_.coll.esc");
+
+        return mongo::fle::readTags(_queryImpl.get(), nssEsc, s, d, cm);
     }
 };
 
@@ -662,13 +788,23 @@ TEST_F(FleCrudTest, InsertOne) {
                     << "secret");
     auto element = doc.firstElement();
 
-    doSingleInsert(1, element);
+    doSingleInsert(1, element, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
     assertECOCDocumentCountByField("encrypted", 1);
 
-    ASSERT_FALSE(_queryImpl->getById(_escNs, ESCCollection::generateId(getTestESCToken(element), 1))
-                     .isEmpty());
+    ASSERT_FALSE(
+        _queryImpl->getById(_escNs, ESCCollection::generateNonAnchorId(getTestESCToken(element), 1))
+            .isEmpty());
+}
+
+TEST_F(FleCrudTest, InsertOneRange) {
+    auto doc = BSON("encrypted" << 5);
+    auto element = doc.firstElement();
+
+    doSingleInsert(1, element, Fle2AlgorithmInt::kRange);
+    assertDocumentCounts(1, 5, 5);
+    assertECOCDocumentCountByField("encrypted", 5);
 }
 
 // Insert two documents with same values
@@ -677,16 +813,17 @@ TEST_F(FleCrudTest, InsertTwoSame) {
     auto doc = BSON("encrypted"
                     << "secret");
     auto element = doc.firstElement();
-    doSingleInsert(1, element);
-    doSingleInsert(2, element);
+    doSingleInsert(1, element, Fle2AlgorithmInt::kEquality);
+    doSingleInsert(2, element, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(2, 2, 0, 2);
+    assertDocumentCounts(2, 2, 2);
     assertECOCDocumentCountByField("encrypted", 2);
 
-    ASSERT_FALSE(_queryImpl->getById(_escNs, ESCCollection::generateId(getTestESCToken(element), 1))
-                     .isEmpty());
-    ASSERT_FALSE(_queryImpl->getById(_escNs, ESCCollection::generateId(getTestESCToken(element), 2))
-                     .isEmpty());
+    auto escTagToken = getTestESCToken(element);
+    ASSERT_FALSE(
+        _queryImpl->getById(_escNs, ESCCollection::generateNonAnchorId(escTagToken, 1)).isEmpty());
+    ASSERT_FALSE(
+        _queryImpl->getById(_escNs, ESCCollection::generateNonAnchorId(escTagToken, 2)).isEmpty());
 }
 
 // Insert two documents with different values
@@ -699,21 +836,23 @@ TEST_F(FleCrudTest, InsertTwoDifferent) {
                    BSON("encrypted"
                         << "topsecret"));
 
-    assertDocumentCounts(2, 2, 0, 2);
+    assertDocumentCounts(2, 2, 2);
     assertECOCDocumentCountByField("encrypted", 2);
 
-    ASSERT_FALSE(_queryImpl
-                     ->getById(_escNs,
-                               ESCCollection::generateId(getTestESCToken(BSON("encrypted"
+    ASSERT_FALSE(
+        _queryImpl
+            ->getById(_escNs,
+                      ESCCollection::generateNonAnchorId(getTestESCToken(BSON("encrypted"
                                                                               << "secret")),
                                                          1))
-                     .isEmpty());
-    ASSERT_FALSE(_queryImpl
-                     ->getById(_escNs,
-                               ESCCollection::generateId(getTestESCToken(BSON("encrypted"
+            .isEmpty());
+    ASSERT_FALSE(
+        _queryImpl
+            ->getById(_escNs,
+                      ESCCollection::generateNonAnchorId(getTestESCToken(BSON("encrypted"
                                                                               << "topsecret")),
                                                          1))
-                     .isEmpty());
+            .isEmpty());
 }
 
 // Insert 1 document with 100 fields
@@ -725,7 +864,7 @@ TEST_F(FleCrudTest, Insert100Fields) {
     };
     doSingleWideInsert(1, fieldCount, valueGenerator);
 
-    assertDocumentCounts(1, fieldCount, 0, fieldCount);
+    assertDocumentCounts(1, fieldCount, fieldCount);
 
     for (uint64_t field = 0; field < fieldCount; field++) {
         auto fieldName = fieldNameFromInt(field);
@@ -736,7 +875,7 @@ TEST_F(FleCrudTest, Insert100Fields) {
             _queryImpl
                 ->getById(
                     _escNs,
-                    ESCCollection::generateId(
+                    ESCCollection::generateNonAnchorId(
                         getTestESCToken(fieldName, valueGenerator(fieldNameFromInt(field), 0)), 1))
                 .isEmpty());
     }
@@ -757,7 +896,7 @@ TEST_F(FleCrudTest, Insert20Fields50Rows) {
         doSingleWideInsert(row, fieldCount, valueGenerator);
     }
 
-    assertDocumentCounts(rowCount, rowCount * fieldCount, 0, rowCount * fieldCount);
+    assertDocumentCounts(rowCount, rowCount * fieldCount, rowCount * fieldCount);
 
     for (uint64_t row = 0; row < rowCount; row++) {
         for (uint64_t field = 0; field < fieldCount; field++) {
@@ -769,7 +908,7 @@ TEST_F(FleCrudTest, Insert20Fields50Rows) {
             ASSERT_FALSE(
                 _queryImpl
                     ->getById(_escNs,
-                              ESCCollection::generateId(
+                              ESCCollection::generateNonAnchorId(
                                   getTestESCToken(fieldName,
                                                   valueGenerator(fieldNameFromInt(field), row)),
                                   count))
@@ -778,13 +917,98 @@ TEST_F(FleCrudTest, Insert20Fields50Rows) {
     }
 }
 
-#define ASSERT_ECC_DOC(assertElement, assertPosition, assertStart, assertEnd)            \
-    {                                                                                    \
-        auto _eccDoc = getECCDocument(getTestECCToken((assertElement)), assertPosition); \
-        ASSERT(_eccDoc.valueType == ECCValueType::kNormal);                              \
-        ASSERT_EQ(_eccDoc.start, assertStart);                                           \
-        ASSERT_EQ(_eccDoc.end, assertEnd);                                               \
-    }
+// Test v1 FLE2InsertUpdatePayload is rejected if v2 is enabled.
+// There are 2 places where the payload version compatibility is checked:
+// 1. When parsing the InsertUpdatePayload in EDCServerCollection::getEncryptedFieldInfo()
+// 2. When transforming the InsertUpdatePayload to the on-disk format in processInsert()
+TEST_F(FleCrudTest, InsertV1PayloadAgainstV2Protocol) {
+
+    std::vector<uint8_t> buf(64);
+    buf[0] = static_cast<uint8_t>(EncryptedBinDataType::kFLE2InsertUpdatePayload);
+
+    BSONObjBuilder builder;
+    builder.append("_id", 1);
+    builder.append("counter", 1);
+    builder.append("plainText", "sample");
+    builder.appendBinData("encrypted", buf.size(), BinDataType::Encrypt, buf.data());
+
+    BSONObj document = builder.obj();
+    ASSERT_THROWS_CODE(EDCServerCollection::getEncryptedFieldInfo(document), DBException, 7291901);
+
+    auto bogusEncryptedTokens = StateCollectionTokensV2({{}}, false).encrypt({{}});
+
+    FLE2InsertUpdatePayloadV2 payload;
+    payload.setEdcDerivedToken({{}});
+    payload.setEscDerivedToken({{}});
+    payload.setServerDerivedFromDataToken({{}});
+    payload.setServerEncryptionToken({{}});
+    payload.setEncryptedTokens(bogusEncryptedTokens);
+    payload.setValue(buf);
+    payload.setType(BSONType::String);
+
+    std::vector<EDCServerPayloadInfo> serverPayload(1);
+    serverPayload.front().fieldPathName = "encrypted";
+    serverPayload.front().counts = {1};
+    serverPayload.front().payload = std::move(payload);
+
+    auto efc = getTestEncryptedFieldConfig();
+    ASSERT_THROWS_CODE(
+        processInsert(_queryImpl.get(), _edcNs, serverPayload, efc, 0, document, false),
+        DBException,
+        6379103);
+}
+
+// Test insert of v1 FLEUnindexedEncryptedValue is rejected if v2 is enabled.
+// There are 2 places where the payload version compatibility is checked:
+// 1. When visiting all encrypted BinData in EDCServerCollection::getEncryptedFieldInfo()
+// 2. When visiting all encrypted BinData in processInsert()
+TEST_F(FleCrudTest, InsertUnindexedV1AgainstV2Protocol) {
+
+    // Create a dummy InsertUpdatePayloadV2 to include in the document.
+    // This is so that the assertion being tested will not be skipped during processInsert()
+    auto bogusEncryptedTokens = StateCollectionTokensV2({{}}, false).encrypt({{}});
+    FLE2InsertUpdatePayloadV2 payload;
+    payload.setEdcDerivedToken({{}});
+    payload.setEscDerivedToken({{}});
+    payload.setServerDerivedFromDataToken({{}});
+    payload.setServerEncryptionToken({{}});
+    payload.setEncryptedTokens(bogusEncryptedTokens);
+    payload.setValue(std::vector<uint8_t>{64});
+    payload.setType(BSONType::String);
+    payload.setContentionFactor(0);
+    payload.setIndexKeyId(indexKeyId);
+    auto iup = payload.toBSON();
+    std::vector<uint8_t> buf(iup.objsize() + 1);
+    buf[0] = static_cast<uint8_t>(EncryptedBinDataType::kFLE2InsertUpdatePayloadV2);
+    std::copy(iup.objdata(), iup.objdata() + iup.objsize(), buf.data() + 1);
+
+    BSONObjBuilder builder;
+    builder.append("_id", 1);
+    builder.append("counter", 1);
+    builder.append("plainText", "sample");
+    builder.appendBinData("encrypted", buf.size(), BinDataType::Encrypt, buf.data());
+    // Append the unindexed v1 blob
+    buf[0] = static_cast<uint8_t>(EncryptedBinDataType::kFLE2UnindexedEncryptedValue);
+    builder.appendBinData("unindexed", buf.size(), BinDataType::Encrypt, buf.data());
+
+    BSONObj document = builder.obj();
+
+    // I. Verify the document gets rejected in getEncryptedFieldInfo()
+    ASSERT_THROWS_CODE(EDCServerCollection::getEncryptedFieldInfo(document), DBException, 7413901);
+
+    // II. Verify the document gets rejected in processInsert()
+    std::vector<EDCServerPayloadInfo> serverPayload(1);
+    serverPayload.front().fieldPathName = "encrypted";
+    serverPayload.front().counts = {1};
+    serverPayload.front().payload = std::move(payload);
+
+    auto efc = getTestEncryptedFieldConfig();
+    ASSERT_THROWS_CODE(
+        processInsert(_queryImpl.get(), _edcNs, serverPayload, efc, 0, document, false),
+        DBException,
+        6379103);
+}
+
 
 // Insert and delete one document
 TEST_F(FleCrudTest, InsertAndDeleteOne) {
@@ -792,47 +1016,59 @@ TEST_F(FleCrudTest, InsertAndDeleteOne) {
                     << "secret");
     auto element = doc.firstElement();
 
-    doSingleInsert(1, element);
+    doSingleInsert(1, element, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
-    ASSERT_FALSE(_queryImpl->getById(_escNs, ESCCollection::generateId(getTestESCToken(element), 1))
-                     .isEmpty());
+    ASSERT_FALSE(
+        _queryImpl->getById(_escNs, ESCCollection::generateNonAnchorId(getTestESCToken(element), 1))
+            .isEmpty());
 
-    doSingleDelete(1);
+    doSingleDelete(1, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(0, 1, 1, 2);
-    assertECOCDocumentCountByField("encrypted", 2);
+    assertDocumentCounts(0, 1, 1);
+    assertECOCDocumentCountByField("encrypted", 1);
+}
 
-    getECCDocument(getTestECCToken(element), 1);
+// Insert and delete one document
+TEST_F(FleCrudTest, InsertAndDeleteOneRange) {
+    auto doc = BSON("encrypted" << 5);
+    auto element = doc.firstElement();
+
+    doSingleInsert(1, element, Fle2AlgorithmInt::kRange);
+
+    assertDocumentCounts(1, 5, 5);
+
+    doSingleDelete(1, Fle2AlgorithmInt::kRange);
+
+    assertDocumentCounts(0, 5, 5);
+    assertECOCDocumentCountByField("encrypted", 5);
 }
 
 // Insert two documents, and delete both
-TEST_F(FleCrudTest, InsertTwoSamAndDeleteTwo) {
+TEST_F(FleCrudTest, InsertTwoSameAndDeleteTwo) {
     auto doc = BSON("encrypted"
                     << "secret");
     auto element = doc.firstElement();
 
-    doSingleInsert(1, element);
-    doSingleInsert(2, element);
+    doSingleInsert(1, element, Fle2AlgorithmInt::kEquality);
+    doSingleInsert(2, element, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(2, 2, 0, 2);
+    assertDocumentCounts(2, 2, 2);
 
-    ASSERT_FALSE(_queryImpl->getById(_escNs, ESCCollection::generateId(getTestESCToken(element), 1))
-                     .isEmpty());
+    ASSERT_FALSE(
+        _queryImpl->getById(_escNs, ESCCollection::generateNonAnchorId(getTestESCToken(element), 1))
+            .isEmpty());
 
-    doSingleDelete(2);
-    doSingleDelete(1);
+    doSingleDelete(2, Fle2AlgorithmInt::kEquality);
+    doSingleDelete(1, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(0, 2, 2, 4);
-    assertECOCDocumentCountByField("encrypted", 4);
-    ASSERT_ECC_DOC(element, 1, 2, 2);
-    ASSERT_ECC_DOC(element, 2, 1, 1);
+    assertDocumentCounts(0, 2, 2);
+    assertECOCDocumentCountByField("encrypted", 2);
 }
 
 // Insert two documents with different values and delete them
 TEST_F(FleCrudTest, InsertTwoDifferentAndDeleteTwo) {
-
     doSingleInsert(1,
                    BSON("encrypted"
                         << "secret"));
@@ -840,39 +1076,25 @@ TEST_F(FleCrudTest, InsertTwoDifferentAndDeleteTwo) {
                    BSON("encrypted"
                         << "topsecret"));
 
-    assertDocumentCounts(2, 2, 0, 2);
+    assertDocumentCounts(2, 2, 2);
 
-    doSingleDelete(2);
-    doSingleDelete(1);
+    doSingleDelete(2, Fle2AlgorithmInt::kEquality);
+    doSingleDelete(1, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(0, 2, 2, 4);
-    assertECOCDocumentCountByField("encrypted", 4);
-
-    ASSERT_ECC_DOC(BSON("encrypted"
-                        << "secret")
-                       .firstElement(),
-                   1,
-                   1,
-                   1);
-    ASSERT_ECC_DOC(BSON("encrypted"
-                        << "topsecret")
-                       .firstElement(),
-                   1,
-                   1,
-                   1);
+    assertDocumentCounts(0, 2, 2);
+    assertECOCDocumentCountByField("encrypted", 2);
 }
 
 // Insert one document but delete another document
 TEST_F(FleCrudTest, InsertOneButDeleteAnother) {
-
     doSingleInsert(1,
                    BSON("encrypted"
                         << "secret"));
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
-    doSingleDelete(2);
+    doSingleDelete(2, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
     assertECOCDocumentCountByField("encrypted", 1);
 }
 
@@ -883,53 +1105,75 @@ TEST_F(FleCrudTest, UpdateOne) {
                    BSON("encrypted"
                         << "secret"));
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
     doSingleUpdate(1,
                    BSON("encrypted"
                         << "top secret"));
 
-    assertDocumentCounts(1, 2, 1, 3);
-    assertECOCDocumentCountByField("encrypted", 3);
+    assertDocumentCounts(1, 2, 2);
+    assertECOCDocumentCountByField("encrypted", 2);
 
     validateDocument(1,
                      BSON("_id" << 1 << "counter" << 2 << "plainText"
                                 << "sample"
                                 << "encrypted"
-                                << "top secret"));
+                                << "top secret"),
+                     Fle2AlgorithmInt::kEquality);
+}
+
+TEST_F(FleCrudTest, UpdateOneRange) {
+    auto doc = BSON("encrypted" << 5);
+    auto element = doc.firstElement();
+
+    doSingleInsert(1, element, Fle2AlgorithmInt::kRange);
+
+    assertDocumentCounts(1, 5, 5);
+
+    auto doc2 = BSON("encrypted" << 2);
+    auto elem2 = doc2.firstElement();
+
+    doSingleUpdate(1, elem2, Fle2AlgorithmInt::kRange);
+
+    assertDocumentCounts(1, 10, 10);
+
+    validateDocument(1,
+                     BSON("_id" << 1 << "counter" << 2 << "plainText"
+                                << "sample"
+                                << "encrypted" << 2),
+                     Fle2AlgorithmInt::kRange);
 }
 
 // Update one document but to the same value
 TEST_F(FleCrudTest, UpdateOneSameValue) {
-
     doSingleInsert(1,
                    BSON("encrypted"
                         << "secret"));
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
     doSingleUpdate(1,
                    BSON("encrypted"
                         << "secret"));
 
-    assertDocumentCounts(1, 2, 1, 3);
-    assertECOCDocumentCountByField("encrypted", 3);
+    assertDocumentCounts(1, 2, 2);
+    assertECOCDocumentCountByField("encrypted", 2);
 
     validateDocument(1,
                      BSON("_id" << 1 << "counter" << 2 << "plainText"
                                 << "sample"
                                 << "encrypted"
-                                << "secret"));
+                                << "secret"),
+                     Fle2AlgorithmInt::kEquality);
 }
 
 // Update one document with replacement
 TEST_F(FleCrudTest, UpdateOneReplace) {
-
     doSingleInsert(1,
                    BSON("encrypted"
                         << "secret"));
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
     auto replace = BSON("encrypted"
                         << "top secret");
@@ -945,17 +1189,51 @@ TEST_F(FleCrudTest, UpdateOneReplace) {
 
     doSingleUpdateWithUpdateDoc(
         1,
-        write_ops::UpdateModification(result, write_ops::UpdateModification::ClassicTag{}, true));
+        write_ops::UpdateModification(result, write_ops::UpdateModification::ReplacementTag{}),
+        Fle2AlgorithmInt::kEquality);
 
 
-    assertDocumentCounts(1, 2, 1, 3);
-    assertECOCDocumentCountByField("encrypted", 3);
+    assertDocumentCounts(1, 2, 2);
+    assertECOCDocumentCountByField("encrypted", 2);
 
     validateDocument(1,
                      BSON("_id" << 1 << "plainText"
                                 << "fake"
                                 << "encrypted"
-                                << "top secret"));
+                                << "top secret"),
+                     Fle2AlgorithmInt::kEquality);
+}
+
+TEST_F(FleCrudTest, UpdateOneReplaceRange) {
+    auto doc = BSON("encrypted" << 5);
+    auto element = doc.firstElement();
+
+    doSingleInsert(1, element, Fle2AlgorithmInt::kRange);
+
+    assertDocumentCounts(1, 5, 5);
+
+    auto replace = BSON("encrypted" << 2);
+    auto buf = generateSinglePlaceholder(replace.firstElement(), Fle2AlgorithmInt::kRange);
+
+    auto replaceEP = BSON("plaintext"
+                          << "fake"
+                          << "encrypted"
+                          << BSONBinData(buf.data(), buf.size(), BinDataType::Encrypt));
+
+    auto result = FLEClientCrypto::transformPlaceholders(replaceEP, &_keyVault);
+
+    doSingleUpdateWithUpdateDoc(
+        1,
+        write_ops::UpdateModification(result, write_ops::UpdateModification::ReplacementTag{}),
+        Fle2AlgorithmInt::kRange);
+
+    assertDocumentCounts(1, 10, 10);
+
+    validateDocument(1,
+                     BSON("_id" << 1 << "plaintext"
+                                << "fake"
+                                << "encrypted" << 2),
+                     Fle2AlgorithmInt::kRange);
 }
 
 // Rename safeContent
@@ -965,14 +1243,15 @@ TEST_F(FleCrudTest, RenameSafeContent) {
                    BSON("encrypted"
                         << "secret"));
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
     BSONObjBuilder builder;
     builder.append("$inc", BSON("counter" << 1));
     builder.append("$rename", BSON(kSafeContent << "foo"));
     auto result = builder.obj();
 
-    ASSERT_THROWS_CODE(doSingleUpdateWithUpdateDoc(1, result), DBException, 6371506);
+    ASSERT_THROWS_CODE(
+        doSingleUpdateWithUpdateDoc(1, result, Fle2AlgorithmInt::kEquality), DBException, 6371506);
 }
 
 // Mess with __safeContent__ and ensure the update errors
@@ -981,14 +1260,15 @@ TEST_F(FleCrudTest, SetSafeContent) {
                    BSON("encrypted"
                         << "secret"));
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
     BSONObjBuilder builder;
     builder.append("$inc", BSON("counter" << 1));
     builder.append("$set", BSON(kSafeContent << "foo"));
     auto result = builder.obj();
 
-    ASSERT_THROWS_CODE(doSingleUpdateWithUpdateDoc(1, result), DBException, 6666200);
+    ASSERT_THROWS_CODE(
+        doSingleUpdateWithUpdateDoc(1, result, Fle2AlgorithmInt::kEquality), DBException, 6666200);
 }
 
 // Test that EDCServerCollection::validateEncryptedFieldInfo checks that the
@@ -1000,14 +1280,24 @@ TEST_F(FleCrudTest, testValidateEncryptedFieldConfig) {
                        6666200);
 }
 
+// Test that EDCServerCollection::validateEncryptedFieldInfo throws an error when collection names
+// do not match naming rules.
+TEST_F(FleCrudTest, testValidateEncryptedFieldConfigFields) {
+    ASSERT_THROWS_CODE(parseEncryptedInvalidFieldConfig("enxcol_.coll.esc1", "enxcol_.coll.ecoc"),
+                       DBException,
+                       7406900);
+    ASSERT_THROWS_CODE(parseEncryptedInvalidFieldConfig("enxcol_.coll.esc", "enxcol_.coll.ecoc1"),
+                       DBException,
+                       7406902);
+}
+
 // Update one document via findAndModify
 TEST_F(FleCrudTest, FindAndModify_UpdateOne) {
-
     doSingleInsert(1,
                    BSON("encrypted"
                         << "secret"));
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
     auto doc = BSON("encrypted"
                     << "top secret");
@@ -1024,17 +1314,54 @@ TEST_F(FleCrudTest, FindAndModify_UpdateOne) {
     write_ops::FindAndModifyCommandRequest req(_edcNs);
     req.setQuery(BSON("_id" << 1));
     req.setUpdate(
-        write_ops::UpdateModification(result, write_ops::UpdateModification::ClassicTag{}, false));
-    doFindAndModify(req);
+        write_ops::UpdateModification(result, write_ops::UpdateModification::ModifierUpdateTag{}));
+    doFindAndModify(req, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(1, 2, 1, 3);
-    assertECOCDocumentCountByField("encrypted", 3);
+    assertDocumentCounts(1, 2, 2);
+    assertECOCDocumentCountByField("encrypted", 2);
 
     validateDocument(1,
                      BSON("_id" << 1 << "counter" << 2 << "plainText"
                                 << "sample"
                                 << "encrypted"
-                                << "top secret"));
+                                << "top secret"),
+                     Fle2AlgorithmInt::kEquality);
+}
+
+// Update one document via findAndModify
+TEST_F(FleCrudTest, FindAndModify_UpdateOneRange) {
+
+    auto firstDoc = BSON("encrypted" << 5);
+
+    doSingleInsert(1, firstDoc.firstElement(), Fle2AlgorithmInt::kRange);
+
+    assertDocumentCounts(1, 5, 5);
+
+    auto doc = BSON("encrypted" << 2);
+    auto element = doc.firstElement();
+    auto buf = generateSinglePlaceholder(element, Fle2AlgorithmInt::kRange);
+    BSONObjBuilder builder;
+    builder.append("$inc", BSON("counter" << 1));
+    builder.append("$set",
+                   BSON("encrypted" << BSONBinData(buf.data(), buf.size(), BinDataType::Encrypt)));
+    auto clientDoc = builder.obj();
+    auto result = FLEClientCrypto::transformPlaceholders(clientDoc, &_keyVault);
+
+
+    write_ops::FindAndModifyCommandRequest req(_edcNs);
+    req.setQuery(BSON("_id" << 1));
+    req.setUpdate(
+        write_ops::UpdateModification(result, write_ops::UpdateModification::ModifierUpdateTag{}));
+    doFindAndModify(req, Fle2AlgorithmInt::kRange);
+
+    assertDocumentCounts(1, 10, 10);
+    assertECOCDocumentCountByField("encrypted", 10);
+
+    validateDocument(1,
+                     BSON("_id" << 1 << "counter" << 2 << "plainText"
+                                << "sample"
+                                << "encrypted" << 2),
+                     Fle2AlgorithmInt::kRange);
 }
 
 // Insert and delete one document via findAndModify
@@ -1043,19 +1370,17 @@ TEST_F(FleCrudTest, FindAndModify_InsertAndDeleteOne) {
                     << "secret");
     auto element = doc.firstElement();
 
-    doSingleInsert(1, element);
+    doSingleInsert(1, element, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
     write_ops::FindAndModifyCommandRequest req(_edcNs);
     req.setQuery(BSON("_id" << 1));
     req.setRemove(true);
-    doFindAndModify(req);
+    doFindAndModify(req, Fle2AlgorithmInt::kEquality);
 
-    assertDocumentCounts(0, 1, 1, 2);
-    assertECOCDocumentCountByField("encrypted", 2);
-
-    getECCDocument(getTestECCToken(element), 1);
+    assertDocumentCounts(0, 1, 1);
+    assertECOCDocumentCountByField("encrypted", 1);
 }
 
 // Rename safeContent
@@ -1065,7 +1390,7 @@ TEST_F(FleCrudTest, FindAndModify_RenameSafeContent) {
                    BSON("encrypted"
                         << "secret"));
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
     BSONObjBuilder builder;
     builder.append("$inc", BSON("counter" << 1));
@@ -1075,9 +1400,9 @@ TEST_F(FleCrudTest, FindAndModify_RenameSafeContent) {
     write_ops::FindAndModifyCommandRequest req(_edcNs);
     req.setQuery(BSON("_id" << 1));
     req.setUpdate(
-        write_ops::UpdateModification(result, write_ops::UpdateModification::ClassicTag{}, false));
+        write_ops::UpdateModification(result, write_ops::UpdateModification::ModifierUpdateTag{}));
 
-    ASSERT_THROWS_CODE(doFindAndModify(req), DBException, 6371506);
+    ASSERT_THROWS_CODE(doFindAndModify(req, Fle2AlgorithmInt::kEquality), DBException, 6371506);
 }
 
 TEST_F(FleCrudTest, validateTagsTest) {
@@ -1091,7 +1416,7 @@ TEST_F(FleCrudTest, FindAndModify_SetSafeContent) {
                    BSON("encrypted"
                         << "secret"));
 
-    assertDocumentCounts(1, 1, 0, 1);
+    assertDocumentCounts(1, 1, 1);
 
     BSONObjBuilder builder;
     builder.append("$inc", BSON("counter" << 1));
@@ -1101,9 +1426,54 @@ TEST_F(FleCrudTest, FindAndModify_SetSafeContent) {
     write_ops::FindAndModifyCommandRequest req(_edcNs);
     req.setQuery(BSON("_id" << 1));
     req.setUpdate(
-        write_ops::UpdateModification(result, write_ops::UpdateModification::ClassicTag{}, false));
+        write_ops::UpdateModification(result, write_ops::UpdateModification::ModifierUpdateTag{}));
 
-    ASSERT_THROWS_CODE(doFindAndModify(req), DBException, 6666200);
+    ASSERT_THROWS_CODE(doFindAndModify(req, Fle2AlgorithmInt::kEquality), DBException, 6666200);
+}
+
+BSONObj makeInsertUpdatePayload(StringData path, const UUID& uuid) {
+    // Actual values don't matter for these tests (apart from indexKeyId).
+    auto encryptedTokens = StateCollectionTokensV2({{}}, boost::none).encrypt({{}});
+    auto bson = FLE2InsertUpdatePayloadV2(
+                    {}, {}, std::move(encryptedTokens), uuid, BSONType::String, {}, {}, {}, 0)
+                    .toBSON();
+    std::vector<std::uint8_t> bindata;
+    bindata.resize(bson.objsize() + 1);
+    bindata[0] = static_cast<std::uint8_t>(EncryptedBinDataType::kFLE2InsertUpdatePayloadV2);
+    memcpy(bindata.data() + 1, bson.objdata(), bson.objsize());
+
+    BSONObjBuilder bob;
+    bob.appendBinData(path, bindata.size(), BinDataType::Encrypt, bindata.data());
+    return bob.obj();
+}
+
+TEST_F(FleCrudTest, validateIndexKeyValid) {
+    // This test assumes we have at least one field in EFC.
+    auto fields = getTestEncryptedFieldConfig().getFields();
+    ASSERT_GTE(fields.size(), 1);
+    auto field = fields[0];
+
+    auto validInsert = makeInsertUpdatePayload(field.getPath(), field.getKeyId());
+    auto validPayload = EDCServerCollection::getEncryptedFieldInfo(validInsert);
+    validateInsertUpdatePayloads(fields, validPayload);
+}
+
+TEST_F(FleCrudTest, validateIndexKeyInvalid) {
+    // This test assumes we have at least one field in EFC.
+    auto fields = getTestEncryptedFieldConfig().getFields();
+    ASSERT_GTE(fields.size(), 1);
+    auto field = fields[0];
+
+    auto invalidInsert = makeInsertUpdatePayload(field.getPath(), UUID::gen());
+    auto invalidPayload = EDCServerCollection::getEncryptedFieldInfo(invalidInsert);
+    ASSERT_THROWS_WITH_CHECK(validateInsertUpdatePayloads(fields, invalidPayload),
+                             DBException,
+                             [&](const DBException& ex) {
+                                 ASSERT_STRING_CONTAINS(ex.what(),
+                                                        str::stream()
+                                                            << "Mismatched keyId for field '"
+                                                            << field.getPath() << "'");
+                             });
 }
 
 TEST_F(FleTagsTest, InsertOne) {
@@ -1143,9 +1513,9 @@ TEST_F(FleTagsTest, InsertAndDeleteOne) {
                     << "a");
 
     doSingleInsert(1, doc);
-    doSingleDelete(1);
+    doSingleDelete(1, Fle2AlgorithmInt::kEquality);
 
-    ASSERT_EQ(0, readTags(doc).size());
+    ASSERT_EQ(1, readTags(doc).size());
 }
 
 TEST_F(FleTagsTest, InsertTwoSameAndDeleteOne) {
@@ -1154,9 +1524,9 @@ TEST_F(FleTagsTest, InsertTwoSameAndDeleteOne) {
 
     doSingleInsert(1, doc);
     doSingleInsert(2, doc);
-    doSingleDelete(2);
+    doSingleDelete(2, Fle2AlgorithmInt::kEquality);
 
-    ASSERT_EQ(1, readTags(doc).size());
+    ASSERT_EQ(2, readTags(doc).size());
 }
 
 TEST_F(FleTagsTest, InsertTwoDifferentAndDeleteOne) {
@@ -1167,9 +1537,9 @@ TEST_F(FleTagsTest, InsertTwoDifferentAndDeleteOne) {
 
     doSingleInsert(1, doc1);
     doSingleInsert(2, doc2);
-    doSingleDelete(1);
+    doSingleDelete(1, Fle2AlgorithmInt::kEquality);
 
-    ASSERT_EQ(0, readTags(doc1).size());
+    ASSERT_EQ(1, readTags(doc1).size());
     ASSERT_EQ(1, readTags(doc2).size());
 }
 
@@ -1182,15 +1552,15 @@ TEST_F(FleTagsTest, InsertAndUpdate) {
     doSingleInsert(1, doc1);
     doSingleUpdate(1, doc2);
 
-    ASSERT_EQ(0, readTags(doc1).size());
+    // In v2, readTags returns 1 tag for doc1 because stale tags are no longer removed.
+    ASSERT_EQ(1, readTags(doc1).size());
     ASSERT_EQ(1, readTags(doc2).size());
 }
 
 TEST_F(FleTagsTest, ContentionFactor) {
-    auto efc = EncryptedFieldConfig::parse(IDLParserErrorContext("root"), fromjson(R"({
-        "escCollection": "esc",
-        "eccCollection": "ecc",
-        "ecocCollection": "ecoc",
+    auto efc = EncryptedFieldConfig::parse(IDLParserContext("root"), fromjson(R"({
+        "escCollection": "enxcol_.coll.esc",
+        "ecocCollection": "enxcol_.coll.ecoc",
         "fields": [{
             "keyId": { "$uuid": "12345678-1234-9876-1234-123456789012"},
             "path": "encrypted",
@@ -1213,14 +1583,41 @@ TEST_F(FleTagsTest, ContentionFactor) {
     doSingleInsertWithContention(7, doc2, 4, 2, efc);
     doSingleInsertWithContention(8, doc2, 4, 3, efc);
 
-    ASSERT_EQ(2, readTagsWithContention(doc1, 0).size());
-    ASSERT_EQ(0, readTagsWithContention(doc2, 0).size());
-    ASSERT_EQ(0, readTagsWithContention(doc1, 1).size());
-    ASSERT_EQ(0, readTagsWithContention(doc2, 1).size());
-    ASSERT_EQ(0, readTagsWithContention(doc1, 2).size());
-    ASSERT_EQ(1, readTagsWithContention(doc2, 2).size());
-    ASSERT_EQ(1, readTagsWithContention(doc1, 3).size());
-    ASSERT_EQ(1, readTagsWithContention(doc2, 3).size());
+    {
+        // Test the counts of the results from individual contention factors, ensuring that
+        // the data stored on disk and the getTags algorithm is working correctly.
+        //
+        // This relies on the order preserving nature of the query.
+
+        auto countInfoSetDoc1 = getCountInfoSets(doc1, 4);
+        {
+            ASSERT_EQ(1, countInfoSetDoc1.size());
+
+            auto countInfoSet = countInfoSetDoc1[0];
+
+            ASSERT_EQ(5, countInfoSet.size());
+
+            ASSERT_EQ(2, countInfoSet[0].count);
+            ASSERT_EQ(0, countInfoSet[1].count);
+            ASSERT_EQ(0, countInfoSet[2].count);
+            ASSERT_EQ(1, countInfoSet[3].count);
+        }
+
+        auto countInfoSetDoc2 = getCountInfoSets(doc2, 4);
+        {
+            ASSERT_EQ(1, countInfoSetDoc2.size());
+
+            auto countInfoSet = countInfoSetDoc2[0];
+
+            ASSERT_EQ(5, countInfoSet.size());
+
+            ASSERT_EQ(0, countInfoSet[0].count);
+            ASSERT_EQ(0, countInfoSet[1].count);
+            ASSERT_EQ(1, countInfoSet[2].count);
+            ASSERT_EQ(1, countInfoSet[3].count);
+        }
+    }
+
     ASSERT_EQ(3, readTags(doc1, 4).size());
     ASSERT_EQ(2, readTags(doc2, 4).size());
 }
@@ -1247,10 +1644,10 @@ TEST_F(FleTagsTest, MemoryLimit) {
     // readTags returns 11 tags which does exceed memory limit.
     ASSERT_THROWS_CODE(readTags(doc), DBException, ErrorCodes::FLEMaxTagLimitExceeded);
 
-    doSingleDelete(5);
+    doSingleDelete(5, Fle2AlgorithmInt::kEquality);
 
-    // readTags returns 10 tags which does not exceed memory limit.
-    ASSERT_EQ(tagLimit, readTags(doc).size());
+    // readTags returns 11 tags which does exceed memory limit.
+    ASSERT_THROWS_CODE(readTags(doc), DBException, ErrorCodes::FLEMaxTagLimitExceeded);
 }
 
 TEST_F(FleTagsTest, SampleMemoryLimit) {

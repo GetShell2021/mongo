@@ -4,7 +4,7 @@
  * Verifies that all unique indexes belonging to all collections on all databases on the server
  * are in correct data format version.
  */
-function checkUniqueIndexFormatVersion(adminDB) {
+export function checkUniqueIndexFormatVersion(adminDB) {
     // Data format version is WiredTiger specific and not required to be tested for other
     // storage engines.
     const isWiredTiger =
@@ -12,17 +12,15 @@ function checkUniqueIndexFormatVersion(adminDB) {
     if (!isWiredTiger)
         return;
 
-    res = assert.commandWorked(adminDB.runCommand({"listDatabases": 1}));
+    let res = assert.commandWorked(adminDB.runCommand({"listDatabases": 1}));
     let databaseList = res.databases;
 
     databaseList.forEach(function(database) {
         let currentDatabase = adminDB.getSiblingDB(database.name);
         // Get the list of collections including collections that are pending drop. This is to
         // ensure that every unique index has the correct format version.
-        let collectionsWithPending =
-            currentDatabase.runCommand("listCollections", {includePendingDrops: true})
-                .cursor.firstBatch;
-        collectionsWithPending.forEach(function(c) {
+        let collections = currentDatabase.runCommand("listCollections").cursor.firstBatch;
+        collections.forEach(function(c) {
             if (c.type == "view") {
                 return;
             }

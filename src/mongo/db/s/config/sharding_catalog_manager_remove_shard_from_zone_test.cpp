@@ -27,15 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <string>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/client/shard.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -109,9 +117,8 @@ TEST_F(RemoveShardFromZoneTest, RemoveLastZoneFromShardShouldSucceedWhenNoChunks
 
     // Insert a chunk range document referring to a different zone
     TagsType tagDoc;
-    tagDoc.setNS(NamespaceString("test.foo"));
-    tagDoc.setMinKey(BSON("x" << 0));
-    tagDoc.setMaxKey(BSON("x" << 10));
+    tagDoc.setNS(NamespaceString::createNamespaceString_forTest("test.foo"));
+    tagDoc.setRange({BSON("x" << 0), BSON("x" << 10)});
     tagDoc.setTag("y");
     insertToConfigCollection(operationContext(), TagsType::ConfigNS, tagDoc.toBSON())
         .transitional_ignore();
@@ -149,9 +156,8 @@ TEST_F(RemoveShardFromZoneTest, RemoveLastZoneFromShardShouldFailWhenAChunkRefer
     setupShards({shardA, shardB});
 
     TagsType tagDoc;
-    tagDoc.setNS(NamespaceString("test.foo"));
-    tagDoc.setMinKey(BSON("x" << 0));
-    tagDoc.setMaxKey(BSON("x" << 10));
+    tagDoc.setNS(NamespaceString::createNamespaceString_forTest("test.foo"));
+    tagDoc.setRange({BSON("x" << 0), BSON("x" << 10)});
     tagDoc.setTag("z");
     insertToConfigCollection(operationContext(), TagsType::ConfigNS, tagDoc.toBSON())
         .transitional_ignore();

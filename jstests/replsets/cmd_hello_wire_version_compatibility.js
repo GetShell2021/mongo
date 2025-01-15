@@ -3,6 +3,8 @@
 // @tags: [
 // ]
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 // See wire_version.h
 const RELEASE_2_4_AND_BEFORE = NumberLong(0);
 const WIRE_VERSION_49 = NumberLong(12);
@@ -11,9 +13,6 @@ const VERSION_4_9_COMPATIBILITY = {
     minWireVersion: RELEASE_2_4_AND_BEFORE,
     maxWireVersion: WIRE_VERSION_49,
 };
-
-(function() {
-"use strict";
 
 let testWireVersion = function(isSystem, compatibilityBounds) {
     const rst = new ReplSetTest({nodes: 3, auth: ""});
@@ -47,4 +46,3 @@ let testWireVersion = function(isSystem, compatibilityBounds) {
 // external user.
 testWireVersion(false, VERSION_4_9_COMPATIBILITY);
 testWireVersion(true, VERSION_4_9_COMPATIBILITY);
-})();

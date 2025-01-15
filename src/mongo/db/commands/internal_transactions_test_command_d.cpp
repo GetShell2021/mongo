@@ -27,8 +27,22 @@
  *    it in the license file.
  */
 
+#include <boost/optional.hpp>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/db/cluster_transaction_api.h"
-#include "mongo/db/transaction_participant_resource_yielder.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/resource_yielder.h"
+#include "mongo/db/transaction/transaction_api.h"
+#include "mongo/db/transaction/transaction_participant_resource_yielder.h"
+#include "mongo/executor/inline_executor.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/s/commands/internal_transactions_test_command.h"
 
 namespace mongo {
@@ -42,24 +56,32 @@ public:
         std::shared_ptr<executor::TaskExecutor> executor,
         StringData commandName,
         bool useClusterClient) {
+        auto inlineExecutor = std::make_shared<executor::InlineExecutor>();
         // If a sharded mongod is acting as a mongos, it will need special routing behaviors.
         if (useClusterClient) {
+            auto sleepInlineExecutor = inlineExecutor->getSleepableExecutor(executor);
             return txn_api::SyncTransactionWithRetries(
                 opCtx,
                 executor,
                 TransactionParticipantResourceYielder::make(commandName),
+                inlineExecutor,
                 std::make_unique<txn_api::details::SEPTransactionClient>(
                     opCtx,
+                    inlineExecutor,
+                    sleepInlineExecutor,
                     executor,
                     std::make_unique<txn_api::details::ClusterSEPTransactionClientBehaviors>(
-                        opCtx->getServiceContext())));
+                        opCtx)));
         }
 
         return txn_api::SyncTransactionWithRetries(
-            opCtx, executor, TransactionParticipantResourceYielder::make(commandName));
+            opCtx,
+            executor,
+            TransactionParticipantResourceYielder::make(commandName),
+            inlineExecutor);
     }
 };
 
-MONGO_REGISTER_TEST_COMMAND(InternalTransactionsTestCommandD);
+MONGO_REGISTER_COMMAND(InternalTransactionsTestCommandD).testOnly().forShard();
 }  // namespace
 }  // namespace mongo

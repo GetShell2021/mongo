@@ -27,12 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <absl/container/inlined_vector.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
+#include <utility>
 
-#include "mongo/db/exec/sbe/stages/sorted_merge.h"
-
-#include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/sbe/expressions/compile_ctx.h"
 #include "mongo/db/exec/sbe/size_estimator.h"
+#include "mongo/db/exec/sbe/stages/sorted_merge.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace sbe {
@@ -43,7 +52,7 @@ SortedMergeStage::SortedMergeStage(PlanStage::Vector inputStages,
                                    value::SlotVector outputVals,
                                    PlanNodeId planNodeId,
                                    bool participateInTrialRunTracking)
-    : PlanStage("smerge"_sd, planNodeId, participateInTrialRunTracking),
+    : PlanStage("smerge"_sd, nullptr /* yieldPolicy */, planNodeId, participateInTrialRunTracking),
       _inputKeys(std::move(inputKeys)),
       _dirs(std::move(dirs)),
       _inputVals(std::move(inputVals)),
@@ -76,7 +85,7 @@ std::unique_ptr<PlanStage> SortedMergeStage::clone() const {
                                               _inputVals,
                                               _outputVals,
                                               _commonStats.nodeId,
-                                              _participateInTrialRunTracking);
+                                              participateInTrialRunTracking());
 }
 
 void SortedMergeStage::prepare(CompileCtx& ctx) {

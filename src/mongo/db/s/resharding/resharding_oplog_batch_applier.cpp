@@ -28,18 +28,38 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/s/resharding/resharding_oplog_batch_applier.h"
-
+#include <cstddef>
 #include <memory>
+#include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/status.h"
+#include "mongo/db/client.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_future_util.h"
 #include "mongo/db/s/resharding/resharding_oplog_application.h"
+#include "mongo/db/s/resharding/resharding_oplog_batch_applier.h"
 #include "mongo/db/s/resharding/resharding_oplog_session_application.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/s/shard_version_factory.h"
+#include "mongo/s/sharding_index_catalog_cache.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/functional.h"
+#include "mongo/util/future_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
@@ -82,20 +102,27 @@ SemiFuture<void> ReshardingOplogBatchApplier::applyBatch(
                                    std::move(*conflictingTxnCompletionFuture), cancelToken);
                            }
                        } else {
-                           // ReshardingOpObserver depends on the collection metadata being known
-                           // when processing writes to the temporary resharding collection. We
-                           // attach shard version IGNORED to the write operations and retry once
-                           // on a StaleConfig exception to allow the collection metadata
-                           // information to be recovered.
-                           ScopedSetShardRole scopedSetShardRole(
-                               opCtx.get(),
-                               _crudApplication.getOutputNss(),
-                               ChunkVersion::IGNORED() /* shardVersion */,
-                               boost::none /* databaseVersion */);
-
                            resharding::data_copy::withOneStaleConfigRetry(opCtx.get(), [&] {
+                               // ReshardingOpObserver depends on the collection metadata being
+                               // known when processing writes to the temporary resharding
+                               // collection. We attach placement version IGNORED to the write
+                               // operations and retry once on a StaleConfig error to allow the
+                               // collection metadata information to be recovered.
+                               auto [_, sii] = uassertStatusOK(
+                                   Grid::get(opCtx.get())
+                                       ->catalogCache()
+                                       ->getCollectionRoutingInfo(opCtx.get(),
+                                                                  _crudApplication.getOutputNss()));
+                               ScopedSetShardRole scopedSetShardRole(
+                                   opCtx.get(),
+                                   _crudApplication.getOutputNss(),
+                                   ShardVersionFactory::make(
+                                       ChunkVersion::IGNORED(),
+                                       sii ? boost::make_optional(sii->getCollectionIndexes())
+                                           : boost::none) /* shardVersion */,
+                                   boost::none /* databaseVersion */);
                                uassertStatusOK(
-                                   _crudApplication.applyOperation(opCtx.get(), oplogEntry));
+                                   _crudApplication.applyOperation(opCtx.get(), sii, oplogEntry));
                            });
                        }
                    }

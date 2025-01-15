@@ -28,17 +28,34 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <string>
+#include <utility>
 
-#include "mongo/db/audit.h"
-#include "mongo/db/auth/action_set.h"
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/s/cluster_ddl.h"
 #include "mongo/s/commands/shard_collection_gen.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -66,27 +83,30 @@ public:
         return "Shard a collection. Requires key. Optional unique.";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::enableSharding)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forExactNamespace(parseNs(dbName, cmdObj)),
+                     ActionType::enableSharding)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::deserialize(dbName.tenantId(),
+                                                CommandHelpers::parseNsFullyQualified(cmdObj),
+                                                SerializationContext::stateDefault());
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNs(dbName, cmdObj));
 
         uassert(5731501,
                 "Sharding a buckets collection is not allowed",
@@ -96,32 +116,32 @@ public:
                 "Sharding a Queryable Encryption state collection is not allowed",
                 !nss.isFLE2StateCollection());
 
-        auto shardCollRequest =
-            ShardCollection::parse(IDLParserErrorContext("ShardCollection"), cmdObj);
+        auto clusterRequest = ShardCollection::parse(IDLParserContext(""), cmdObj);
+        ShardsvrCreateCollectionRequest serverRequest;
+        serverRequest.setShardKey(clusterRequest.getKey());
+        serverRequest.setUnique(clusterRequest.getUnique());
+        serverRequest.setNumInitialChunks(clusterRequest.getNumInitialChunks());
+        serverRequest.setPresplitHashedZones(clusterRequest.getPresplitHashedZones());
+        serverRequest.setCollation(clusterRequest.getCollation());
+        serverRequest.setTimeseries(clusterRequest.getTimeseries());
+        serverRequest.setCollectionUUID(clusterRequest.getCollectionUUID());
+        serverRequest.setImplicitlyCreateIndex(clusterRequest.getImplicitlyCreateIndex());
+        serverRequest.setEnforceUniquenessCheck(clusterRequest.getEnforceUniquenessCheck());
 
-        ShardsvrCreateCollection shardsvrCollRequest(nss);
-        CreateCollectionRequest requestParamsObj;
-        requestParamsObj.setShardKey(shardCollRequest.getKey());
-        requestParamsObj.setUnique(shardCollRequest.getUnique());
-        requestParamsObj.setNumInitialChunks(shardCollRequest.getNumInitialChunks());
-        requestParamsObj.setPresplitHashedZones(shardCollRequest.getPresplitHashedZones());
-        requestParamsObj.setCollation(shardCollRequest.getCollation());
-        requestParamsObj.setTimeseries(shardCollRequest.getTimeseries());
-        requestParamsObj.setCollectionUUID(shardCollRequest.getCollectionUUID());
-        requestParamsObj.setImplicitlyCreateIndex(shardCollRequest.getImplicitlyCreateIndex());
-        requestParamsObj.setEnforceUniquenessCheck(shardCollRequest.getEnforceUniquenessCheck());
-        shardsvrCollRequest.setCreateCollectionRequest(std::move(requestParamsObj));
-        shardsvrCollRequest.setDbName(nss.db());
+        ShardsvrCreateCollection shardsvrCreateCommand(nss);
+        shardsvrCreateCommand.setShardsvrCreateCollectionRequest(std::move(serverRequest));
+        shardsvrCreateCommand.setDbName(nss.dbName());
 
-        cluster::createCollection(opCtx, shardsvrCollRequest);
+        cluster::createCollection(opCtx, std::move(shardsvrCreateCommand));
 
         // Add only collectionsharded as a response parameter and remove the version to maintain the
         // same format as before.
-        result.append("collectionsharded", nss.toString());
+        result.append("collectionsharded",
+                      NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
         return true;
     }
-
-} shardCollectionCmd;
+};
+MONGO_REGISTER_COMMAND(ShardCollectionCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

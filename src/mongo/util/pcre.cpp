@@ -32,12 +32,16 @@
 #include <fmt/format.h>
 
 #define PCRE2_CODE_UNIT_WIDTH 8  // Select 8-bit PCRE2 library.
+#include <algorithm>
+#include <array>
+#include <new>
 #include <pcre2.h>
 
+
 #include "mongo/base/error_codes.h"
-#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/errno_util.h"
+#include "mongo/util/static_immortal.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -121,7 +125,6 @@ const std::error_category& pcreCategory() noexcept {
 
 namespace detail {
 
-class MatchDataImpl;
 
 // Global.
 inline constexpr size_t kMaxPatternLength = 16384;
@@ -156,7 +159,8 @@ private:
 /** Members implement Regex interface and are documented there. */
 class RegexImpl {
 public:
-    RegexImpl(std::string pattern, CompileOptions options) : _pattern{std::move(pattern)} {
+    RegexImpl(std::string pattern, CompileOptions options)
+        : _pattern{std::move(pattern)}, _errorPos{0} {
         int err = 0;
         CompileContext compileContext;
         if (auto ec = compileContext.setMaxPatternLength(kMaxPatternLength)) {
@@ -478,7 +482,7 @@ MatchData& MatchData::operator=(MatchData&&) noexcept = default;
 
 IFWD(Regex, pattern, (const std::string&), (), ())
 IFWD(Regex, options, (CompileOptions), (), ())
-IFWD(Regex, operator bool,(), (), ())
+IFWD(Regex, operator bool, (), (), ())
 IFWD(Regex, error, (std::error_code), (), ())
 IFWD(Regex, errorPosition, (size_t), (), ())
 IFWD(Regex, captureCount, (size_t), (), ())
@@ -491,10 +495,10 @@ IFWD(Regex,
      (StringData r, std::string* s, MatchOptions o, size_t p),
      (r, s, o, p))
 
-IFWD(MatchData, operator bool,(), (), ())
+IFWD(MatchData, operator bool, (), (), ())
 IFWD(MatchData, captureCount, (size_t), (), ())
-IFWD(MatchData, operator[],(StringData), (size_t i), (i))
-IFWD(MatchData, operator[],(StringData), (const std::string& name), (name))
+IFWD(MatchData, operator[], (StringData), (size_t i), (i))
+IFWD(MatchData, operator[], (StringData), (const std::string& name), (name))
 IFWD(MatchData, getCaptures, (std::vector<StringData>), (), ())
 IFWD(MatchData, getMatchList, (std::vector<StringData>), (), ())
 IFWD(MatchData, error, (std::error_code), (), ())

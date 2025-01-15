@@ -30,10 +30,30 @@
 #pragma once
 
 #include <deque>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 
@@ -75,7 +95,11 @@ public:
 
     // virtuals from DocumentSource
     const char* getSourceName() const final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
+
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kListCatalog;
+    }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints(StreamType::kStreaming,
@@ -87,7 +111,8 @@ public:
                                      LookupRequirement::kAllowed,
                                      UnionRequirement::kAllowed);
 
-        constraints.isIndependentOfAnyCollection = pExpCtx->ns.isCollectionlessAggregateNS();
+        constraints.isIndependentOfAnyCollection =
+            pExpCtx->getNamespaceString().isCollectionlessAggregateNS();
         constraints.requiresInputDocSource = false;
         return constraints;
     }
@@ -95,6 +120,8 @@ public:
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         return boost::none;
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);

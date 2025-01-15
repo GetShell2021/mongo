@@ -2,15 +2,17 @@
  * Test that the logical session cache reaper does not reap sessions with active TransactionRouter
  * yielders.
  *
- * @tags: [requires_fcv_60, uses_transactions]
+ * @tags: [
+ *    requires_fcv_60,
+ *    uses_transactions,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/parallelTester.js");
-load("jstests/libs/uuid_util.js");
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {extractUUIDFromObject} from "jstests/libs/uuid_util.js";
 
 // This test runs the reapLogicalSessionCacheNow command. That can lead to direct writes to the
 // config.transactions collection, which cannot be performed on a session.
@@ -41,6 +43,17 @@ assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 0}}));
 assert.commandWorked(
     st.s.adminCommand({moveChunk: ns, find: {x: MinKey}, to: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {x: 1}, to: st.shard1.shardName}));
+
+// This test relies on the router shard version cache within shard0 being up to date because it
+// expects a certain number of request "unyields" which happens one per request routing attempt. A
+// stale cache can trigger a retry, which throws off the count expected by the fail point with skip
+// below. This forces a remote lookup so the router cache is up to date.
+assert.commandWorked(st.rs0.getPrimary().adminCommand({
+    testInternalTransactions: 1,
+    commandInfos: [{dbName, command: {find: collName}}],
+    useClusterClient: true,
+    lsid: {id: UUID()}
+}));
 
 const sessionsColl = st.s.getCollection("config.system.sessions");
 const transactionsCollOnShard0 = shard0Primary.getCollection("config.transactions");
@@ -104,6 +117,8 @@ assertNumEntries({
 // Force the logical session cache to reap, and verify that the config.transactions entry for
 // the internal transaction does not get reaped.
 assert.commandWorked(sessionsColl.remove({"_id.id": parentLsid.id}));
+// Wait for the delete to replicate to guarantee the reap below will see its effect.
+st.awaitReplicationOnShards();
 assert.commandWorked(shard0Primary.adminCommand({reapLogicalSessionCacheNow: 1}));
 assertNumEntries({
     sessionUUID: parentLsid.id,
@@ -127,4 +142,3 @@ assertNumEntries({
 });
 
 st.stop();
-})();

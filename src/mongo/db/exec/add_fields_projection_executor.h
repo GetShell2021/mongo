@@ -30,10 +30,32 @@
 #pragma once
 
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/inclusion_projection_executor.h"
+#include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/projection_policies.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo::projection_executor {
 /**
@@ -94,9 +116,8 @@ public:
      */
     void parse(const BSONObj& spec);
 
-    Document serializeTransformation(
-        boost::optional<ExplainOptions::Verbosity> explain) const final {
-        return _root->serialize(explain);
+    Document serializeTransformation(const SerializationOptions& options = {}) const final {
+        return _root->serialize(options);
     }
 
     /**
@@ -111,13 +132,19 @@ public:
         return DepsTracker::State::SEE_NEXT;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        _root->addVariableRefs(refs);
+    }
+
     DocumentSource::GetModPathsReturn getModifiedPaths() const final {
-        std::set<std::string> computedPaths;
+        OrderedPathSet computedPaths;
         StringMap<std::string> renamedPaths;
-        _root->reportComputedPaths(&computedPaths, &renamedPaths);
+        StringMap<std::string> complexRenamedPaths;
+        _root->reportComputedPaths(&computedPaths, &renamedPaths, &complexRenamedPaths);
         return {DocumentSource::GetModPathsReturn::Type::kFiniteSet,
                 std::move(computedPaths),
-                std::move(renamedPaths)};
+                std::move(renamedPaths),
+                std::move(complexRenamedPaths)};
     }
 
     /**
@@ -134,14 +161,12 @@ public:
      */
     Document applyProjection(const Document& inputDoc) const final;
 
-    boost::optional<std::set<FieldRef>> extractExhaustivePaths() const {
+    boost::optional<std::set<FieldRef>> extractExhaustivePaths() const override {
         return boost::none;
     }
 
     std::pair<BSONObj, bool> extractComputedProjections(
-        const StringData& oldName,
-        const StringData& newName,
-        const std::set<StringData>& reservedNames) final {
+        StringData oldName, StringData newName, const std::set<StringData>& reservedNames) final {
         return _root->extractComputedProjectionsInAddFields(oldName, newName, reservedNames);
     }
 

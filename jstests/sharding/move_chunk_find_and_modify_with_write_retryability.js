@@ -1,7 +1,5 @@
-load("jstests/sharding/move_chunk_with_session_helper.js");
-
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {testMoveChunkWithSession} from "jstests/sharding/move_chunk_with_session_helper.js";
 
 var checkFindAndModifyResult = function(expected, toCheck) {
     assert.eq(expected.ok, toCheck.ok);
@@ -106,8 +104,8 @@ var st = new ShardingTest({
         rs1: {nodes: [{rsConfig: {}}, {rsConfig: {}}]}
     }
 });
-assert.commandWorked(st.s.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'test', primaryShard: st.shard0.shardName}));
 
 tests.forEach(function(test) {
     testMoveChunkWithSession(
@@ -115,4 +113,3 @@ tests.forEach(function(test) {
 });
 
 st.stop();
-})();

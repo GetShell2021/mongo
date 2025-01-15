@@ -1,9 +1,9 @@
 // Library functions for change_stream_pre_image_time_based_expiration tests.
 
-load("jstests/libs/fail_point_util.js");  // For configureFailPoint.
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
 
 // Helper to verify if expected pre-images are present in pre-image collection.
-function verifyPreImages(preImageColl, expectedPreImages, collectionsInfo) {
+export function verifyPreImages(preImageColl, expectedPreImages, collectionsInfo) {
     const preImageDocs = preImageColl.find().sort({"preImage._id": 1}).toArray();
 
     assert.eq(preImageDocs.length, expectedPreImages.length, preImageDocs);
@@ -24,12 +24,17 @@ function verifyPreImages(preImageColl, expectedPreImages, collectionsInfo) {
     }
 }
 
-// Tests time-based change stream pre-image retention policy.
-// When run on a replica set, both 'conn' and 'primary' store connections to the
-// replica set primary node.
-// When run on a sharded cluster, 'conn' represents the connection to the mongos while
-// 'primary' represents the connection to the shard primary node.
-function testTimeBasedPreImageRetentionPolicy(conn, primary) {
+// Get the newest pre-image and compute a time that would make it expire. The time is computed by
+// adding (expireAfterSeconds + 0.001) seconds to the operation time of the last recorded pre-image.
+export function getDateToExpireAllPreImages(preImageColl, expireAfterSeconds) {
+    const lastPreImageToExpire = preImageColl.find().sort({"_id.ts": -1}).limit(1).toArray();
+    assert.eq(lastPreImageToExpire.length, 1, lastPreImageToExpire);
+    const preImageShouldExpireAfter =
+        lastPreImageToExpire[0].operationTime.getTime() + expireAfterSeconds * 1000;
+    return new Date(preImageShouldExpireAfter + 1);
+}
+
+export function setupTimeBasedPreImageRetentionPolicyTest(conn, primary, expireAfterSeconds) {
     // Status for pre-images that define if pre-image is expected to expire or not.
     const shouldExpire = "shouldExpire";
     const shouldRetain = "shouldRetain";
@@ -119,19 +124,11 @@ function testTimeBasedPreImageRetentionPolicy(conn, primary) {
     shouldExpireDocs.forEach(updateDocument);
 
     const preImageColl = primary.getDB("config").getCollection("system.preimages");
-    const expireAfterSeconds = 1;
 
     // Verify that pre-images to be expired is recorded.
     verifyPreImages(preImageColl, shouldExpireDocs, collectionsInfo);
 
-    // Get the last pre-image that should expire and compute the current time using that. The
-    // current time is computed by adding (expireAfterSeconds + 0.001) seconds to the operation time
-    // of the last recorded pre-image.
-    const lastPreImageToExpire = preImageColl.find().sort({"_id.ts": -1}).limit(1).toArray();
-    assert.eq(lastPreImageToExpire.length, 1, lastPreImageToExpire);
-    const preImageShouldExpireAfter =
-        lastPreImageToExpire[0].operationTime.getTime() + expireAfterSeconds * 1000;
-    const currentTime = new Date(preImageShouldExpireAfter + 1);
+    const currentTime = getDateToExpireAllPreImages(preImageColl, expireAfterSeconds);
 
     // Sleep for 1 ms before doing the next updates. The will ensure that the difference in
     // operation time between pre-images to be retained and pre-images to be expired is at least
@@ -145,16 +142,44 @@ function testTimeBasedPreImageRetentionPolicy(conn, primary) {
     // Verify that all pre-images are recorded.
     verifyPreImages(preImageColl, allDocs, collectionsInfo);
 
+    return {
+        currentTimeForTimeBasedExpiration: currentTime,
+        shouldExpireDocs: shouldExpireDocs,
+        shouldRetainDocs: shouldRetainDocs,
+        allDocs: allDocs,
+        collectionsInfo: collectionsInfo
+    };
+}
+
+// Tests time-based change stream pre-image retention policy.
+// When run on a replica set, both 'conn' and 'primary' store connections to the
+// replica set primary node.
+// When run on a sharded cluster, 'conn' represents the connection to the mongos while
+// 'primary' represents the connection to the shard primary node.
+export function testTimeBasedPreImageRetentionPolicy(conn, primary) {
+    // Activate more detailed logging for pre-image removal.
+    conn.getDB("admin").setLogLevel(1, 'query');
+
+    const expireAfterSeconds = 1;
+    const {
+        currentTimeForTimeBasedExpiration,
+        shouldExpireDocs,
+        shouldRetainDocs,
+        allDocs,
+        collectionsInfo
+    } = setupTimeBasedPreImageRetentionPolicyTest(conn, primary, expireAfterSeconds);
+
     // Configure the current time for the pre-image remover job. At this point, the time-based
     // pre-image expiration is still disabled.
     const currentTimeFailPoint =
         configureFailPoint(primary,
                            "changeStreamPreImageRemoverCurrentTime",
-                           {currentTimeForTimeBasedExpiration: currentTime});
+                           {currentTimeForTimeBasedExpiration: currentTimeForTimeBasedExpiration});
 
     // Wait until at least 1 complete cycle of pre-image removal job is completed.
     currentTimeFailPoint.wait({timesEntered: 2});
 
+    const preImageColl = primary.getDB("config").getCollection("system.preimages");
     // Verify that when time-based pre-image expiration disabled, no pre-images are not deleted.
     verifyPreImages(preImageColl, allDocs, collectionsInfo);
 
@@ -165,9 +190,8 @@ function testTimeBasedPreImageRetentionPolicy(conn, primary) {
     }));
 
     // Verify that at some point in time, all expired pre-images will be deleted.
-    assert.soon(() => {
-        return preImageColl.find().toArray().length == shouldRetainDocs.length;
-    });
+    assert.soon(() => preImageColl.find().toArray().length === shouldRetainDocs.length,
+                () => "Existing pre-images: " + tojson(preImageColl.find().toArray()));
 
     // Verify that pre-images corresponding to documents with document states 'shouldRetain' are
     // present.

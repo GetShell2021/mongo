@@ -27,27 +27,73 @@
  *    it in the license file.
  */
 
+#include "mongo/db/s/resharding/resharding_data_replication.h"
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <ostream>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/counter.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/crypto/encryption_fields_gen.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/concurrency/exception_util.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_factory_mock.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
-#include "mongo/db/s/resharding/resharding_data_replication.h"
 #include "mongo/db/s/resharding/resharding_oplog_applier_progress_gen.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/stdx/thread.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/timer.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 namespace mongo {
 namespace {
 
-class ReshardingDataReplicationTest : public ServiceContextMongoDTest {
+class ReshardingDataReplicationTest : service_context_test::WithSetupTransportLayer,
+                                      public ServiceContextMongoDTest {
 public:
     void setUp() override {
         ServiceContextMongoDTest::setUp();
@@ -77,13 +123,13 @@ public:
         auto rt = RoutingTableHistory::makeNew(_sourceNss,
                                                _sourceUUID,
                                                BSON(_currentShardKey << 1),
+                                               false, /* unsplittable */
                                                std::move(defaultCollator),
                                                false /* unique */,
-                                               std::move(epoch),
+                                               epoch,
                                                Timestamp(1, 1),
                                                boost::none /* timeseriesFields */,
                                                boost::none /* reshardingFields */,
-                                               boost::none /* chunkSizeBytes */,
                                                true /* allowMigrations */,
                                                chunks);
 
@@ -91,6 +137,31 @@ public:
                             DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
                             makeStandaloneRoutingTableHistory(std::move(rt)),
                             boost::none /* clusterTime */);
+    }
+
+    DonorShardFetchTimestamp makeDonorShardFetchTimestamp(ShardId shardId,
+                                                          Timestamp fetchTimestamp) {
+        DonorShardFetchTimestamp donorFetchTimestamp(shardId);
+        donorFetchTimestamp.setMinFetchTimestamp(fetchTimestamp);
+        return donorFetchTimestamp;
+    }
+
+    ReshardingRecipientDocument makeRecipientStateDocument(
+        std::vector<DonorShardFetchTimestamp> donorShardTimestamps, Timestamp cloneTimestamp) {
+        RecipientShardContext recipientCtx;
+        recipientCtx.setState(RecipientStateEnum::kAwaitingFetchTimestamp);
+
+        ReshardingRecipientDocument doc(std::move(recipientCtx),
+                                        donorShardTimestamps,
+                                        durationCount<Milliseconds>(Milliseconds{5}));
+
+        auto commonMetadata = CommonReshardingMetadata(
+            UUID::gen(), sourceNss(), sourceUUID(), outputNss(), {BSON(_currentShardKey << 1)});
+        commonMetadata.setStartTime(getServiceContext()->getFastClockSource()->now());
+
+        doc.setCommonReshardingMetadata(std::move(commonMetadata));
+        doc.setCloneTimestamp(cloneTimestamp);
+        return doc;
     }
 
     const NamespaceString& sourceNss() {
@@ -101,7 +172,89 @@ public:
         return _sourceUUID;
     }
 
+    const NamespaceString& outputNss() {
+        return _outputNss;
+    }
+
+protected:
+    /**
+     * Tests that making ReshardingOplogReplication creates the oplog fetcher progress collection
+     * if 'storeOplogFetcherProgress' is set to true, and does not do so otherwise.
+     */
+    void testCreateOplogFetcherProgressCollection(bool storeOplogFetcherProgress) {
+        CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+        auto sourceChunkMgr = makeChunkManagerForSourceCollection(collator.clone());
+
+        auto cloneTimestamp = Timestamp(5, 0);
+        ShardId shardId0{"shard0"};
+        auto minFetchTimestamp0 = Timestamp{10, 0};
+        auto myShardId = shardId0;
+        ShardId shardId1{"shard1"};
+        auto minFetchTimestamp1 = Timestamp{12, 0};
+
+        std::vector<DonorShardFetchTimestamp> donorFetchTimestamps = {
+            makeDonorShardFetchTimestamp(shardId0, minFetchTimestamp0),
+            makeDonorShardFetchTimestamp(shardId1, minFetchTimestamp1)};
+        auto recipientDoc = makeRecipientStateDocument(donorFetchTimestamps, cloneTimestamp);
+
+        auto reshardingMetrics =
+            ReshardingMetrics::initializeFrom(recipientDoc, getServiceContext());
+
+        ReshardingApplierMetricsMap applierMetricsMap;
+        for (const auto& donor : donorFetchTimestamps) {
+            applierMetricsMap.emplace(donor.getShardId(),
+                                      std::make_unique<ReshardingOplogApplierMetrics>(
+                                          reshardingMetrics.get(), boost::none));
+        }
+
+        auto opCtx = makeOperationContext();
+        create(opCtx.get(), outputNss());
+        auto dataReplication =
+            ReshardingDataReplication::make(opCtx.get(),
+                                            reshardingMetrics.get(),
+                                            &applierMetricsMap,
+                                            1 /* oplogBatchTaskCount */,
+                                            recipientDoc.getCommonReshardingMetadata(),
+                                            recipientDoc.getDonorShards(),
+                                            *recipientDoc.getCloneTimestamp(),
+                                            true /* cloningDone */,
+                                            myShardId,
+                                            sourceChunkMgr,
+                                            storeOplogFetcherProgress,
+                                            false /* relaxed */);
+
+        AutoGetCollection oplopFetcherProgressColl(
+            opCtx.get(), NamespaceString::kReshardingFetcherProgressNamespace, MODE_IS);
+        if (storeOplogFetcherProgress) {
+            // The progress collection should have been created but it should not have any
+            // documents.
+            ASSERT(oplopFetcherProgressColl);
+            ASSERT(oplopFetcherProgressColl->isEmpty(opCtx.get()));
+        } else {
+            ASSERT(!oplopFetcherProgressColl);
+        }
+    }
+
 private:
+    void create(OperationContext* opCtx, NamespaceString nss) {
+        writeConflictRetry(opCtx, "create", nss, [&] {
+            AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(
+                shard_role_details::getLocker(opCtx));
+            AutoGetDb autoDb(opCtx, nss.dbName(), LockMode::MODE_X);
+            WriteUnitOfWork wunit(opCtx);
+            if (shard_role_details::getRecoveryUnit(opCtx)->getCommitTimestamp().isNull()) {
+                ASSERT_OK(
+                    shard_role_details::getRecoveryUnit(opCtx)->setTimestamp(Timestamp(1, 1)));
+            }
+
+            OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
+                unsafeCreateCollection(opCtx);
+            auto db = autoDb.ensureDbExists(opCtx);
+            ASSERT(db->createCollection(opCtx, nss)) << nss.toStringForErrorMsg();
+            wunit.commit();
+        });
+    }
+
     RoutingTableHistoryValueHandle makeStandaloneRoutingTableHistory(RoutingTableHistory rt) {
         const auto version = rt.getVersion();
         return RoutingTableHistoryValueHandle(
@@ -109,10 +262,15 @@ private:
             ComparableChunkVersion::makeComparableChunkVersion(version));
     }
 
-    const StringData _currentShardKey = "sk";
+    const StringData _currentShardKey = "currentShardKey";
+    const StringData _newShardKey = "newShardKey";
 
-    const NamespaceString _sourceNss{"test_crud", "collection_being_resharded"};
+    const NamespaceString _sourceNss =
+        NamespaceString::createNamespaceString_forTest("testDb", "testColl");
     const UUID _sourceUUID = UUID::gen();
+
+    const NamespaceString _outputNss =
+        resharding::constructTemporaryReshardingNss(sourceNss(), sourceUUID());
 
     const ShardId _myDonorId{"myDonorId"};
 };
@@ -148,7 +306,7 @@ TEST_F(ReshardingDataReplicationTest,
 
     for (int t = 0; t < kThreads; ++t) {
         stdx::thread thread([&]() {
-            ThreadClient threadClient(getGlobalServiceContext());
+            ThreadClient threadClient(getGlobalServiceContext()->getService());
             Timer timer;
             while (timer.elapsed() < Seconds(2)) {
                 CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
@@ -179,7 +337,7 @@ TEST_F(ReshardingDataReplicationTest,
         t.join();
     }
 
-    LOGV2(5930702, "Stress test completed", "iterations"_attr = iterations);
+    LOGV2(5930702, "Stress test completed", "iterations"_attr = iterations.get());
 }
 
 TEST_F(ReshardingDataReplicationTest, GetOplogFetcherResumeId) {
@@ -219,8 +377,8 @@ TEST_F(ReshardingDataReplicationTest, GetOplogFetcherResumeId) {
 
         AutoGetCollection oplogBufferColl(opCtx.get(), oplogBufferNss, MODE_IX);
         WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_OK(oplogBufferColl->insertDocument(
-            opCtx.get(), InsertStatement{oplogEntry.toBSON()}, nullptr));
+        ASSERT_OK(collection_internal::insertDocument(
+            opCtx.get(), *oplogBufferColl, InsertStatement{oplogEntry.toBSON()}, nullptr));
         wuow.commit();
     };
 
@@ -283,6 +441,14 @@ TEST_F(ReshardingDataReplicationTest, GetOplogApplierResumeId) {
         ReshardingDataReplication::getOplogApplierResumeId(opCtx.get(), sourceId, minFetchTimestamp)
             .toBSON(),
         expectedOplogId.toBSON());
+}
+
+TEST_F(ReshardingDataReplicationTest, CreateProgressCollection) {
+    testCreateOplogFetcherProgressCollection(true /* storeOplogFetcherProgress */);
+}
+
+TEST_F(ReshardingDataReplicationTest, NotCreateProgressCollection) {
+    testCreateOplogFetcherProgressCollection(false /* storeOplogFetcherProgress */);
 }
 
 }  // namespace

@@ -27,22 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/none.hpp>
+#include <boost/none_t.hpp>
+#include <memory>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/exec/mutable_bson/algorithm.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/exec/mutable_bson/element.h"
 #include "mongo/db/update/object_transform_executor.h"
-
-#include "mongo/bson/mutable/algorithm.h"
-#include "mongo/bson/mutable/mutable_bson_test_utils.h"
-#include "mongo/db/json.h"
 #include "mongo/db/update/update_node_test_fixture.h"
-#include "mongo/idl/server_parameter_test_util.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
-using ObjectTransformExecutorTest = UpdateNodeTest;
-using mongo::mutablebson::countChildren;
-using mongo::mutablebson::Element;
+using ObjectTransformExecutorTest = UpdateTestFixture;
 
 TEST_F(ObjectTransformExecutorTest, Noop) {
     BSONObj input = fromjson("{a: 1, b: 2}");
@@ -55,7 +61,6 @@ TEST_F(ObjectTransformExecutorTest, Noop) {
     mutablebson::Document doc(input);
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{}"), result.oplogEntry);
@@ -67,7 +72,6 @@ TEST_F(ObjectTransformExecutorTest, NoneNoop) {
     mutablebson::Document doc(fromjson("{a: 1, b: 2}"));
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_TRUE(result.noop);
-    ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{}"), result.oplogEntry);
@@ -85,7 +89,6 @@ TEST_F(ObjectTransformExecutorTest, Replace) {
     mutablebson::Document doc(from);
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(to, doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(to, result.oplogEntry);
@@ -103,7 +106,6 @@ TEST_F(ObjectTransformExecutorTest, ShouldSucceedWhenImmutableIdIsNotModified) {
     addImmutablePath("_id");
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(to, doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(to, result.oplogEntry);
@@ -186,7 +188,6 @@ TEST_F(ObjectTransformExecutorTest, CanAddImmutableField) {
     addImmutablePath("a.b");
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: {b: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: {b: 1}}"), result.oplogEntry);
@@ -200,7 +201,6 @@ TEST_F(ObjectTransformExecutorTest, CanAddImmutableId) {
     addImmutablePath("_id");
     auto result = node.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
-    ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0}"), result.oplogEntry);

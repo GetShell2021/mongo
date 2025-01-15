@@ -11,24 +11,26 @@
  * Note that this fixture does not support resetting the collection after each runTest() call so it
  * is illegal to do more than one runTest() call.
  */
-'use strict';
 
-load("jstests/libs/discover_topology.js");
-load('jstests/sharding/internal_txns/libs/fixture_helpers.js');
-load("jstests/sharding/libs/resharding_test_fixture.js");
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {DiscoverTopology} from "jstests/libs/discover_topology.js";
+import {ReshardingTest} from "jstests/sharding/libs/resharding_test_fixture.js";
+import {
+    getTxnEntriesForSession,
+    makeAbortTransactionCmdObj,
+    makeCommitTransactionCmdObj,
+    makePrepareTransactionCmdObj,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
-function InternalTransactionReshardingTest(
-    {reshardInPlace, storeFindAndModifyImagesInSideCollection}) {
-    jsTest.log(`Running resharding test with options ${
-        tojson({reshardInPlace, storeFindAndModifyImagesInSideCollection})}`);
+export function InternalTransactionReshardingTest({reshardInPlace}) {
+    jsTest.log(`Running resharding test with options ${tojson({reshardInPlace})}`);
 
     const reshardingTest = new ReshardingTest({
         numDonors: 2,
         numRecipients: 1,
         reshardInPlace,
-        storeFindAndModifyImagesInSideCollection,
-        oplogSize: 256
+        oplogSize: 256,
+        maxNumberOfTransactionOperationsInSingleOplogEntry: 1
     });
     reshardingTest.setup();
 
@@ -47,7 +49,6 @@ function InternalTransactionReshardingTest(
         ],
     };
 
-    const kSize10MB = 10 * 1024 * 1024;
     const kInternalTxnType = {kRetryable: 1, kNonRetryable: 2};
     const kImageType = {kPreImage: 1, kPostImage: 2};
 
@@ -249,11 +250,7 @@ function InternalTransactionReshardingTest(
             // Prior to resharding, the insert statements below will be routed to donor0.
             const numLargeDocs = 2;
             for (let i = 0; i < numLargeDocs; i++) {
-                const docToInsert = {
-                    insert10MB: i.toString() + new Array(kSize10MB).join("x"),
-                    oldShardKey: -testId,
-                    newShardKey: -testId
-                };
+                const docToInsert = {insert: i, oldShardKey: -testId, newShardKey: -testId};
                 testCase.commands.push({
                     // Use stmtId -1 to get test coverage for "applyOps" entries without a stmtId.
                     cmdObj: {insert: kCollName, documents: [docToInsert], stmtId: NumberInt(-1)},
@@ -325,7 +322,7 @@ function InternalTransactionReshardingTest(
         testCase.setUpFunc();
 
         const lsid = getTransactionSessionId(txnType, testCase);
-        runTxnRetryOnTransientError(() => {
+        withRetryOnTransientTxnError(() => {
             const txnNumber = getNextTxnNumber(txnType, testCase);
 
             for (let i = 0; i < testCase.commands.length; i++) {
@@ -369,7 +366,7 @@ function InternalTransactionReshardingTest(
         const lsid = getTransactionSessionId(txnType, testCase);
         // Give the session a different txnUUID to simulate a retry from a different mongos.
         lsid.txnUUID = UUID();
-        runTxnRetryOnTransientError(() => {
+        withRetryOnTransientTxnError(() => {
             const txnNumber = getNextTxnNumber(txnType, testCase);
 
             for (let i = 0; i < testCase.commands.length; i++) {

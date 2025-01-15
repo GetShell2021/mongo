@@ -27,40 +27,62 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/resharding/resharding_util.h"
 
+#include <absl/container/node_hash_map.h>
+#include <algorithm>
+#include <boost/optional.hpp>
+#include <cmath>
 #include <fmt/format.h>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/json.h"
-#include "mongo/bson/util/bson_extract.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/feature_flag.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/document_source_add_fields.h"
 #include "mongo/db/pipeline/document_source_find_and_modify_image_lookup.h"
 #include "mongo/db/pipeline/document_source_match.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/resharding/document_source_resharding_add_resume_id.h"
 #include "mongo/db/s/resharding/document_source_resharding_iterate_transaction.h"
-#include "mongo/db/s/resharding/resharding_metrics.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/resharding/resharding_coordinator_service.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/write_unit_of_work.h"
-#include "mongo/logv2/log.h"
-#include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_tags.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/request_types/flush_routing_table_cache_updates_gen.h"
-#include "mongo/s/shard_invalidated_for_targeting_exception.h"
+#include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
-
 
 namespace mongo {
 namespace resharding {
@@ -132,27 +154,16 @@ RecipientShardEntry makeRecipientShard(ShardId shardId,
     return RecipientShardEntry{std::move(shardId), std::move(recipientCtx)};
 }
 
-NamespaceString constructTemporaryReshardingNss(StringData db, const UUID& sourceUuid) {
-    return NamespaceString(db,
-                           fmt::format("{}{}",
-                                       NamespaceString::kTemporaryReshardingCollectionPrefix,
-                                       sourceUuid.toString()));
-}
-
-std::set<ShardId> getRecipientShards(OperationContext* opCtx,
-                                     const NamespaceString& sourceNss,
-                                     const UUID& reshardingUUID) {
-    const auto& tempNss = constructTemporaryReshardingNss(sourceNss.db(), reshardingUUID);
-    auto* catalogCache = Grid::get(opCtx)->catalogCache();
-    auto cm = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, tempNss));
-
-    uassert(ErrorCodes::NamespaceNotSharded,
-            str::stream() << "Expected collection " << tempNss << " to be sharded",
-            cm.isSharded());
-
-    std::set<ShardId> recipients;
-    cm.getAllShardIds(&recipients);
-    return recipients;
+NamespaceString constructTemporaryReshardingNss(const NamespaceString& nss,
+                                                const UUID& sourceUuid) {
+    auto tempCollPrefix = nss.isTimeseriesBucketsCollection()
+        ? NamespaceString::kTemporaryTimeseriesReshardingCollectionPrefix
+        : NamespaceString::kTemporaryReshardingCollectionPrefix;
+    return NamespaceStringUtil::deserialize(
+        boost::none,
+        nss.db_forSharding(),
+        fmt::format("{}{}", tempCollPrefix, sourceUuid.toString()),
+        SerializationContext::stateDefault());
 }
 
 void checkForHolesAndOverlapsInChunks(std::vector<ReshardedChunk>& chunks,
@@ -171,11 +182,11 @@ void checkForHolesAndOverlapsInChunks(std::vector<ReshardedChunk>& chunks,
                                                         keyPattern.globalMax()));
 
     boost::optional<BSONObj> prevMax = boost::none;
-    for (auto chunk : chunks) {
+    for (const auto& chunk : chunks) {
         if (prevMax) {
             uassert(ErrorCodes::BadValue,
                     "Chunk ranges must be contiguous",
-                    SimpleBSONObjComparator::kInstance.evaluate(prevMax.get() == chunk.getMin()));
+                    SimpleBSONObjComparator::kInstance.evaluate(prevMax.value() == chunk.getMin()));
         }
         prevMax = boost::optional<BSONObj>(chunk.getMax());
     }
@@ -202,7 +213,7 @@ Timestamp getHighestMinFetchTimestamp(const std::vector<DonorShardEntry>& donorS
         uassert(4957300,
                 "All donors must have a minFetchTimestamp, but donor {} does not."_format(
                     StringData{donor.getId()}),
-                donorFetchTimestamp.is_initialized());
+                donorFetchTimestamp.has_value());
         if (maxMinFetchTimestamp < donorFetchTimestamp.value()) {
             maxMinFetchTimestamp = donorFetchTimestamp.value();
         }
@@ -217,27 +228,44 @@ void checkForOverlappingZones(std::vector<ReshardingZoneType>& zones) {
         });
 
     boost::optional<BSONObj> prevMax = boost::none;
-    for (auto zone : zones) {
+    for (const auto& zone : zones) {
         if (prevMax) {
             uassert(ErrorCodes::BadValue,
                     "Zone ranges must not overlap",
-                    SimpleBSONObjComparator::kInstance.evaluate(prevMax.get() <= zone.getMin()));
+                    SimpleBSONObjComparator::kInstance.evaluate(prevMax.value() <= zone.getMin()));
         }
         prevMax = boost::optional<BSONObj>(zone.getMax());
     }
 }
 
 std::vector<BSONObj> buildTagsDocsFromZones(const NamespaceString& tempNss,
-                                            const std::vector<ReshardingZoneType>& zones) {
+                                            std::vector<ReshardingZoneType>& zones,
+                                            const ShardKeyPattern& shardKey) {
     std::vector<BSONObj> tags;
     tags.reserve(zones.size());
-    for (const auto& zone : zones) {
+    for (auto& zone : zones) {
+        zone.setMin(shardKey.getKeyPattern().extendRangeBound(zone.getMin(), false));
+        zone.setMax(shardKey.getKeyPattern().extendRangeBound(zone.getMax(), false));
         ChunkRange range(zone.getMin(), zone.getMax());
         TagsType tag(tempNss, zone.getZone().toString(), range);
         tags.push_back(tag.toBSON());
     }
 
     return tags;
+}
+
+std::vector<ReshardingZoneType> getZonesFromExistingCollection(OperationContext* opCtx,
+                                                               const NamespaceString& sourceNss) {
+    std::vector<ReshardingZoneType> zones;
+    const auto collectionZones = uassertStatusOK(
+        ShardingCatalogManager::get(opCtx)->localCatalogClient()->getTagsForCollection(opCtx,
+                                                                                       sourceNss));
+
+    for (const auto& zone : collectionZones) {
+        ReshardingZoneType newZone(zone.getTag(), zone.getMinKey(), zone.getMaxKey());
+        zones.push_back(newZone);
+    }
+    return zones;
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForResharding(
@@ -352,21 +380,20 @@ bool isFinalOplog(const repl::OplogEntry& oplog, UUID reshardingUUID) {
 }
 
 NamespaceString getLocalOplogBufferNamespace(UUID existingUUID, ShardId donorShardId) {
-    return NamespaceString("config.localReshardingOplogBuffer.{}.{}"_format(
-        existingUUID.toString(), donorShardId.toString()));
+    return NamespaceString::makeReshardingLocalOplogBufferNSS(existingUUID,
+                                                              donorShardId.toString());
 }
 
 NamespaceString getLocalConflictStashNamespace(UUID existingUUID, ShardId donorShardId) {
-    return NamespaceString{NamespaceString::kConfigDb,
-                           "localReshardingConflictStash.{}.{}"_format(existingUUID.toString(),
-                                                                       donorShardId.toString())};
+    return NamespaceString::makeReshardingLocalConflictStashNSS(existingUUID,
+                                                                donorShardId.toString());
 }
 
 void doNoopWrite(OperationContext* opCtx, StringData opStr, const NamespaceString& nss) {
-    writeConflictRetry(opCtx, opStr, NamespaceString::kRsOplogNamespace.ns(), [&] {
-        AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+    writeConflictRetry(opCtx, opStr, NamespaceString::kRsOplogNamespace, [&] {
+        AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
 
-        const std::string msg = str::stream() << opStr << " on " << nss;
+        const std::string msg = str::stream() << opStr << " on " << nss.toStringForErrorMsg();
         WriteUnitOfWork wuow(opCtx);
         opCtx->getClient()->getServiceContext()->getOpObserver()->onInternalOpMessage(
             opCtx,
@@ -402,6 +429,213 @@ boost::optional<Milliseconds> estimateRemainingRecipientTime(bool applyingBegan,
         return estimateRemainingTime(timeSpentCopying, bytesCopied, 2 * bytesToCopy);
     }
     return {};
+}
+
+void validateShardDistribution(const std::vector<ShardKeyRange>& shardDistribution,
+                               OperationContext* opCtx,
+                               const ShardKeyPattern& keyPattern) {
+    boost::optional<bool> hasMinMax = boost::none;
+    std::vector<ShardKeyRange> validShards;
+    stdx::unordered_set<ShardId> shardIds;
+    for (const auto& shard : shardDistribution) {
+        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shard.getShard()));
+        uassert(ErrorCodes::InvalidOptions,
+                "ShardKeyRange should have a pair of min/max or none of them",
+                !(shard.getMax().has_value() ^ shard.getMin().has_value()));
+        uassert(ErrorCodes::InvalidOptions,
+                "ShardKeyRange min should follow shard key's keyPattern",
+                (!shard.getMin().has_value()) || keyPattern.isShardKey(*shard.getMin()));
+        uassert(ErrorCodes::InvalidOptions,
+                "ShardKeyRange max should follow shard key's keyPattern",
+                (!shard.getMax().has_value()) || keyPattern.isShardKey(*shard.getMax()));
+        uassert(ErrorCodes::ShardNotFound,
+                "Shard URL cannot be used for shard name",
+                !shard.getShard().isShardURL());
+        if (hasMinMax && !(*hasMinMax)) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "Non-explicit shardDistribution should have unique shardIds",
+                    shardIds.find(shard.getShard()) == shardIds.end());
+        }
+
+        // Check all shardKeyRanges have min/max or none of them has min/max.
+        if (hasMinMax.has_value()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "All ShardKeyRanges should have the same min/max pattern",
+                    !(*hasMinMax ^ shard.getMax().has_value()));
+        } else {
+            hasMinMax = shard.getMax().has_value();
+        }
+
+        validShards.push_back(shard);
+        shardIds.insert(shard.getShard());
+    }
+
+    // If the shardDistribution contains min/max, validate whether they are continuous and complete.
+    if (hasMinMax && *hasMinMax) {
+        std::sort(validShards.begin(),
+                  validShards.end(),
+                  [](const ShardKeyRange& a, const ShardKeyRange& b) {
+                      return SimpleBSONObjComparator::kInstance.evaluate(*a.getMin() < *b.getMin());
+                  });
+
+        uassert(
+            ErrorCodes::InvalidOptions,
+            "ShardKeyRange must start at global min for the new shard key",
+            SimpleBSONObjComparator::kInstance.evaluate(validShards.front().getMin().value() ==
+                                                        keyPattern.getKeyPattern().globalMin()));
+        uassert(ErrorCodes::InvalidOptions,
+                "ShardKeyRange must end at global max for the new shard key",
+                SimpleBSONObjComparator::kInstance.evaluate(
+                    validShards.back().getMax().value() == keyPattern.getKeyPattern().globalMax()));
+
+        boost::optional<BSONObj> prevMax = boost::none;
+        for (const auto& shard : validShards) {
+            if (prevMax) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "ShardKeyRanges must be continuous",
+                        SimpleBSONObjComparator::kInstance.evaluate(prevMax.value() ==
+                                                                    *shard.getMin()));
+            }
+            prevMax = *shard.getMax();
+        }
+    }
+}
+
+bool isMoveCollection(const boost::optional<ProvenanceEnum>& provenance) {
+    return provenance &&
+        (provenance.get() == ProvenanceEnum::kMoveCollection ||
+         provenance.get() == ProvenanceEnum::kBalancerMoveCollection);
+}
+
+bool isUnshardCollection(const boost::optional<ProvenanceEnum>& provenance) {
+    return provenance && provenance.get() == ProvenanceEnum::kUnshardCollection;
+}
+
+std::shared_ptr<ThreadPool> makeThreadPoolForMarkKilledExecutor(const std::string& poolName) {
+    return std::make_shared<ThreadPool>([&] {
+        ThreadPool::Options options;
+        options.poolName = poolName;
+        options.minThreads = 0;
+        options.maxThreads = 1;
+        return options;
+    }());
+}
+
+boost::optional<Status> coordinatorAbortedError() {
+    return Status{ErrorCodes::ReshardCollectionAborted,
+                  "Recieved abort from the resharding coordinator"};
+}
+
+void validateImplicitlyCreateIndex(bool implicitlyCreateIndex, const BSONObj& shardKey) {
+    if (!implicitlyCreateIndex) {
+        uassert(
+            ErrorCodes::InvalidOptions,
+            str::stream()
+                << "Can only specify'" << CommonReshardingMetadata::kImplicitlyCreateIndexFieldName
+                << "' when featureFlagHashedShardKeyIndexOptionalUponShardingCollection is "
+                   "enabled",
+            feature_flags::gFeatureFlagHashedShardKeyIndexOptionalUponShardingCollection.isEnabled(
+                serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
+
+        auto shardKeyPattern = ShardKeyPattern(shardKey);
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "Can only specify '"
+                              << CommonReshardingMetadata::kImplicitlyCreateIndexFieldName
+                              << "' false when resharding on a hashed shard key",
+                shardKeyPattern.isHashedPattern());
+    }
+}
+
+void validatePerformVerification(boost::optional<bool> performVerification) {
+    if (performVerification.has_value()) {
+        validatePerformVerification(*performVerification);
+    }
+}
+
+void validatePerformVerification(bool performVerification) {
+    uassert(ErrorCodes::InvalidOptions,
+            str::stream() << "Cannot specify '"
+                          << CommonReshardingMetadata::kPerformVerificationFieldName
+                          << "' to true when featureFlagReshardingVerification is not enabled",
+            !performVerification ||
+                resharding::gFeatureFlagReshardingVerification.isEnabled(
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
+}
+
+ReshardingCoordinatorDocument createReshardingCoordinatorDoc(
+    OperationContext* opCtx,
+    const ConfigsvrReshardCollection& request,
+    const CollectionType& collEntry,
+    const NamespaceString& nss,
+    const bool& setProvenance) {
+
+    auto coordinatorDoc = ReshardingCoordinatorDocument(
+        std::move(CoordinatorStateEnum::kUnused), {} /* donorShards */, {} /* recipientShards */);
+
+    // Generate the resharding metadata for the ReshardingCoordinatorDocument.
+    auto reshardingUUID = UUID::gen();
+    auto existingUUID = collEntry.getUuid();
+    auto shardKeySpec = request.getKey();
+
+    // moveCollection/unshardCollection are called with _id as the new shard key since
+    // that's an acceptable value for tracked unsharded collections so we can skip this.
+    if (collEntry.getTimeseriesFields() &&
+        (!setProvenance || (*request.getProvenance() == ProvenanceEnum::kReshardCollection))) {
+        auto tsOptions = collEntry.getTimeseriesFields().get().getTimeseriesOptions();
+        shardkeyutil::validateTimeseriesShardKey(
+            tsOptions.getTimeField(), tsOptions.getMetaField(), request.getKey());
+        shardKeySpec =
+            uassertStatusOK(timeseries::createBucketsShardKeySpecFromTimeseriesShardKeySpec(
+                tsOptions, request.getKey()));
+    }
+
+    auto tempReshardingNss = resharding::constructTemporaryReshardingNss(nss, collEntry.getUuid());
+
+    auto commonMetadata = CommonReshardingMetadata(std::move(reshardingUUID),
+                                                   nss,
+                                                   std::move(existingUUID),
+                                                   std::move(tempReshardingNss),
+                                                   shardKeySpec);
+    commonMetadata.setStartTime(opCtx->getServiceContext()->getFastClockSource()->now());
+    if (request.getReshardingUUID()) {
+        commonMetadata.setUserReshardingUUID(*request.getReshardingUUID());
+    }
+    if (setProvenance && request.getProvenance()) {
+        commonMetadata.setProvenance(*request.getProvenance());
+    }
+
+    coordinatorDoc.setSourceKey(collEntry.getKeyPattern().toBSON());
+    coordinatorDoc.setCommonReshardingMetadata(std::move(commonMetadata));
+    coordinatorDoc.setZones(request.getZones());
+    coordinatorDoc.setPresetReshardedChunks(request.get_presetReshardedChunks());
+    coordinatorDoc.setNumInitialChunks(request.getNumInitialChunks());
+    coordinatorDoc.setShardDistribution(request.getShardDistribution());
+    coordinatorDoc.setForceRedistribution(request.getForceRedistribution());
+    coordinatorDoc.setUnique(request.getUnique());
+    coordinatorDoc.setCollation(request.getCollation());
+    coordinatorDoc.setImplicitlyCreateIndex(request.getImplicitlyCreateIndex());
+
+    auto performVerification = request.getPerformVerification();
+    if (!performVerification.has_value() &&
+        resharding::gFeatureFlagReshardingVerification.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        performVerification = true;
+    }
+    coordinatorDoc.setPerformVerification(performVerification);
+
+    coordinatorDoc.setRecipientOplogBatchTaskCount(request.getRecipientOplogBatchTaskCount());
+    coordinatorDoc.setRelaxed(request.getRelaxed());
+
+    if (!resharding::gfeatureFlagReshardingNumSamplesPerChunk.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Resharding with numSamplesPerChunk is not enabled, reject numSamplesPerChunk "
+                "parameter",
+                !request.getNumSamplesPerChunk().has_value());
+    }
+    coordinatorDoc.setNumSamplesPerChunk(request.getNumSamplesPerChunk());
+
+    return coordinatorDoc;
 }
 
 }  // namespace resharding

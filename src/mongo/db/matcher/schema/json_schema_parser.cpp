@@ -28,18 +28,39 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/matcher/schema/json_schema_parser.h"
-
+#include <absl/container/node_hash_map.h>
+#include <absl/meta/type_traits.h>
+#include <algorithm>
+#include <array>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <functional>
 #include <memory>
+#include <set>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/clonable_ptr.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement_comparator_interface.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
 #include "mongo/bson/unordered_fields_bsonelement_comparator.h"
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/matcher/doc_validation_util.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
+#include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/matcher/expression_type.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
 #include "mongo/db/matcher/matcher_type_set.h"
 #include "mongo/db/matcher/schema/encrypt_schema_gen.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_all_elem_match_from_index.h"
@@ -58,9 +79,16 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_root_doc_eq.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_unique_items.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
-#include "mongo/db/matcher/schema/json_pointer.h"
+#include "mongo/db/matcher/schema/json_schema_parser.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
-#include "mongo/logv2/log_component_settings.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/pcre.h"
+#include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
@@ -97,10 +125,10 @@ constexpr StringData kNamePlaceholder = JSONSchemaParser::kNamePlaceholder;
  *    {properties: {myProp: <nested-schema>}}
  *
  * then this is passed in 'path'. In this example, the value of 'path' is "myProp". If there is no
- * path, e.g. for top-level schemas, then 'path' is empty.
+ * path, e.g. for top-level schemas, then 'path' is not set.
  */
 StatusWithMatchExpression _parse(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                 StringData path,
+                                 boost::optional<StringData> path,
                                  BSONObj schema,
                                  AllowedFeatureSet allowedFeatures,
                                  bool ignoreUnknownKeywords);
@@ -122,7 +150,7 @@ StatusWithMatchExpression _parse(const boost::intrusive_ptr<ExpressionContext>& 
 std::unique_ptr<MatchExpression> makeRestriction(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const MatcherTypeSet& restrictionType,
-    StringData path,
+    boost::optional<StringData> path,
     std::unique_ptr<MatchExpression> restrictionExpr,
     InternalSchemaTypeExpression* statedType) {
     invariant(restrictionType.isSingleType());
@@ -170,7 +198,7 @@ std::unique_ptr<MatchExpression> makeRestriction(
 
 StatusWith<std::unique_ptr<InternalSchemaTypeExpression>> parseType(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    StringData path,
+    boost::optional<StringData> path,
     StringData keywordName,
     BSONElement typeElt,
     const findBSONTypeAliasFun& aliasMapFind) {
@@ -196,7 +224,7 @@ StatusWith<std::unique_ptr<InternalSchemaTypeExpression>> parseType(
 }
 
 StatusWithMatchExpression parseMaximum(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                       StringData path,
+                                       boost::optional<StringData> path,
                                        BSONElement maximum,
                                        InternalSchemaTypeExpression* typeExpr,
                                        bool isExclusiveMaximum) {
@@ -218,7 +246,7 @@ StatusWithMatchExpression parseMaximum(const boost::intrusive_ptr<ExpressionCont
             expCtx, maximum.fieldNameStringData().toString(), maximum.wrap());
     }
 
-    if (path.empty()) {
+    if (!path) {
         // This restriction has no effect in a top-level schema, since we only store objects.
         return {std::make_unique<AlwaysTrueMatchExpression>(std::move(annotation))};
     }
@@ -236,7 +264,7 @@ StatusWithMatchExpression parseMaximum(const boost::intrusive_ptr<ExpressionCont
 }
 
 StatusWithMatchExpression parseMinimum(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                       StringData path,
+                                       boost::optional<StringData> path,
                                        BSONElement minimum,
                                        InternalSchemaTypeExpression* typeExpr,
                                        bool isExclusiveMinimum) {
@@ -258,7 +286,7 @@ StatusWithMatchExpression parseMinimum(const boost::intrusive_ptr<ExpressionCont
             expCtx, minimum.fieldNameStringData().toString(), minimum.wrap());
     }
 
-    if (path.empty()) {
+    if (!path) {
         // This restriction has no effect in a top-level schema, since we only store objects.
         return {std::make_unique<AlwaysTrueMatchExpression>(std::move(annotation))};
     }
@@ -280,7 +308,7 @@ StatusWithMatchExpression parseMinimum(const boost::intrusive_ptr<ExpressionCont
  */
 template <class T>
 StatusWithMatchExpression parseLength(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                      StringData path,
+                                      boost::optional<StringData> path,
                                       BSONElement length,
                                       InternalSchemaTypeExpression* typeExpr,
                                       BSONType restrictionType) {
@@ -291,7 +319,7 @@ StatusWithMatchExpression parseLength(const boost::intrusive_ptr<ExpressionConte
 
     auto annotation = doc_validation_error::createAnnotation(
         expCtx, length.fieldNameStringData().toString(), length.wrap());
-    if (path.empty()) {
+    if (!path) {
         return {std::make_unique<AlwaysTrueMatchExpression>(std::move(annotation))};
     }
 
@@ -300,7 +328,7 @@ StatusWithMatchExpression parseLength(const boost::intrusive_ptr<ExpressionConte
 }
 
 StatusWithMatchExpression parsePattern(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                       StringData path,
+                                       boost::optional<StringData> path,
                                        BSONElement pattern,
                                        InternalSchemaTypeExpression* typeExpr) {
     if (pattern.type() != BSONType::String) {
@@ -312,7 +340,7 @@ StatusWithMatchExpression parsePattern(const boost::intrusive_ptr<ExpressionCont
 
     auto annotation = doc_validation_error::createAnnotation(
         expCtx, pattern.fieldNameStringData().toString(), pattern.wrap());
-    if (path.empty()) {
+    if (!path) {
         return {std::make_unique<AlwaysTrueMatchExpression>(std::move(annotation))};
     }
 
@@ -325,7 +353,7 @@ StatusWithMatchExpression parsePattern(const boost::intrusive_ptr<ExpressionCont
 }
 
 StatusWithMatchExpression parseMultipleOf(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                          StringData path,
+                                          boost::optional<StringData> path,
                                           BSONElement multipleOf,
                                           InternalSchemaTypeExpression* typeExpr) {
     if (!multipleOf.isNumber()) {
@@ -343,7 +371,7 @@ StatusWithMatchExpression parseMultipleOf(const boost::intrusive_ptr<ExpressionC
     }
     auto annotation = doc_validation_error::createAnnotation(
         expCtx, multipleOf.fieldNameStringData().toString(), multipleOf.wrap());
-    if (path.empty()) {
+    if (!path) {
         return {std::make_unique<AlwaysTrueMatchExpression>(std::move(annotation))};
     }
 
@@ -357,7 +385,7 @@ StatusWithMatchExpression parseMultipleOf(const boost::intrusive_ptr<ExpressionC
 
 template <class T>
 StatusWithMatchExpression parseLogicalKeyword(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                              StringData path,
+                                              boost::optional<StringData> path,
                                               BSONElement logicalElement,
                                               AllowedFeatureSet allowedFeatures,
                                               bool ignoreUnknownKeywords) {
@@ -397,7 +425,7 @@ StatusWithMatchExpression parseLogicalKeyword(const boost::intrusive_ptr<Express
 }
 
 StatusWithMatchExpression parseEnum(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                    StringData path,
+                                    boost::optional<StringData> path,
                                     BSONElement enumElement) {
     if (enumElement.type() != BSONType::Array) {
         return {ErrorCodes::TypeMismatch,
@@ -426,7 +454,7 @@ StatusWithMatchExpression parseEnum(const boost::intrusive_ptr<ExpressionContext
         }
 
         // 'enum' at the top-level implies a literal object match on the root document.
-        if (path.empty()) {
+        if (!path) {
             // Top-level non-object enum values can be safely ignored, since MongoDB only stores
             // objects, not scalars or arrays.
             if (arrayElem.type() == BSONType::Object) {
@@ -501,7 +529,7 @@ StatusWith<StringDataSet> parseRequired(BSONElement requiredElt) {
 StatusWithMatchExpression translateRequired(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                             const StringDataSet& requiredProperties,
                                             BSONElement requiredElt,
-                                            StringData path,
+                                            boost::optional<StringData> path,
                                             InternalSchemaTypeExpression* typeExpr) {
     auto andExpr = std::make_unique<AndMatchExpression>(
         doc_validation_error::createAnnotation(expCtx, "required", requiredElt.wrap()));
@@ -518,7 +546,7 @@ StatusWithMatchExpression translateRequired(const boost::intrusive_ptr<Expressio
 
     // If this is a top-level schema, then we know that we are matching against objects, and there
     // is no need to worry about ensuring that non-objects match.
-    if (path.empty()) {
+    if (!path) {
         return {std::move(andExpr)};
     }
 
@@ -531,7 +559,7 @@ StatusWithMatchExpression translateRequired(const boost::intrusive_ptr<Expressio
 }
 
 StatusWithMatchExpression parseProperties(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                          StringData path,
+                                          boost::optional<StringData> path,
                                           BSONElement propertiesElt,
                                           InternalSchemaTypeExpression* typeExpr,
                                           const StringDataSet& requiredProperties,
@@ -594,7 +622,7 @@ StatusWithMatchExpression parseProperties(const boost::intrusive_ptr<ExpressionC
 
     // If this is a top-level schema, then we have no path and there is no need for an
     // explicit object match node.
-    if (path.empty()) {
+    if (!path) {
         return {std::move(andExpr)};
     }
 
@@ -709,7 +737,7 @@ StatusWithMatchExpression parseAdditionalProperties(
  */
 StatusWithMatchExpression parseAllowedProperties(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    StringData path,
+    boost::optional<StringData> path,
     BSONElement propertiesElt,
     BSONElement patternPropertiesElt,
     BSONElement additionalPropertiesElt,
@@ -773,7 +801,7 @@ StatusWithMatchExpression parseAllowedProperties(
 
     // If this is a top-level schema, then we have no path and there is no need for an explicit
     // object match node.
-    if (path.empty()) {
+    if (!path) {
         return {std::move(allowedPropertiesExpr)};
     }
 
@@ -790,7 +818,7 @@ StatusWithMatchExpression parseAllowedProperties(
  */
 template <class T>
 StatusWithMatchExpression parseNumProperties(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                             StringData path,
+                                             boost::optional<StringData> path,
                                              BSONElement numProperties,
                                              InternalSchemaTypeExpression* typeExpr) {
     auto parsedNumProps = numProperties.parseIntegerElementToNonNegativeLong();
@@ -803,7 +831,7 @@ StatusWithMatchExpression parseNumProperties(const boost::intrusive_ptr<Expressi
         doc_validation_error::createAnnotation(
             expCtx, numProperties.fieldNameStringData().toString(), numProperties.wrap()));
 
-    if (path.empty()) {
+    if (!path) {
         // This is a top-level schema.
         return {std::move(expr)};
     }
@@ -818,14 +846,14 @@ StatusWithMatchExpression parseNumProperties(const boost::intrusive_ptr<Expressi
 
 StatusWithMatchExpression makeDependencyExistsClause(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    StringData path,
+    boost::optional<StringData> path,
     StringData dependencyName) {
     // This node is tagged as '_propertyExists' to indicate that it will produce a path instead
     // of a detailed BSONObj error during error generation.
     auto existsExpr = std::make_unique<ExistsMatchExpression>(
         dependencyName,
         doc_validation_error::createAnnotation(expCtx, "_propertyExists", BSONObj()));
-    if (path.empty()) {
+    if (!path) {
         return {std::move(existsExpr)};
     }
 
@@ -839,7 +867,7 @@ StatusWithMatchExpression makeDependencyExistsClause(
 
 StatusWithMatchExpression translateSchemaDependency(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    StringData path,
+    boost::optional<StringData> path,
     BSONElement dependency,
     AllowedFeatureSet allowedFeatures,
     bool ignoreUnknownKeywords) {
@@ -873,7 +901,7 @@ StatusWithMatchExpression translateSchemaDependency(
 
 StatusWithMatchExpression translatePropertyDependency(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    StringData path,
+    boost::optional<StringData> path,
     BSONElement dependency) {
     invariant(dependency.type() == BSONType::Array);
 
@@ -939,7 +967,7 @@ StatusWithMatchExpression translatePropertyDependency(
 }
 
 StatusWithMatchExpression parseDependencies(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                            StringData path,
+                                            boost::optional<StringData> path,
                                             BSONElement dependencies,
                                             AllowedFeatureSet allowedFeatures,
                                             bool ignoreUnknownKeywords) {
@@ -985,7 +1013,7 @@ StatusWithMatchExpression parseDependencies(const boost::intrusive_ptr<Expressio
 
 StatusWithMatchExpression parseUniqueItems(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                            BSONElement uniqueItemsElt,
-                                           StringData path,
+                                           boost::optional<StringData> path,
                                            InternalSchemaTypeExpression* typeExpr) {
     auto errorAnnotation = doc_validation_error::createAnnotation(
         expCtx, uniqueItemsElt.fieldNameStringData().toString(), uniqueItemsElt.wrap());
@@ -994,7 +1022,7 @@ StatusWithMatchExpression parseUniqueItems(const boost::intrusive_ptr<Expression
                 str::stream() << "$jsonSchema keyword '"
                               << JSONSchemaParser::kSchemaUniqueItemsKeyword
                               << "' must be a boolean"};
-    } else if (path.empty()) {
+    } else if (!path) {
         return {std::make_unique<AlwaysTrueMatchExpression>(std::move(errorAnnotation))};
     } else if (uniqueItemsElt.boolean()) {
         auto uniqueItemsExpr = std::make_unique<InternalSchemaUniqueItemsMatchExpression>(
@@ -1011,7 +1039,7 @@ StatusWithMatchExpression parseUniqueItems(const boost::intrusive_ptr<Expression
  */
 StatusWith<boost::optional<long long>> parseItems(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    StringData path,
+    boost::optional<StringData> path,
     BSONElement itemsElt,
     AllowedFeatureSet allowedFeatures,
     bool ignoreUnknownKeywords,
@@ -1062,7 +1090,7 @@ StatusWith<boost::optional<long long>> parseItems(
         }
         startIndexForAdditionalItems = index;
 
-        if (path.empty()) {
+        if (!path) {
             andExpr->add(
                 std::make_unique<AlwaysTrueMatchExpression>(doc_validation_error::createAnnotation(
                     expCtx, itemsElt.fieldNameStringData().toString(), itemsElt.wrap())));
@@ -1087,7 +1115,7 @@ StatusWith<boost::optional<long long>> parseItems(
 
         auto errorAnnotation = doc_validation_error::createAnnotation(
             expCtx, itemsElt.fieldNameStringData().toString(), itemsElt.wrap());
-        if (path.empty()) {
+        if (!path) {
             andExpr->add(std::make_unique<AlwaysTrueMatchExpression>(std::move(errorAnnotation)));
         } else {
             constexpr auto startIndexForItems = 0LL;
@@ -1110,7 +1138,7 @@ StatusWith<boost::optional<long long>> parseItems(
 }
 
 Status parseAdditionalItems(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                            StringData path,
+                            boost::optional<StringData> path,
                             BSONElement additionalItemsElt,
                             boost::optional<long long> startIndexForAdditionalItems,
                             AllowedFeatureSet allowedFeatures,
@@ -1156,7 +1184,7 @@ Status parseAdditionalItems(const boost::intrusive_ptr<ExpressionContext>& expCt
     if (startIndexForAdditionalItems) {
         auto errorAnnotation = doc_validation_error::createAnnotation(
             expCtx, additionalItemsElt.fieldNameStringData().toString(), additionalItemsElt.wrap());
-        if (path.empty()) {
+        if (!path) {
             andExpr->add(std::make_unique<AlwaysTrueMatchExpression>(std::move(errorAnnotation)));
         } else {
             auto allElemMatch =
@@ -1174,7 +1202,7 @@ Status parseAdditionalItems(const boost::intrusive_ptr<ExpressionContext>& expCt
 
 Status parseItemsAndAdditionalItems(StringMap<BSONElement>& keywordMap,
                                     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                    StringData path,
+                                    boost::optional<StringData> path,
                                     AllowedFeatureSet allowedFeatures,
                                     bool ignoreUnknownKeywords,
                                     InternalSchemaTypeExpression* typeExpr,
@@ -1215,7 +1243,7 @@ Status parseItemsAndAdditionalItems(StringMap<BSONElement>& keywordMap,
  */
 Status translateLogicalKeywords(StringMap<BSONElement>& keywordMap,
                                 const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                StringData path,
+                                boost::optional<StringData> path,
                                 AndMatchExpression* andExpr,
                                 AllowedFeatureSet allowedFeatures,
                                 bool ignoreUnknownKeywords) {
@@ -1290,7 +1318,7 @@ Status translateLogicalKeywords(StringMap<BSONElement>& keywordMap,
  */
 Status translateArrayKeywords(StringMap<BSONElement>& keywordMap,
                               const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                              StringData path,
+                              boost::optional<StringData> path,
                               AllowedFeatureSet allowedFeatures,
                               bool ignoreUnknownKeywords,
                               InternalSchemaTypeExpression* typeExpr,
@@ -1340,7 +1368,7 @@ Status translateArrayKeywords(StringMap<BSONElement>& keywordMap,
  */
 Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
                                const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                               StringData path,
+                               boost::optional<StringData> path,
                                InternalSchemaTypeExpression* typeExpr,
                                AndMatchExpression* andExpr,
                                AllowedFeatureSet allowedFeatures,
@@ -1378,7 +1406,7 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
             // If a top level 'required' field does not contain '_id' and 'additionalProperties' is
             // false, no documents will be permitted. Calculate whether we need to warn the user
             // later in parsing.
-            bool requiredMissingID = expCtx->isParsingCollectionValidator && path.empty() &&
+            bool requiredMissingID = expCtx->getIsParsingCollectionValidator() && !path &&
                 !requiredProperties.contains("_id");
             auto allowedPropertiesExpr = parseAllowedProperties(expCtx,
                                                                 path,
@@ -1454,7 +1482,7 @@ Status translateObjectKeywords(StringMap<BSONElement>& keywordMap,
  */
 Status translateScalarKeywords(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                StringMap<BSONElement>& keywordMap,
-                               StringData path,
+                               boost::optional<StringData> path,
                                InternalSchemaTypeExpression* typeExpr,
                                AndMatchExpression* andExpr) {
     // String keywords.
@@ -1554,7 +1582,7 @@ Status translateScalarKeywords(const boost::intrusive_ptr<ExpressionContext>& ex
  */
 Status translateEncryptionKeywords(StringMap<BSONElement>& keywordMap,
                                    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                   StringData path,
+                                   boost::optional<StringData> path,
                                    AllowedFeatureSet allowedFeatures,
                                    AndMatchExpression* andExpr) {
     auto encryptElt = keywordMap[JSONSchemaParser::kSchemaEncryptKeyword];
@@ -1585,7 +1613,7 @@ Status translateEncryptionKeywords(StringMap<BSONElement>& keywordMap,
                                   << "' cannot be an empty object "};
         }
 
-        const IDLParserErrorContext ctxt("encryptMetadata");
+        const IDLParserContext ctxt("encryptMetadata");
         try {
             // Discard the result as we are only concerned with validation.
             EncryptionMetadata::parse(ctxt, encryptMetadataElt.embeddedObject());
@@ -1604,7 +1632,7 @@ Status translateEncryptionKeywords(StringMap<BSONElement>& keywordMap,
 
         try {
             // This checks the types of all the fields. Will throw on any parsing error.
-            const IDLParserErrorContext encryptCtxt("encrypt");
+            const IDLParserContext encryptCtxt("encrypt");
             auto encryptInfo = EncryptionInfo::parse(encryptCtxt, encryptElt.embeddedObject());
             auto infoType = encryptInfo.getBsonType();
 
@@ -1656,7 +1684,7 @@ Status validateMetadataKeywords(StringMap<BSONElement>& keywordMap) {
 }
 
 StatusWithMatchExpression _parse(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                 StringData path,
+                                 boost::optional<StringData> path,
                                  BSONObj schema,
                                  AllowedFeatureSet allowedFeatures,
                                  bool ignoreUnknownKeywords) {
@@ -1828,14 +1856,14 @@ StatusWithMatchExpression _parse(const boost::intrusive_ptr<ExpressionContext>& 
         return translationStatus;
     }
 
-    if (path.empty() && typeExpr && !typeExpr->typeSet().hasType(BSONType::Object)) {
+    if (!path && typeExpr && !typeExpr->typeSet().hasType(BSONType::Object)) {
         // This is a top-level schema which requires that the type is something other than
         // "object". Since we only know how to store objects, this schema matches nothing.
         return {std::make_unique<AlwaysFalseMatchExpression>(doc_validation_error::createAnnotation(
             expCtx, "$jsonSchema", BSON("$jsonSchema" << schema)))};
     }
 
-    if (!path.empty() && typeExpr) {
+    if (path && typeExpr) {
         andExpr->add(std::move(typeExpr));
     }
     return {std::move(andExpr)};
@@ -1895,16 +1923,15 @@ StatusWithMatchExpression JSONSchemaParser::parse(
     bool ignoreUnknownKeywords) {
     LOGV2_DEBUG(20728,
                 5,
-                "Parsing JSON Schema: {schema}",
                 "Parsing JSON Schema",
                 "schema"_attr = schema.jsonString(JsonStringFormat::LegacyStrict));
     try {
-        auto translation = _parse(expCtx, ""_sd, schema, allowedFeatures, ignoreUnknownKeywords);
+        auto translation =
+            _parse(expCtx, boost::none /* path */, schema, allowedFeatures, ignoreUnknownKeywords);
         if (shouldLog(MONGO_LOGV2_DEFAULT_COMPONENT, logv2::LogSeverity::Debug(5)) &&
             translation.isOK()) {
             LOGV2_DEBUG(20729,
                         5,
-                        "Translated schema match expression: {expression}",
                         "Translated schema match expression",
                         "expression"_attr = translation.getValue()->debugString());
         }
@@ -1916,7 +1943,7 @@ StatusWithMatchExpression JSONSchemaParser::parse(
                     expCtx, "$jsonSchema", oldAnnotation, schema));
             }
         }
-        expCtx->sbeCompatible = false;
+        expCtx->setSbeCompatibility(SbeCompatibility::notCompatible);
         return translation;
     } catch (const DBException& ex) {
         return {ex.toStatus()};

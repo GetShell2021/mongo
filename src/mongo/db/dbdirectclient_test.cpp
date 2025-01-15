@@ -28,13 +28,39 @@
  */
 
 #include "mongo/db/dbdirectclient.h"
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d_test_fixture.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace {
 
-const NamespaceString kNs("a.b");
+auto& opCounters() {
+    return serviceOpCounters(ClusterRole::ShardServer);
+}
+
+const NamespaceString kNs = NamespaceString::createNamespaceString_forTest("a.b");
 
 class DBDirectClientTest : public ServiceContextMongoDTest {
 protected:
@@ -61,12 +87,24 @@ TEST_F(DBDirectClientTest, NoAuth) {
 }
 
 TEST_F(DBDirectClientTest, InsertSingleDocumentSuccessful) {
+    auto globalDeletesCountBefore = opCounters().getDelete()->load();
+    auto globalInsertsCountBefore = opCounters().getInsert()->load();
+    auto globalUpdatesCountBefore = opCounters().getUpdate()->load();
+    auto globalCommandsCountBefore = opCounters().getCommand()->load();
     DBDirectClient client(_opCtx);
     write_ops::InsertCommandRequest insertOp(kNs);
     insertOp.setDocuments({BSON("_id" << 1)});
     auto insertReply = client.insert(insertOp);
     ASSERT_EQ(insertReply.getN(), 1);
     ASSERT_FALSE(insertReply.getWriteErrors());
+    auto globalCommandsCountAfter = opCounters().getCommand()->load();
+    auto globalDeletesCountAfter = opCounters().getDelete()->load();
+    auto globalInsertsCountAfter = opCounters().getInsert()->load();
+    auto globalUpdatesCountAfter = opCounters().getUpdate()->load();
+    ASSERT_EQ(1, globalInsertsCountAfter - globalInsertsCountBefore);
+    ASSERT_EQ(0, globalDeletesCountAfter - globalDeletesCountBefore);
+    ASSERT_EQ(0, globalCommandsCountAfter - globalCommandsCountBefore);
+    ASSERT_EQ(0, globalUpdatesCountAfter - globalUpdatesCountBefore);
 }
 
 TEST_F(DBDirectClientTest, InsertDuplicateDocumentDoesNotThrow) {
@@ -75,12 +113,16 @@ TEST_F(DBDirectClientTest, InsertDuplicateDocumentDoesNotThrow) {
     insertOp.setDocuments({BSON("_id" << 1), BSON("_id" << 1)});
     auto insertReply = client.insert(insertOp);
     ASSERT_EQ(insertReply.getN(), 1);
-    auto writeErrors = insertReply.getWriteErrors().get();
+    auto writeErrors = insertReply.getWriteErrors().value();
     ASSERT_EQ(writeErrors.size(), 1);
     ASSERT_EQ(writeErrors[0].getStatus(), ErrorCodes::DuplicateKey);
 }
 
 TEST_F(DBDirectClientTest, UpdateSingleDocumentSuccessfully) {
+    auto globalDeletesCountBefore = opCounters().getDelete()->load();
+    auto globalInsertsCountBefore = opCounters().getInsert()->load();
+    auto globalUpdatesCountBefore = opCounters().getUpdate()->load();
+    auto globalCommandsCountBefore = opCounters().getCommand()->load();
     DBDirectClient client(_opCtx);
     write_ops::UpdateCommandRequest updateOp(kNs);
     updateOp.setUpdates({[&] {
@@ -96,6 +138,14 @@ TEST_F(DBDirectClientTest, UpdateSingleDocumentSuccessfully) {
     // No documents there initially
     ASSERT_EQ(updateReply.getNModified(), 0);
     ASSERT_FALSE(updateReply.getWriteErrors());
+    auto globalCommandsCountAfter = opCounters().getCommand()->load();
+    auto globalDeletesCountAfter = opCounters().getDelete()->load();
+    auto globalInsertsCountAfter = opCounters().getInsert()->load();
+    auto globalUpdatesCountAfter = opCounters().getUpdate()->load();
+    ASSERT_EQ(0, globalInsertsCountAfter - globalInsertsCountBefore);
+    ASSERT_EQ(0, globalDeletesCountAfter - globalDeletesCountBefore);
+    ASSERT_EQ(0, globalCommandsCountAfter - globalCommandsCountBefore);
+    ASSERT_EQ(1, globalUpdatesCountAfter - globalUpdatesCountBefore);
 }
 
 TEST_F(DBDirectClientTest, UpdateDuplicateImmutableFieldDoesNotThrow) {
@@ -111,7 +161,7 @@ TEST_F(DBDirectClientTest, UpdateDuplicateImmutableFieldDoesNotThrow) {
     auto updateReply = client.update(updateOp);
     ASSERT_EQ(updateReply.getN(), 0);
     ASSERT_EQ(updateReply.getNModified(), 0);
-    auto writeErrors = updateReply.getWriteErrors().get();
+    auto writeErrors = updateReply.getWriteErrors().value();
     ASSERT_EQ(writeErrors.size(), 1);
     ASSERT_EQ(writeErrors[0].getStatus(), ErrorCodes::ImmutableField);
 }
@@ -122,6 +172,11 @@ TEST_F(DBDirectClientTest, DeleteSingleDocumentSuccessful) {
     write_ops::InsertCommandRequest insertOp(kNs);
     insertOp.setDocuments({BSON("_id" << 1)});
     auto insertReply = client.insert(insertOp);
+
+    auto globalDeletesCountBefore = opCounters().getDelete()->load();
+    auto globalInsertsCountBefore = opCounters().getInsert()->load();
+    auto globalUpdatesCountBefore = opCounters().getUpdate()->load();
+    auto globalCommandsCountBefore = opCounters().getCommand()->load();
     // Delete document
     write_ops::DeleteCommandRequest deleteOp(kNs);
     deleteOp.setDeletes({[&] {
@@ -133,6 +188,14 @@ TEST_F(DBDirectClientTest, DeleteSingleDocumentSuccessful) {
     auto deleteReply = client.remove(deleteOp);
     ASSERT_EQ(deleteReply.getN(), 1);
     ASSERT_FALSE(deleteReply.getWriteErrors());
+    auto globalCommandsCountAfter = opCounters().getCommand()->load();
+    auto globalDeletesCountAfter = opCounters().getDelete()->load();
+    auto globalInsertsCountAfter = opCounters().getInsert()->load();
+    auto globalUpdatesCountAfter = opCounters().getUpdate()->load();
+    ASSERT_EQ(0, globalInsertsCountAfter - globalInsertsCountBefore);
+    ASSERT_EQ(1, globalDeletesCountAfter - globalDeletesCountBefore);
+    ASSERT_EQ(0, globalCommandsCountAfter - globalCommandsCountBefore);
+    ASSERT_EQ(0, globalUpdatesCountAfter - globalUpdatesCountBefore);
 }
 
 TEST_F(DBDirectClientTest, DeleteDocumentIncorrectHintDoesNotThrow) {
@@ -152,7 +215,7 @@ TEST_F(DBDirectClientTest, DeleteDocumentIncorrectHintDoesNotThrow) {
     }()});
     auto deleteReply = client.remove(deleteOp);
     ASSERT_EQ(deleteReply.getN(), 0);
-    auto writeErrors = deleteReply.getWriteErrors().get();
+    auto writeErrors = deleteReply.getWriteErrors().value();
     ASSERT_EQ(writeErrors.size(), 1);
     ASSERT_EQ(writeErrors[0].getStatus(), ErrorCodes::BadValue);
 }
@@ -175,6 +238,21 @@ TEST_F(DBDirectClientTest, ExhaustQuery) {
     findCmd.setBatchSize(2);
     auto cursor = client.find(std::move(findCmd), ReadPreferenceSetting{}, ExhaustMode::kOn);
     ASSERT_EQ(cursor->itcount(), numDocs);
+}
+
+TEST_F(DBDirectClientTest, InternalErrorAllowedToEscapeDBDirectClient) {
+    DBDirectClient client(_opCtx);
+    FindCommandRequest findCmd{kNs};
+
+    FailPointEnableBlock failPoint("failCommand",
+                                   BSON("errorCode" << ErrorCodes::TransactionAPIMustRetryCommit
+                                                    << "failCommands" << BSON_ARRAY("find")
+                                                    << "failInternalCommands" << true
+                                                    << "failLocalClients" << true));
+
+    ASSERT_THROWS_CODE(client.find(std::move(findCmd), ReadPreferenceSetting{}, ExhaustMode::kOff),
+                       DBException,
+                       ErrorCodes::TransactionAPIMustRetryCommit);
 }
 
 }  // namespace

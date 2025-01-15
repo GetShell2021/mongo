@@ -1,10 +1,12 @@
 """Given a test name, path to log file and exit code, generate/append an Evergreen report.json."""
+
 import json
-import pathlib
 import os
-from typing import List, Dict, Optional
-from typing_extensions import TypedDict
+import pathlib
+from typing import List
+
 import click
+from typing_extensions import TypedDict
 
 
 class Result(TypedDict, total=False):
@@ -13,9 +15,9 @@ class Result(TypedDict, total=False):
     status: str
     exit_code: int
     test_file: str
-    start: int
-    end: int
-    elapsed: int
+    start: float
+    end: float
+    elapsed: float
     log_raw: str
 
 
@@ -51,20 +53,26 @@ def _clean_log_file(log_file: pathlib.Path, dedup_lines: bool) -> str:
     return os.linesep.join(lines)
 
 
-def _make_report(test_name: str, log_file_contents: str, exit_code: int) -> Report:
+def make_report(test_name: str, log_file_contents: str, exit_code: int) -> Report:
     status = "pass" if exit_code == 0 else "fail"
-    return Report({
-        'failures':
-            0 if exit_code == 0 else 1, "results": [
-                Result({
-                    "status": status, "exit_code": exit_code, "test_file": test_name,
-                    "log_raw": log_file_contents
-                })
-            ]
-    })
+    return Report(
+        {
+            "failures": 0 if exit_code == 0 else 1,
+            "results": [
+                Result(
+                    {
+                        "status": status,
+                        "exit_code": exit_code,
+                        "test_file": test_name,
+                        "log_raw": log_file_contents,
+                    }
+                )
+            ],
+        }
+    )
 
 
-def _try_combine_reports(out: Report):
+def try_combine_reports(out: Report):
     try:
         with open("report.json") as fh:
             report = json.load(fh)
@@ -80,7 +88,7 @@ def _dedup_lines(lines: List[str]) -> List[str]:
     return list(set(lines))
 
 
-def _put_report(out: Report):
+def put_report(out: Report):
     with open("report.json", "w") as fh:
         json.dump(out, fh)
 
@@ -93,9 +101,9 @@ def _put_report(out: Report):
 def main(test_name: str, log_file: pathlib.Path, exit_code: int, dedup_lines: bool):
     """Given a test name, path to log file and exit code, generate/append an Evergreen report.json."""
     log_file_contents = _clean_log_file(log_file, dedup_lines)
-    report = _make_report(test_name, log_file_contents, exit_code)
-    _try_combine_reports(report)
-    _put_report(report)
+    report = make_report(test_name, log_file_contents, exit_code)
+    try_combine_reports(report)
+    put_report(report)
 
 
 if __name__ == "__main__":

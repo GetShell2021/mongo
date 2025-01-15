@@ -20,10 +20,8 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({nodes: [{}, {rsConfig: {priority: 0, votes: 0}}]});
 replTest.startSet();
@@ -100,7 +98,7 @@ replTest.awaitReplication();
 jsTestLog("Secondary was restarted");
 
 // Wait for the secondary to complete initial sync.
-replTest.waitForState(secondary, ReplSetTest.State.SECONDARY);
+replTest.awaitSecondaryNodes(null, [secondary]);
 
 jsTestLog("Initial sync completed");
 
@@ -111,11 +109,10 @@ assert.eq(secondaryOplog.find({"ts": beginFetchingTs}).itcount(), 1);
 
 // Make sure the first transaction committed properly and is reflected after the initial sync.
 let res = secondary.getDB(dbName).getCollection(collName).findOne({_id: 2});
-assert.docEq(res, {_id: 2}, res);
+assert.docEq({_id: 2}, res);
 
 jsTestLog("Aborting the second transaction");
 
 assert.commandWorked(session2.abortTransaction_forTesting());
 
 replTest.stopSet();
-})();

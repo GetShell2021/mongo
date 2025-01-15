@@ -27,12 +27,19 @@
  *    it in the license file.
  */
 #pragma once
+#include <functional>
 #include <memory>
+#include <vector>
 
+#include "mongo/client/sdam/sdam_configuration.h"
 #include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/client/sdam/topology_description.h"
 #include "mongo/client/sdam/topology_listener.h"
 #include "mongo/client/sdam/topology_state_machine.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/future.h"
+#include "mongo/util/net/hostandport.h"
 
 namespace mongo::sdam {
 
@@ -106,7 +113,7 @@ private:
         const TopologyDescriptionPtr& oldTopologyDescription,
         const TopologyDescriptionPtr& newTopologyDescription) const;
 
-    mutable mongo::Mutex _mutex = MONGO_MAKE_LATCH("TopologyManager");
+    mutable mongo::stdx::mutex _mutex;
     const SdamConfiguration _config;
     ClockSource* _clockSource;
     TopologyDescriptionPtr _topologyDescription;

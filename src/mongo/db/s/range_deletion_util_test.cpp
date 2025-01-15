@@ -27,31 +27,61 @@
  *    it in the license file.
  */
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/create_collection.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/repl/member_state.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/metadata_manager.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
-#include "mongo/db/s/sharding_runtime_d_params_gen.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/db/vector_clock.h"
-#include "mongo/unittest/death_test.h"
+#include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/platform/random.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
 namespace {
 
-const NamespaceString kNss = NamespaceString("foo", "bar");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("foo", "bar");
 const std::string kShardKey = "_id";
 const BSONObj kShardKeyPattern = BSON(kShardKey << 1);
 
-class RangeDeleterTest : public ShardServerTestFixture {
+class RangeDeleterTest : service_context_test::WithSetupTransportLayer,
+                         public ShardServerTestFixture {
 public:
     // Needed because UUID default constructor is private
     RangeDeleterTest() : _opCtx(nullptr), _uuid(UUID::gen()) {}
@@ -74,8 +104,7 @@ public:
         {
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(_opCtx);
-            uassertStatusOK(
-                createCollection(_opCtx, kNss.db().toString(), BSON("create" << kNss.coll())));
+            uassertStatusOK(createCollection(_opCtx, kNss.dbName(), BSON("create" << kNss.coll())));
         }
 
         AutoGetCollection autoColl(_opCtx, kNss, MODE_IX);
@@ -84,7 +113,7 @@ public:
 
     void tearDown() override {
         DBDirectClient client(_opCtx);
-        client.dropCollection(kNss.ns());
+        client.dropCollection(kNss);
 
         while (migrationutil::getMigrationUtilExecutor(getServiceContext())->hasTasks()) {
             continue;
@@ -101,13 +130,14 @@ public:
             kNss,
             uuid,
             kShardKeyPattern,
+            false, /* unsplittable */
             nullptr,
             false,
             epoch,
             Timestamp(1, 1),
             boost::none /* timeseriesFields */,
-            boost::none,
-            boost::none /* chunkSizeBytes */,
+            boost::none /* reshardingFields */,
+
             true,
             {ChunkType{uuid,
                        ChunkRange{BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)},
@@ -117,13 +147,11 @@ public:
                         DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
                         makeStandaloneRoutingTableHistory(std::move(rt)),
                         boost::none);
-        AutoGetDb autoDb(_opCtx, kNss.db(), MODE_IX);
+        AutoGetDb autoDb(_opCtx, kNss.dbName(), MODE_IX);
         Lock::CollectionLock collLock(_opCtx, kNss, MODE_IX);
-        CollectionMetadata collMetadata(std::move(cm), ShardId("dummyShardId"));
-        CollectionShardingRuntime::get(_opCtx, kNss)->setFilteringMetadata(_opCtx, collMetadata);
-        auto* css = CollectionShardingState::get(_opCtx, kNss);
-        auto& csr = *checked_cast<CollectionShardingRuntime*>(css);
-        csr.setFilteringMetadata(_opCtx, collMetadata);
+        CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(_opCtx, kNss)
+            ->setFilteringMetadata(_opCtx,
+                                   CollectionMetadata(std::move(cm), ShardId("dummyShardId")));
     }
 
     UUID uuid() const {
@@ -142,7 +170,8 @@ private:
  */
 class RenameRangeDeletionsTest : public RangeDeleterTest {
 public:
-    const NamespaceString kToNss = NamespaceString(kNss.db(), "toColl");
+    const NamespaceString kToNss =
+        NamespaceString::createNamespaceString_forTest(kNss.db_forTest(), "toColl");
 
     void setUp() override {
         RangeDeleterTest::setUp();
@@ -154,7 +183,7 @@ public:
 
     void tearDown() override {
         DBDirectClient client(_opCtx);
-        client.dropCollection(kToNss.ns());
+        client.dropCollection(kToNss);
         // Re-enabling range deletions to drain tasks on the executor
         globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::off);
         RangeDeleterTest::tearDown();
@@ -194,7 +223,7 @@ RangeDeletionTask insertRangeDeletionTask(OperationContext* opCtx,
     store.add(opCtx, t);
 
     // Document should be in the store.
-    ASSERT_EQUALS(countDocsInConfigRangeDeletions(store, opCtx), 1);
+    ASSERT_GTE(countDocsInConfigRangeDeletions(store, opCtx), 1);
 
     auto query = BSON(RangeDeletionTask::kIdFieldName << migrationId);
     t.setPending(boost::none);
@@ -211,718 +240,29 @@ RangeDeletionTask insertRangeDeletionTask(OperationContext* opCtx,
     return insertRangeDeletionTask(opCtx, kNss, uuid, range, numOrphans);
 }
 
-TEST_F(RangeDeleterTest,
-       RemoveDocumentsInRangeRemovesAllDocumentsInRangeWhenAllDocumentsFitInSingleBatch) {
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto queriesComplete = SemiFuture<void>::makeReady();
+template <typename ShardKey>
+RangeDeletionTask createDeletionTask(OperationContext* opCtx,
+                                     const NamespaceString& nss,
+                                     const UUID& uuid,
+                                     ShardKey min,
+                                     ShardKey max,
+                                     ShardId donorShard = ShardId("donorShard"),
+                                     bool pending = true) {
+    auto task = RangeDeletionTask(UUID::gen(),
+                                  nss,
+                                  uuid,
+                                  donorShard,
+                                  ChunkRange{BSON("_id" << min), BSON("_id" << max)},
+                                  CleanWhenEnum::kNow);
+    const auto currentTime = VectorClock::get(opCtx)->getTime();
+    task.setTimestamp(currentTime.clusterTime().asTimestamp());
 
-    setFilteringMetadataWithUUID(uuid());
-    auto task = insertRangeDeletionTask(_opCtx, uuid(), range, 1);
-    DBDirectClient dbclient(_opCtx);
-    dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
+    if (pending)
+        task.setPending(true);
 
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               task.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-    cleanupComplete.get();
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 0);
+    return task;
 }
-
-TEST_F(RangeDeleterTest,
-       RemoveDocumentsInRangeRemovesAllDocumentsInRangeWhenSeveralBatchesAreRequired) {
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    // More documents than the batch size.
-    const auto numDocsToInsert = 3;
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    // Insert documents in range.
-    setFilteringMetadataWithUUID(uuid());
-    auto task = insertRangeDeletionTask(_opCtx, uuid(), range, numDocsToInsert);
-    DBDirectClient dbclient(_opCtx);
-    for (auto i = 0; i < numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               task.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-    cleanupComplete.get();
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 0);
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeInsertsDocumentToNotifySecondariesOfRangeDeletion) {
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    setFilteringMetadataWithUUID(uuid());
-    auto task = insertRangeDeletionTask(_opCtx, uuid(), range, 1);
-    DBDirectClient dbclient(_opCtx);
-    dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               task.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-    cleanupComplete.get();
-
-    ASSERT_EQUALS(dbclient.count(NamespaceString::kServerConfigurationNamespace,
-                                 BSON(kShardKey << "startRangeDeletion")),
-                  1);
-}
-
-TEST_F(
-    RangeDeleterTest,
-    RemoveDocumentsInRangeOnlyInsertsStartRangeDeletionDocumentOnceWhenSeveralBatchesAreRequired) {
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    // More documents than the batch size.
-    const auto numDocsToInsert = 3;
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    // Insert documents in range.
-    setFilteringMetadataWithUUID(uuid());
-    auto task = insertRangeDeletionTask(_opCtx, uuid(), range, numDocsToInsert);
-    DBDirectClient dbclient(_opCtx);
-    for (auto i = 0; i < numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               task.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-    cleanupComplete.get();
-    ASSERT_EQUALS(dbclient.count(NamespaceString::kServerConfigurationNamespace,
-                                 BSON(kShardKey << "startRangeDeletion")),
-                  1);
-}
-
-TEST_F(RangeDeleterTest,
-       RemoveDocumentsInRangeDoesNotRemoveDocumentsWithKeysLowerThanMinKeyOfRange) {
-    const auto numDocsToInsert = 3;
-
-    const auto minKey = 0;
-    const auto range = ChunkRange(BSON(kShardKey << minKey), BSON(kShardKey << 10));
-
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    setFilteringMetadataWithUUID(uuid());
-    auto task = insertRangeDeletionTask(_opCtx, uuid(), range, 0);
-    DBDirectClient dbclient(_opCtx);
-    // All documents below the range.
-    for (auto i = minKey - numDocsToInsert; i < minKey; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               task.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-    cleanupComplete.get();
-    // No documents should have been deleted.
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), numDocsToInsert);
-}
-
-TEST_F(RangeDeleterTest,
-       RemoveDocumentsInRangeDoesNotRemoveDocumentsWithKeysGreaterThanOrEqualToMaxKeyOfRange) {
-    const auto numDocsToInsert = 3;
-
-    const auto maxKey = 10;
-    const auto range = ChunkRange(BSON(kShardKey << 0), BSON(kShardKey << maxKey));
-
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    setFilteringMetadataWithUUID(uuid());
-    auto task = insertRangeDeletionTask(_opCtx, uuid(), range, 0);
-    DBDirectClient dbclient(_opCtx);
-    // All documents greater than or equal to the range.
-    for (auto i = maxKey; i < maxKey + numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               task.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-    cleanupComplete.get();
-    // No documents should have been deleted.
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), numDocsToInsert);
-}
-
-TEST_F(RangeDeleterTest,
-       RemoveDocumentsInRangeDoesNotRemoveDocumentsForCollectionWithSameNamespaceAndDifferentUUID) {
-    const auto numDocsToInsert = 3;
-    const auto range = ChunkRange(BSON(kShardKey << 0), BSON(kShardKey << 10));
-
-    setFilteringMetadataWithUUID(uuid());
-    auto task = insertRangeDeletionTask(_opCtx, uuid(), range, numDocsToInsert);
-    DBDirectClient dbclient(_opCtx);
-    for (auto i = 0; i < numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
-    auto queriesComplete = SemiFuture<void>::makeReady();
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               // Use a different UUID from the collection UUID.
-                               UUID::gen(),
-                               kShardKeyPattern,
-                               range,
-                               task.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-
-    ASSERT_THROWS_CODE(cleanupComplete.get(),
-                       DBException,
-                       ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist);
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), numDocsToInsert);
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeThrowsErrorWhenCollectionDoesNotExist) {
-    auto queriesComplete = SemiFuture<void>::makeReady();
-    const auto range = ChunkRange(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto task = insertRangeDeletionTask(_opCtx, uuid(), range, 0);
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               NamespaceString("someFake", "namespace"),
-                               UUID::gen(),
-                               kShardKeyPattern,
-                               ChunkRange(BSON(kShardKey << 0), BSON(kShardKey << 10)),
-                               task.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-
-    ASSERT_THROWS_CODE(cleanupComplete.get(),
-                       DBException,
-                       ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist);
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeLeavesDocumentsWhenTaskDocumentDoesNotExist) {
-    auto replCoord = checked_cast<repl::ReplicationCoordinatorMock*>(
-        repl::ReplicationCoordinator::get(getServiceContext()));
-
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-
-    setFilteringMetadataWithUUID(uuid());
-    DBDirectClient dbclient(_opCtx);
-    dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
-
-    // We intentionally skip inserting a range deletion task document to simulate it already having
-    // been deleted.
-
-    // We should wait for replication after attempting to delete the document in the range even when
-    // the task document doesn't exist.
-    const auto expectedNumTimesWaitedForReplication = 1;
-    int numTimesWaitedForReplication = 0;
-
-    // Override special handler for waiting for replication to count the number of times we wait for
-    // replication.
-    replCoord->setAwaitReplicationReturnValueFunction(
-        [&](OperationContext* opCtx, const repl::OpTime& opTime) {
-            ++numTimesWaitedForReplication;
-            return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
-        });
-
-    auto queriesComplete = SemiFuture<void>::makeReady();
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               UUID::gen(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */);
-
-    cleanupComplete.get();
-
-    // Document should not have been deleted.
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 1);
-    ASSERT_EQ(numTimesWaitedForReplication, expectedNumTimesWaitedForReplication);
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationAfterDeletingSingleBatch) {
-    auto replCoord = checked_cast<repl::ReplicationCoordinatorMock*>(
-        repl::ReplicationCoordinator::get(getServiceContext()));
-
-    const auto numDocsToInsert = 3;
-    const auto numDocsToRemovePerBatch = 10;
-    rangeDeleterBatchSize.store(numDocsToRemovePerBatch);
-    const auto numBatches = ceil((double)numDocsToInsert / numDocsToRemovePerBatch);
-    ASSERT_EQ(numBatches, 1);
-    // We should wait twice: Once after deleting documents in the range, and once after deleting the
-    // range deletion task.
-    const auto expectedNumTimesWaitedForReplication = 2;
-
-    setFilteringMetadataWithUUID(uuid());
-    DBDirectClient dbclient(_opCtx);
-    for (auto i = 0; i < numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
-    // Insert range deletion task for this collection and range.
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto t = insertRangeDeletionTask(_opCtx, uuid(), range);
-
-    int numTimesWaitedForReplication = 0;
-    // Override special handler for waiting for replication to count the number of times we wait for
-    // replication.
-    replCoord->setAwaitReplicationReturnValueFunction(
-        [&](OperationContext* opCtx, const repl::OpTime& opTime) {
-            ++numTimesWaitedForReplication;
-            return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
-        });
-
-    auto queriesComplete = SemiFuture<void>::makeReady();
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               t.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-    cleanupComplete.get();
-
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 0);
-    ASSERT_EQ(numTimesWaitedForReplication, expectedNumTimesWaitedForReplication);
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationOnlyOnceAfterSeveralBatches) {
-    auto replCoord = checked_cast<repl::ReplicationCoordinatorMock*>(
-        repl::ReplicationCoordinator::get(getServiceContext()));
-
-    const auto numDocsToInsert = 3;
-    const auto numDocsToRemovePerBatch = 1;
-    rangeDeleterBatchSize.store(numDocsToRemovePerBatch);
-    const auto numBatches = ceil((double)numDocsToInsert / numDocsToRemovePerBatch);
-    ASSERT_GTE(numBatches, 1);
-
-    // We should wait twice: Once after deleting documents in the range, and once after deleting the
-    // range deletion task.
-    const auto expectedNumTimesWaitedForReplication = 2;
-
-    setFilteringMetadataWithUUID(uuid());
-    DBDirectClient dbclient(_opCtx);
-    for (auto i = 0; i < numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
-    // Insert range deletion task for this collection and range.
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto t = insertRangeDeletionTask(_opCtx, uuid(), range);
-
-    int numTimesWaitedForReplication = 0;
-
-    // Set special handler for waiting for replication.
-    replCoord->setAwaitReplicationReturnValueFunction(
-        [&](OperationContext* opCtx, const repl::OpTime& opTime) {
-            ++numTimesWaitedForReplication;
-            return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
-        });
-
-    auto queriesComplete = SemiFuture<void>::makeReady();
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               t.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */);
-
-    cleanupComplete.get();
-
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 0);
-    ASSERT_EQ(numTimesWaitedForReplication, expectedNumTimesWaitedForReplication);
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeDoesNotWaitForReplicationIfErrorDuringDeletion) {
-    auto replCoord = checked_cast<repl::ReplicationCoordinatorMock*>(
-        repl::ReplicationCoordinator::get(getServiceContext()));
-
-    const auto numDocsToInsert = 3;
-
-    setFilteringMetadataWithUUID(uuid());
-    DBDirectClient dbclient(_opCtx);
-    for (auto i = 0; i < numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
-    // Insert range deletion task for this collection and range.
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto t = insertRangeDeletionTask(_opCtx, uuid(), range);
-
-    int numTimesWaitedForReplication = 0;
-    // Override special handler for waiting for replication to count the number of times we wait for
-    // replication.
-    replCoord->setAwaitReplicationReturnValueFunction(
-        [&](OperationContext* opCtx, const repl::OpTime& opTime) {
-            ++numTimesWaitedForReplication;
-            return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
-        });
-
-    // Pretend we stepped down.
-    replCoord->setCanAcceptNonLocalWrites(false);
-    std::ignore = replCoord->setFollowerMode(repl::MemberState::RS_SECONDARY);
-
-    auto queriesComplete = SemiFuture<void>::makeReady();
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               t.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-    ASSERT_THROWS_CODE(cleanupComplete.get(), DBException, ErrorCodes::PrimarySteppedDown);
-    ASSERT_EQ(numTimesWaitedForReplication, 0);
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRetriesOnWriteConflictException) {
-    // Enable fail point to throw WriteConflictException.
-    globalFailPointRegistry()
-        .find("throwWriteConflictExceptionInDeleteRange")
-        ->setMode(FailPoint::nTimes, 3 /* Throw a few times before disabling. */);
-
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    setFilteringMetadataWithUUID(uuid());
-    DBDirectClient dbclient(_opCtx);
-    dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
-
-    // Insert range deletion task for this collection and range.
-    auto t = insertRangeDeletionTask(_opCtx, uuid(), range);
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               t.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */);
-
-    cleanupComplete.get();
-
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 0);
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRetriesOnUnexpectedError) {
-    // Enable fail point to throw InternalError.
-    globalFailPointRegistry()
-        .find("throwInternalErrorInDeleteRange")
-        ->setMode(FailPoint::nTimes, 3 /* Throw a few times before disabling. */);
-
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    setFilteringMetadataWithUUID(uuid());
-    DBDirectClient dbclient(_opCtx);
-    dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
-
-    // Insert range deletion task for this collection and range.
-    auto t = insertRangeDeletionTask(_opCtx, uuid(), range);
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               t.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */);
-
-    cleanupComplete.get();
-
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 0);
-}
-
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRespectsDelayInBetweenBatches) {
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    // More documents than the batch size.
-    const auto numDocsToInsert = 3;
-    const auto numDocsToRemovePerBatch = 1;
-    rangeDeleterBatchSize.store(numDocsToRemovePerBatch);
-
-    auto queriesComplete = SemiFuture<void>::makeReady();
-    // Insert documents in range.
-    setFilteringMetadataWithUUID(uuid());
-    auto task = insertRangeDeletionTask(_opCtx, uuid(), range, numDocsToInsert);
-    DBDirectClient dbclient(_opCtx);
-    for (auto i = 0; i < numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
-    // The deletion of a document in unit tests with ephemeral storage engine is usually
-    // extremely fast (less than 5ms), so setting the delay to 1 second ensures the test
-    // is relevant: it is very improbable for a deletion to last so much, even on slow
-    // machines.
-    const auto delayBetweenBatchesMS = 1000 /* 1 second */;
-    rangeDeleterBatchDelayMS.store(delayBetweenBatchesMS);
-
-    auto beforeRangeDeletion = Date_t::now();
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               task.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */);
-
-    cleanupComplete.get();
-    auto afterRangeDeletion = Date_t::now();
-    auto rangeDeletionTimeMS =
-        afterRangeDeletion.toMillisSinceEpoch() - beforeRangeDeletion.toMillisSinceEpoch();
-    ASSERT(rangeDeletionTimeMS >= delayBetweenBatchesMS * numDocsToInsert);
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 0);
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRespectsOrphanCleanupDelay) {
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    // More documents than the batch size.
-    const auto numDocsToInsert = 3;
-    const auto orphanCleanupDelay = Seconds(10);
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    // Insert documents in range.
-    setFilteringMetadataWithUUID(uuid());
-    auto task = insertRangeDeletionTask(_opCtx, uuid(), range, numDocsToInsert);
-    DBDirectClient dbclient(_opCtx);
-    for (auto i = 0; i < numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
-    auto cleanupComplete = removeDocumentsInRange(executor(),
-                                                  std::move(queriesComplete),
-                                                  kNss,
-                                                  uuid(),
-                                                  kShardKeyPattern,
-                                                  range,
-                                                  task.getId(),
-                                                  orphanCleanupDelay);
-
-    // A best-effort check that cleanup has not completed without advancing the clock.
-    sleepsecs(1);
-    ASSERT_FALSE(cleanupComplete.isReady());
-
-    // Advance the time past the delay until cleanup is complete. This cannot be made exact because
-    // there's no way to tell when the sleep operation gets hit exactly, so instead we incrementally
-    // advance time until it's ready.
-    while (!cleanupComplete.isReady()) {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(network());
-        network()->advanceTime(network()->now() + orphanCleanupDelay);
-    }
-
-    cleanupComplete.get();
-
-    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 0);
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRemovesRangeDeletionTaskOnSuccess) {
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    setFilteringMetadataWithUUID(uuid());
-    DBDirectClient dbclient(_opCtx);
-    dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
-
-    // Insert range deletion task for this collection and range.
-    auto t = insertRangeDeletionTask(_opCtx, uuid(), range);
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               t.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */);
-
-    cleanupComplete.get();
-    // Document should have been deleted.
-    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-    ASSERT_EQUALS(countDocsInConfigRangeDeletions(store, _opCtx), 0);
-}
-
-TEST_F(RangeDeleterTest,
-       RemoveDocumentsInRangeRemovesRangeDeletionTaskOnCollectionDroppedErrorWhenStillPrimary) {
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    auto fakeUuid = UUID::gen();
-
-    setFilteringMetadataWithUUID(fakeUuid);
-    DBDirectClient dbclient(_opCtx);
-    dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
-
-    // Insert range deletion task for this collection and range.
-    auto t = insertRangeDeletionTask(_opCtx, uuid(), range);
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               fakeUuid,
-                               kShardKeyPattern,
-                               range,
-                               t.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */);
-
-    ASSERT_THROWS_CODE(cleanupComplete.get(),
-                       DBException,
-                       ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist);
-
-    // Document should have been deleted.
-    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-    ASSERT_EQUALS(countDocsInConfigRangeDeletions(store, _opCtx), 0);
-}
-
-TEST_F(RangeDeleterTest,
-       RemoveDocumentsInRangeDoesNotRemoveRangeDeletionTaskOnErrorWhenNotStillPrimary) {
-    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    auto queriesComplete = SemiFuture<void>::makeReady();
-
-    setFilteringMetadataWithUUID(uuid());
-    DBDirectClient dbclient(_opCtx);
-    dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
-
-    // Insert range deletion task for this collection and range.
-    auto t = insertRangeDeletionTask(_opCtx, uuid(), range);
-
-    // Pretend we stepped down.
-    auto replCoord = checked_cast<repl::ReplicationCoordinatorMock*>(
-        repl::ReplicationCoordinator::get(getServiceContext()));
-    replCoord->setCanAcceptNonLocalWrites(false);
-    std::ignore = replCoord->setFollowerMode(repl::MemberState::RS_SECONDARY);
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               t.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */);
-
-    ASSERT_THROWS_CODE(cleanupComplete.get(), DBException, ErrorCodes::PrimarySteppedDown);
-
-    // Pretend we stepped back up so we can read the task store.
-    replCoord->setCanAcceptNonLocalWrites(true);
-    std::ignore = replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY);
-
-    // Document should not have been deleted.
-    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-    ASSERT_EQUALS(countDocsInConfigRangeDeletions(store, _opCtx), 1);
-}
-
-// The input future should never have an error.
-DEATH_TEST_F(RangeDeleterTest, RemoveDocumentsInRangeCrashesIfInputFutureHasError, "invariant") {
-    const ChunkRange range = ChunkRange(BSON(kShardKey << 0), BSON(kShardKey << 10));
-    DBDirectClient dbclient(_opCtx);
-    dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
-
-    // Insert range deletion task for this collection and range.
-    auto t = insertRangeDeletionTask(_opCtx, uuid(), range);
-
-    auto queriesCompletePf = makePromiseFuture<void>();
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move((queriesCompletePf.future)).semi(),
-                               kNss,
-                               uuid(),
-                               kShardKeyPattern,
-                               range,
-                               t.getId(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */);
-
-
-    // Should cause an invariant failure.
-    queriesCompletePf.promise.setError(Status(ErrorCodes::InternalError, "Some unexpected error"));
-    cleanupComplete.get();
-}
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeDoesNotCrashWhenShardKeyIndexDoesNotExist) {
-    auto queriesComplete = SemiFuture<void>::makeReady();
-    const std::string kNoShardKeyIndexMsg("Unable to find shard key index for");
-    auto logCountBefore = countTextFormatLogLinesContaining(kNoShardKeyIndexMsg);
-
-    auto cleanupComplete =
-        removeDocumentsInRange(executor(),
-                               std::move(queriesComplete),
-                               kNss,
-                               uuid(),
-                               BSON("x" << 1) /* shard key pattern */,
-                               ChunkRange(BSON("x" << 0), BSON("x" << 10)),
-                               UUID::gen(),
-                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/);
-
-    // Range deleter will keep on retrying when it encounters non-stepdown errors. Make it run
-    // a few iterations and then create the index to make it exit the retry loop.
-    while (countTextFormatLogLinesContaining(kNoShardKeyIndexMsg) < logCountBefore) {
-        sleepmicros(100);
-    }
-
-    DBDirectClient client(_opCtx);
-    client.createIndex(kNss.ns(), BSON("x" << 1));
-
-    cleanupComplete.get();
-}
+}  // namespace
 
 /**
  *  Tests that the rename range deletion flow:
@@ -946,23 +286,27 @@ TEST_F(RenameRangeDeletionsTest, BasicRenameRangeDeletionsTest) {
     }
 
     // Rename range deletions
-    snapshotRangeDeletionsForRename(_opCtx, kNss, kToNss);
-    restoreRangeDeletionTasksForRename(_opCtx, kToNss);
-    deleteRangeDeletionTasksForRename(_opCtx, kNss, kToNss);
+    rangedeletionutil::snapshotRangeDeletionsForRename(_opCtx, kNss, kToNss);
+    rangedeletionutil::restoreRangeDeletionTasksForRename(_opCtx, kToNss);
+    rangedeletionutil::deleteRangeDeletionTasksForRename(_opCtx, kNss, kToNss);
 
-    // Make sure just range deletions for the TO collection are found
-    ASSERT_EQ(10, rangeDeletionsStore.count(_opCtx));
+    const auto targetRangeDeletionsQuery =
+        BSON(RangeDeletionTask::kNssFieldName << kToNss.ns_forTest());
+
+    // Make sure range deletions for the TO collection are found
+    ASSERT_EQ(10, rangeDeletionsStore.count(_opCtx, targetRangeDeletionsQuery));
     int foundTasks = 0;
-    rangeDeletionsStore.forEach(_opCtx, BSONObj(), [&](const RangeDeletionTask& newTask) {
-        auto task = tasks.at(foundTasks++);
-        ASSERT_EQ(newTask.getNss(), kToNss);
-        ASSERT_EQ(newTask.getCollectionUuid(), task.getCollectionUuid());
-        ASSERT_EQ(newTask.getDonorShardId(), task.getDonorShardId());
-        ASSERT(SimpleBSONObjComparator::kInstance.evaluate(newTask.getRange().toBSON() ==
-                                                           task.getRange().toBSON()));
-        ASSERT(newTask.getWhenToClean() == task.getWhenToClean());
-        return true;
-    });
+    rangeDeletionsStore.forEach(
+        _opCtx, targetRangeDeletionsQuery, [&](const RangeDeletionTask& newTask) {
+            auto task = tasks.at(foundTasks++);
+            ASSERT_EQ(newTask.getNss(), kToNss);
+            ASSERT_EQ(newTask.getCollectionUuid(), task.getCollectionUuid());
+            ASSERT_EQ(newTask.getDonorShardId(), task.getDonorShardId());
+            ASSERT(SimpleBSONObjComparator::kInstance.evaluate(newTask.getRange().toBSON() ==
+                                                               task.getRange().toBSON()));
+            ASSERT(newTask.getWhenToClean() == task.getWhenToClean());
+            return true;
+        });
     ASSERT_EQ(foundTasks, numTasks);
 
     // Make sure no garbage is left in intermediate collection
@@ -975,6 +319,11 @@ TEST_F(RenameRangeDeletionsTest, BasicRenameRangeDeletionsTest) {
  *  Same as BasicRenameRangeDeletionsTest, but also tests idempotency of single utility functions
  */
 TEST_F(RenameRangeDeletionsTest, IdempotentRenameRangeDeletionsTest) {
+    PseudoRandom random(SecureRandom().nextInt64());
+    auto generateRandomNumberFrom1To10 = [&random]() {
+        return random.nextInt32(9) + 1;
+    };
+
     const auto numTasks = 10;
     std::vector<RangeDeletionTask> tasks;
 
@@ -991,30 +340,36 @@ TEST_F(RenameRangeDeletionsTest, IdempotentRenameRangeDeletionsTest) {
     }
 
     // Rename range deletions, repeating idempotent steps several times
-    const auto kMaxRepeat = 10;
-    for (int i = 0; i < rand() % kMaxRepeat; i++) {
-        snapshotRangeDeletionsForRename(_opCtx, kNss, kToNss);
+    auto randomLoopNTimes = generateRandomNumberFrom1To10();
+    for (int i = 0; i < randomLoopNTimes; i++) {
+        rangedeletionutil::snapshotRangeDeletionsForRename(_opCtx, kNss, kToNss);
     }
-    for (int i = 0; i < rand() % kMaxRepeat; i++) {
-        restoreRangeDeletionTasksForRename(_opCtx, kToNss);
+    randomLoopNTimes = generateRandomNumberFrom1To10();
+    for (int i = 0; i < randomLoopNTimes; i++) {
+        rangedeletionutil::restoreRangeDeletionTasksForRename(_opCtx, kToNss);
     }
-    for (int i = 0; i < rand() % kMaxRepeat; i++) {
-        deleteRangeDeletionTasksForRename(_opCtx, kNss, kToNss);
+    randomLoopNTimes = generateRandomNumberFrom1To10();
+    for (int i = 0; i < randomLoopNTimes; i++) {
+        rangedeletionutil::deleteRangeDeletionTasksForRename(_opCtx, kNss, kToNss);
     }
 
-    // Make sure just range deletions for the TO collection are found
-    ASSERT_EQ(10, rangeDeletionsStore.count(_opCtx));
+    const auto targetRangeDeletionsQuery =
+        BSON(RangeDeletionTask::kNssFieldName << kToNss.ns_forTest());
+
+    // Make sure range deletions for the TO collection are found
+    ASSERT_EQ(10, rangeDeletionsStore.count(_opCtx, targetRangeDeletionsQuery));
     int foundTasks = 0;
-    rangeDeletionsStore.forEach(_opCtx, BSONObj(), [&](const RangeDeletionTask& newTask) {
-        auto task = tasks.at(foundTasks++);
-        ASSERT_EQ(newTask.getNss(), kToNss);
-        ASSERT_EQ(newTask.getCollectionUuid(), task.getCollectionUuid());
-        ASSERT_EQ(newTask.getDonorShardId(), task.getDonorShardId());
-        ASSERT(SimpleBSONObjComparator::kInstance.evaluate(newTask.getRange().toBSON() ==
-                                                           task.getRange().toBSON()));
-        ASSERT(newTask.getWhenToClean() == task.getWhenToClean());
-        return true;
-    });
+    rangeDeletionsStore.forEach(
+        _opCtx, targetRangeDeletionsQuery, [&](const RangeDeletionTask& newTask) {
+            auto task = tasks.at(foundTasks++);
+            ASSERT_EQ(newTask.getNss(), kToNss);
+            ASSERT_EQ(newTask.getCollectionUuid(), task.getCollectionUuid());
+            ASSERT_EQ(newTask.getDonorShardId(), task.getDonorShardId());
+            ASSERT(SimpleBSONObjComparator::kInstance.evaluate(newTask.getRange().toBSON() ==
+                                                               task.getRange().toBSON()));
+            ASSERT(newTask.getWhenToClean() == task.getWhenToClean());
+            return true;
+        });
     ASSERT_EQ(foundTasks, numTasks);
 
     // Make sure no garbage is left in intermediate collection
@@ -1023,52 +378,275 @@ TEST_F(RenameRangeDeletionsTest, IdempotentRenameRangeDeletionsTest) {
     ASSERT_EQ(0, forRenameStore.count(_opCtx, BSONObj()));
 }
 
-TEST_F(RangeDeleterTest,
-       setOrphanCountersOnRangeDeletionTasksUpdatesTaskWithExpectedNumberOfOrphans) {
-    const auto numOrphansInRange = 5;
-    setFilteringMetadataWithUUID(uuid());
+// Test that rangedeletionutil::overlappingRangeDeletionsQuery() can handle the cases that we expect
+// to encounter.
+//           1    1    2    2    3    3    4    4    5
+// 0----5----0----5----0----5----0----5----0----5----0
+//                          |---------O                Range 1 [25, 35)
+//      |---------O                                    Range 2 [5, 15)
+//           |---------O                               Range 4 [10, 20)
+// |----O                                              Range 5 [0, 5)
+//             |-----O                                 Range 7 [12, 18)
+//                               |---------O           Range 8 [30, 40)
+// Ranges in store
+// |---------O                                         [0, 10)
+//           |---------O                               [10, 20)
+//                                         |---------O [40 50)
+//           1    1    2    2    3    3    4    4    5
+// 0----5----0----5----0----5----0----5----0----5----0
+TEST_F(RenameRangeDeletionsTest, overlappingRangeDeletionsQueryWithIntegerShardKey) {
+    auto opCtx = operationContext();
+    const auto uuid = UUID::gen();
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
 
-    DBDirectClient dbClient(_opCtx);
-    const ChunkRange orphansRange(BSON(kShardKey << 0), BSON(kShardKey << numOrphansInRange));
-    auto t = insertRangeDeletionTask(_opCtx, uuid(), orphansRange);
-    for (auto i = 0; i < numOrphansInRange; ++i) {
-        dbClient.insert(kNss.toString(), BSON(kShardKey << i));  // orphaned documents
-        dbClient.insert(kNss.toString(), BSON(kShardKey << -i));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("one"), uuid, 0, 10));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("two"), uuid, 10, 20));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("three"), uuid, 40, 50));
+
+    ASSERT_EQ(store.count(opCtx), 3);
+
+    // 1. Non-overlapping range
+    auto range1 = ChunkRange{BSON("_id" << 25), BSON("_id" << 35)};
+    auto results =
+        store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range1, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(rangedeletionutil::checkForConflictingDeletions(opCtx, range1, uuid));
+
+    // 2, 3. Find overlapping ranges, either direction.
+    auto range2 = ChunkRange{BSON("_id" << 5), BSON("_id" << 15)};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range2, uuid));
+    ASSERT_EQ(results, 2);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range2, uuid));
+
+    // 4. Identical range
+    auto range4 = ChunkRange{BSON("_id" << 10), BSON("_id" << 20)};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range4, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range4, uuid));
+
+    // 5, 6. Find overlapping edge, either direction.
+    auto range5 = ChunkRange{BSON("_id" << 0), BSON("_id" << 5)};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range5, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range5, uuid));
+    auto range6 = ChunkRange{BSON("_id" << 5), BSON("_id" << 10)};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range6, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range6, uuid));
+
+    // 7. Find fully enclosed range
+    auto range7 = ChunkRange{BSON("_id" << 12), BSON("_id" << 18)};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range7, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range7, uuid));
+
+    // 8, 9. Open max doesn't overlap closed min, either direction.
+    auto range8 = ChunkRange{BSON("_id" << 30), BSON("_id" << 40)};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range8, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(rangedeletionutil::checkForConflictingDeletions(opCtx, range8, uuid));
+    auto range9 = ChunkRange{BSON("_id" << 20), BSON("_id" << 30)};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range9, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(rangedeletionutil::checkForConflictingDeletions(opCtx, range9, uuid));
+}
+
+TEST_F(RenameRangeDeletionsTest,
+       overlappingRangeDeletionsQueryWithCompoundShardKeyWhereFirstValueIsConstant) {
+    auto opCtx = operationContext();
+    const auto uuid = UUID::gen();
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+
+    auto deletionTasks = {
+        createDeletionTask(opCtx,
+                           NamespaceString::createNamespaceString_forTest("one"),
+                           uuid,
+                           BSON("a" << 0 << "b" << 0),
+                           BSON("a" << 0 << "b" << 10)),
+        createDeletionTask(opCtx,
+                           NamespaceString::createNamespaceString_forTest("two"),
+                           uuid,
+                           BSON("a" << 0 << "b" << 10),
+                           BSON("a" << 0 << "b" << 20)),
+        createDeletionTask(opCtx,
+                           NamespaceString::createNamespaceString_forTest("one"),
+                           uuid,
+                           BSON("a" << 0 << "b" << 40),
+                           BSON("a" << 0 << "b" << 50)),
+    };
+
+    for (auto&& task : deletionTasks) {
+        store.add(opCtx, task);
     }
 
-    setOrphanCountersOnRangeDeletionTasks(_opCtx);
+    ASSERT_EQ(store.count(opCtx), 3);
 
+    // 1. Non-overlapping range
+    auto range1 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 25)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 35))};
+    auto results =
+        store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range1, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(rangedeletionutil::checkForConflictingDeletions(opCtx, range1, uuid));
+
+    // 2, 3. Find overlapping ranges, either direction.
+    auto range2 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 5)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 15))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range2, uuid));
+    ASSERT_EQ(results, 2);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range2, uuid));
+
+    // 4. Identical range
+    auto range4 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 10)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 20))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range4, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range4, uuid));
+
+    // 5, 6. Find overlapping edge, either direction.
+    auto range5 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 5))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range5, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range5, uuid));
+    auto range6 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 5)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 10))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range6, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range6, uuid));
+
+    // 7. Find fully enclosed range
+    auto range7 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 12)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 18))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range7, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range7, uuid));
+
+    // 8, 9. Open max doesn't overlap closed min, either direction.
+    auto range8 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 30)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 40))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range8, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(rangedeletionutil::checkForConflictingDeletions(opCtx, range8, uuid));
+    auto range9 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 20)),
+                             BSON("_id" << BSON("a" << 0 << "b" << 30))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range9, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(rangedeletionutil::checkForConflictingDeletions(opCtx, range9, uuid));
+}
+
+TEST_F(RenameRangeDeletionsTest,
+       overlappingRangeDeletionsQueryWithCompoundShardKeyWhereSecondValueIsConstant) {
+    auto opCtx = operationContext();
+    const auto uuid = UUID::gen();
     PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-    ASSERT_EQ(
-        store.count(_opCtx, BSON(RangeDeletionTask::kNumOrphanDocsFieldName << numOrphansInRange)),
-        1);
+
+    auto deletionTasks = {
+        createDeletionTask(opCtx,
+                           NamespaceString::createNamespaceString_forTest("one"),
+                           uuid,
+                           BSON("a" << 0 << "b" << 0),
+                           BSON("a" << 10 << "b" << 0)),
+        createDeletionTask(opCtx,
+                           NamespaceString::createNamespaceString_forTest("two"),
+                           uuid,
+                           BSON("a" << 10 << "b" << 0),
+                           BSON("a" << 20 << "b" << 0)),
+        createDeletionTask(opCtx,
+                           NamespaceString::createNamespaceString_forTest("one"),
+                           uuid,
+                           BSON("a" << 40 << "b" << 0),
+                           BSON("a" << 50 << "b" << 0)),
+    };
+
+    for (auto&& task : deletionTasks) {
+        store.add(opCtx, task);
+    }
+
+    ASSERT_EQ(store.count(opCtx), 3);
+
+    // 1. Non-overlapping range
+    auto range1 = ChunkRange{BSON("_id" << BSON("a" << 25 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 35 << "b" << 0))};
+    auto results =
+        store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range1, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(rangedeletionutil::checkForConflictingDeletions(opCtx, range1, uuid));
+
+    // 2, 3. Find overlapping ranges, either direction.
+    auto range2 = ChunkRange{BSON("_id" << BSON("a" << 5 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 15 << "b" << 0))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range2, uuid));
+    ASSERT_EQ(results, 2);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range2, uuid));
+
+    // 4. Identical range
+    auto range4 = ChunkRange{BSON("_id" << BSON("a" << 10 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 20 << "b" << 0))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range4, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range4, uuid));
+
+    // 5, 6. Find overlapping edge, either direction.
+    auto range5 = ChunkRange{BSON("_id" << BSON("a" << 0 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 5 << "b" << 0))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range5, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range5, uuid));
+    auto range6 = ChunkRange{BSON("_id" << BSON("a" << 5 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 10 << "b" << 0))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range6, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range6, uuid));
+
+    // 7. Find fully enclosed range
+    auto range7 = ChunkRange{BSON("_id" << BSON("a" << 12 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 18 << "b" << 0))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range7, uuid));
+    ASSERT_EQ(results, 1);
+    ASSERT(rangedeletionutil::checkForConflictingDeletions(opCtx, range7, uuid));
+
+    // 8, 9. Open max doesn't overlap closed min, either direction.
+    auto range8 = ChunkRange{BSON("_id" << BSON("a" << 30 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 40 << "b" << 0))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range8, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(rangedeletionutil::checkForConflictingDeletions(opCtx, range8, uuid));
+    auto range9 = ChunkRange{BSON("_id" << BSON("a" << 20 << "b" << 0)),
+                             BSON("_id" << BSON("a" << 30 << "b" << 0))};
+    results = store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range9, uuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(rangedeletionutil::checkForConflictingDeletions(opCtx, range9, uuid));
 }
 
-TEST_F(RangeDeleterTest, setOrphanCountersOnRangeDeletionTasksAddsZeroValueWhenNamespaceNotFound) {
-    NamespaceString unexistentCollection("foo", "iDontExist");
-    auto collUuid = UUID::gen();
-    DBDirectClient dbClient(_opCtx);
-    const ChunkRange orphansRange(BSON(kShardKey << 0), BSON(kShardKey << 20));
-    auto t = insertRangeDeletionTask(_opCtx, unexistentCollection, collUuid, orphansRange, 3);
-
-    setOrphanCountersOnRangeDeletionTasks(_opCtx);
-
+TEST_F(RenameRangeDeletionsTest, TestInvalidUUID) {
+    auto opCtx = operationContext();
+    const auto uuid = UUID::gen();
     PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-    ASSERT_EQ(store.count(_opCtx, BSON(RangeDeletionTask::kNumOrphanDocsFieldName << 0)), 1);
+
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("one"), uuid, 0, 10));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("two"), uuid, 10, 20));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("three"), uuid, 40, 50));
+
+    ASSERT_EQ(store.count(opCtx), 3);
+
+    const auto wrongUuid = UUID::gen();
+    auto range = ChunkRange{BSON("_id" << 5), BSON("_id" << 15)};
+    auto results =
+        store.count(opCtx, rangedeletionutil::overlappingRangeDeletionsQuery(range, wrongUuid));
+    ASSERT_EQ(results, 0);
+    ASSERT_FALSE(rangedeletionutil::checkForConflictingDeletions(opCtx, range, wrongUuid));
 }
-
-TEST_F(RangeDeleterTest, clearOrphanCountersFromRangeDeletionTasksRemovesFieldFromAllDocs) {
-    DBDirectClient dbClient(_opCtx);
-    const ChunkRange orphansRange(BSON(kShardKey << 0), BSON(kShardKey << 20));
-    auto t1 = insertRangeDeletionTask(_opCtx, uuid(), orphansRange, 3);
-
-    clearOrphanCountersFromRangeDeletionTasks(_opCtx);
-
-    auto cursor = dbClient.find(FindCommandRequest(NamespaceString::kRangeDeletionNamespace));
-    ASSERT_TRUE(cursor->more());
-    ASSERT_FALSE(cursor->next().hasField(RangeDeletionTask::kNumOrphanDocsFieldName));
-    ASSERT_FALSE(cursor->more());
-}
-
-}  // namespace
 }  // namespace mongo

@@ -27,18 +27,48 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/index_scan.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/index_bounds.h"
+#include "mongo/db/query/interval.h"
+#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
+namespace mongo {
 namespace QueryStageIxscan {
 namespace {
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
@@ -48,9 +78,9 @@ class IndexScanTest {
 public:
     IndexScanTest()
         : _dbLock(&_opCtx, nss().dbName(), MODE_X),
-          _ctx(&_opCtx, ns()),
+          _ctx(&_opCtx, nss()),
           _coll(nullptr),
-          _expCtx(make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss())) {}
+          _expCtx(ExpressionContextBuilder{}.opCtx(&_opCtx).ns(nss()).build()) {}
 
     virtual ~IndexScanTest() {}
 
@@ -59,7 +89,7 @@ public:
 
         _ctx.db()->dropCollection(&_opCtx, nss()).transitional_ignore();
         _coll = _ctx.db()->createCollection(&_opCtx, nss());
-        _collPtr = _coll;
+        _collPtr = CollectionPtr(_coll);
 
         ASSERT_OK(_coll->getIndexCatalog()->createIndexOnEmptyCollection(
             &_opCtx,
@@ -73,7 +103,8 @@ public:
     void insert(const BSONObj& doc) {
         WriteUnitOfWork wunit(&_opCtx);
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(_coll->insertDocument(&_opCtx, InsertStatement(doc), nullOpDebug, false));
+        ASSERT_OK(collection_internal::insertDocument(
+            &_opCtx, CollectionPtr(_coll), InsertStatement(doc), nullOpDebug, false));
         wunit.commit();
     }
 
@@ -91,6 +122,19 @@ public:
         }
 
         return _ws.get(out);
+    }
+
+    /**
+     * Works 'ixscan' until the scan ends. Asserts that no new results will be found.
+     */
+    void assertNoNextResult(IndexScan* ixscan) {
+        WorkingSetID out;
+
+        PlanStage::StageState state = PlanStage::NEED_TIME;
+        while (PlanStage::IS_EOF != state) {
+            state = ixscan->work(&out);
+            ASSERT_NE(PlanStage::ADVANCED, state);
+        }
     }
 
 
@@ -111,14 +155,16 @@ public:
 
         // This child stage gets owned and freed by the caller.
         MatchExpression* filter = nullptr;
-        return new IndexScan(_expCtx.get(), _collPtr, params, &_ws, filter);
+        return new IndexScan(_expCtx.get(), &_collPtr, params, &_ws, filter);
     }
 
     IndexScan* createIndexScan(BSONObj startKey,
                                BSONObj endKey,
                                bool startInclusive,
                                bool endInclusive,
-                               int direction = 1) {
+                               int direction = 1,
+                               bool dedup = false,
+                               MatchExpression* filter = nullptr) {
         IndexCatalog* catalog = _coll->getIndexCatalog();
         std::vector<const IndexDescriptor*> indexes;
         catalog->findIndexesByKeyPattern(
@@ -127,6 +173,7 @@ public:
 
         IndexScanParams params(&_opCtx, _collPtr, indexes[0]);
         params.direction = direction;
+        params.shouldDedup = dedup;
 
         OrderedIntervalList oil("x");
         BSONObjBuilder bob;
@@ -135,15 +182,14 @@ public:
         oil.intervals.push_back(Interval(bob.obj(), startInclusive, endInclusive));
         params.bounds.fields.push_back(oil);
 
-        MatchExpression* filter = nullptr;
-        return new IndexScan(_expCtx.get(), _coll, params, &_ws, filter);
+        return new IndexScan(_expCtx.get(), &_collPtr, params, &_ws, filter);
     }
 
     static const char* ns() {
         return "unittest.QueryStageIxscan";
     }
     static NamespaceString nss() {
-        return NamespaceString(ns());
+        return NamespaceString::createNamespaceString_forTest(ns());
     }
 
 protected:
@@ -319,19 +365,72 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+// SERVER-29667
+class QueryStageIxscanMultikeyFilter : public IndexScanTest {
+public:
+    void run() {
+        setup();
+
+        // Insert some documents where 'x' is an array.
+        insert(fromjson("{_id: 1, x: [2, 1, 3]}"));
+        insert(fromjson("{_id: 2, x: [3, -1, 5]}"));
+        insert(fromjson("{_id: 3, x: [6, 5, 4]}"));
+        insert(fromjson("{_id: 4, x: [2, 4, 6]}"));
+        insert(fromjson("{_id: 5, x: [3, 3, 6]}"));
+        insert(fromjson("{_id: 6, x: [7, 5, 8]}"));
+
+        // Scan the index across the range [1, 7] for even keys.
+        BSONObj bsonObj = BSON("x" << BSON("$mod" << BSON_ARRAY(2 << 0)));
+        StatusWithMatchExpression swMatch = MatchExpressionParser::parse(bsonObj, _expCtx.get());
+        ASSERT_OK(swMatch.getStatus());
+        auto filter = std::move(swMatch.getValue());
+        std::unique_ptr<IndexScan> ixscan(
+            createIndexScan(BSON("x" << 1), BSON("x" << 7), true, true, 1, true, filter.get()));
+
+        // Expect to get records with ids 1, 4, 3, 5, in that order.
+        WorkingSetMember* member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_EQ(member->recordId, RecordId{1});
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 2));
+        member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_EQ(member->recordId, RecordId{4});
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 2));
+        member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_EQ(member->recordId, RecordId{3});
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 4));
+        member = getNext(ixscan.get());
+        ASSERT_EQ(WorkingSetMember::RID_AND_IDX, member->getState());
+        ASSERT_EQ(member->recordId, RecordId{5});
+        ASSERT_BSONOBJ_EQ(member->keyData[0].keyData, BSON("" << 6));
+        assertNoNextResult(ixscan.get());
+
+        // Verify that 15 values were tested and 5 duplicates were dropped.
+        const IndexScanStats* stats =
+            static_cast<const IndexScanStats*>(ixscan->getSpecificStats());
+        ASSERT(stats);
+        ASSERT_TRUE(stats->isMultiKey);
+        ASSERT_EQ(stats->dupsDropped, 5);
+        ASSERT_EQ(stats->dupsTested, 15);
+    }
+};
+
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("query_stage_ixscan") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<QueryStageIxscanInitializeStats>();
         add<QueryStageIxscanInsertDuringSave>();
         add<QueryStageIxscanInsertDuringSaveExclusive>();
         add<QueryStageIxscanInsertDuringSaveExclusive2>();
         add<QueryStageIxscanInsertDuringSaveReverse>();
+        add<QueryStageIxscanMultikeyFilter>();
     }
 };
 
-OldStyleSuiteInitializer<All> aueryStageIxscanAll;
+unittest::OldStyleSuiteInitializer<All> aueryStageIxscanAll;
 
 }  // namespace QueryStageIxscan
+}  // namespace mongo

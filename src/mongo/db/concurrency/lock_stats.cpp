@@ -27,18 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/concurrency/lock_stats.h"
+#include <memory>
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/concurrency/lock_stats.h"
+#include "mongo/db/stats/counter_ops.h"
 
 namespace mongo {
-
-template <typename CounterType>
-LockStats<CounterType>::LockStats() {
-    reset();
-}
 
 template <typename CounterType>
 void LockStats<CounterType>::report(BSONObjBuilder* builder) const {
@@ -70,7 +65,7 @@ void LockStats<CounterType>::_report(BSONObjBuilder* builder,
     {
         std::unique_ptr<BSONObjBuilder> numAcquires;
         for (int mode = 1; mode < LockModesCount; mode++) {
-            long long value = CounterOps::get(stat.modeStats[mode].numAcquisitions);
+            long long value = counter_ops::get(stat.modeStats[mode].numAcquisitions);
 
             if (value > 0) {
                 if (!numAcquires) {
@@ -89,7 +84,7 @@ void LockStats<CounterType>::_report(BSONObjBuilder* builder,
     {
         std::unique_ptr<BSONObjBuilder> numWaits;
         for (int mode = 1; mode < LockModesCount; mode++) {
-            long long value = CounterOps::get(stat.modeStats[mode].numWaits);
+            long long value = counter_ops::get(stat.modeStats[mode].numWaits);
             if (value > 0) {
                 if (!numWaits) {
                     if (!section) {
@@ -107,7 +102,7 @@ void LockStats<CounterType>::_report(BSONObjBuilder* builder,
     {
         std::unique_ptr<BSONObjBuilder> timeAcquiring;
         for (int mode = 1; mode < LockModesCount; mode++) {
-            long long value = CounterOps::get(stat.modeStats[mode].combinedWaitTimeMicros);
+            long long value = counter_ops::get(stat.modeStats[mode].combinedWaitTimeMicros);
             if (value > 0) {
                 if (!timeAcquiring) {
                     if (!section) {
@@ -142,6 +137,31 @@ void LockStats<CounterType>::reset() {
     }
 }
 
+template <typename CounterType>
+int64_t LockStats<CounterType>::getCumulativeWaitTimeMicros() const {
+    int64_t totalWaitTime = 0;
+    for (uint8_t i = 0; i < static_cast<uint8_t>(ResourceGlobalId::kNumIds); ++i) {
+        totalWaitTime += _getWaitTime(_resourceGlobalStats[i]);
+    }
+
+    // Index starting from offset 2 because position 0 is a sentinel value for invalid resource/no
+    // lock, and position 1 is the global resource which was already accounted for above.
+    for (int i = RESOURCE_GLOBAL + 1; i < ResourceTypesCount; i++) {
+        totalWaitTime += _getWaitTime(_stats[i]);
+    }
+
+    totalWaitTime += _getWaitTime(_oplogStats);
+    return totalWaitTime;
+}
+
+template <typename CounterType>
+int64_t LockStats<CounterType>::_getWaitTime(const PerModeLockStatCounters& stat) const {
+    int64_t timeAcquiringLocks = 0;
+    for (int mode = 1; mode < LockModesCount; mode++) {
+        timeAcquiringLocks += counter_ops::get(stat.modeStats[mode].combinedWaitTimeMicros);
+    }
+    return timeAcquiringLocks;
+}
 
 // Ensures that there are instances compiled for LockStats for AtomicWord<long long> and int64_t
 template class LockStats<int64_t>;

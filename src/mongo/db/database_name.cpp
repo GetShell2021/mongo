@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2022-present MongoDB, Inc.
+ *    Copyright (C) 2024-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#include "mongo/db/database_name.h"
+
+#include "database_name.h"
+
+#include <boost/container_hash/hash.hpp>
 
 namespace mongo {
-
-DatabaseName DatabaseName::createSystemTenantDbName(StringData dbString) {
-    // TODO SERVER-62491 Use kSystemTenantId
-    return DatabaseName(boost::none, dbString);
+size_t hash_value(const DatabaseName& dbn) {
+    return boost::hash<std::string_view>{}(
+        std::string_view{dbn.view().substr(0, dbn.sizeWithTenant() + DatabaseName::kDataOffset)});
 }
-
 }  // namespace mongo

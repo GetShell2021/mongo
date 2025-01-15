@@ -29,10 +29,13 @@
 
 #pragma once
 
-#include "mongo/platform/basic.h"
+#include <string>
 
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/service_context.h"
+#include "mongo/platform/basic.h"
 
 namespace mongo {
 
@@ -47,69 +50,29 @@ class ClusterServerParameterInitializer
 
 public:
     ClusterServerParameterInitializer() = default;
-    ~ClusterServerParameterInitializer() = default;
+    ~ClusterServerParameterInitializer() override = default;
 
     static ClusterServerParameterInitializer* get(OperationContext* opCtx);
     static ClusterServerParameterInitializer* get(ServiceContext* serviceContext);
 
-    void updateParameter(OperationContext* opCtx, BSONObj doc, StringData mode);
-    void clearParameter(OperationContext* opCtx, ServerParameter* sp);
-    void clearParameter(OperationContext* opCtx, StringData id);
-    void clearAllParameters(OperationContext* opCtx);
-
-    /**
-     * Used to initialize in-memory cluster parameter state based on the on-disk contents after
-     * startup recovery or initial sync is complete.
-     */
-    void initializeAllParametersFromDisk(OperationContext* opCtx);
-
-    /**
-     * Used on rollback and rename with drop.
-     * Updates settings which are present and clears settings which are not.
-     */
-    void resynchronizeAllParametersFromDisk(OperationContext* opCtx);
-
     // Virtual methods coming from the ReplicaSetAwareService
-    void onStartup(OperationContext* opCtx) override final {}
+    void onStartup(OperationContext* opCtx) final {}
 
+    void onSetCurrentConfig(OperationContext* opCtx) final {}
+
+    static void synchronizeAllParametersFromDisk(OperationContext* opCtx);
     /**
      * Called after startup recovery or initial sync is complete.
      */
-    void onInitialDataAvailable(OperationContext* opCtx,
-                                bool isMajorityDataAvailable) override final;
-    void onShutdown() override final {}
-    void onStepUpBegin(OperationContext* opCtx, long long term) override final {}
-    void onStepUpComplete(OperationContext* opCtx, long long term) override final {}
-    void onStepDown() override final {}
-    void onBecomeArbiter() override final {}
-
-private:
-    template <typename OnEntry>
-    void doLoadAllParametersFromDisk(OperationContext* opCtx,
-                                     StringData mode,
-                                     OnEntry onEntry) try {
-        std::vector<Status> failures;
-
-        DBDirectClient client(opCtx);
-        FindCommandRequest findRequest{NamespaceString::kClusterParametersNamespace};
-        client.find(std::move(findRequest), [&](BSONObj doc) {
-            try {
-                onEntry(opCtx, doc, mode);
-            } catch (const DBException& ex) {
-                failures.push_back(ex.toStatus());
-            }
-        });
-        if (!failures.empty()) {
-            StringBuilder msg;
-            for (const auto& failure : failures) {
-                msg << failure.toString() << ", ";
-            }
-            msg.reset(msg.len() - 2);
-            uasserted(ErrorCodes::OperationFailed, msg.str());
-        }
-    } catch (const DBException& ex) {
-        uassertStatusOK(ex.toStatus().withContext(
-            str::stream() << "Failed " << mode << " cluster server parameters from disk"));
+    void onConsistentDataAvailable(OperationContext* opCtx, bool isMajority, bool isRollback) final;
+    void onShutdown() final {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) final {}
+    void onStepUpComplete(OperationContext* opCtx, long long term) final {}
+    void onStepDown() final {}
+    void onRollbackBegin() final {}
+    void onBecomeArbiter() final {}
+    inline std::string getServiceName() const final {
+        return "ClusterServerParameterInitializer";
     }
 };
 

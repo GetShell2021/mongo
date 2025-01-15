@@ -28,19 +28,25 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
-#include "mongo/db/audit.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/cluster_server_parameter_cmds_gen.h"
 #include "mongo/db/commands/get_cluster_parameter_invocation.h"
-#include "mongo/idl/cluster_server_parameter_gen.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/service_context.h"
 #include "mongo/idl/cluster_server_parameter_refresher.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -72,17 +78,24 @@ public:
 
         Reply typedRun(OperationContext* opCtx) {
             GetClusterParameterInvocation invocation;
-            if (gFeatureFlagClusterWideConfigM2.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
+
+            if (serverGlobalParams.clusterRole.hasExclusively(ClusterRole::RouterServer)) {
                 // Refresh cached cluster server parameters via a majority read from the config
                 // servers.
                 uassertStatusOK(
                     ClusterServerParameterRefresher::get(opCtx)->refreshParameters(opCtx));
-
-                return invocation.getCachedParameters(opCtx, request());
+            } else {
+                // If we're an embedded router, we don't have a separate cache of the parameters and
+                // refresh mechanism. We rely on the co-process shard-role to update our in-memory
+                // parameters. Double check that we have the router-role if we're running this
+                // router command.
+                bool isEmbeddedRouter =
+                    serverGlobalParams.clusterRole.has(ClusterRole::RouterServer) &&
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer);
+                invariant(isEmbeddedRouter);
             }
 
-            return invocation.getDurableParameters(opCtx, request());
+            return invocation.getCachedParameters(opCtx, request());
         }
 
     private:
@@ -95,14 +108,16 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Not authorized to retrieve cluster parameters",
                     authzSession->isAuthorizedForPrivilege(Privilege{
-                        ResourcePattern::forClusterResource(), ActionType::getClusterParameter}));
+                        ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                        ActionType::getClusterParameter}));
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
-} getClusterParameterCmd;
+};
+MONGO_REGISTER_COMMAND(GetClusterParameterCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

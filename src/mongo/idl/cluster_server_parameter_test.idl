@@ -30,7 +30,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/idl/cluster_server_parameter.idl"
 
 structs:
@@ -57,3 +57,13 @@ server_parameters:
         description: "Cluster server parameter OpObserver test param"
         cpp_vartype: ClusterServerParameterTest
         cpp_varname: cspTestStorage
+        redact: false
+        omit_in_ftdc: false
+
+    cspTest2:
+        set_at: cluster
+        description: "Cluster server parameter OpObserver test param #2"
+        cpp_vartype: ClusterServerParameterTest
+        cpp_varname: cspTest2Storage
+        redact: false
+        omit_in_ftdc: false

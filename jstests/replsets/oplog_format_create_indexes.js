@@ -2,10 +2,8 @@
  * Tests that the index's full specification is included in the oplog entry corresponding to its
  * creation.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/index_catalog_helpers.js");
+import {IndexCatalogHelpers} from "jstests/libs/index_catalog_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
@@ -92,4 +90,3 @@ testOplogEntryContainsIndexInfoObj(
     testDB.oplog_format_collation, {withSimpleCollation: 1}, {collation: {locale: "simple"}});
 
 rst.stopSet();
-})();

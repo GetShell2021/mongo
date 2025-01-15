@@ -27,12 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/s/catalog/type_mongos.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/time_support.h"
 
 namespace {
@@ -188,7 +191,8 @@ TEST(Validity, Valid) {
                        << MongosType::mongoVersion("x.x.x") << MongosType::configVersion(0)
                        << MongosType::advisoryHostFQDNs(BSON_ARRAY("foo"
                                                                    << "bar"
-                                                                   << "baz")));
+                                                                   << "baz"))
+                       << MongosType::embeddedRouter(false));
 
     auto mongosTypeResult = MongosType::fromBSON(obj);
     ASSERT_OK(mongosTypeResult.getStatus());
@@ -206,6 +210,7 @@ TEST(Validity, Valid) {
     ASSERT_EQUALS(mType.getAdvisoryHostFQDNs()[0], "foo");
     ASSERT_EQUALS(mType.getAdvisoryHostFQDNs()[1], "bar");
     ASSERT_EQUALS(mType.getAdvisoryHostFQDNs()[2], "baz");
+    ASSERT_EQUALS(mType.isEmbeddedRouter(), false);
 }
 
 TEST(Validity, BadType) {

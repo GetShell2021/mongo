@@ -5,8 +5,11 @@
  *   requires_fcv_60,
  * ]
  */
-(function() {
-'use strict';
+
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
 
 const st = new ShardingTest({shards: 1});
 const mongos = st.s0;
@@ -104,4 +107,3 @@ assert.eq(res.expectedCollection, coll2.getName());
 assert.eq(res.actualCollection, coll.getName());
 
 st.stop();
-})();

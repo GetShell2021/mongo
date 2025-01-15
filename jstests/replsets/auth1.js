@@ -3,10 +3,8 @@
 // This test requires users to persist across a restart.
 // @tags: [requires_persistence, multiversion_incompatible]
 
-load("jstests/replsets/rslib.js");
-
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {wait} from "jstests/replsets/rslib.js";
 
 // Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
@@ -57,7 +55,7 @@ print("make sure user is written before shutting down");
 MongoRunner.stopMongod(m);
 
 print("start up rs");
-var rs = new ReplSetTest({"name": name, "nodes": 3});
+const rs = new ReplSetTest({"name": name, "nodes": 3});
 
 // The first node is started with the pre-populated data directory.
 print("start 0 with keyFile");
@@ -93,7 +91,7 @@ function doQueryOn(p) {
                                  r = p.getDB("test").foo.findOne();
                              }, [], "find did not throw, returned: " + tojson(r)).toString();
     printjson(error);
-    assert.gt(error.indexOf("command find requires authentication"), -1, "error was non-auth");
+    assert.gt(error.indexOf("Command find requires authentication"), -1, "error was non-auth");
 }
 
 doQueryOn(secondary);
@@ -222,4 +220,3 @@ assert.soon(function() {
 });
 MongoRunner.stopMongod(conn);
 rs.stopSet();
-})();

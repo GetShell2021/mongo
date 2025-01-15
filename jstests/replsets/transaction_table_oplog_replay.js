@@ -1,10 +1,8 @@
 /**
  * Tests that the transaction table is properly updated on secondaries through oplog replay.
  */
-(function() {
-"use strict";
-
-load("jstests/libs/retryable_writes_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {RetryableWritesUtil} from "jstests/libs/retryable_writes_util.js";
 
 /**
  * Runs each command on the primary, awaits replication then asserts the secondary's transaction
@@ -14,6 +12,8 @@ load("jstests/libs/retryable_writes_util.js");
 function runCommandsWithDifferentIds(primary, secondary, cmds) {
     // Disable oplog application to ensure the oplog entries come in the same batch.
     secondary.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "alwaysOn"});
+    checkLog.contains(secondary,
+                      "rsSyncApplyStop fail point enabled. Blocking until fail point is disabled");
 
     let responseTimestamps = [];
     cmds.forEach(function(cmd) {
@@ -46,6 +46,8 @@ function runCommandsWithDifferentIds(primary, secondary, cmds) {
 function runCommandsWithSameId(primary, secondary, cmds) {
     // Disable oplog application to ensure the oplog entries come in the same batch.
     secondary.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "alwaysOn"});
+    checkLog.contains(secondary,
+                      "rsSyncApplyStop fail point enabled. Blocking until fail point is disabled");
 
     let latestOpTimeTs = Timestamp();
     let highestTxnNumber = NumberLong(-1);
@@ -201,4 +203,3 @@ deleteCommands = deleteCommands.map(function(cmd) {
 runCommandsWithSameId(primary, secondary, deleteCommands);
 
 replTest.stopSet();
-})();

@@ -7,10 +7,8 @@
 //   uses_transactions,
 // ]
 
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 function expectChunks(st, ns, chunks) {
     for (let i = 0; i < chunks.length; i++) {
@@ -83,7 +81,7 @@ function runTest(testCase, ns, collName, moveChunkToFunc, moveChunkBack, hashed,
     // a migration takes long enough.
     const expectedCodes = [ErrorCodes.SnapshotTooOld, ErrorCodes.StaleChunkHistory];
 
-    if (testCaseName === "insert") {
+    if (testCaseName === "insert" || testCaseName.startsWith("insert_")) {
         // Insert always inserts a new document, so the only typical error is MigrationConflict.
         expectedCodes.push(ErrorCodes.MigrationConflict);
         assert.commandFailedWithCode(res, expectedCodes, errMsg);
@@ -103,7 +101,7 @@ function runTest(testCase, ns, collName, moveChunkToFunc, moveChunkBack, hashed,
         }
         assert.commandFailedWithCode(res, expectedCodes, errMsg);
     }
-    assert.eq(res.errorLabels, ["TransientTransactionError"]);
+    assert.eq(res.errorLabels, ["TransientTransactionError"], tojson(res));
 
     // The commit should fail because the earlier write failed.
     assert.commandFailedWithCode(session.commitTransaction_forTesting(),
@@ -121,6 +119,9 @@ function runTest(testCase, ns, collName, moveChunkToFunc, moveChunkBack, hashed,
 const dbName = "test";
 
 const st = new ShardingTest({shards: 3, mongos: 1, config: 1});
+
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 var fixtures = [
     {collName: "not_hashed", shardKey: "_id", docs: [{_id: -3}, {_id: 11}, {_id: 3}]},
@@ -143,9 +144,6 @@ fixtures.forEach(function(fixture) {
         fixture.docs[0], {writeConcern: {w: "majority"}}));
     assert.commandWorked(st.s.getDB(dbName)[rangedCollName].insert(
         fixture.docs[1], {writeConcern: {w: "majority"}}));
-
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    st.ensurePrimaryShard(dbName, st.shard0.shardName);
 
     assert.commandWorked(st.s.getDB(dbName)[rangedCollName].createIndex({[fixture.shardKey]: 1}));
     assert.commandWorked(
@@ -235,6 +233,51 @@ const hashedNs = dbName + '.' + hashedCollName;
 
 assert.commandWorked(st.s.adminCommand({shardCollection: hashedNs, key: {_id: 'hashed'}}));
 
+// Make sure there are two chunks on each shard
+assert.commandWorked(
+    st.s.adminCommand({split: hashedNs, middle: {_id: NumberLong("-6148914691236517204")}}));
+assert.commandWorked(st.s.adminCommand({split: hashedNs, middle: {_id: NumberLong("0")}}));
+assert.commandWorked(
+    st.s.adminCommand({split: hashedNs, middle: {_id: NumberLong("6148914691236517204")}}));
+
+// Setup a predictable chunk distribution:
+assert.commandWorked(st.s.adminCommand({
+    moveChunk: hashedNs,
+    bounds: [{_id: MinKey}, {_id: NumberLong("-6148914691236517204")}],
+    to: st.shard0.shardName,
+    _waitForDelete: true
+}));
+assert.commandWorked(st.s.adminCommand({
+    moveChunk: hashedNs,
+    bounds: [{_id: NumberLong("-6148914691236517204")}, {_id: NumberLong("-3074457345618258602")}],
+    to: st.shard0.shardName,
+    _waitForDelete: true
+}));
+assert.commandWorked(st.s.adminCommand({
+    moveChunk: hashedNs,
+    bounds: [{_id: NumberLong("-3074457345618258602")}, {_id: NumberLong("0")}],
+    to: st.shard1.shardName,
+    _waitForDelete: true
+}));
+assert.commandWorked(st.s.adminCommand({
+    moveChunk: hashedNs,
+    bounds: [{_id: NumberLong("0")}, {_id: NumberLong("3074457345618258602")}],
+    to: st.shard1.shardName,
+    _waitForDelete: true
+}));
+assert.commandWorked(st.s.adminCommand({
+    moveChunk: hashedNs,
+    bounds: [{_id: NumberLong("3074457345618258602")}, {_id: NumberLong("6148914691236517204")}],
+    to: st.shard2.shardName,
+    _waitForDelete: true
+}));
+assert.commandWorked(st.s.adminCommand({
+    moveChunk: hashedNs,
+    bounds: [{_id: NumberLong("6148914691236517204")}, {_id: MaxKey}],
+    to: st.shard2.shardName,
+    _waitForDelete: true
+}));
+
 assert.commandWorked(
     st.s.getDB(dbName)[hashedCollName].insert({_id: -3}, {writeConcern: {w: "majority"}}));
 assert.commandWorked(
@@ -252,12 +295,22 @@ let moveHashed = function(toShard) {
 
 var hashedDocs = [{_id: -3}, {_id: 11}];
 
-// The command should target only the second chunk.
+// The "insert_into_multiple_chunks" test case depends on the first document targeting the chunk on
+// the second shard which isn't being moved.
+assert(bsonWoCompare(convertShardKeyToHashed(4), NumberLong("0")) >= 0 &&
+           bsonWoCompare(convertShardKeyToHashed(4), NumberLong("3074457345618258602")) < 0,
+       "expected {_id: 4} document to reside within unmoved chunk on shard1");
+
+// The command should target only the second shard.
 let commandTestCases = function(collName) {
     return [
         {
             name: "insert",
             command: {insert: collName, documents: [{_id: 3}]},
+        },
+        {
+            name: "insert_into_multiple_chunks",
+            command: {insert: collName, documents: [{_id: 4}, {_id: 3}]},
         },
         {
             name: "update_query",
@@ -300,4 +353,3 @@ commandTestCases(hashedCollName)
                                  hashedDocs));
 
 st.stop();
-})();

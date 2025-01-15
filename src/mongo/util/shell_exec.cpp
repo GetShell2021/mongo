@@ -27,23 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <system_error>
 
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/shell_exec.h"
-
-#include <memory>
 
 #ifdef _WIN32
 #include <processthreadsapi.h>
 #include <synchapi.h>
 #else
+#include <cstdio>
 #include <poll.h>
-#include <stdio.h>
 #endif
 
 #include "mongo/util/errno_util.h"
 #include "mongo/util/str.h"
-#include "mongo/util/text.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -288,7 +294,8 @@ private:
 }  // namespace mongo
 mongo::StatusWith<std::string> mongo::shellExec(const std::string& cmd,
                                                 Milliseconds timeout,
-                                                size_t maxlen) try {
+                                                size_t maxlen,
+                                                bool ignoreExitCode) try {
     if (durationCount<Milliseconds>(timeout) <= 0) {
         return {ErrorCodes::OperationFailed, str::stream() << "Invalid timeout: " << timeout};
     }
@@ -310,7 +317,7 @@ mongo::StatusWith<std::string> mongo::shellExec(const std::string& cmd,
     }
 
     auto exitcode = process.close();
-    if (exitcode) {
+    if (!ignoreExitCode && exitcode) {
         return {ErrorCodes::OperationFailed,
                 str::stream() << "Process returned non-zero exit code: " << exitcode};
     }

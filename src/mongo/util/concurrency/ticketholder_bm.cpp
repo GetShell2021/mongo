@@ -28,155 +28,137 @@
  */
 
 #include <benchmark/benchmark.h>
+// IWYU pragma: no_include "cxxabi.h"
+#include <map>
+#include <memory>
 
-#include <string>
-#include <vector>
-
-#include "mongo/db/concurrency/locker_noop_client_observer.h"
-#include "mongo/db/operation_context.h"
+#include "mongo/db/admission/execution_admission_context.h"
+#include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
+#include "mongo/stdx/condition_variable.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/admission_context.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/latency_distribution.h"
+#include "mongo/util/system_clock_source.h"
 #include "mongo/util/tick_source_mock.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 namespace {
 
-static int kTickets = 128;
-static int kThreadMin = 8;
+static int kTickets = 32;
+static int kThreadMin = 16;
 static int kThreadMax = 1024;
-static TicketHolder::WaitMode waitMode = TicketHolder::WaitMode::kUninterruptible;
 
-template <typename TicketHolderImpl>
 class TicketHolderFixture {
 public:
-    ServiceContext::UniqueServiceContext serviceContext;
     std::unique_ptr<TicketHolder> ticketHolder;
-    std::vector<ServiceContext::UniqueClient> clients;
-    std::vector<ServiceContext::UniqueOperationContext> opCtxs;
 
-
-    TicketHolderFixture(int threads) {
-        serviceContext = ServiceContext::make();
-        serviceContext->setTickSource(std::make_unique<TickSourceMock<Microseconds>>());
-        ticketHolder = std::make_unique<TicketHolderImpl>(kTickets, serviceContext.get());
-        serviceContext->registerClientObserver(std::make_unique<LockerNoopClientObserver>());
-        for (int i = 0; i < threads; ++i) {
-            clients.push_back(
-                serviceContext->makeClient(str::stream() << "test client for thread " << i));
-            opCtxs.push_back(clients[i]->makeOperationContext());
-        }
+    TicketHolderFixture(int threads, ServiceContext* serviceContext) {
+        ticketHolder = std::make_unique<TicketHolder>(serviceContext,
+                                                      kTickets,
+                                                      true /* track peakUsed */,
+                                                      TicketHolder::kDefaultMaxQueueDepth);
     }
 };
 
-template <class TicketHolderImpl>
-void BM_tryAcquire(benchmark::State& state) {
-    static std::unique_ptr<TicketHolderFixture<TicketHolderImpl>> p;
-    if (state.thread_index == 0) {
-        p = std::make_unique<TicketHolderFixture<TicketHolderImpl>>(state.threads);
-    }
-    double attempted = 0, acquired = 0;
-    for (auto _ : state) {
-        AdmissionContext admCtx;
-        auto ticket = p->ticketHolder->tryAcquire(&admCtx);
-        state.PauseTiming();
-        sleepmicros(1);
-        attempted++;
-        if (ticket) {
-            acquired++;
-        }
-        ticket.reset();
-        state.ResumeTiming();
-    }
-    state.counters["Attempted"] = attempted;
-    state.counters["Acquired"] = acquired;
-}
 
-BENCHMARK_TEMPLATE(BM_tryAcquire, SemaphoreTicketHolder)->ThreadRange(kThreadMin, kThreadMax);
+static stdx::mutex isReadyMutex;
+static stdx::condition_variable isReadyCv;
+static bool isReady = false;
 
-BENCHMARK_TEMPLATE(BM_tryAcquire, FifoTicketHolder)->ThreadRange(kThreadMin, kThreadMax);
-
-template <class TicketHolderImpl>
-void BM_acquire(benchmark::State& state) {
-    static std::unique_ptr<TicketHolderFixture<TicketHolderImpl>> p;
-    if (state.thread_index == 0) {
-        p = std::make_unique<TicketHolderFixture<TicketHolderImpl>>(state.threads);
-    }
-    double acquired = 0;
-    for (auto _ : state) {
-        AdmissionContext admCtx;
-        auto opCtx = p->opCtxs[state.thread_index].get();
-        {
-            auto ticket = p->ticketHolder->waitForTicket(opCtx, &admCtx, waitMode);
-            state.PauseTiming();
-            sleepmicros(1);
-        }
-        acquired++;
-        state.ResumeTiming();
-    }
-    state.counters["Acquired"] = benchmark::Counter(acquired, benchmark::Counter::kIsRate);
-    state.counters["AcquiredPerThread"] =
-        benchmark::Counter(acquired, benchmark::Counter::kAvgThreadsRate);
-}
-
-BENCHMARK_TEMPLATE(BM_acquire, SemaphoreTicketHolder)->ThreadRange(kThreadMin, kThreadMax);
-
-BENCHMARK_TEMPLATE(BM_acquire, FifoTicketHolder)->ThreadRange(kThreadMin, kThreadMax);
-
-template <class TicketHolderImpl>
-void BM_release(benchmark::State& state) {
-    static std::unique_ptr<TicketHolderFixture<TicketHolderImpl>> p;
-    if (state.thread_index == 0) {
-        p = std::make_unique<TicketHolderFixture<TicketHolderImpl>>(state.threads);
-    }
-    double acquired = 0;
-    for (auto _ : state) {
-        AdmissionContext admCtx;
-        auto opCtx = p->opCtxs[state.thread_index].get();
-        state.PauseTiming();
-        {
-            auto ticket = p->ticketHolder->waitForTicket(opCtx, &admCtx, waitMode);
-            sleepmicros(1);
-            state.ResumeTiming();
-        }
-        acquired++;
-    }
-    state.counters["Acquired"] = benchmark::Counter(acquired, benchmark::Counter::kIsRate);
-    state.counters["AcquiredPerThread"] =
-        benchmark::Counter(acquired, benchmark::Counter::kAvgThreadsRate);
-}
-
-BENCHMARK_TEMPLATE(BM_release, SemaphoreTicketHolder)->ThreadRange(kThreadMin, kThreadMax);
-
-BENCHMARK_TEMPLATE(BM_release, FifoTicketHolder)->ThreadRange(kThreadMin, kThreadMax);
-
-
-template <class TicketHolderImpl>
 void BM_acquireAndRelease(benchmark::State& state) {
-    static std::unique_ptr<TicketHolderFixture<TicketHolderImpl>> p;
-    if (state.thread_index == 0) {
-        p = std::make_unique<TicketHolderFixture<TicketHolderImpl>>(state.threads);
+    static std::unique_ptr<TicketHolderFixture> ticketHolder;
+    static ServiceContext::UniqueServiceContext serviceContext;
+    static constexpr auto resolution = Microseconds{100};
+    static LatencyPercentileDistribution resultingDistribution(resolution);
+    static int numRemainingToMerge;
+    {
+        stdx::unique_lock lk(isReadyMutex);
+        if (state.thread_index == 0) {
+            resultingDistribution = LatencyPercentileDistribution{resolution};
+            numRemainingToMerge = state.threads;
+            serviceContext = ServiceContext::make(std::make_unique<SystemClockSource>(),
+                                                  std::make_unique<SystemClockSource>(),
+                                                  std::make_unique<TickSourceMock<Microseconds>>());
+            ticketHolder =
+                std::make_unique<TicketHolderFixture>(state.threads, serviceContext.get());
+            isReady = true;
+            isReadyCv.notify_all();
+        } else {
+            isReadyCv.wait(lk, [&] { return isReady; });
+        }
     }
     double acquired = 0;
+
+    ServiceContext::UniqueClient client = serviceContext->getService()->makeClient(
+        str::stream() << "test client for thread " << state.thread_index);
+    ServiceContext::UniqueOperationContext opCtx = client->makeOperationContext();
+
+    TicketHolderFixture* fixture = ticketHolder.get();
+    // We build the latency distribution locally in order to avoid synchronizing with other threads.
+    // All of them will be merged at the end instead.
+    LatencyPercentileDistribution localDistribution{resolution};
+
     for (auto _ : state) {
-        AdmissionContext admCtx;
-        auto opCtx = p->opCtxs[state.thread_index].get();
+        Timer timer;
+        Microseconds timeForAcquire;
         {
-            auto ticket = p->ticketHolder->waitForTicket(opCtx, &admCtx, waitMode);
+            auto& admCtx = ExecutionAdmissionContext::get(opCtx.get());
+            auto ticket =
+                fixture->ticketHolder->waitForTicketUntil(opCtx.get(), &admCtx, Date_t::max());
+            timeForAcquire = timer.elapsed();
             state.PauseTiming();
             sleepmicros(1);
+            acquired++;
             state.ResumeTiming();
+            // We reset the timer here to ignore the time spent doing artificial sleeping for time
+            // spent doing acquire and release. Release will be performed as part of the ticket
+            // destructor.
+            timer.reset();
         }
-        acquired++;
+        localDistribution.addEntry(timeForAcquire + timer.elapsed());
     }
     state.counters["Acquired"] = benchmark::Counter(acquired, benchmark::Counter::kIsRate);
     state.counters["AcquiredPerThread"] =
         benchmark::Counter(acquired, benchmark::Counter::kAvgThreadsRate);
+    // Merge all latency distributions in order to get the full view of all threads.
+    {
+        stdx::unique_lock lk(isReadyMutex);
+        opCtx.reset();
+        client.reset();
+        resultingDistribution = resultingDistribution.mergeWith(localDistribution);
+        numRemainingToMerge--;
+        if (numRemainingToMerge > 0) {
+            isReadyCv.wait(lk, [&] { return numRemainingToMerge == 0; });
+        } else {
+            isReadyCv.notify_all();
+        }
+    }
+    if (state.thread_index == 0) {
+        ticketHolder.reset();
+        serviceContext.reset();
+        isReady = false;
+        state.counters["AcqRel50"] =
+            benchmark::Counter(resultingDistribution.getPercentile(0.5f).count());
+        state.counters["AcqRel95"] =
+            benchmark::Counter(resultingDistribution.getPercentile(0.95f).count());
+        state.counters["AcqRel99"] =
+            benchmark::Counter(resultingDistribution.getPercentile(0.99f).count());
+        state.counters["AcqRel99.9"] =
+            benchmark::Counter(resultingDistribution.getPercentile(0.999f).count());
+        state.counters["AcqRelMax"] = benchmark::Counter(resultingDistribution.getMax().count());
+    }
 }
 
-BENCHMARK_TEMPLATE(BM_acquireAndRelease, SemaphoreTicketHolder)
-    ->ThreadRange(kThreadMin, kThreadMax);
-
-BENCHMARK_TEMPLATE(BM_acquireAndRelease, FifoTicketHolder)->ThreadRange(kThreadMin, kThreadMax);
+BENCHMARK(BM_acquireAndRelease)
+    ->Threads(kThreadMin)
+    ->Threads(kTickets)
+    ->Threads(128)
+    ->Threads(kThreadMax);
 
 }  // namespace
 }  // namespace mongo

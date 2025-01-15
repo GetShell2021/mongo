@@ -28,25 +28,47 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
+#include <algorithm>
+#include <cstddef>
+#include <deque>
+#include <functional>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/json.h"
-#include "mongo/db/exec/document_value/document_value_test_util.h"
-#include "mongo/db/hasher.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/resharding/resharding_txn_cloner.h"
 #include "mongo/db/s/resharding/resharding_util.h"
-#include "mongo/db/session_txn_record_gen.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/shard_id.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
+
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -91,8 +113,37 @@ protected:
         return "_zoneName" + zoneNum;
     }
 
+    void validateIndexes(std::vector<BSONObj>& sourceSpecs,
+                         std::vector<BSONObj>& recipientSpecs,
+                         ErrorCodes::Error code) {
+        if (code == ErrorCodes::OK) {
+            ASSERT_DOES_NOT_THROW(verifyIndexSpecsMatch(sourceSpecs.cbegin(),
+                                                        sourceSpecs.cend(),
+                                                        recipientSpecs.cbegin(),
+                                                        recipientSpecs.cend()));
+        } else {
+            ASSERT_THROWS_CODE(verifyIndexSpecsMatch(sourceSpecs.cbegin(),
+                                                     sourceSpecs.cend(),
+                                                     recipientSpecs.cbegin(),
+                                                     recipientSpecs.cend()),
+                               DBException,
+                               code);
+        }
+    }
+
+    void validateIndexes(const BSONObj& sourceSpec,
+                         const BSONObj& recipientSpec,
+                         ErrorCodes::Error code) {
+        std::vector<BSONObj> sourceIndexSpecs;
+        std::vector<BSONObj> recipientSpecs;
+
+        sourceIndexSpecs.push_back(sourceSpec);
+        recipientSpecs.push_back(recipientSpec);
+        validateIndexes(sourceIndexSpecs, recipientSpecs, code);
+    }
+
 private:
-    const NamespaceString _nss{"test.foo"};
+    const NamespaceString _nss = NamespaceString::createNamespaceString_forTest("test.foo");
     const std::string _shardKey = "x";
     const ShardKeyPattern _shardKeyPattern = ShardKeyPattern(BSON("x"
                                                                   << "hashed"));
@@ -221,6 +272,164 @@ TEST(ReshardingUtilTest, AssertDonorOplogIdSerialization) {
     ASSERT_FALSE(it.more());
 }
 
+TEST_F(ReshardingUtilTest, ValidateIndexSpecsMatch) {
+    // 1. Source has index, Recipient has none.
+    validateIndexes(BSON("name"
+                         << "test"),
+                    BSONObj(),
+                    (ErrorCodes::Error)9365601);
+
+    // 2. Collation subField difference.
+    auto sourceSpec = BSON("key" << BSON("field" << 1) << "name"
+                                 << "indexName"
+                                 << "v" << 3 << "collation"
+                                 << BSON("locale"
+                                         << "en"
+                                         << "strength" << 2));
+
+    auto recipientSpec = BSON("key" << BSON("field" << 1) << "name"
+                                    << "indexName"
+                                    << "v" << 3 << "collation"
+                                    << BSON("locale"
+                                            << "en"
+                                            << "strength" << 3));
+    validateIndexes(sourceSpec, recipientSpec, (ErrorCodes::Error)9365602);
+
+    // 3. Collation simple vs non-simple.
+    sourceSpec = BSON("key" << BSON("field" << 1) << "name"
+                            << "indexName"
+                            << "v" << 3);
+
+    recipientSpec = BSON("key" << BSON("field" << 1) << "name"
+                               << "indexName"
+                               << "v" << 3 << "collation"
+                               << BSON("locale"
+                                       << "en"
+                                       << "strength" << 2));
+    validateIndexes(sourceSpec, recipientSpec, (ErrorCodes::Error)9365602);
+
+    // 4. Different field ordering.
+    sourceSpec = BSON("key" << BSON("field" << 1) << "name"
+                            << "indexName"
+                            << "v" << 3);
+    recipientSpec = BSON("key" << BSON("field" << 1) << "v" << 3 << "name"
+                               << "indexName");
+    validateIndexes(sourceSpec, recipientSpec, ErrorCodes::OK);
+
+    // 5. Equal Indexes.
+    std::vector<BSONObj> sourceSpecs{BSON("key" << BSON("field_2" << 1) << "name"
+                                                << "indexName_2"
+                                                << "v" << 3),
+                                     BSON("key" << BSON("field" << 1) << "name"
+                                                << "indexName"
+                                                << "v" << 3 << "collation"
+                                                << BSON("locale"
+                                                        << "en"
+                                                        << "strength" << 2))};
+    std::vector<BSONObj> recipientSpecs{BSON("key" << BSON("field_2" << 1) << "name"
+                                                   << "indexName_2"
+                                                   << "v" << 3),
+                                        BSON("key" << BSON("field" << 1) << "name"
+                                                   << "indexName"
+                                                   << "v" << 3 << "collation"
+                                                   << BSON("locale"
+                                                           << "en"
+                                                           << "strength" << 2))};
+
+    validateIndexes(sourceSpecs, recipientSpecs, ErrorCodes::OK);
+
+    // 6. num(recipientSpecs) > num(recipientSpecs) works.
+    std::vector<BSONObj> sourceSpecs2{BSON("key" << BSON("field2" << 1) << "name"
+                                                 << "indexName_2"
+                                                 << "v" << 3)};
+    std::vector<BSONObj> recipientSpecs2{BSON("key" << BSON("field" << 1) << "name"
+                                                    << "indexName"
+                                                    << "v" << 3 << "collation"
+                                                    << BSON("locale"
+                                                            << "en"
+                                                            << "strength" << 2)),
+                                         BSON("key" << BSON("field2" << 1) << "name"
+                                                    << "indexName_2"
+                                                    << "v" << 3)};
+
+    validateIndexes(sourceSpecs2, recipientSpecs2, ErrorCodes::OK);
+}
+
+TEST_F(ReshardingUtilTest, SetNumSamplesPerChunkThroughConfigsvrReshardCollectionRequest) {
+    RAIIServerParameterControllerForTest featureFlagController(
+        "featureFlagReshardingNumSamplesPerChunk", true);
+
+    int numInitialChunks = 1;
+    int numSamplesPerChunk = 10;
+
+    const CollectionType collEntry(nss(),
+                                   OID::gen(),
+                                   Timestamp(static_cast<unsigned int>(std::time(nullptr)), 1),
+                                   Date_t::now(),
+                                   UUID::gen(),
+                                   keyPattern());
+
+    ConfigsvrReshardCollection configsvrReshardCollection(nss(), BSON(shardKey() << 1));
+    configsvrReshardCollection.setDbName(nss().dbName());
+    configsvrReshardCollection.setUnique(true);
+    const auto collationObj = BSON("locale"
+                                   << "en_US");
+    configsvrReshardCollection.setCollation(collationObj);
+    configsvrReshardCollection.setNumInitialChunks(numInitialChunks);
+
+    boost::optional<ProvenanceEnum> provenance(ProvenanceEnum::kReshardCollection);
+    configsvrReshardCollection.setProvenance(provenance);
+    configsvrReshardCollection.setNumSamplesPerChunk(numSamplesPerChunk);
+
+
+    ReshardingCoordinatorDocument coordinatorDoc = createReshardingCoordinatorDoc(
+        operationContext(), configsvrReshardCollection, collEntry, nss(), true);
+    auto numSamplesPerChunkOptional = coordinatorDoc.getNumSamplesPerChunk();
+    ASSERT_TRUE(numSamplesPerChunkOptional.has_value());
+    ASSERT_EQ(*numSamplesPerChunkOptional, numSamplesPerChunk);
+}
+
+TEST_F(ReshardingUtilTest, CreateCoordinatorDocPerformVerification) {
+    for (auto performVerification : std::vector<boost::optional<bool>>{true, false, boost::none}) {
+        for (bool enableVerification : {true, false}) {
+            LOGV2(9849102,
+                  "Running case",
+                  "test"_attr = _agent.getTestName(),
+                  "performVerification"_attr = performVerification,
+                  "enableVerification"_attr = enableVerification);
+            RAIIServerParameterControllerForTest featureFlagController(
+                "featureFlagReshardingVerification", enableVerification);
+
+
+            const CollectionType collEntry(
+                nss(),
+                OID::gen(),
+                Timestamp(static_cast<unsigned int>(std::time(nullptr)), 1),
+                Date_t::now(),
+                UUID::gen(),
+                keyPattern());
+
+            ConfigsvrReshardCollection configsvrReshardCollection(nss(), BSON(shardKey() << 1));
+            configsvrReshardCollection.setDbName(nss().dbName());
+            configsvrReshardCollection.setPerformVerification(performVerification);
+
+            ReshardingCoordinatorDocument coordinatorDoc = createReshardingCoordinatorDoc(
+                operationContext(), configsvrReshardCollection, collEntry, nss(), true);
+
+            auto actualPerformVerification = coordinatorDoc.getPerformVerification();
+            if (performVerification.has_value()) {
+                ASSERT(actualPerformVerification.has_value());
+                ASSERT_EQ(actualPerformVerification, *performVerification);
+            } else if (enableVerification) {
+                ASSERT(actualPerformVerification.has_value());
+                ASSERT_EQ(actualPerformVerification, true);
+            } else {
+                ASSERT_FALSE(actualPerformVerification.has_value());
+            }
+        }
+    }
+}
+
 class ReshardingTxnCloningPipelineTest : public AggregationContextFixture {
 
 protected:
@@ -259,7 +468,8 @@ protected:
         Timestamp fetchTimestamp,
         boost::optional<LogicalSessionId> startAfter) {
         // create expression context
-        static const NamespaceString _transactionsNss{"config.transactions"};
+        static const NamespaceString _transactionsNss =
+            NamespaceString::createNamespaceString_forTest("config.transactions");
         boost::intrusive_ptr<ExpressionContextForTest> expCtx(
             new ExpressionContextForTest(getOpCtx(), _transactionsNss));
         expCtx->setResolvedNamespace(_transactionsNss, {_transactionsNss, {}});

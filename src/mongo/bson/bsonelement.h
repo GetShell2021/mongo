@@ -30,37 +30,48 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>  // strlen
 #include <fmt/format.h>
-#include <string.h>  // strlen
+#include <limits>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "mongo/base/data_range.h"
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
-#include "mongo/base/string_data_comparator_interface.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/base/string_data_comparator.h"
 #include "mongo/bson/bson_comparator_interface_base.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/config.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/platform/decimal128.h"
 #include "mongo/platform/strnlen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 class BSONObj;
+
 class BSONElement;
 class BSONObjBuilder;
 class Timestamp;
+
 class ExtendedCanonicalV200Generator;
 class ExtendedRelaxedV200Generator;
 class LegacyStrictGenerator;
-
-typedef BSONElement be;
-typedef BSONObj bo;
-typedef BSONObjBuilder bob;
 
 /**
     BSONElement represents an "element" in a BSONObj.  So for the object { a : 3, b : "abc" },
@@ -103,7 +114,7 @@ public:
     static int compareElements(const BSONElement& l,
                                const BSONElement& r,
                                ComparisonRulesSet rules,
-                               const StringData::ComparatorInterface* comparator);
+                               const StringDataComparator* comparator);
 
 
     /**
@@ -143,7 +154,14 @@ public:
     bool Bool() const {
         return chk(mongo::Bool).boolean();
     }
-    std::vector<BSONElement> Array() const;  // see implementation for detailed comments
+
+    /**
+     * Transform a BSON array into a vector of BSONElements.
+     * If the array keys are not in sequential order or are otherwise invalid, an exception is
+     * thrown.
+     */
+    std::vector<BSONElement> Array() const;
+
     mongo::OID OID() const {
         return chk(jstOID).__oid();
     }
@@ -258,7 +276,7 @@ public:
      * Returns the type of the element
      */
     BSONType type() const {
-        const signed char typeByte = ConstDataView(data).read<signed char>();
+        const signed char typeByte = ConstDataView(_data).read<signed char>();
         return static_cast<BSONType>(typeByte);
     }
 
@@ -287,7 +305,7 @@ public:
      * Size of the element.
      */
     int size() const {
-        return totalSize;
+        return valuesize() + 1 + fieldNameSize();
     }
 
     /**
@@ -308,14 +326,14 @@ public:
     const char* fieldName() const {
         if (eoo())
             return "";  // no fieldname for it.
-        return data + 1;
+        return _data + 1;
     }
 
     /**
      * NOTE: size includes the NULL terminator.
      */
     int fieldNameSize() const {
-        return fieldNameSize_;
+        return _fieldNameSize;
     }
 
     StringData fieldNameStringData() const {
@@ -326,13 +344,20 @@ public:
      * raw data of the element's value (so be careful).
      */
     const char* value() const {
-        return (data + fieldNameSize() + 1);
+        return _data + fieldNameSize() + 1;
     }
     /**
      * size in bytes of the element's value (when applicable).
      */
     int valuesize() const {
-        return size() - fieldNameSize() - 1;
+        auto type = static_cast<uint8_t>(*_data);
+        uint32_t mask = 1u << (type & 0x1fu);
+        int32_t size = kFixedSizes[type];
+        if (mask & kVariableSizeMask)  // These types use a 32-bit int to store their size
+            size += ConstDataView(value()).read<LittleEndian<int32_t>>();
+        if (MONGO_unlikely(!size))  // 0 means we have a regex, minkey, maxkey, or invalid element
+            return computeRegexSize(_data, fieldNameSize()) - fieldNameSize() - 1;
+        return size - 1;
     }
 
     bool isBoolean() const {
@@ -371,6 +396,11 @@ public:
      * True if element is of a numeric type.
      */
     bool isNumber() const;
+
+    /**
+     * True if element is a NaN double or decimal.
+     */
+    bool isNaN() const;
 
     /**
      * Return double value for this field. MUST be NumberDouble type.
@@ -614,7 +644,7 @@ public:
      */
     const char* binData(int& len) const {
         // BinData: <int len> <byte subtype> <byte[len] data>
-        verify(type() == BinData);
+        MONGO_verify(type() == BinData);
         len = valuestrsize();
         return value() + 5;
     }
@@ -634,14 +664,14 @@ public:
 
     static BinDataType binDataType(const char* raw, size_t length) {
         // BinData: <int len> <byte subtype> <byte[len] data>
-        verify(length >= 5);
+        MONGO_verify(length >= 5);
         unsigned char c = raw[4];
         return static_cast<BinDataType>(c);
     }
 
     BinDataType binDataType() const {
         // BinData: <int len> <byte subtype> <byte[len] data>
-        verify(type() == BinData);
+        MONGO_verify(type() == BinData);
         unsigned char c = (value() + 4)[0];
         return static_cast<BinDataType>(c);
     }
@@ -658,7 +688,7 @@ public:
      * Retrieve the regex std::string for a Regex element
      */
     const char* regex() const {
-        verify(type() == RegEx);
+        MONGO_verify(type() == RegEx);
         return value();
     }
 
@@ -705,7 +735,7 @@ public:
      */
     int woCompare(const BSONElement& elem,
                   ComparisonRulesSet rules = ComparisonRules::kConsiderFieldName,
-                  const StringData::ComparatorInterface* comparator = nullptr) const;
+                  const StringDataComparator* comparator = nullptr) const;
 
     DeferredComparison operator<(const BSONElement& other) const {
         return DeferredComparison(DeferredComparison::Type::kLT, *this, other);
@@ -732,13 +762,8 @@ public:
     }
 
     const char* rawdata() const {
-        return data;
+        return _data;
     }
-
-    /**
-     * Constructs an empty element
-     */
-    BSONElement();
 
     /**
      * True if this element may contain subobjects.
@@ -767,6 +792,13 @@ public:
         }
     }
 
+    /**
+     * Returns BSON types Timestamp and Date as Timestamp.
+     *
+     * This can be dangerous if the result is used for comparisons as Timestamp is an unsigned type
+     * where Date is signed. Instead, consider using date() when a timestamp before the unix epoch
+     * is possible.
+     */
     Timestamp timestamp() const {
         if (type() == mongo::Date || type() == bsonTimestamp) {
             return Timestamp(ConstDataView(value()).read<LittleEndian<unsigned long long>>().value);
@@ -829,37 +861,24 @@ public:
         return mongo::OID::from(start);
     }
 
-    explicit BSONElement(const char* d) : data(d) {
+    constexpr BSONElement() = default;
+
+    explicit BSONElement(const char* d) : _data(d) {
         // While we should skip the type, and add 1 for the terminating null byte, just include
-        // the type byte in the strlen call: the extra byte cancels out. As an extra bonus, this
+        // the type byte in the strlen loop: the extra byte cancels out. As an extra bonus, this
         // also handles the EOO case, where the type byte is 0.
-        uint8_t type = *d;
-        fieldNameSize_ = strlen(d);
-        totalSize = computeSize(type, d, fieldNameSize_);
+        while (*d)
+            ++d;
+        _fieldNameSize = d - _data;
     }
 
     /**
-     * Construct a BSONElement where you already know the length of the name and/or the total size
-     * of the element. fieldNameSize includes the null terminator. You may pass -1 for either or
-     * both sizes to indicate that they are unknown and should be computed.
+     * Construct a BSONElement where you already know the length of the name.
+     * The fieldNameSize includes the null terminator.
      */
-    BSONElement(const char* d, int fieldNameSize, int totalSize) : data(d) {
-        if (eoo()) {
-            fieldNameSize_ = 0;
-            this->totalSize = 1;
-        } else {
-            if (fieldNameSize == -1) {
-                fieldNameSize_ = strlen(d + 1 /*skip type*/) + 1 /*include NUL byte*/;
-            } else {
-                fieldNameSize_ = fieldNameSize;
-            }
-            if (totalSize == -1) {
-                this->totalSize = computeSize(*d, d, fieldNameSize_);
-            } else {
-                this->totalSize = totalSize;
-            }
-        }
-    }
+    struct TrustedInitTag {};
+    constexpr BSONElement(const char* d, int fieldNameSize, TrustedInitTag)
+        : _data(d), _fieldNameSize(fieldNameSize) {}
 
     std::string _asCode() const;
 
@@ -907,6 +926,65 @@ public:
     static const long long kSmallestSafeLongLongAsDouble;
 
 private:
+    // This needs to be 2 elements because we check the strlen of data + 1 and GCC sees that as
+    // accessing beyond the end of a constant string, even though we always check whether the
+    // element is an eoo.
+    static constexpr const char kEooElement[2] = {'\0', '\0'};
+
+    /**
+     *  The kFixedSizes table provides the fixed size of each element type, including the type byte,
+     *  but excluding the field name and its terminating 0 byte, and excluding the variable sized
+     *  part for objects, arrays, strings, etc. Elements that are 0 may be regex/minkey/maxkey
+     *  elements, or elements with invalid types. The table is extended to 256 bytes to make it more
+     *  likely that we will error on such invalid type bytes in the case of memory corruption.
+     *  The alignas clause ensures the first part of the table fits on a single cache line, which
+     *  avoids performance changes due to memory layout.
+     */
+    static constexpr uint8_t kFixedSizes alignas(32)[256] = {
+        1,                        // 0x00 EOO
+        9,                        // 0x01 NumberDouble
+        5,                        // 0x02 String
+        1,                        // 0x03 Object
+        1,                        // 0x04 Array
+        6,                        // 0x05 BinData
+        1,                        // 0x06 Undefined
+        13,                       // 0x07 ObjectID
+        2,                        // 0x08 Bool
+        9,                        // 0x09 Date
+        1,                        // 0x0a Null
+        0,                        // 0x0b Regex
+        17,                       // 0x0c DBRef
+        5,                        // 0x0d Code
+        5,                        // 0x0e Symbol
+        1,                        // 0x0f CodeWScope
+        5,                        // 0x10 NumberInt
+        9,                        // 0x11 Timestamp
+        9,                        // 0x12 NumberLong
+        17,                       // 0x13 NumberDecimal
+        0,  0, 0, 0,              // 0x14 - 0x17 (reserved)
+        0,  0, 0, 0, 0, 0, 0, 0,  // 0x18 - 0x1f (reserved)
+    };
+    MONGO_STATIC_ASSERT(sizeof(kFixedSizes) == 256);
+
+    /**
+     * The kVariableSizeMask table provides a mask for the types that have a variable size. The mask
+     * is 1 << type, so that we can use it to check whether a type is variable size with a single
+     * bit test.
+     */
+    static constexpr uint32_t kVariableSizeMask =  // equal to 0xf03cu (61500)
+        (1u << mongo::String) | (1u << mongo::Object) | (1u << mongo::Array) |
+        (1u << mongo::BinData) | (1u << mongo::DBRef) | (1u << mongo::Code) |
+        (1u << mongo::Symbol) | (1u << mongo::CodeWScope);
+
+    /**
+     * This is an out-of-line helper only for use as the slow path of valuesize()!
+     *
+     * Computes the size of the encoding of a Regex, MinKey or MaxKey. Throws if the element is
+     * not any of these. This function is suitable as a fallback after other known BSON types are
+     * handled, as it will try to dump extra diagnostic information in case of memory corruption.
+     */
+    static int computeRegexSize(const char* data, int fieldNameSize);
+
     /**
      * This is to enable structured bindings for BSONElement, it should not be used explicitly.
      * When used in a structed binding, BSONElement behaves as-if it is a
@@ -945,10 +1023,6 @@ private:
                                  fmt::memory_buffer& buffer,
                                  size_t writeLimit) const;
 
-    const char* data;
-    int fieldNameSize_;  // internal size includes null terminator
-    int totalSize;
-
     friend class BSONObjIterator;
     friend class BSONObjStlIterator;
     friend class BSONObj;
@@ -964,8 +1038,8 @@ private:
         return *this;
     }
 
-    // Only called from constructors.
-    static int computeSize(int8_t type, const char* data, int fieldNameSize);
+    const char* _data = kEooElement;
+    int _fieldNameSize = 0;  // internal size includes null terminator, 0 for EOO
 };
 
 inline bool BSONElement::trueValue() const {
@@ -1000,6 +1074,21 @@ inline bool BSONElement::isNumber() const {
         case NumberDecimal:
         case NumberInt:
             return true;
+        default:
+            return false;
+    }
+}
+
+inline bool BSONElement::isNaN() const {
+    switch (type()) {
+        case NumberDouble: {
+            double d = _numberDouble();
+            return std::isnan(d);
+        }
+        case NumberDecimal: {
+            Decimal128 d = _numberDecimal();
+            return d.isNaN();
+        }
         default:
             return false;
     }
@@ -1242,15 +1331,6 @@ inline long long BSONElement::exactNumberLong() const {
     return uassertStatusOK(parseIntegerElementToLong());
 }
 
-inline BSONElement::BSONElement() {
-    // This needs to be 2 elements because we check the strlen of data + 1 and GCC sees that as
-    // accessing beyond the end of a constant string, even though we always check whether the
-    // element is an eoo.
-    static const char kEooElement[2] = {'\0', '\0'};
-    data = kEooElement;
-    fieldNameSize_ = 0;
-    totalSize = 1;
-}
 }  // namespace mongo
 
 // These template specializations in namespace std are required in order to support structured

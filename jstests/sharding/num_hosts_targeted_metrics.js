@@ -1,20 +1,24 @@
 /**
  * @tags: [
  *   multiversion_incompatible,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
  *   uses_multi_shard_transaction,
  *   uses_transactions,
  * ]
  */
 
-(function() {
-'use strict';
+import {
+    withAbortAndRetryOnTransientTxnError
+} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 3});
 const mongos = st.s;
 const testDb = mongos.getDB("test");
 
-assert.commandWorked(mongos.adminCommand({enablesharding: "test"}));
-st.ensurePrimaryShard("test", st.shard1.shardName);
+assert.commandWorked(
+    mongos.adminCommand({enablesharding: "test", primaryShard: st.shard1.shardName}));
 
 // Set up "test.coll0"
 assert.commandWorked(mongos.adminCommand({shardcollection: "test.coll0", key: {x: 1}}));
@@ -107,10 +111,12 @@ assertShardingStats(serverStatusInitial.shardingStatistics.numHostsTargeted,
 // transaction
 let session = mongos.startSession();
 let sessionDB = session.getDatabase("test");
-session.startTransaction();
-serverStatusInitial = testDb.serverStatus();
-assert.commandWorked(sessionDB.coll0.remove({x: {$lt: 9}}));
-session.commitTransaction();
+withAbortAndRetryOnTransientTxnError(session, () => {
+    session.startTransaction();
+    serverStatusInitial = testDb.serverStatus();
+    assert.commandWorked(sessionDB.coll0.remove({x: {$lt: 9}}));
+    session.commitTransaction();
+});
 assertShardingStats(serverStatusInitial.shardingStatistics.numHostsTargeted,
                     testDb.serverStatus().shardingStatistics.numHostsTargeted,
                     {"delete": {"manyShards": 1}});
@@ -216,4 +222,3 @@ assertShardingStats(serverStatusInitial.shardingStatistics.numHostsTargeted,
                     {"aggregate": {"allShards": 1}});
 
 st.stop();
-})();

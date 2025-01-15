@@ -30,40 +30,88 @@
 
 #include "mongo/db/s/balancer/balancer.h"
 
+#include <absl/container/node_hash_set.h>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/none_t.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+// IWYU pragma: no_include "cxxabi.h"
 #include <algorithm>
+#include <cmath>
+#include <iterator>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <ratio>
 #include <string>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/read_preference.h"
-#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/client.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/balancer/balancer_chunk_selection_policy_impl.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/balancer/actions_stream_policy.h"
+#include "mongo/db/s/balancer/auto_merger_policy.h"
+#include "mongo/db/s/balancer/balancer_commands_scheduler.h"
 #include "mongo/db/s/balancer/balancer_commands_scheduler_impl.h"
-#include "mongo/db/s/balancer/balancer_defragmentation_policy_impl.h"
-#include "mongo/db/s/balancer/cluster_chunks_resize_policy_impl.h"
+#include "mongo/db/s/balancer/balancer_defragmentation_policy.h"
 #include "mongo/db/s/balancer/cluster_statistics_impl.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_config_server_parameters_gen.h"
 #include "mongo/db/s/sharding_logging.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/executor/scoped_task_executor.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/random.h"
 #include "mongo/s/balancer_configuration.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/balancer_collection_status_gen.h"
-#include "mongo/s/request_types/configure_collection_balancing_gen.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
+#include "mongo/s/routing_information_cache.h"
 #include "mongo/s/shard_util.h"
-#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/exit.h"
-#include "mongo/util/fail_point.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
 #include "mongo/util/pcre.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/testing_proctor.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/version.h"
 
@@ -76,17 +124,13 @@ using std::map;
 using std::string;
 using std::vector;
 
+using MigrationsAndResponses = std::vector<std::pair<const MigrateInfo&, SemiFuture<void>>>;
+
 namespace {
 
-MONGO_FAIL_POINT_DEFINE(overrideBalanceRoundInterval);
+MONGO_FAIL_POINT_DEFINE(forceBalancerWarningChecks);
 
 const Milliseconds kBalanceRoundDefaultInterval(10 * 1000);
-
-// Sleep between balancer rounds in the case where the last round found some chunks which needed to
-// be balanced. This value should be set sufficiently low so that imbalanced clusters will quickly
-// reach balanced state, but setting it too low may cause CRUD operations to start failing due to
-// not being able to establish a stable shard version.
-const Milliseconds kBalancerMigrationsThrottling(1 * 1000);
 
 /**
  * Balancer status response
@@ -103,10 +147,23 @@ class BalanceRoundDetails {
 public:
     BalanceRoundDetails() : _executionTimer() {}
 
-    void setSucceeded(int candidateChunks, int chunksMoved) {
-        invariant(!_errMsg);
-        _candidateChunks = candidateChunks;
-        _chunksMoved = chunksMoved;
+    void setSucceeded(int numCandidateChunks,
+                      int numChunksMoved,
+                      int numImbalancedCachedCollections,
+                      int numCandidateUnshardedCollections,
+                      int numUnshardedCollectionsMoved,
+                      Milliseconds selectionTime,
+                      Milliseconds throttleTime,
+                      Milliseconds migrationTime) {
+        tassert(8245236, "Error message is not empty", !_errMsg);
+        _numCandidateChunks = numCandidateChunks;
+        _numChunksMoved = numChunksMoved;
+        _numImbalancedCachedCollections = numImbalancedCachedCollections;
+        _numCandidateUnshardedCollections = numCandidateUnshardedCollections;
+        _numUnshardedCollectionsMoved = numUnshardedCollectionsMoved;
+        _selectionTime = selectionTime;
+        _throttleTime = throttleTime;
+        _migrationTime = migrationTime;
     }
 
     void setFailed(const string& errMsg) {
@@ -116,58 +173,112 @@ public:
     BSONObj toBSON() const {
         BSONObjBuilder builder;
         builder.append("executionTimeMillis", _executionTimer.millis());
-        builder.append("errorOccurred", _errMsg.is_initialized());
+        builder.append("errorOccurred", _errMsg.has_value());
 
         if (_errMsg) {
             builder.append("errmsg", *_errMsg);
         } else {
-            builder.append("candidateChunks", _candidateChunks);
-            builder.append("chunksMoved", _chunksMoved);
+            builder.append("candidateChunks", _numCandidateChunks);
+            builder.append("chunksMoved", _numChunksMoved);
+            builder.append("candidateUnshardedCollections", _numCandidateUnshardedCollections);
+            builder.append("unshardedCollectionsMoved", _numUnshardedCollectionsMoved);
+            builder.append("imbalancedCachedCollections", _numImbalancedCachedCollections);
+            BSONObjBuilder timeInfo{builder.subobjStart("times"_sd)};
+            timeInfo.append("selectionTimeMillis"_sd, _selectionTime.count());
+            timeInfo.append("throttleTimeMillis"_sd, _throttleTime.count());
+            timeInfo.append("migrationTimeMillis"_sd, _migrationTime.count());
+            timeInfo.done();
         }
         return builder.obj();
     }
 
 private:
     const Timer _executionTimer;
+    Milliseconds _selectionTime;
+    Milliseconds _throttleTime;
+    Milliseconds _migrationTime;
 
     // Set only on success
-    int _candidateChunks{0};
-    int _chunksMoved{0};
+    int _numCandidateChunks{0};
+    int _numChunksMoved{0};
+    int _numImbalancedCachedCollections{0};
+    int _numCandidateUnshardedCollections{0};
+    int _numUnshardedCollectionsMoved{0};
 
     // Set only on failure
     boost::optional<string> _errMsg;
 };
 
 /**
- * Occasionally prints a log message with shard versions if the versions are not the same
- * in the cluster.
+ *  Interface to group a set of migrations of the same type.
  */
-void warnOnMultiVersion(const vector<ClusterStatistics::ShardStatistics>& clusterStats) {
-    static const auto& majorMinorRE = *new pcre::Regex(R"re(^(\d+)\.(\d+)\.)re");
-    auto&& vii = VersionInfoInterface::instance();
-    auto hasMyVersion = [&](auto&& stat) {
-        auto m = majorMinorRE.match(stat.mongoVersion);
-        return m && std::stoi(std::string{m[1]}) == vii.majorVersion() &&
-            std::stoi(std::string{m[2]}) == vii.minorVersion();
-    };
-
-    // If we're all the same version, don't message
-    if (std::all_of(clusterStats.begin(), clusterStats.end(), hasMyVersion))
-        return;
-
-    BSONObjBuilder shardVersions;
-    for (const auto& stat : clusterStats) {
-        shardVersions << stat.shardId << stat.mongoVersion;
+class MigrationTask {
+public:
+    MigrationTask(OperationContext* opCtx,
+                  BalancerCommandsScheduler& scheduler,
+                  const MigrateInfoVector& migrations)
+        : _opCtx(opCtx), _scheduler(scheduler), _numCompleted(0) {
+        _migrationsAndResponses.reserve(migrations.size());
+        for (const MigrateInfo& x : migrations) {
+            _migrationsAndResponses.emplace_back(x, SemiFuture<void>());
+        }
     }
 
-    LOGV2_WARNING(21875,
-                  "Multiversion cluster detected",
-                  "localVersion"_attr = vii.version(),
-                  "shardVersions"_attr = shardVersions.done());
+    virtual ~MigrationTask() = default;
+
+    virtual void enqueue() = 0;
+
+    int getNumCompleted() {
+        return _numCompleted;
+    };
+
+    const std::vector<NamespaceString>& getNamespacesFromFailedMigrations() const {
+        return _failedNss;
+    }
+
+    // Resolve all enqueued tasks and record the number completed successfully
+    void waitForQueuedAndProcessResponses() {
+        for (const auto& [migrateInfo, futureStatus] : _migrationsAndResponses) {
+            auto status = futureStatus.getNoThrow(_opCtx);
+            if (processResponse(migrateInfo, status)) {
+                _numCompleted++;
+            } else {
+                _failedNss.push_back(migrateInfo.nss);
+            }
+        }
+    }
+
+protected:
+    virtual bool processResponse(const MigrateInfo& migrationInfo, const Status& status) = 0;
+
+    OperationContext* _opCtx;
+    BalancerCommandsScheduler& _scheduler;
+    MigrationsAndResponses _migrationsAndResponses;
+    std::vector<NamespaceString> _failedNss;
+    int _numCompleted;
+};
+
+StatusWith<ChunkManager> getPlacementInfoForShardedCollection(OperationContext* opCtx,
+                                                              const NamespaceString& nss) {
+    auto swCm =
+        RoutingInformationCache::get(opCtx)->getCollectionPlacementInfoWithRefresh(opCtx, nss);
+
+    if (!swCm.isOK()) {
+        return swCm;
+    }
+
+    if (!swCm.getValue().isSharded()) {
+        return Status{ErrorCodes::NamespaceNotSharded,
+                      str::stream() << "Expected collection " << nss.toStringForErrorMsg()
+                                    << " to be sharded"};
+    }
+
+    return swCm;
 }
 
 Status processManualMigrationOutcome(OperationContext* opCtx,
-                                     const BSONObj& chunkMin,
+                                     const boost::optional<BSONObj>& min,
+                                     const boost::optional<BSONObj>& max,
                                      const NamespaceString& nss,
                                      const ShardId& destination,
                                      Status outcome) {
@@ -181,14 +292,15 @@ Status processManualMigrationOutcome(OperationContext* opCtx,
         return outcome;
     }
 
-    auto swCM =
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss);
-    if (!swCM.isOK()) {
-        return swCM.getStatus();
+    auto swCm = getPlacementInfoForShardedCollection(opCtx, nss);
+    if (!swCm.isOK()) {
+        return swCm.getStatus();
     }
+    const auto& cm = swCm.getValue();
 
     const auto currentChunkInfo =
-        swCM.getValue().findIntersectingChunkWithSimpleCollation(chunkMin);
+        min ? cm.findIntersectingChunkWithSimpleCollation(*min) : getChunkForMaxBound(cm, *max);
+
     if (currentChunkInfo.getShardId() == destination &&
         outcome != ErrorCodes::BalancerInterrupted) {
         // Migration calls can be interrupted after the metadata is committed but before the command
@@ -230,6 +342,314 @@ const auto _balancerDecoration = ServiceContext::declareDecoration<Balancer>();
 
 const ReplicaSetAwareServiceRegistry::Registerer<Balancer> _balancerRegisterer("Balancer");
 
+/**
+ * Returns the names of shards that are currently draining. When the balancer is disabled, draining
+ * shards are stuck in this state as chunks cannot be migrated.
+ */
+std::vector<std::string> getDrainingShardNames(OperationContext* opCtx) {
+    // Find the shards that are currently draining.
+    const auto& configShard = ShardingCatalogManager::get(opCtx)->localConfigShard();
+    const auto drainingShardsDocs{
+        uassertStatusOK(
+            configShard->exhaustiveFindOnConfig(opCtx,
+                                                ReadPreferenceSetting{ReadPreference::Nearest},
+                                                repl::ReadConcernLevel::kMajorityReadConcern,
+                                                NamespaceString::kConfigsvrShardsNamespace,
+                                                BSON(ShardType::draining << true),
+                                                BSONObj() /* No sorting */,
+                                                boost::none /* No limit */))
+            .docs};
+
+    // Build the list of the draining shard names.
+    std::vector<std::string> drainingShardNames;
+    drainingShardNames.reserve(drainingShardsDocs.size());
+    std::transform(drainingShardsDocs.begin(),
+                   drainingShardsDocs.end(),
+                   std::back_inserter(drainingShardNames),
+                   [](const auto& shardDoc) {
+                       const auto shardEntry{uassertStatusOK(ShardType::fromBSON(shardDoc))};
+                       return shardEntry.getName();
+                   });
+    return drainingShardNames;
+}
+
+void enqueueCollectionMigrations(OperationContext* opCtx,
+                                 BalancerCommandsScheduler& scheduler,
+                                 MigrationsAndResponses& migrationsAndResponses) {
+    auto requestMigration = [&](const MigrateInfo& migrateInfo) -> SemiFuture<void> {
+        auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+        const auto dbEntry = catalogClient->getDatabase(
+            opCtx, migrateInfo.nss.dbName(), repl::ReadConcernLevel::kMajorityReadConcern);
+
+        return scheduler.requestMoveCollection(
+            opCtx, migrateInfo.nss, migrateInfo.to, dbEntry.getPrimary(), dbEntry.getVersion());
+    };
+
+    for (auto& migrationAndResponse : migrationsAndResponses) {
+        migrationAndResponse.second = requestMigration(migrationAndResponse.first);
+    }
+}
+
+void enqueueChunkMigrations(OperationContext* opCtx,
+                            BalancerCommandsScheduler& scheduler,
+                            MigrationsAndResponses& migrationsAndResponses) {
+    auto requestMigration = [&](const MigrateInfo& migrateInfo) -> SemiFuture<void> {
+        auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+        auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
+
+        auto maxChunkSizeBytes = [&]() {
+            if (migrateInfo.optMaxChunkSizeBytes.has_value()) {
+                return *migrateInfo.optMaxChunkSizeBytes;
+            }
+
+            auto coll = catalogClient->getCollection(
+                opCtx, migrateInfo.nss, repl::ReadConcernLevel::kMajorityReadConcern);
+            return coll.getMaxChunkSizeBytes().value_or(balancerConfig->getMaxChunkSizeBytes());
+        }();
+
+        MoveRangeRequestBase requestBase(migrateInfo.to);
+        requestBase.setWaitForDelete(balancerConfig->waitForDelete());
+        requestBase.setMin(migrateInfo.minKey);
+        requestBase.setMax(migrateInfo.maxKey);
+
+        ShardsvrMoveRange shardSvrRequest(migrateInfo.nss);
+        shardSvrRequest.setDbName(DatabaseName::kAdmin);
+        shardSvrRequest.setMoveRangeRequestBase(requestBase);
+        shardSvrRequest.setMaxChunkSizeBytes(maxChunkSizeBytes);
+        shardSvrRequest.setFromShard(migrateInfo.from);
+        shardSvrRequest.setCollectionTimestamp(migrateInfo.version.getTimestamp());
+        shardSvrRequest.setEpoch(migrateInfo.version.epoch());
+        shardSvrRequest.setForceJumbo(migrateInfo.forceJumbo);
+        const auto [secondaryThrottle, wc] =
+            getSecondaryThrottleAndWriteConcern(balancerConfig->getSecondaryThrottle());
+        shardSvrRequest.setSecondaryThrottle(secondaryThrottle);
+
+        return scheduler.requestMoveRange(
+            opCtx, shardSvrRequest, wc, false /* issuedByRemoteUser */);
+    };
+
+    for (auto& migrationAndResponse : migrationsAndResponses) {
+        migrationAndResponse.second = requestMigration(migrationAndResponse.first);
+    }
+}
+
+bool processActionStreamPolicyResponse(OperationContext* opCtx,
+                                       ActionsStreamPolicy& streamPolicy,
+                                       const MigrateInfo& migrationInfo,
+                                       Status status) {
+    streamPolicy.applyActionResult(opCtx, migrationInfo, status);
+    return status.isOK();
+};
+
+
+bool processRebalanceResponse(OperationContext* opCtx,
+                              BalancerCommandsScheduler& commandScheduler,
+                              const MigrateInfo& migrateInfo,
+                              Status status) {
+    if (status.isOK()) {
+        return true;
+    }
+
+    // ChunkTooBig is returned by the source shard during the cloning phase if the migration
+    // manager finds that the chunk is larger than some calculated size, the source shard is
+    // *not* in draining mode, and the 'forceJumbo' balancer setting is 'kDoNotForce'.
+    // ExceededMemoryLimit is returned when the transfer mods queue surpasses 500MB regardless
+    // of whether the source shard is in draining mode or the value if the 'froceJumbo' balancer
+    // setting.
+    if (status == ErrorCodes::ChunkTooBig || status == ErrorCodes::ExceededMemoryLimit) {
+        LOGV2(21871,
+              "Migration failed, going to try splitting the chunk",
+              "migrateInfo"_attr = redact(migrateInfo.toString()),
+              "error"_attr = redact(status),
+              logAttrs(migrateInfo.nss));
+
+        auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+        const CollectionType collection = catalogClient->getCollection(
+            opCtx, migrateInfo.uuid, repl::ReadConcernLevel::kMajorityReadConcern);
+
+        ShardingCatalogManager::get(opCtx)->splitOrMarkJumbo(
+            opCtx, collection.getNss(), migrateInfo.minKey, migrateInfo.getMaxChunkSizeBytes());
+        return true;
+    }
+
+    if (status == ErrorCodes::IndexNotFound) {
+        const auto cm =
+            uassertStatusOK(getPlacementInfoForShardedCollection(opCtx, migrateInfo.nss));
+
+        if (cm.getShardKeyPattern().isHashedPattern()) {
+            LOGV2(78252,
+                  "Turning off balancing for hashed collection because migration failed due to "
+                  "missing shardkey index",
+                  "migrateInfo"_attr = redact(migrateInfo.toString()),
+                  "error"_attr = redact(status),
+                  logAttrs(migrateInfo.nss));
+
+            // Schedule writing to config.collections to turn off the balancer.
+            commandScheduler.disableBalancerForCollection(opCtx, migrateInfo.nss);
+            return false;
+        }
+    }
+
+    LOGV2(21872,
+          "Migration failed",
+          "migrateInfo"_attr = redact(migrateInfo.toString()),
+          "error"_attr = redact(status),
+          logAttrs(migrateInfo.nss));
+    return false;
+}
+
+class MigrateUnshardedCollectionTask : public MigrationTask {
+public:
+    MigrateUnshardedCollectionTask(OperationContext* opCtx,
+                                   MoveUnshardedPolicy& moveUnshardedPolicy,
+                                   BalancerCommandsScheduler& commandScheduler,
+                                   const MigrateInfoVector& migrations)
+        : MigrationTask(opCtx, commandScheduler, migrations),
+          _moveUnshardedPolicy(moveUnshardedPolicy) {}
+
+    void enqueue() override {
+        enqueueCollectionMigrations(_opCtx, _scheduler, _migrationsAndResponses);
+    }
+
+    bool processResponse(const MigrateInfo& migrateInfo, const Status& status) override {
+        return processActionStreamPolicyResponse(_opCtx, _moveUnshardedPolicy, migrateInfo, status);
+    }
+
+protected:
+    MoveUnshardedPolicy& _moveUnshardedPolicy;
+};
+
+class RebalanceChunkTask : public MigrationTask {
+public:
+    RebalanceChunkTask(OperationContext* opCtx,
+                       BalancerCommandsScheduler& commandScheduler,
+                       const MigrateInfoVector& migrations)
+        : MigrationTask(opCtx, commandScheduler, migrations) {}
+
+    void enqueue() override {
+        enqueueChunkMigrations(_opCtx, _scheduler, _migrationsAndResponses);
+    }
+
+    bool processResponse(const MigrateInfo& migrateInfo, const Status& status) override {
+        return processRebalanceResponse(_opCtx, _scheduler, migrateInfo, status);
+    }
+};
+
+class DefragmentChunkTask : public MigrationTask {
+public:
+    DefragmentChunkTask(OperationContext* opCtx,
+                        BalancerDefragmentationPolicy& defragmentationPolicy,
+                        BalancerCommandsScheduler& scheduler,
+                        const MigrateInfoVector& migrations)
+        : MigrationTask(opCtx, scheduler, migrations),
+          _defragmentationPolicy(defragmentationPolicy) {}
+
+    void enqueue() override {
+        enqueueChunkMigrations(_opCtx, _scheduler, _migrationsAndResponses);
+    }
+
+    bool processResponse(const MigrateInfo& migrateInfo, const Status& status) override {
+        return processActionStreamPolicyResponse(
+            _opCtx, _defragmentationPolicy, migrateInfo, status);
+    }
+
+protected:
+    BalancerDefragmentationPolicy& _defragmentationPolicy;
+};
+
+class BalancerWarning {
+    // Time interval between checks on draining shards.
+    constexpr static Minutes kDrainingShardsCheckInterval{10};
+
+public:
+    BalancerWarning() = default;
+
+    void warnIfRequired(OperationContext* opCtx, BalancerSettingsType::BalancerMode balancerMode) {
+        if (Date_t::now() - _lastDrainingShardsCheckTime < kDrainingShardsCheckInterval &&
+            MONGO_likely(!forceBalancerWarningChecks.shouldFail())) {
+            return;
+        }
+        _lastDrainingShardsCheckTime = Date_t::now();
+
+        LOGV2(7977401, "Performing balancer warning checks");
+
+        const auto drainingShardNames{getDrainingShardNames(opCtx)};
+        if (drainingShardNames.empty()) {
+            return;
+        }
+
+        if (balancerMode == BalancerSettingsType::BalancerMode::kOff) {
+            LOGV2_WARNING(
+                6434000,
+                "Draining of removed shards cannot be completed because the balancer is disabled",
+                "shards"_attr = drainingShardNames);
+            return;
+        }
+
+        _warnIfDrainingShardHasChunksForCollectionWithBalancingDisabled(opCtx, drainingShardNames);
+    }
+
+private:
+    void _warnIfDrainingShardHasChunksForCollectionWithBalancingDisabled(
+        OperationContext* opCtx, const std::vector<std::string>& drainingShardNames) {
+        // Balancer is on, emit warning if balancer is disabled for collections which have chunks in
+        // shards in draining mode.
+        const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+        auto collections =
+            catalogClient->getShardedCollections(opCtx,
+                                                 DatabaseName::kEmpty,
+                                                 repl::ReadConcernLevel::kMajorityReadConcern,
+                                                 BSON(CollectionType::kNssFieldName << 1));
+        if (collections.empty()) {
+            return;
+        }
+
+        // Construct BSONArray of draining shard names.
+        const auto drainingShardNameArray = [&]() {
+            BSONArrayBuilder shardNameArrayBuilder;
+            std::for_each(drainingShardNames.begin(),
+                          drainingShardNames.end(),
+                          [&shardNameArrayBuilder](const auto& shardName) {
+                              shardNameArrayBuilder.append(shardName);
+                          });
+            return shardNameArrayBuilder.arr();
+        }();
+
+        // For each collection, check if the collection has balancing disabled. If it is disabled,
+        // checks if the collection has any chunks in any of the draining shards. In which case a
+        // warning is emitted.
+        for (const auto& collType : collections) {
+            if (!collType.getAllowBalance() || !collType.getAllowMigrations() ||
+                !collType.getPermitMigrations()) {
+                auto matchStage = BSON("$match" << BSON(ChunkType::collectionUUID()
+                                                        << collType.getUuid() << ChunkType::shard()
+                                                        << BSON("$in" << drainingShardNameArray)));
+                AggregateCommandRequest aggRequest{NamespaceString::kConfigsvrChunksNamespace,
+                                                   {std::move(matchStage)}};
+
+                auto chunks = catalogClient->runCatalogAggregation(
+                    opCtx, aggRequest, {repl::ReadConcernLevel::kMajorityReadConcern});
+
+                if (!chunks.empty()) {
+                    stdx::unordered_set<std::string> shardsWithChunks;
+                    std::for_each(
+                        chunks.begin(), chunks.end(), [&shardsWithChunks](const BSONObj& chunkObj) {
+                            shardsWithChunks.emplace(chunkObj.getStringField(ChunkType::shard()));
+                        });
+                    LOGV2_WARNING(
+                        7977400,
+                        "Draining of removed shards cannot be completed because the balancer is "
+                        "disabled for a collection which has chunks in those shards",
+                        "uuid"_attr = collType.getUuid(),
+                        "nss"_attr = collType.getNss(),
+                        "shardsWithChunks"_attr = shardsWithChunks);
+                }
+            }
+        }
+    }
+
+    Date_t _lastDrainingShardsCheckTime{Date_t::fromMillisSinceEpoch(0)};
+};
 }  // namespace
 
 Balancer* Balancer::get(ServiceContext* serviceContext) {
@@ -241,36 +661,40 @@ Balancer* Balancer::get(OperationContext* operationContext) {
 }
 
 Balancer::Balancer()
-    : _balancedLastTime(0),
-      _random(std::random_device{}()),
-      _clusterStats(std::make_unique<ClusterStatisticsImpl>(_random)),
-      _chunkSelectionPolicy(
-          std::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get(), _random)),
+    : _balancedLastTime({}),
+      _clusterStats(std::make_unique<ClusterStatisticsImpl>()),
+      _chunkSelectionPolicy(std::make_unique<BalancerChunkSelectionPolicy>(_clusterStats.get())),
       _commandScheduler(std::make_unique<BalancerCommandsSchedulerImpl>()),
-      _defragmentationPolicy(std::make_unique<BalancerDefragmentationPolicyImpl>(
-          _clusterStats.get(), _random, [this]() { _onActionsStreamPolicyStateUpdate(); })),
-      _clusterChunksResizePolicy(std::make_unique<ClusterChunksResizePolicyImpl>(
-          [this] { _onActionsStreamPolicyStateUpdate(); })) {}
+      _defragmentationPolicy(std::make_unique<BalancerDefragmentationPolicy>(
+          _clusterStats.get(), [this]() { _onActionsStreamPolicyStateUpdate(); })),
+      _autoMergerPolicy(
+          std::make_unique<AutoMergerPolicy>([this]() { _onActionsStreamPolicyStateUpdate(); })),
+      _moveUnshardedPolicy(std::make_unique<MoveUnshardedPolicy>()) {}
 
 Balancer::~Balancer() {
-    // Terminate the balancer thread so it doesn't leak memory.
-    interruptBalancer();
-    waitForBalancerToStop();
+    onShutdown();
 }
 
 void Balancer::onStepUpBegin(OperationContext* opCtx, long long term) {
-    // Before starting step-up, ensure the balancer is ready to start. Specifically, that the
-    // balancer is actually stopped, because it may still be in the process of stopping if this
-    // node was previously primary.
-    waitForBalancerToStop();
+    // Before starting step-up, ensure the balancer is ready to start. Specifically, that there is
+    // not an outstanding termination sequence requested during a previous step down of this node.
+    joinTermination();
 }
 
 void Balancer::onStepUpComplete(OperationContext* opCtx, long long term) {
-    initiateBalancer(opCtx);
+    initiate(opCtx);
 }
 
 void Balancer::onStepDown() {
-    interruptBalancer();
+    // Asynchronously request to terminate all the worker threads and allow the stepdown sequence to
+    // continue.
+    requestTermination();
+}
+
+void Balancer::onShutdown() {
+    // Terminate the balancer thread so it doesn't leak memory.
+    requestTermination();
+    joinTermination();
 }
 
 void Balancer::onBecomeArbiter() {
@@ -279,10 +703,11 @@ void Balancer::onBecomeArbiter() {
     MONGO_UNREACHABLE;
 }
 
-void Balancer::initiateBalancer(OperationContext* opCtx) {
-    stdx::lock_guard<Latch> scopedLock(_mutex);
-    invariant(_state == kStopped);
-    _state = kRunning;
+void Balancer::initiate(OperationContext* opCtx) {
+    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    _imbalancedCollectionsCache.clear();
+    invariant(_threadSetState == ThreadSetState::Terminated);
+    _threadSetState = ThreadSetState::Running;
 
     invariant(!_thread.joinable());
     invariant(!_actionStreamConsumerThread.joinable());
@@ -290,13 +715,13 @@ void Balancer::initiateBalancer(OperationContext* opCtx) {
     _thread = stdx::thread([this] { _mainThread(); });
 }
 
-void Balancer::interruptBalancer() {
-    stdx::lock_guard<Latch> scopedLock(_mutex);
-    if (_state != kRunning) {
+void Balancer::requestTermination() {
+    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    if (_threadSetState != ThreadSetState::Running) {
         return;
     }
 
-    _state = kStopping;
+    _threadSetState = ThreadSetState::Terminating;
 
     // Interrupt the balancer thread if it has been started. We are guaranteed that the operation
     // context of that thread is still alive, because we hold the balancer mutex.
@@ -306,114 +731,56 @@ void Balancer::interruptBalancer() {
     }
 
     _condVar.notify_all();
-    _defragmentationCondVar.notify_all();
+    _actionStreamCondVar.notify_all();
 }
 
-void Balancer::waitForBalancerToStop() {
-    stdx::unique_lock<Latch> scopedLock(_mutex);
-    _joinCond.wait(scopedLock, [this] { return _state == kStopped; });
+void Balancer::joinTermination() {
+    stdx::unique_lock<stdx::mutex> scopedLock(_mutex);
+    _joinCond.wait(scopedLock, [this] { return _threadSetState == ThreadSetState::Terminated; });
     if (_thread.joinable()) {
         _thread.join();
     }
 }
 
 void Balancer::joinCurrentRound(OperationContext* opCtx) {
-    stdx::unique_lock<Latch> scopedLock(_mutex);
+    stdx::unique_lock<stdx::mutex> scopedLock(_mutex);
     const auto numRoundsAtStart = _numBalancerRounds;
     opCtx->waitForConditionOrInterrupt(_condVar, scopedLock, [&] {
         return !_inBalancerRound || _numBalancerRounds != numRoundsAtStart;
     });
 }
 
-Status Balancer::rebalanceSingleChunk(OperationContext* opCtx,
-                                      const NamespaceString& nss,
-                                      const ChunkType& chunk) {
-    auto migrateStatus = _chunkSelectionPolicy->selectSpecificChunkToMove(opCtx, nss, chunk);
-    if (!migrateStatus.isOK()) {
-        return migrateStatus.getStatus();
-    }
-
-    auto migrateInfo = std::move(migrateStatus.getValue());
-    if (!migrateInfo) {
-        LOGV2_DEBUG(21854,
-                    1,
-                    "Unable to find more appropriate location for chunk {chunk}",
-                    "Unable to find more appropriate location for chunk",
-                    "chunk"_attr = redact(chunk.toString()));
-        return Status::OK();
-    }
-
-    auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
-    Status refreshStatus = balancerConfig->refreshAndCheck(opCtx);
-    if (!refreshStatus.isOK()) {
-        return refreshStatus;
-    }
-
-    auto coll = Grid::get(opCtx)->catalogClient()->getCollection(
-        opCtx, nss, repl::ReadConcernLevel::kMajorityReadConcern);
-    auto maxChunkSize =
-        coll.getMaxChunkSizeBytes().value_or(balancerConfig->getMaxChunkSizeBytes());
-
-    MoveChunkSettings settings(
-        maxChunkSize, balancerConfig->getSecondaryThrottle(), balancerConfig->waitForDelete());
-    auto response =
-        _commandScheduler
-            ->requestMoveChunk(opCtx, *migrateInfo, settings, true /* issuedByRemoteUser */)
-            .getNoThrow(opCtx);
-    return processManualMigrationOutcome(opCtx, chunk.getMin(), nss, migrateInfo->to, response);
-}
-
-Status Balancer::moveSingleChunk(OperationContext* opCtx,
-                                 const NamespaceString& nss,
-                                 const ChunkType& chunk,
-                                 const ShardId& newShardId,
-                                 const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                                 bool waitForDelete,
-                                 bool forceJumbo) {
-    auto moveAllowedStatus = _chunkSelectionPolicy->checkMoveAllowed(opCtx, chunk, newShardId);
-    if (!moveAllowedStatus.isOK()) {
-        return moveAllowedStatus;
-    }
-
-    auto coll = Grid::get(opCtx)->catalogClient()->getCollection(
-        opCtx, nss, repl::ReadConcernLevel::kMajorityReadConcern);
-    const auto maxChunkSize = getMaxChunkSizeBytes(opCtx, coll);
-
-    MoveChunkSettings settings(maxChunkSize, secondaryThrottle, waitForDelete);
-    MigrateInfo migrateInfo(newShardId,
-                            nss,
-                            chunk,
-                            forceJumbo ? MoveChunkRequest::ForceJumbo::kForceManual
-                                       : MoveChunkRequest::ForceJumbo::kDoNotForce);
-    auto response =
-        _commandScheduler
-            ->requestMoveChunk(opCtx, migrateInfo, settings, true /* issuedByRemoteUser */)
-            .getNoThrow(opCtx);
-    return processManualMigrationOutcome(opCtx, chunk.getMin(), nss, newShardId, response);
-}
-
 Status Balancer::moveRange(OperationContext* opCtx,
                            const NamespaceString& nss,
                            const ConfigsvrMoveRange& request,
                            bool issuedByRemoteUser) {
-    auto coll = Grid::get(opCtx)->catalogClient()->getCollection(
-        opCtx, nss, repl::ReadConcernLevel::kMajorityReadConcern);
+    const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+    auto coll =
+        catalogClient->getCollection(opCtx, nss, repl::ReadConcernLevel::kMajorityReadConcern);
+
+    if (coll.getUnsplittable())
+        return {ErrorCodes::NamespaceNotSharded,
+                str::stream() << "Can't execute moveRange on unsharded collection "
+                              << nss.toStringForErrorMsg()};
+
     const auto maxChunkSize = getMaxChunkSizeBytes(opCtx, coll);
 
-    const auto [fromShardId, min] = [&]() {
-        const auto cm = uassertStatusOK(
-            Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
-                                                                                         nss));
-        // TODO SERVER-64926 do not assume min always present
-        const auto& chunk = cm.findIntersectingChunkWithSimpleCollation(*request.getMin());
-        return std::tuple<ShardId, BSONObj>{chunk.getShardId(), chunk.getMin()};
+    const auto fromShardId = [&]() {
+        const auto cm = uassertStatusOK(getPlacementInfoForShardedCollection(opCtx, nss));
+        if (request.getMin()) {
+            const auto& chunk = cm.findIntersectingChunkWithSimpleCollation(*request.getMin());
+            return chunk.getShardId();
+        } else {
+            return getChunkForMaxBound(cm, *request.getMax()).getShardId();
+        }
     }();
 
     ShardsvrMoveRange shardSvrRequest(nss);
-    shardSvrRequest.setDbName(NamespaceString::kAdminDb);
+    shardSvrRequest.setDbName(DatabaseName::kAdmin);
     shardSvrRequest.setMoveRangeRequestBase(request.getMoveRangeRequestBase());
     shardSvrRequest.setMaxChunkSizeBytes(maxChunkSize);
     shardSvrRequest.setFromShard(fromShardId);
+    shardSvrRequest.setCollectionTimestamp(coll.getTimestamp());
     shardSvrRequest.setEpoch(coll.getEpoch());
     const auto [secondaryThrottle, wc] =
         getSecondaryThrottleAndWriteConcern(request.getSecondaryThrottle());
@@ -423,8 +790,12 @@ Status Balancer::moveRange(OperationContext* opCtx,
     auto response =
         _commandScheduler->requestMoveRange(opCtx, shardSvrRequest, wc, issuedByRemoteUser)
             .getNoThrow(opCtx);
-    return processManualMigrationOutcome(
-        opCtx, min, nss, shardSvrRequest.getToShard(), std::move(response));
+    return processManualMigrationOutcome(opCtx,
+                                         request.getMin(),
+                                         request.getMax(),
+                                         nss,
+                                         shardSvrRequest.getToShard(),
+                                         std::move(response));
 }
 
 void Balancer::report(OperationContext* opCtx, BSONObjBuilder* builder) {
@@ -433,218 +804,230 @@ void Balancer::report(OperationContext* opCtx, BSONObjBuilder* builder) {
 
     const auto mode = balancerConfig->getBalancerMode();
 
-    stdx::lock_guard<Latch> scopedLock(_mutex);
+    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
     builder->append("mode", BalancerSettingsType::kBalancerModes[mode]);
     builder->append("inBalancerRound", _inBalancerRound);
     builder->append("numBalancerRounds", _numBalancerRounds);
+    builder->append("term", repl::ReplicationCoordinator::get(opCtx)->getTerm());
 }
 
 void Balancer::_consumeActionStreamLoop() {
-    ScopeGuard onExitCleanup([this] {
-        _defragmentationPolicy->interruptAllDefragmentations();
-        _clusterChunksResizePolicy->stop();
-    });
+    Client::initThread("BalancerSecondary",
+                       getGlobalServiceContext()->getService(ClusterRole::ShardServer));
 
-    Client::initThread("BalancerSecondary");
     auto opCtx = cc().makeOperationContext();
-    // This thread never refreshes balancerConfig - instead, it relies on the requests
-    // performed by _mainThread() on each round to eventually see updated information.
-    auto balancerConfig = Grid::get(opCtx.get())->getBalancerConfiguration();
     executor::ScopedTaskExecutor executor(
         Grid::get(opCtx.get())->getExecutorPool()->getFixedExecutor());
 
-    auto selectStream = [&]() -> ActionsStreamPolicy* {
-        // This policy has higher priority - and once activated, it cannot be disabled through cfg
-        // changes.
-        if (_clusterChunksResizePolicy->isActive()) {
-            return _clusterChunksResizePolicy.get();
+    ScopeGuard onExitCleanup([this, &opCtx, &executor] {
+        _defragmentationPolicy->interruptAllDefragmentations();
+        try {
+            _autoMergerPolicy->disable(opCtx.get());
+        } catch (const DBException& e) {
+            LOGV2_WARNING(8145100,
+                          "Failed to log in config.changelog when disabling the auto merger",
+                          "error"_attr = redact(e));
         }
+        // Explicitly cancel and drain any outstanding streaming action already dispatched to the
+        // task executor.
+        executor->shutdown();
+        executor->join();
+        // When shutting down, the task executor may or may not invoke the
+        // applyActionResponseTo()callback for canceled streaming actions: to ensure a consistent
+        // state of the balancer after a step down, _outstandingStreamingOps needs then to be reset
+        // to 0 once all the tasks have been drained.
+        _outstandingStreamingOps.store(0);
+    });
 
-        if (balancerConfig->shouldBalanceForAutoSplit()) {
-            return _defragmentationPolicy.get();
-        }
-        return nullptr;
-    };
+    // Lambda function to sleep for throttling
+    auto applyThrottling =
+        [lastActionTime = Date_t::fromMillisSinceEpoch(0)](const Milliseconds throttle) mutable {
+            auto timeSinceLastAction = Date_t::now() - lastActionTime;
+            if (throttle > timeSinceLastAction) {
+                auto sleepingTime = throttle - timeSinceLastAction;
+                LOGV2_DEBUG(6443700,
+                            2,
+                            "Applying throttling on balancer secondary thread",
+                            "sleepingTime"_attr = sleepingTime);
+                sleepFor(sleepingTime);
+            }
+            lastActionTime = Date_t::now();
+        };
 
-    auto applyActionResponseTo = [this](const DefragmentationAction& action,
-                                        const DefragmentationActionResponse& response,
-                                        ActionsStreamPolicy* policy) {
-        invariant(_outstandingStreamingOps.addAndFetch(-1) >= 0);
-        ThreadClient tc("BalancerSecondaryThread::applyActionResponse", getGlobalServiceContext());
-        auto opCtx = tc->makeOperationContext();
-        policy->applyActionResult(opCtx.get(), action, response);
-    };
+    auto backOff = Backoff(Seconds(1), Milliseconds::max());
+    bool errorOccurred = false;
 
-    auto applyThrottling = [lastActionTime = Date_t::fromMillisSinceEpoch(0)]() mutable {
-        const Milliseconds throttle{chunkDefragmentationThrottlingMS.load()};
-        auto timeSinceLastAction = Date_t::now() - lastActionTime;
-        if (throttle > timeSinceLastAction) {
-            auto sleepingTime = throttle - timeSinceLastAction;
-            LOGV2_DEBUG(6443700,
-                        2,
-                        "Applying throttling on balancer secondary thread",
-                        "sleepingTime"_attr = sleepingTime);
-            // TODO SERVER-64865 interrupt the sleep when a shutwdown request is received
-            sleepFor(sleepingTime);
-        }
-        lastActionTime = Date_t::now();
-    };
-    ActionsStreamPolicy* selectedStream(nullptr);
-    bool streamDrained = false;
     while (true) {
-        bool newStreamSelected = false;
         {
-            stdx::unique_lock<Latch> ul(_mutex);
-            _defragmentationCondVar.wait(ul, [&] {
-                auto nextSelection = selectStream();
-                if (nextSelection != selectedStream) {
-                    newStreamSelected = true;
-                    selectedStream = nextSelection;
-                    streamDrained = false;
-                }
-                auto canConsumeStream = selectedStream != nullptr &&
-                    _outstandingStreamingOps.load() <= kMaxOutstandingStreamingOperations;
-                return _state != kRunning ||
-                    (canConsumeStream && (!streamDrained || _newInfoOnStreamingActions.load()));
-            });
-            if (_state != kRunning) {
+            stdx::unique_lock<stdx::mutex> ul(_mutex);
+
+            // Keep asking for more actions if we meet all these conditions:
+            //  - Balancer is in kRunning state
+            //  - There are less than kMaxOutstandingStreamingOperations
+            //  - There were  actions to schedule on the previous iteration or there is an update on
+            //  the streams state
+            auto stopWaitingCondition = [&] {
+                return _threadSetState != ThreadSetState::Running ||
+                    (_outstandingStreamingOps.load() <= kMaxOutstandingStreamingOperations &&
+                     _actionStreamsStateUpdated.load());
+            };
+
+            if (!errorOccurred) {
+                _actionStreamCondVar.wait(ul, stopWaitingCondition);
+            } else {
+                // Enable retries in case of error by performing a backoff
+                _actionStreamCondVar.wait_for(
+                    ul, backOff.nextSleep().toSystemDuration(), stopWaitingCondition);
+            }
+
+            if (_threadSetState != ThreadSetState::Running) {
                 break;
             }
         }
 
-        if (newStreamSelected) {
-            LOGV2(6417110,
-                  "New actions stream source selected",
-                  "selectedStream"_attr = selectedStream->getName());
-        }
+        // Clear flags
+        errorOccurred = false;
+        _actionStreamsStateUpdated.store(false);
 
-        _newInfoOnStreamingActions.store(false);
-        auto nextAction = selectedStream->getNextStreamingAction(opCtx.get());
-        if ((streamDrained = !nextAction.is_initialized())) {
+        // Get active streams
+        auto activeStreams = [&]() -> std::vector<ActionsStreamPolicy*> {
+            auto balancerConfig = Grid::get(opCtx.get())->getBalancerConfiguration();
+            std::vector<ActionsStreamPolicy*> streams;
+            if (balancerConfig->shouldBalanceForAutoMerge() && _autoMergerPolicy->isEnabled()) {
+                streams.push_back(_autoMergerPolicy.get());
+            }
+            if (balancerConfig->shouldBalance()) {
+                streams.push_back(_defragmentationPolicy.get());
+            }
+            return streams;
+        }();
+
+        // Get next action from a random stream together with its stream
+        auto [nextAction, sourcedStream] =
+            [&]() -> std::tuple<boost::optional<BalancerStreamAction>, ActionsStreamPolicy*> {
+            auto client = opCtx->getClient();
+            std::shuffle(activeStreams.begin(), activeStreams.end(), client->getPrng().urbg());
+            for (auto stream : activeStreams) {
+                try {
+                    auto action = stream->getNextStreamingAction(opCtx.get());
+                    if (action.has_value()) {
+                        return std::make_tuple(std::move(action), stream);
+                    }
+
+                } catch (const DBException& e) {
+                    LOGV2_WARNING(7435001,
+                                  "Failed to get next action from action stream",
+                                  "error"_attr = redact(e),
+                                  "stream"_attr = stream->getName());
+
+                    errorOccurred = true;
+                }
+            }
+            return std::make_tuple(boost::none, nullptr);
+        }();
+
+        if (!nextAction.has_value()) {
             continue;
         }
 
+        // Signal there are still actions to be consumed by next iteration
+        _actionStreamsStateUpdated.store(true);
+
         _outstandingStreamingOps.fetchAndAdd(1);
-        stdx::visit(
-            visit_helper::Overloaded{
-                [&, selectedStream](MergeInfo&& mergeAction) {
-                    applyThrottling();
-                    auto result =
-                        _commandScheduler
-                            ->requestMergeChunks(opCtx.get(),
-                                                 mergeAction.nss,
-                                                 mergeAction.shardId,
-                                                 mergeAction.chunkRange,
-                                                 mergeAction.collectionVersion)
-                            .thenRunOn(*executor)
-                            .onCompletion([this,
-                                           selectedStream,
-                                           &applyActionResponseTo,
-                                           action = std::move(mergeAction)](const Status& status) {
-                                applyActionResponseTo(action, status, selectedStream);
-                            });
-                },
-                [&, selectedStream](DataSizeInfo&& dataSizeAction) {
-                    auto result =
-                        _commandScheduler
-                            ->requestDataSize(opCtx.get(),
-                                              dataSizeAction.nss,
-                                              dataSizeAction.shardId,
-                                              dataSizeAction.chunkRange,
-                                              dataSizeAction.version,
-                                              dataSizeAction.keyPattern,
-                                              dataSizeAction.estimatedValue)
-                            .thenRunOn(*executor)
-                            .onCompletion([this,
-                                           selectedStream,
-                                           &applyActionResponseTo,
-                                           action = std::move(dataSizeAction)](
-                                              const StatusWith<DataSizeResponse>& swDataSize) {
-                                applyActionResponseTo(action, swDataSize, selectedStream);
-                            });
-                },
-                [&, selectedStream](AutoSplitVectorInfo&& splitVectorAction) {
-                    auto result =
-                        _commandScheduler
-                            ->requestAutoSplitVector(opCtx.get(),
-                                                     splitVectorAction.nss,
-                                                     splitVectorAction.shardId,
-                                                     splitVectorAction.keyPattern,
-                                                     splitVectorAction.minKey,
-                                                     splitVectorAction.maxKey,
-                                                     splitVectorAction.maxChunkSizeBytes)
-                            .thenRunOn(*executor)
-                            .onCompletion(
-                                [this,
-                                 selectedStream,
-                                 &applyActionResponseTo,
-                                 action = std::move(splitVectorAction)](
-                                    const StatusWith<AutoSplitVectorResponse>& swSplitPoints) {
-                                    applyActionResponseTo(action, swSplitPoints, selectedStream);
-                                });
-                },
-                [&, selectedStream](SplitInfoWithKeyPattern&& splitAction) {
-                    applyThrottling();
-                    auto result =
-                        _commandScheduler
-                            ->requestSplitChunk(opCtx.get(),
-                                                splitAction.info.nss,
-                                                splitAction.info.shardId,
-                                                splitAction.info.collectionVersion,
-                                                splitAction.keyPattern,
-                                                splitAction.info.minKey,
-                                                splitAction.info.maxKey,
-                                                splitAction.info.splitKeys)
-                            .thenRunOn(*executor)
-                            .onCompletion([this,
-                                           selectedStream,
-                                           &applyActionResponseTo,
-                                           action = std::move(splitAction)](const Status& status) {
-                                applyActionResponseTo(action, status, selectedStream);
-                            });
-                },
-                [](MigrateInfo&& _) {
-                    uasserted(ErrorCodes::BadValue,
-                              "Migrations cannot be processed as Streaming Actions");
-                }},
-            std::move(*nextAction));
+        visit(OverloadedVisitor{
+                  [&, stream = sourcedStream](MergeInfo&& mergeAction) {
+                      applyThrottling(Milliseconds(chunkDefragmentationThrottlingMS.load()));
+                      auto result =
+                          _commandScheduler
+                              ->requestMergeChunks(opCtx.get(),
+                                                   mergeAction.nss,
+                                                   mergeAction.shardId,
+                                                   mergeAction.chunkRange,
+                                                   mergeAction.collectionPlacementVersion)
+                              .thenRunOn(*executor)
+                              .onCompletion([this, stream, action = std::move(mergeAction)](
+                                                const Status& status) {
+                                  _applyStreamingActionResponseToPolicy(action, status, stream);
+                              });
+                  },
+                  [&, stream = sourcedStream](DataSizeInfo&& dataSizeAction) {
+                      auto result =
+                          _commandScheduler
+                              ->requestDataSize(opCtx.get(),
+                                                dataSizeAction.nss,
+                                                dataSizeAction.shardId,
+                                                dataSizeAction.chunkRange,
+                                                dataSizeAction.version,
+                                                dataSizeAction.keyPattern,
+                                                dataSizeAction.estimatedValue,
+                                                dataSizeAction.maxSize)
+                              .thenRunOn(*executor)
+                              .onCompletion([this, stream, action = std::move(dataSizeAction)](
+                                                const StatusWith<DataSizeResponse>& swDataSize) {
+                                  _applyStreamingActionResponseToPolicy(action, swDataSize, stream);
+                              });
+                  },
+                  [&, stream = sourcedStream](MergeAllChunksOnShardInfo&& mergeAllChunksAction) {
+                      if (mergeAllChunksAction.applyThrottling) {
+                          applyThrottling(Milliseconds(autoMergerThrottlingMS.load()));
+                      }
+
+                      auto result =
+                          _commandScheduler
+                              ->requestMergeAllChunksOnShard(opCtx.get(),
+                                                             mergeAllChunksAction.nss,
+                                                             mergeAllChunksAction.shardId)
+                              .thenRunOn(*executor)
+                              .onCompletion(
+                                  [this, stream, action = mergeAllChunksAction](
+                                      const StatusWith<NumMergedChunks>& swNumMergedChunks) {
+                                      _applyStreamingActionResponseToPolicy(
+                                          action, swNumMergedChunks, stream);
+                                  });
+                  },
+                  [](MigrateInfo&& _) {
+                      uasserted(ErrorCodes::BadValue,
+                                "Migrations cannot be processed as Streaming Actions");
+                  }},
+              std::move(nextAction.value()));
     }
 }
 
 void Balancer::_mainThread() {
     ON_BLOCK_EXIT([this] {
         {
-            stdx::lock_guard<Latch> scopedLock(_mutex);
-            _state = kStopped;
-            LOGV2_DEBUG(21855, 1, "Balancer thread terminated");
+            stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+            _threadSetState = ThreadSetState::Terminated;
+            LOGV2_DEBUG(21855, 1, "Balancer thread set terminated");
         }
         _joinCond.notify_all();
     });
 
-    Client::initThread("Balancer");
-    auto opCtx = cc().makeOperationContext();
+    // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+    ThreadClient threadClient("Balancer",
+                              getGlobalServiceContext()->getService(ClusterRole::ShardServer),
+                              ClientOperationKillableByStepdown{false});
+
+    auto opCtx = threadClient->makeOperationContext();
     auto shardingContext = Grid::get(opCtx.get());
 
     LOGV2(21856, "CSRS balancer is starting");
 
     {
-        stdx::lock_guard<Latch> scopedLock(_mutex);
+        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
         _threadOperationContext = opCtx.get();
     }
 
     const Seconds kInitBackoffInterval(10);
 
     auto balancerConfig = shardingContext->getBalancerConfiguration();
-    while (!_stopRequested()) {
+    while (!_terminationRequested()) {
         Status refreshStatus = balancerConfig->refreshAndCheck(opCtx.get());
         if (!refreshStatus.isOK()) {
-            LOGV2_WARNING(
-                21876,
-                "Balancer settings could not be loaded because of {error} and will be retried in "
-                "{backoffInterval}",
-                "Got error while refreshing balancer settings, will retry with a backoff",
-                "backoffInterval"_attr = Milliseconds(kInitBackoffInterval),
-                "error"_attr = refreshStatus);
+            LOGV2_WARNING(21876,
+                          "Got error while refreshing balancer settings, will retry with a backoff",
+                          "backoffInterval"_attr = Milliseconds(kInitBackoffInterval),
+                          "error"_attr = refreshStatus);
 
             _sleepFor(opCtx.get(), kInitBackoffInterval);
             continue;
@@ -655,10 +1038,7 @@ void Balancer::_mainThread() {
 
     LOGV2(6036605, "Starting command scheduler");
 
-    _commandScheduler->start(
-        opCtx.get(),
-        MigrationsRecoveryDefaultValues(balancerConfig->getMaxChunkSizeBytes(),
-                                        balancerConfig->getSecondaryThrottle()));
+    _commandScheduler->start(opCtx.get());
 
     _actionStreamConsumerThread = stdx::thread([&] { _consumeActionStreamLoop(); });
 
@@ -666,123 +1046,152 @@ void Balancer::_mainThread() {
 
     // Main balancer loop
     auto lastMigrationTime = Date_t::fromMillisSinceEpoch(0);
-    while (!_stopRequested()) {
+    BalancerWarning balancerWarning;
+    while (!_terminationRequested()) {
         BalanceRoundDetails roundDetails;
 
         _beginRound(opCtx.get());
 
         try {
-            shardingContext->shardRegistry()->reload(opCtx.get());
-
             uassert(13258, "oids broken after resetting!", _checkOIDs(opCtx.get()));
 
             Status refreshStatus = balancerConfig->refreshAndCheck(opCtx.get());
             if (!refreshStatus.isOK()) {
-                LOGV2_WARNING(21877,
-                              "Skipping balancing round due to {error}",
-                              "Skipping balancing round",
-                              "error"_attr = refreshStatus);
+                LOGV2_WARNING(21877, "Skipping balancing round", "error"_attr = refreshStatus);
                 _endRound(opCtx.get(), kBalanceRoundDefaultInterval);
                 continue;
             }
 
-            if (!balancerConfig->shouldBalance() || _stopRequested() ||
-                _clusterChunksResizePolicy->isActive()) {
+            // Warn before we skip the iteration due to balancing being disabled.
+            balancerWarning.warnIfRequired(opCtx.get(), balancerConfig->getBalancerMode());
+
+            if (!balancerConfig->shouldBalance() || _terminationRequested()) {
+                _autoMergerPolicy->disable(opCtx.get());
+
                 LOGV2_DEBUG(21859, 1, "Skipping balancing round because balancing is disabled");
                 _endRound(opCtx.get(), kBalanceRoundDefaultInterval);
                 continue;
             }
 
-            boost::optional<Milliseconds> forcedBalancerRoundInterval(boost::none);
-            overrideBalanceRoundInterval.execute([&](const BSONObj& data) {
-                forcedBalancerRoundInterval = Milliseconds(data["intervalMs"].numberInt());
-                LOGV2(21864,
-                      "overrideBalanceRoundInterval: using customized balancing interval",
-                      "balancerInterval"_attr = *forcedBalancerRoundInterval);
-            });
+            if (balancerConfig->shouldBalanceForAutoMerge()) {
+                _autoMergerPolicy->enable(opCtx.get());
+            }
+
+            LOGV2_DEBUG(21860,
+                        1,
+                        "Start balancing round",
+                        "waitForDelete"_attr = balancerConfig->waitForDelete(),
+                        "secondaryThrottle"_attr = balancerConfig->getSecondaryThrottle().toBSON());
+
+            // Collect and apply up-to-date configuration values on the cluster collections.
+            _defragmentationPolicy->startCollectionDefragmentations(opCtx.get());
+
+            // Reactivate the Automerger if needed.
+            _autoMergerPolicy->checkInternalUpdates(opCtx.get());
 
             // The current configuration is allowing the balancer to perform operations.
             // Unblock the secondary thread if needed.
-            _defragmentationCondVar.notify_all();
+            _actionStreamCondVar.notify_all();
+
+            // Split chunk to match zones boundaries
             {
-                LOGV2_DEBUG(21860,
-                            1,
-                            "Start balancing round. waitForDelete: {waitForDelete}, "
-                            "secondaryThrottle: {secondaryThrottle}",
-                            "Start balancing round",
-                            "waitForDelete"_attr = balancerConfig->waitForDelete(),
-                            "secondaryThrottle"_attr =
-                                balancerConfig->getSecondaryThrottle().toBSON());
-
-                static Occasionally sampler;
-                if (sampler.tick()) {
-                    warnOnMultiVersion(uassertStatusOK(_clusterStats->getStats(opCtx.get())));
-                }
-
-                // Collect and apply up-to-date configuration values on the cluster collections.
-                {
-                    OperationContext* ctx = opCtx.get();
-                    auto allCollections = Grid::get(ctx)->catalogClient()->getCollections(ctx, {});
-                    for (const auto& coll : allCollections) {
-                        _defragmentationPolicy->startCollectionDefragmentation(ctx, coll);
-                    }
-                }
-
                 Status status = _splitChunksIfNeeded(opCtx.get());
                 if (!status.isOK()) {
-                    LOGV2_WARNING(21878,
-                                  "Failed to split chunks due to {error}",
-                                  "Failed to split chunks",
-                                  "error"_attr = status);
+                    LOGV2_WARNING(21878, "Failed to split chunks", "error"_attr = status);
                 } else {
-                    LOGV2_DEBUG(21861, 1, "Done enforcing tag range boundaries.");
+                    LOGV2_DEBUG(21861, 1, "Done enforcing zone range boundaries.");
                 }
+            }
 
-                stdx::unordered_set<ShardId> usedShards;
+            // Select and migrate chunks
+            {
+                Timer selectionTimer;
+
+                const std::vector<ClusterStatistics::ShardStatistics> shardStats =
+                    uassertStatusOK(_clusterStats->getStats(opCtx.get()));
+
+                stdx::unordered_set<ShardId> availableShards;
+                availableShards.reserve(shardStats.size());
+                std::transform(
+                    shardStats.begin(),
+                    shardStats.end(),
+                    std::inserter(availableShards, availableShards.end()),
+                    [](const ClusterStatistics::ShardStatistics& shardStatistics) -> ShardId {
+                        return shardStatistics.shardId;
+                    });
+
+                const auto unshardedToMove = _moveUnshardedPolicy->selectCollectionsToMove(
+                    opCtx.get(), shardStats, &availableShards);
 
                 const auto chunksToDefragment =
-                    _defragmentationPolicy->selectChunksToMove(opCtx.get(), &usedShards);
+                    _defragmentationPolicy->selectChunksToMove(opCtx.get(), &availableShards);
 
-                const auto chunksToRebalance = uassertStatusOK(
-                    _chunkSelectionPolicy->selectChunksToMove(opCtx.get(), &usedShards));
+                const auto chunksToRebalance =
+                    uassertStatusOK(_chunkSelectionPolicy->selectChunksToMove(
+                        opCtx.get(), shardStats, &availableShards, &_imbalancedCollectionsCache));
+                const Milliseconds selectionTimeMillis{selectionTimer.millis()};
 
-                if (chunksToRebalance.empty() && chunksToDefragment.empty()) {
+                if (chunksToRebalance.empty() && chunksToDefragment.empty() &&
+                    unshardedToMove.empty()) {
                     LOGV2_DEBUG(21862, 1, "No need to move any chunk");
-                    _balancedLastTime = 0;
+                    _balancedLastTime = {};
                     LOGV2_DEBUG(21863, 1, "End balancing round");
+                    // Set to 100ms when executed in context of a test
                     _endRound(opCtx.get(),
-                              forcedBalancerRoundInterval ? *forcedBalancerRoundInterval
-                                                          : kBalanceRoundDefaultInterval);
+                              TestingProctor::instance().isEnabled()
+                                  ? Milliseconds(100)
+                                  : kBalanceRoundDefaultInterval);
                 } else {
-                    auto timeSinceLastMigration = Date_t::now() - lastMigrationTime;
-                    _sleepFor(opCtx.get(),
-                              forcedBalancerRoundInterval
-                                  ? *forcedBalancerRoundInterval - timeSinceLastMigration
-                                  : kBalancerMigrationsThrottling - timeSinceLastMigration);
 
-                    _balancedLastTime =
-                        _moveChunks(opCtx.get(), chunksToRebalance, chunksToDefragment);
+                    // Sleep according to the migration throttling settings
+                    const auto throttleTimeMillis = [&] {
+                        const auto& minRoundinterval =
+                            Milliseconds(balancerMigrationsThrottlingMs.load());
+
+                        const auto timeSinceLastMigration = Date_t::now() - lastMigrationTime;
+                        if (timeSinceLastMigration < minRoundinterval) {
+                            return minRoundinterval - timeSinceLastMigration;
+                        }
+                        return Milliseconds::zero();
+                    }();
+                    _sleepFor(opCtx.get(), throttleTimeMillis);
+
+                    // Migrate chunks
+                    Timer migrationTimer;
+                    _balancedLastTime = _doMigrations(
+                        opCtx.get(), unshardedToMove, chunksToRebalance, chunksToDefragment);
                     lastMigrationTime = Date_t::now();
+                    const Milliseconds migrationTimeMillis{migrationTimer.millis()};
 
+                    // Complete round
                     roundDetails.setSucceeded(
                         static_cast<int>(chunksToRebalance.size() + chunksToDefragment.size()),
-                        _balancedLastTime);
+                        _balancedLastTime.rebalancedChunks + _balancedLastTime.defragmentedChunks,
+                        _imbalancedCollectionsCache.size(),
+                        static_cast<int>(unshardedToMove.size()),
+                        _balancedLastTime.unshardedCollections,
+                        selectionTimeMillis,
+                        throttleTimeMillis,
+                        migrationTimeMillis);
 
+                    auto catalogManager = ShardingCatalogManager::get(opCtx.get());
                     ShardingLogging::get(opCtx.get())
-                        ->logAction(opCtx.get(), "balancer.round", "", roundDetails.toBSON())
+                        ->logAction(opCtx.get(),
+                                    "balancer.round",
+                                    NamespaceString::kEmpty,
+                                    roundDetails.toBSON(),
+                                    catalogManager->localConfigShard(),
+                                    catalogManager->localCatalogClient())
                         .ignore();
 
                     LOGV2_DEBUG(6679500, 1, "End balancing round");
-                    // Migration throttling of kBalancerMigrationsThrottling will be applied before
-                    // the next call to _moveChunks, so don't sleep here.
+                    // Migration throttling of `balancerMigrationsThrottlingMs` will be applied
+                    // before the next call to _doMigrations, so don't sleep here.
                     _endRound(opCtx.get(), Milliseconds(0));
                 }
             }
         } catch (const DBException& e) {
-            LOGV2(21865,
-                  "caught exception while doing balance: {error}",
-                  "Error while doing balance",
-                  "error"_attr = e);
+            LOGV2(21865, "Error while doing balance", "error"_attr = e);
 
             // Just to match the opening statement if in log level 1
             LOGV2_DEBUG(21866, 1, "End balancing round");
@@ -790,8 +1199,14 @@ void Balancer::_mainThread() {
             // This round failed, tell the world!
             roundDetails.setFailed(e.what());
 
+            auto catalogManager = ShardingCatalogManager::get(opCtx.get());
             ShardingLogging::get(opCtx.get())
-                ->logAction(opCtx.get(), "balancer.round", "", roundDetails.toBSON())
+                ->logAction(opCtx.get(),
+                            "balancer.round",
+                            NamespaceString::kEmpty,
+                            roundDetails.toBSON(),
+                            catalogManager->localConfigShard(),
+                            catalogManager->localCatalogClient())
                 .ignore();
 
             // Sleep a fair amount before retrying because of the error
@@ -800,8 +1215,8 @@ void Balancer::_mainThread() {
     }
 
     {
-        stdx::lock_guard<Latch> scopedLock(_mutex);
-        invariant(_state == kStopping);
+        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+        invariant(_threadSetState == ThreadSetState::Terminating);
     }
 
     _commandScheduler->stop();
@@ -810,27 +1225,38 @@ void Balancer::_mainThread() {
 
 
     {
-        stdx::lock_guard<Latch> scopedLock(_mutex);
+        stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
         _threadOperationContext = nullptr;
     }
 
     LOGV2(21867, "CSRS balancer is now stopped");
 }
 
-bool Balancer::_stopRequested() {
-    stdx::lock_guard<Latch> scopedLock(_mutex);
-    return (_state != kRunning);
+void Balancer::_applyStreamingActionResponseToPolicy(const BalancerStreamAction& action,
+                                                     const BalancerStreamActionResponse& response,
+                                                     ActionsStreamPolicy* policy) {
+    tassert(8245242, "No action in progress", _outstandingStreamingOps.addAndFetch(-1) >= 0);
+    ThreadClient tc("BalancerSecondaryThread::applyActionResponse",
+                    getGlobalServiceContext()->getService(ClusterRole::ShardServer));
+
+    auto opCtx = tc->makeOperationContext();
+    policy->applyActionResult(opCtx.get(), action, response);
+};
+
+bool Balancer::_terminationRequested() {
+    stdx::lock_guard<stdx::mutex> scopedLock(_mutex);
+    return (_threadSetState != ThreadSetState::Running);
 }
 
 void Balancer::_beginRound(OperationContext* opCtx) {
-    stdx::unique_lock<Latch> lock(_mutex);
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
     _inBalancerRound = true;
     _condVar.notify_all();
 }
 
 void Balancer::_endRound(OperationContext* opCtx, Milliseconds waitTimeout) {
     {
-        stdx::lock_guard<Latch> lock(_mutex);
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
         _inBalancerRound = false;
         _numBalancerRounds++;
         _condVar.notify_all();
@@ -841,20 +1267,22 @@ void Balancer::_endRound(OperationContext* opCtx, Milliseconds waitTimeout) {
 }
 
 void Balancer::_sleepFor(OperationContext* opCtx, Milliseconds waitTimeout) {
-    stdx::unique_lock<Latch> lock(_mutex);
-    _condVar.wait_for(lock, waitTimeout.toSystemDuration(), [&] { return _state != kRunning; });
+    stdx::unique_lock<stdx::mutex> lock(_mutex);
+    _condVar.wait_for(lock, waitTimeout.toSystemDuration(), [&] {
+        return _threadSetState != ThreadSetState::Running;
+    });
 }
 
 bool Balancer::_checkOIDs(OperationContext* opCtx) {
     auto shardingContext = Grid::get(opCtx);
 
-    const auto all = shardingContext->shardRegistry()->getAllShardIdsNoReload();
+    const auto all = shardingContext->shardRegistry()->getAllShardIds(opCtx);
 
     // map of OID machine ID => shardId
     map<int, ShardId> oids;
 
     for (const ShardId& shardId : all) {
-        if (_stopRequested()) {
+        if (_terminationRequested()) {
             return false;
         }
 
@@ -862,12 +1290,12 @@ bool Balancer::_checkOIDs(OperationContext* opCtx) {
         if (!shardStatus.isOK()) {
             continue;
         }
-        const auto s = shardStatus.getValue();
+        const auto s = std::move(shardStatus.getValue());
 
         auto result = uassertStatusOK(
             s->runCommandWithFixedRetryAttempts(opCtx,
                                                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                                "admin",
+                                                DatabaseName::kAdmin,
                                                 BSON("features" << 1),
                                                 Seconds(30),
                                                 Shard::RetryPolicy::kIdempotent));
@@ -880,8 +1308,6 @@ bool Balancer::_checkOIDs(OperationContext* opCtx) {
                 oids[x] = shardId;
             } else {
                 LOGV2(21868,
-                      "error: 2 machines have {oidMachine} as oid machine piece: {firstShardId} "
-                      "and {secondShardId}",
                       "Two machines have the same oidMachine value",
                       "oidMachine"_attr = x,
                       "firstShardId"_attr = shardId,
@@ -890,7 +1316,7 @@ bool Balancer::_checkOIDs(OperationContext* opCtx) {
                 result = uassertStatusOK(s->runCommandWithFixedRetryAttempts(
                     opCtx,
                     ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                    "admin",
+                    DatabaseName::kAdmin,
                     BSON("features" << 1 << "oidReset" << 1),
                     Seconds(30),
                     Shard::RetryPolicy::kIdempotent));
@@ -902,7 +1328,7 @@ bool Balancer::_checkOIDs(OperationContext* opCtx) {
                         otherShardStatus.getValue()->runCommandWithFixedRetryAttempts(
                             opCtx,
                             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                            "admin",
+                            DatabaseName::kAdmin,
                             BSON("features" << 1 << "oidReset" << 1),
                             Seconds(30),
                             Shard::RetryPolicy::kIdempotent));
@@ -912,10 +1338,7 @@ bool Balancer::_checkOIDs(OperationContext* opCtx) {
                 return false;
             }
         } else {
-            LOGV2(21869,
-                  "warning: oidMachine not set on: {shard}",
-                  "warning: oidMachine not set on shard",
-                  "shard"_attr = s->toString());
+            LOGV2(21869, "warning: oidMachine not set on shard", "shard"_attr = s->toString());
         }
     }
 
@@ -929,147 +1352,87 @@ Status Balancer::_splitChunksIfNeeded(OperationContext* opCtx) {
     }
 
     for (const auto& splitInfo : chunksToSplitStatus.getValue()) {
-        auto routingInfoStatus =
-            Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
-                opCtx, splitInfo.nss);
-        if (!routingInfoStatus.isOK()) {
-            return routingInfoStatus.getStatus();
+        const auto swCm = getPlacementInfoForShardedCollection(opCtx, splitInfo.nss);
+        if (!swCm.isOK()) {
+            return swCm.getStatus();
         }
+        const auto cm = swCm.getValue();
 
-        const auto& cm = routingInfoStatus.getValue();
-
-        auto splitStatus =
-            shardutil::splitChunkAtMultiplePoints(opCtx,
-                                                  splitInfo.shardId,
-                                                  splitInfo.nss,
-                                                  cm.getShardKeyPattern(),
-                                                  splitInfo.collectionVersion.epoch(),
-                                                  splitInfo.collectionVersion.getTimestamp(),
-                                                  ChunkVersion::IGNORED() /*shardVersion*/,
-                                                  ChunkRange(splitInfo.minKey, splitInfo.maxKey),
-                                                  splitInfo.splitKeys);
+        auto splitStatus = shardutil::splitChunkAtMultiplePoints(
+            opCtx,
+            splitInfo.shardId,
+            splitInfo.nss,
+            cm.getShardKeyPattern(),
+            splitInfo.collectionPlacementVersion.epoch(),
+            splitInfo.collectionPlacementVersion.getTimestamp(),
+            ChunkRange(splitInfo.minKey, splitInfo.maxKey),
+            splitInfo.splitKeys);
         if (!splitStatus.isOK()) {
             LOGV2_WARNING(21879,
-                          "Failed to split chunk {splitInfo} {error}",
                           "Failed to split chunk",
                           "splitInfo"_attr = redact(splitInfo.toString()),
-                          "error"_attr = redact(splitStatus.getStatus()));
+                          "error"_attr = redact(splitStatus));
         }
     }
 
     return Status::OK();
 }
 
-int Balancer::_moveChunks(OperationContext* opCtx,
-                          const MigrateInfoVector& chunksToRebalance,
-                          const MigrateInfoVector& chunksToDefragment) {
+Balancer::MigrationStats Balancer::_doMigrations(OperationContext* opCtx,
+                                                 const MigrateInfoVector& unshardedToMove,
+                                                 const MigrateInfoVector& chunksToRebalance,
+                                                 const MigrateInfoVector& chunksToDefragment) {
     auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
-    auto catalogClient = Grid::get(opCtx)->catalogClient();
 
     // If the balancer was disabled since we started this round, don't start new chunk moves
-    if (_stopRequested() || !balancerConfig->shouldBalance() ||
-        _clusterChunksResizePolicy->isActive()) {
-        LOGV2_DEBUG(21870, 1, "Skipping balancing round because balancer was stopped");
-        return 0;
+    if (const bool terminating = _terminationRequested(), enabled = balancerConfig->shouldBalance();
+        terminating || !enabled) {
+        LOGV2_DEBUG(21870,
+                    1,
+                    "Skipping balancing round",
+                    "terminating"_attr = terminating,
+                    "balancerEnabled"_attr = enabled);
+        return {};
     }
 
-    std::vector<std::pair<const MigrateInfo&, SemiFuture<void>>> rebalanceMigrationsAndResponses,
-        defragmentationMigrationsAndResponses;
-    auto requestMigration = [&](const MigrateInfo& migrateInfo) -> SemiFuture<void> {
-        auto maxChunkSizeBytes = [&]() {
-            if (migrateInfo.optMaxChunkSizeBytes.has_value()) {
-                return *migrateInfo.optMaxChunkSizeBytes;
-            }
+    std::array<std::unique_ptr<MigrationTask>, 3> allMigrationTasks = {
+        make_unique<MigrateUnshardedCollectionTask>(
+            opCtx, *_moveUnshardedPolicy, *_commandScheduler, unshardedToMove),
+        make_unique<RebalanceChunkTask>(opCtx, *_commandScheduler, chunksToRebalance),
+        make_unique<DefragmentChunkTask>(
+            opCtx, *_defragmentationPolicy, *_commandScheduler, chunksToDefragment)};
 
-            auto coll = Grid::get(opCtx)->catalogClient()->getCollection(
-                opCtx, migrateInfo.nss, repl::ReadConcernLevel::kMajorityReadConcern);
-            return coll.getMaxChunkSizeBytes().value_or(balancerConfig->getMaxChunkSizeBytes());
-        }();
-
-        MoveRangeRequestBase requestBase(migrateInfo.to);
-        requestBase.setWaitForDelete(balancerConfig->waitForDelete());
-        requestBase.setMin(migrateInfo.minKey);
-        requestBase.setMax(migrateInfo.maxKey);
-
-        ShardsvrMoveRange shardSvrRequest(migrateInfo.nss);
-        shardSvrRequest.setDbName(NamespaceString::kAdminDb);
-        shardSvrRequest.setMoveRangeRequestBase(requestBase);
-        shardSvrRequest.setMaxChunkSizeBytes(maxChunkSizeBytes);
-        shardSvrRequest.setFromShard(migrateInfo.from);
-        shardSvrRequest.setEpoch(migrateInfo.version.epoch());
-        const auto [secondaryThrottle, wc] =
-            getSecondaryThrottleAndWriteConcern(balancerConfig->getSecondaryThrottle());
-        shardSvrRequest.setSecondaryThrottle(secondaryThrottle);
-
-        return _commandScheduler->requestMoveRange(
-            opCtx, shardSvrRequest, wc, false /* issuedByRemoteUser */);
-    };
-
-    for (const auto& rebalanceOp : chunksToRebalance) {
-        rebalanceMigrationsAndResponses.emplace_back(rebalanceOp, requestMigration(rebalanceOp));
-    }
-    for (const auto& defragmentationOp : chunksToDefragment) {
-        defragmentationMigrationsAndResponses.emplace_back(defragmentationOp,
-                                                           requestMigration(defragmentationOp));
+    for (const auto& migrationTask : allMigrationTasks) {
+        migrationTask->enqueue();
     }
 
-    int numChunksProcessed = 0;
-    for (const auto& [migrateInfo, futureStatus] : rebalanceMigrationsAndResponses) {
-        auto status = futureStatus.getNoThrow(opCtx);
-        if (status.isOK()) {
-            ++numChunksProcessed;
-            continue;
+    for (const auto& migrationTask : allMigrationTasks) {
+        migrationTask->waitForQueuedAndProcessResponses();
+        // Remove from the imbalancedCache the failed migrations. Regardless of the reason, we
+        // prevent failed migrations from being prioritized next round.
+        for (const auto& nss : migrationTask->getNamespacesFromFailedMigrations()) {
+            _imbalancedCollectionsCache.erase(nss);
         }
-
-        // ChunkTooBig is returned by the source shard during the cloning phase if the migration
-        // manager finds that the chunk is larger than some calculated size, the source shard is
-        // *not* in draining mode, and the 'forceJumbo' balancer setting is 'kDoNotForce'.
-        // ExceededMemoryLimit is returned when the transfer mods queue surpasses 500MB regardless
-        // of whether the source shard is in draining mode or the value if the 'froceJumbo' balancer
-        // setting.
-        if (status == ErrorCodes::ChunkTooBig || status == ErrorCodes::ExceededMemoryLimit) {
-            ++numChunksProcessed;
-
-            LOGV2(21871,
-                  "Migration {migrateInfo} failed with {error}, going to try splitting the chunk",
-                  "Migration failed, going to try splitting the chunk",
-                  "migrateInfo"_attr = redact(migrateInfo.toString()),
-                  "error"_attr = redact(status));
-
-            const CollectionType collection = catalogClient->getCollection(
-                opCtx, migrateInfo.uuid, repl::ReadConcernLevel::kMajorityReadConcern);
-
-            ShardingCatalogManager::get(opCtx)->splitOrMarkJumbo(
-                opCtx, collection.getNss(), migrateInfo.minKey);
-            continue;
-        }
-
-        LOGV2(21872,
-              "Migration {migrateInfo} failed with {error}",
-              "Migration failed",
-              "migrateInfo"_attr = redact(migrateInfo.toString()),
-              "error"_attr = redact(status));
     }
 
-    for (const auto& [migrateInfo, futureStatus] : defragmentationMigrationsAndResponses) {
-        auto status = futureStatus.getNoThrow(opCtx);
-        if (status.isOK()) {
-            ++numChunksProcessed;
-        }
-        _defragmentationPolicy->applyActionResult(opCtx, migrateInfo, status);
-    }
-
-    return numChunksProcessed;
+    return MigrationStats{allMigrationTasks[0]->getNumCompleted(),
+                          allMigrationTasks[1]->getNumCompleted(),
+                          allMigrationTasks[2]->getNumCompleted()};
 }
 
 void Balancer::_onActionsStreamPolicyStateUpdate() {
     // On any internal update of the defragmentation/cluster chunks resize policy status,
     // wake up the thread consuming the stream of actions
-    _newInfoOnStreamingActions.store(true);
-    _defragmentationCondVar.notify_all();
+    _actionStreamsStateUpdated.store(true);
+    _actionStreamCondVar.notify_all();
 }
 
 void Balancer::notifyPersistedBalancerSettingsChanged(OperationContext* opCtx) {
+    if (!Grid::get(opCtx)->getBalancerConfiguration()->shouldBalanceForAutoMerge()) {
+        _autoMergerPolicy->disable(opCtx);
+    }
+
+    // Try to awake the main balancer thread
     _condVar.notify_all();
 }
 
@@ -1077,51 +1440,29 @@ void Balancer::abortCollectionDefragmentation(OperationContext* opCtx, const Nam
     _defragmentationPolicy->abortCollectionDefragmentation(opCtx, nss);
 }
 
-SharedSemiFuture<void> Balancer::applyLegacyChunkSizeConstraintsOnClusterData(
-    OperationContext* opCtx) {
-    // Remove the maxChunkSizeBytes from config.system.collections to make it compatible with
-    // the balancing strategy based on the number of collection chunks
-    try {
-        ShardingCatalogManager::get(opCtx)->configureCollectionBalancing(
-            opCtx,
-            NamespaceString::kLogicalSessionsNamespace,
-            0,
-            boost::none /*defragmentCollection*/,
-            false /*enableAutoSplitter*/);
-    } catch (const ExceptionFor<ErrorCodes::NamespaceNotSharded>&) {
-        // config.system.collections does not appear in config.collections; continue.
-    }
-
-    // Ensure now that each collection in the cluster complies with its "maxChunkSize" constraint
-    const auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
-    uassertStatusOK(balancerConfig->refreshAndCheck(opCtx));
-    auto futureOutcome =
-        _clusterChunksResizePolicy->activate(opCtx, balancerConfig->getMaxChunkSizeBytes());
-    {
-        stdx::lock_guard<Latch> scopedLock(_mutex);
-        _defragmentationCondVar.notify_all();
-    }
-    return futureOutcome;
-}
-
 BalancerCollectionStatusResponse Balancer::getBalancerStatusForNs(OperationContext* opCtx,
                                                                   const NamespaceString& ns) {
+    const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
     CollectionType coll;
     try {
-        coll = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, ns, {});
+        coll = catalogClient->getCollection(opCtx, ns, {});
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         uasserted(ErrorCodes::NamespaceNotSharded, "Collection unsharded or undefined");
     }
 
-    const auto maxChunkSizeMB = getMaxChunkSizeMB(opCtx, coll);
+
+    const auto maxChunkSizeBytes = getMaxChunkSizeBytes(opCtx, coll);
+    double maxChunkSizeMB = (double)maxChunkSizeBytes / (1024 * 1024);
+    // Keep only 2 decimal digits to return a readable value
+    maxChunkSizeMB = std::ceil(maxChunkSizeMB * 100.0) / 100.0;
+
     BalancerCollectionStatusResponse response(maxChunkSizeMB, true /*balancerCompliant*/);
-    auto setViolationOnResponse = [&response](const StringData& reason,
-                                              const boost::optional<BSONObj>& details =
-                                                  boost::none) {
-        response.setBalancerCompliant(false);
-        response.setFirstComplianceViolation(reason);
-        response.setDetails(details);
-    };
+    auto setViolationOnResponse =
+        [&response](StringData reason, const boost::optional<BSONObj>& details = boost::none) {
+            response.setBalancerCompliant(false);
+            response.setFirstComplianceViolation(reason);
+            response.setDetails(details);
+        };
 
     bool isDefragmenting = coll.getDefragmentCollection();
     if (isDefragmenting) {

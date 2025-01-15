@@ -14,7 +14,8 @@
  * Check that it syncs.
  */
 
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconnect} from "jstests/replsets/rslib.js";
 
 var name = "sync_passive";
 var host = getHostName();
@@ -28,7 +29,7 @@ var config = replTest.getReplSetConfig();
 config.members[0].priority = 2;
 config.members[2].priority = 0;
 
-replTest.initiate(config);
+replTest.initiate(config, null, {initiateWithDefaultElectionTimeout: true});
 replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY);
 
 var primary = replTest.getPrimary().getDB("test");

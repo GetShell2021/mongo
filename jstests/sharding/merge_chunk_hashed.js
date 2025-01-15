@@ -2,11 +2,9 @@
  * Test that merging chunks for hashed sharding via mongos works/doesn't work with
  * different chunk configurations.
  */
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/chunk_bounds_util.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {chunkBoundsUtil} from "jstests/sharding/libs/chunk_bounds_util.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 let st = new ShardingTest({shards: 2, mongos: 2});
 // , configOptions: {verbose: 3}
@@ -18,17 +16,46 @@ let collName = "user";
 let ns = dbName + "." + collName;
 let configDB = mongos.getDB('config');
 let admin = mongos.getDB("admin");
+
+assert.commandWorked(admin.runCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 let coll = mongos.getCollection(ns);
 
-assert.commandWorked(admin.runCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
 assert.commandWorked(admin.runCommand({shardCollection: ns, key: {x: 'hashed'}}));
 
-// Default chunks:
+// Setup predictable chunk distribution:
 // shard0: MIN                  -> -4611686018427387902,
 //         -4611686018427387902 -> 0
 // shard1: 0                    -> 4611686018427387902
 //         4611686018427387902  -> MAX
+assert.commandWorked(
+    st.s.adminCommand({split: ns, middle: {x: NumberLong("-4611686018427387902")}}));
+assert.commandWorked(
+    st.s.adminCommand({split: ns, middle: {x: NumberLong("4611686018427387902")}}));
+
+assert.commandWorked(admin.runCommand({
+    moveChunk: ns,
+    bounds: [{x: MinKey}, {x: NumberLong("-4611686018427387902")}],
+    to: st.shard0.shardName,
+    _waitForDelete: true
+}));
+assert.commandWorked(admin.runCommand({
+    moveChunk: ns,
+    bounds: [{x: NumberLong("-4611686018427387902")}, {x: 0}],
+    to: st.shard0.shardName,
+    _waitForDelete: true
+}));
+assert.commandWorked(admin.runCommand({
+    moveChunk: ns,
+    bounds: [{x: 0}, {x: NumberLong("4611686018427387902")}],
+    to: st.shard1.shardName,
+    _waitForDelete: true
+}));
+assert.commandWorked(admin.runCommand({
+    moveChunk: ns,
+    bounds: [{x: NumberLong("4611686018427387902")}, {x: MaxKey}],
+    to: st.shard1.shardName,
+    _waitForDelete: true
+}));
 
 // Get the chunk -4611686018427387902 -> 0 on shard0.
 let chunkToSplit = findChunksUtil.findOneChunkByNs(
@@ -246,4 +273,3 @@ assert.eq(1,
               .count());
 
 st.stop();
-})();

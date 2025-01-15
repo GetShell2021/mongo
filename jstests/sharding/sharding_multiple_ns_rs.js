@@ -2,17 +2,22 @@
 // primary in each shard. However, this test shuts down the primary of the shard. Since whether or
 // not the shell detects the new primary before issuing the command is nondeterministic, skip the
 // consistency check for this test.
+
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
-(function() {
-'use strict';
-
-load("jstests/replsets/rslib.js");
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var s = new ShardingTest({
     shards: {rs0: {nodes: [{}, {}, {rsConfig: {priority: 0}}]}},
     mongos: 1,
-    other: {rs: true, chunkSize: 1}
+    other: {rs: true, chunkSize: 1},
+    // By default, our test infrastructure sets the election timeout to a very high value (24
+    // hours). For this test, we need a shorter election timeout because it relies on nodes running
+    // an election when they do not detect an active primary. Therefore, we are setting the
+    // electionTimeoutMillis to its default value.
+    initiateWithDefaultElectionTimeout: true
 });
 
 assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
@@ -61,4 +66,3 @@ assert.eq(5, dbother.bar.findOne({_id: 5}).x);
 assert.eq(5, dbother.foo.findOne({_id: 5}).x);
 
 s.stop();
-})();

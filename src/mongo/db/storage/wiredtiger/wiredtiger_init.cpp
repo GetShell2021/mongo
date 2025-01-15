@@ -28,16 +28,28 @@
  */
 
 
+#include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/path.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <utility>
+
 #if defined(__linux__)
-#include <sys/vfs.h>
+#include <sys/statfs.h>  // IWYU pragma: keep
+#include <sys/vfs.h>     // IWYU pragma: keep
 #endif
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/base/init.h"
-#include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/base/init.h"  // IWYU pragma: keep
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
@@ -46,11 +58,12 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_parameters_gen.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_server_status.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_tag.h"
 #include "mongo/util/processinfo.h"
 
 #if __has_feature(address_sanitizer)
@@ -64,13 +77,14 @@ namespace mongo {
 
 namespace {
 std::string kWiredTigerBackupFile = "WiredTiger.backup";
+std::once_flag initializeServerStatusSectionFlag;
 
 class WiredTigerFactory : public StorageEngine::Factory {
 public:
-    virtual ~WiredTigerFactory() {}
-    virtual std::unique_ptr<StorageEngine> create(OperationContext* opCtx,
-                                                  const StorageGlobalParams& params,
-                                                  const StorageEngineLockFile* lockFile) const {
+    ~WiredTigerFactory() override {}
+    std::unique_ptr<StorageEngine> create(OperationContext* opCtx,
+                                          const StorageGlobalParams& params,
+                                          const StorageEngineLockFile* lockFile) const override {
         if (lockFile && lockFile->createdByUncleanShutdown()) {
             LOGV2_WARNING(22302, "Recovering data from the last clean checkpoint.");
 
@@ -125,25 +139,19 @@ public:
                                                  wiredTigerGlobalOptions.engineConfig,
                                                  cacheMB,
                                                  wiredTigerGlobalOptions.getMaxHistoryFileSizeMB(),
-                                                 params.dur,
                                                  params.ephemeral,
                                                  params.repair);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
 
-        // We must only add the server parameters to the global registry once during unit testing.
-        static int setupCountForUnitTests = 0;
-        if (setupCountForUnitTests == 0) {
-            ++setupCountForUnitTests;
-
-            // Intentionally leaked.
-            [[maybe_unused]] auto leakedSection = new WiredTigerServerStatusSection();
-
-            // This allows unit tests to run this code without encountering memory leaks
-#if __has_feature(address_sanitizer)
-            __lsan_ignore_object(leakedSection);
-#endif
-        }
+        // We're using the WT engine; register the ServerStatusSection for it.
+        // Only do so once; even if we re-create the StorageEngine for FCBIS. The section is
+        // stateless.
+        std::call_once(initializeServerStatusSectionFlag, [] {
+            *ServerStatusSectionBuilder<WiredTigerServerStatusSection>(
+                 std::string{kWiredTigerEngineName})
+                 .forShard();
+        });
 
         StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;
@@ -154,20 +162,20 @@ public:
         return std::make_unique<StorageEngineImpl>(opCtx, std::move(kv), options);
     }
 
-    virtual StringData getCanonicalName() const {
+    StringData getCanonicalName() const override {
         return kWiredTigerEngineName;
     }
 
-    virtual Status validateCollectionStorageOptions(const BSONObj& options) const {
+    Status validateCollectionStorageOptions(const BSONObj& options) const override {
         return WiredTigerRecordStore::parseOptionsField(options).getStatus();
     }
 
-    virtual Status validateIndexStorageOptions(const BSONObj& options) const {
+    Status validateIndexStorageOptions(const BSONObj& options) const override {
         return WiredTigerIndex::parseIndexOptions(options).getStatus();
     }
 
-    virtual Status validateMetadata(const StorageEngineMetadata& metadata,
-                                    const StorageGlobalParams& params) const {
+    Status validateMetadata(const StorageEngineMetadata& metadata,
+                            const StorageGlobalParams& params) const override {
         Status status =
             metadata.validateStorageEngineOption("directoryPerDB", params.directoryperdb);
         if (!status.isOK()) {
@@ -196,7 +204,7 @@ public:
         return Status::OK();
     }
 
-    virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const {
+    BSONObj createMetadataOptions(const StorageGlobalParams& params) const override {
         BSONObjBuilder builder;
         builder.appendBool("directoryPerDB", params.directoryperdb);
         builder.appendBool("directoryForIndexes", wiredTigerGlobalOptions.directoryForIndexes);
@@ -213,5 +221,6 @@ ServiceContext::ConstructorActionRegisterer registerWiredTiger(
     "WiredTigerEngineInit", [](ServiceContext* service) {
         registerStorageEngine(service, std::make_unique<WiredTigerFactory>());
     });
+
 }  // namespace
 }  // namespace mongo

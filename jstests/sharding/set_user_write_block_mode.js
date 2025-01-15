@@ -1,34 +1,19 @@
 /**
  * Tests sharding specific functionality of the setUserWriteBlockMode command. Non sharding specific
- * aspects of this command should be checked on jstests/noPassthrough/set_user_write_block_mode.js
- * instead.
+ * aspects of this command should be checked on
+ * jstests/noPassthrough/security/set_user_write_block_mode.js instead.
  *
  * @tags: [
  *   requires_fcv_60,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallel_shell_helpers.js');
-
-function removeShard(shardName) {
-    assert.soon(function() {
-        let res = assert.commandWorked(st.s.adminCommand({removeShard: shardName}));
-        if (!res.ok && res.code === ErrorCodes.ShardNotFound) {
-            // If the config server primary steps down right after removing the config.shards doc
-            // for the shard but before responding with "state": "completed", the mongos would retry
-            // the _configsvrRemoveShard command against the new config server primary, which would
-            // not find the removed shard in its ShardRegistry if it has done a ShardRegistry reload
-            // after the config.shards doc for the shard was removed. This would cause the command
-            // to fail with ShardNotFound.
-            return true;
-        }
-        return res.state == 'completed';
-    });
-}
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
+import {ShardedIndexUtil} from "jstests/sharding/libs/sharded_index_util.js";
 
 const st = new ShardingTest({shards: 2});
 
@@ -74,7 +59,7 @@ newShard.initiate();
     // shard.
     assert.commandWorked(st.s.getDB(newShardDB).dropDatabase());
     assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: true}));
-    removeShard(newShardName);
+    removeShard(st, newShardName);
 
     // Disable write blocking while 'newShard' is not part of the cluster.
     assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: false}));
@@ -178,14 +163,28 @@ newShard.initiate();
     const toShard = st.getOther(fromShard);
     assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: toShard.name}));
 
-    // Check that the new primary has cloned the data.
-    assert.eq(1, toShard.getDB(dbName)[unshardedCollName].find().itcount());
+    // Check that the new primary has cloned the data. The data will only be moved if the collection
+    // is untracked.
+    const isTrackUnshardedDisabled = !FeatureFlagUtil.isPresentAndEnabled(
+        st.s.getDB('admin'), "TrackUnshardedCollectionsUponCreation");
+    if (isTrackUnshardedDisabled) {
+        assert.eq(1, toShard.getDB(dbName)[unshardedCollName].find().itcount());
+    }
 
-    // Check that the collection has been removed from the former primary.
-    assert.eq(0,
-              fromShard.getDB(dbName)
-                  .runCommand({listCollections: 1, filter: {name: unshardedCollName}})
-                  .cursor.firstBatch.length);
+    if (isTrackUnshardedDisabled) {
+        // Check that the collection has been removed from the former primary.
+        assert.eq(0,
+                  fromShard.getDB(dbName)
+                      .runCommand({listCollections: 1, filter: {name: unshardedCollName}})
+                      .cursor.firstBatch.length);
+    } else {
+        // Check that the database primary has been changed to the new primary.
+        assert.eq(1,
+                  st.s.getDB("config")
+                      .getCollection("databases")
+                      .find({_id: dbName, primary: toShard.shardName})
+                      .itcount());
+    }
 
     assert.commandWorked(st.s.adminCommand({setUserWriteBlockMode: 1, global: false}));
 }
@@ -293,4 +292,3 @@ newShard.initiate();
 
 st.stop();
 newShard.stopSet();
-})();

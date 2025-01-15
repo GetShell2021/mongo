@@ -1,15 +1,14 @@
 // Verify that clients can speculatively authenticate to mongos.
 // @tags: [requires_sharding]
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const fallbackMech = 'SCRAM-SHA-256';
 const keyfile = 'jstests/libs/key1';
 const st = new ShardingTest({
     mongos: 1,
     keyFile: keyfile,
-    other: {mongosOptions: {auth: null}, configOptions: {auth: null}, shardOptions: {auth: null}}
+    other: {mongosOptions: {auth: null}, configOptions: {auth: null}, rsOptions: {auth: null}}
 });
 
 const admin = st.s.getDB('admin');
@@ -66,4 +65,3 @@ test('mongodb://__system:' + systemPass + '@' + st.s.host + '/admin?authMechanis
 
 admin.logout();
 st.stop();
-}());

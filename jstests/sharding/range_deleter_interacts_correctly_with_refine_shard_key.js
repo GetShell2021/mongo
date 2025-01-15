@@ -1,14 +1,15 @@
 /**
  * Tests the interaction of the refineCollectionShardKey command with the range deleter.
  */
-(function() {
 
-"use strict";
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
 
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallel_shell_helpers.js');
-load('jstests/replsets/rslib.js');
-load('jstests/libs/feature_flag_util.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 
@@ -29,10 +30,6 @@ const shardKeyValueInChunk = {
     x: 1
 };
 
-const shardKeyValueInFirstChunk = {
-    x: -2
-};
-
 const refinedShardKeyValueInChunk = {
     x: 1,
     y: 1
@@ -40,8 +37,8 @@ const refinedShardKeyValueInChunk = {
 
 function setUp(st) {
     // Create a sharded collection with two chunk on shard0, split at key {x: -1}.
-    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-    assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+    assert.commandWorked(
+        st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: originalShardKey}));
     assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: -1}}));
     // Insert documents into the collection, which contains two chunks. Insert documents only
@@ -70,7 +67,17 @@ function test(st, description, testBody) {
 }
 
 (() => {
-    const st = new ShardingTest({shards: {rs0: {nodes: 3}, rs1: {nodes: 3}}});
+    const st = new ShardingTest({
+        shards: {
+            rs0: {nodes: 3},
+            rs1: {nodes: 3},
+            // By default, our test infrastructure sets the election timeout to a very high value
+            // (24 hours). For this test, we need a shorter election timeout because it relies on
+            // nodes running an election when they do not detect an active primary. Therefore, we
+            // are setting the electionTimeoutMillis to its default value.
+            initiateWithDefaultElectionTimeout: true
+        }
+    });
     test(st,
          "Refining the shard key does not prevent removal of orphaned documents on a donor" +
              " shard after a successful migration",
@@ -146,10 +153,6 @@ function test(st, description, testBody) {
              // should be able to succeed overall.
              let hangDonorAtEndOfMigration =
                  configureFailPoint(st.rs1.getPrimary(), "moveChunkHangAtStep6");
-
-             // Increase timeout for range deletion of overlapping range on recipient.
-             st.shard0.rs.getPrimary().adminCommand(
-                 {setParameter: 1, receiveChunkWaitForRangeDeleterTimeoutMS: 90000});
 
              // Attempt to move the chunk back to shard 0. Synchronize with the parallel shell to
              // make sure that the moveChunk started.
@@ -251,5 +254,4 @@ function test(st, description, testBody) {
          });
 
     st.stop();
-})();
 })();

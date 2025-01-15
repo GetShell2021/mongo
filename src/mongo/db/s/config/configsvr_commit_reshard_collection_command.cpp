@@ -28,17 +28,36 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+#include <memory>
+#include <string>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/resharding/coordinator_document_gen.h"
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
-#include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/request_types/commit_reshard_collection_gen.h"
-#include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -51,12 +70,13 @@ UUID retrieveReshardingUUID(OperationContext* opCtx, const NamespaceString& ns) 
     repl::ReadConcernArgs::get(opCtx) =
         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+    const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
     const auto collEntry = catalogClient->getCollection(opCtx, ns);
 
-    uassert(ErrorCodes::NoSuchReshardCollection,
-            format(FMT_STRING("Could not find resharding metadata for {}"), ns.toString()),
-            collEntry.getReshardingFields());
+    uassert(
+        ErrorCodes::NoSuchReshardCollection,
+        format(FMT_STRING("Could not find resharding metadata for {}"), ns.toStringForErrorMsg()),
+        collEntry.getReshardingFields());
 
     return collEntry.getReshardingFields()->getReshardingUUID();
 }
@@ -72,23 +92,19 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassert(ErrorCodes::CommandNotSupported,
-                    format(FMT_STRING("{} command not enabled"), definition()->getName()),
-                    resharding::gFeatureFlagResharding.isEnabled(
-                        serverGlobalParams.featureCompatibility));
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
             uassert(
                 ErrorCodes::IllegalOperation,
                 format(FMT_STRING("{} can only be run on config servers"), definition()->getName()),
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
             UUID reshardingUUID = retrieveReshardingUUID(opCtx, ns());
 
-            auto machine = resharding::tryGetReshardingStateMachine<
+            auto machine = resharding::tryGetReshardingStateMachineAndThrowIfShuttingDown<
                 ReshardingCoordinatorService,
-                ReshardingCoordinatorService::ReshardingCoordinator,
+                ReshardingCoordinator,
                 ReshardingCoordinatorDocument>(opCtx, reshardingUUID);
 
             uassert(ErrorCodes::NoSuchReshardCollection,
@@ -110,8 +126,9 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
 
@@ -132,7 +149,8 @@ public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
-} configsvrCommitReshardCollectionCommand;
+};
+MONGO_REGISTER_COMMAND(ConfigsvrCommitReshardCollectionCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

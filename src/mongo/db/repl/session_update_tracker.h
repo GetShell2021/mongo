@@ -30,13 +30,12 @@
 #pragma once
 
 #include <boost/optional.hpp>
-#include <map>
+#include <boost/optional/optional.hpp>
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/oplog_entry.h"
-#include "mongo/util/uuid.h"
+#include "mongo/db/session/logical_session_id.h"
 
 namespace mongo {
 namespace repl {

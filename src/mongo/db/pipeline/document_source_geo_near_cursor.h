@@ -30,7 +30,11 @@
 #pragma once
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <list>
 #include <memory>
 
@@ -64,7 +68,7 @@ public:
         const MultipleCollectionAccessor&,
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>,
         const boost::intrusive_ptr<ExpressionContext>&,
-        FieldPath distanceField,
+        boost::optional<FieldPath> distanceField,
         boost::optional<FieldPath> locationField = boost::none,
         double distanceMultiplier = 1.0);
 
@@ -74,19 +78,19 @@ private:
     DocumentSourceGeoNearCursor(const MultipleCollectionAccessor&,
                                 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>,
                                 const boost::intrusive_ptr<ExpressionContext>&,
-                                FieldPath distanceField,
+                                boost::optional<FieldPath> distanceField,
                                 boost::optional<FieldPath> locationField,
                                 double distanceMultiplier);
 
-    ~DocumentSourceGeoNearCursor() = default;
+    ~DocumentSourceGeoNearCursor() override = default;
 
     /**
      * Transforms 'obj' into a Document, calculating the distance.
      */
-    Document transformDoc(Document&& obj) const override final;
+    Document transformDoc(Document&& obj) const final;
 
-    // The output field in which to store the computed distance.
-    FieldPath _distanceField;
+    // The output field in which to store the computed distance, if specified.
+    boost::optional<FieldPath> _distanceField;
 
     // The output field to store the point that matched, if specified.
     boost::optional<FieldPath> _locationField;

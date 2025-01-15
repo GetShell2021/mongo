@@ -4,8 +4,7 @@
  * write concern actually exists on the shards.
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // Define the custom write concern multiRegion, only in the shard.
 const st = new ShardingTest({
@@ -46,4 +45,3 @@ assert.commandWorked(
 assert.commandWorked(coll.insert({a: 1}));
 
 st.stop();
-})();

@@ -1,17 +1,29 @@
-/*
+/**
  * Tests basic support for internal sessions.
  *
- * @tags: [requires_fcv_60, uses_transactions]
+ * @tags: [
+ *   requires_fcv_60,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ *   uses_transactions,
+ * ]
  */
-(function() {
-'use strict';
+import {
+    withRetryOnTransientTxnErrorIncrementTxnNum
+} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 TestData.disableImplicitSessions = true;
 
 const st = new ShardingTest({
     shards: 1,
-    mongosOptions: {setParameter: {maxSessions: 1}},
-    shardOptions: {setParameter: {maxSessions: 1}}
+    mongosOptions: {
+        setParameter:
+            {maxSessions: 1, 'failpoint.skipClusterParameterRefresh': "{'mode':'alwaysOn'}"}
+    },
+    // The config server uses a session for internal operations, so raise the limit by 1 for a
+    // config shard.
+    rsOptions: {setParameter: {maxSessions: TestData.configShard ? 3 : 2}}
 });
 const shard0Primary = st.rs0.getPrimary();
 
@@ -92,6 +104,12 @@ const kConfigSessionNs = "config.system.sessions";
     // document).
     const sessionUUID = UUID();
 
+    if (TestData.configShard) {
+        // Create the collection first separately, otherwise the session will be used for the
+        // transaction that creates the collection, leading to one extra transaction document.
+        assert.commandWorked(testDB.createCollection(kCollName));
+    }
+
     const parentLsid = {id: sessionUUID};
     assert.commandWorked(testDB.runCommand(
         {insert: kCollName, documents: [{x: 0}], lsid: parentLsid, txnNumber: NumberLong(0)}));
@@ -114,16 +132,22 @@ const kConfigSessionNs = "config.system.sessions";
     jsTest.log("Test running an internal transaction with lsid containing txnNumber and txnUUID");
     const childLsid1 = {id: sessionUUID, txnNumber: NumberLong(35), txnUUID: UUID()};
     const txnNumber1 = NumberLong(0);
-    assert.commandWorked(testDB.runCommand({
-        insert: kCollName,
-        documents: [{x: 1}],
-        lsid: childLsid1,
-        txnNumber: txnNumber1,
-        startTransaction: true,
-        autocommit: false
-    }));
-    assert.commandWorked(testDB.adminCommand(
-        {commitTransaction: 1, lsid: childLsid1, txnNumber: txnNumber1, autocommit: false}));
+    withRetryOnTransientTxnErrorIncrementTxnNum(txnNumber1, (txnNum) => {
+        assert.commandWorked(testDB.runCommand({
+            insert: kCollName,
+            documents: [{x: 1}],
+            lsid: childLsid1,
+            txnNumber: NumberLong(txnNum),
+            startTransaction: true,
+            autocommit: false
+        }));
+        assert.commandWorked(testDB.adminCommand({
+            commitTransaction: 1,
+            lsid: childLsid1,
+            txnNumber: NumberLong(txnNum),
+            autocommit: false
+        }));
+    });
     const childSessionDoc1 = shard0Primary.getCollection(kConfigTxnNs).findOne({
         "_id.id": sessionUUID,
         "_id.txnNumber": childLsid1.txnNumber,
@@ -136,16 +160,22 @@ const kConfigSessionNs = "config.system.sessions";
     jsTest.log("Test running an internal transaction with lsid containing txnUUID");
     const childLsid2 = {id: sessionUUID, txnUUID: UUID()};
     const txnNumber2 = NumberLong(35);
-    assert.commandWorked(testDB.runCommand({
-        insert: kCollName,
-        documents: [{x: 2}],
-        lsid: childLsid2,
-        txnNumber: txnNumber2,
-        startTransaction: true,
-        autocommit: false
-    }));
-    assert.commandWorked(testDB.adminCommand(
-        {commitTransaction: 1, lsid: childLsid2, txnNumber: txnNumber2, autocommit: false}));
+    withRetryOnTransientTxnErrorIncrementTxnNum(txnNumber2, (txnNum) => {
+        assert.commandWorked(testDB.runCommand({
+            insert: kCollName,
+            documents: [{x: 2}],
+            lsid: childLsid2,
+            txnNumber: NumberLong(txnNum),
+            startTransaction: true,
+            autocommit: false
+        }));
+        assert.commandWorked(testDB.adminCommand({
+            commitTransaction: 1,
+            lsid: childLsid2,
+            txnNumber: NumberLong(txnNum),
+            autocommit: false
+        }));
+    });
     const childSessionDoc2 = shard0Primary.getCollection(kConfigTxnNs).findOne({
         "_id.id": sessionUUID,
         "_id.txnUUID": childLsid2.txnUUID
@@ -164,4 +194,3 @@ const kConfigSessionNs = "config.system.sessions";
 })();
 
 st.stop();
-})();

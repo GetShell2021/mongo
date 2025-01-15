@@ -40,10 +40,16 @@ namespace test_harness {
 static void
 populate_worker(thread_worker *tc)
 {
-    uint64_t collections_per_thread = tc->collection_count / tc->thread_count;
+    uint64_t tc_collection_count = tc->get_assigned_collection_count();
+    uint64_t tc_first_collection_id = tc->get_assigned_first_collection_id();
+    /*
+     * Extra threads will keep idle if there are more threads than collections, so collection_count
+     * must be greater than or equal to thread_count.
+     */
+    testutil_assert(tc->db.get_collection_count() >= tc->thread_count);
 
-    for (int64_t i = 0; i < collections_per_thread; ++i) {
-        collection &coll = tc->db.get_collection((tc->id * collections_per_thread) + i);
+    for (int64_t i = 0; i < tc_collection_count; ++i) {
+        collection &coll = tc->db.get_collection(tc_first_collection_id + i);
         /*
          * WiredTiger lets you open a cursor on a collection using the same pointer. When a session
          * is closed, WiredTiger APIs close the cursors too.
@@ -80,7 +86,6 @@ database_operation::populate(
     key_count = config->get_int(KEY_COUNT_PER_COLLECTION);
     value_size = config->get_int(VALUE_SIZE);
     thread_count = config->get_int(THREAD_COUNT);
-    testutil_assert(thread_count == 0 || collection_count % thread_count == 0);
     testutil_assert(value_size > 0);
     key_size = config->get_int(KEY_SIZE);
     testutil_assert(key_size > 0);
@@ -125,6 +130,18 @@ database_operation::populate(
 }
 
 void
+database_operation::background_compact_operation(thread_worker *tc)
+{
+    logger::log_msg(
+      LOG_INFO, type_string(tc->type) + " thread {" + std::to_string(tc->id) + "} commencing.");
+
+    /* This needs to be executed only once in the workload. */
+    const std::string compact_cfg(
+      "background=true,free_space_target=" + std::to_string(tc->free_space_target_mb) + "MB");
+    testutil_check(tc->session->compact(tc->session.get(), nullptr, compact_cfg.c_str()));
+}
+
+void
 database_operation::checkpoint_operation(thread_worker *tc)
 {
     logger::log_msg(
@@ -132,6 +149,12 @@ database_operation::checkpoint_operation(thread_worker *tc)
 
     while (tc->running()) {
         tc->sleep();
+        /*
+         * This may seem like noise but it can prevent the test being killed by the evergreen
+         * timeout.
+         */
+        logger::log_msg(LOG_INFO,
+          type_string(tc->type) + " thread {" + std::to_string(tc->id) + "} taking a checkpoint.");
         testutil_check(tc->session->checkpoint(tc->session.get(), nullptr));
     }
 }
@@ -163,12 +186,16 @@ database_operation::insert_operation(thread_worker *tc)
     std::vector<collection_cursor> ccv;
     uint64_t collection_count = tc->db.get_collection_count();
     testutil_assert(collection_count != 0);
-    uint64_t collections_per_thread = collection_count / tc->thread_count;
-    /* Must have unique collections for each thread. */
-    testutil_assert(collection_count % tc->thread_count == 0);
-    for (int i = tc->id * collections_per_thread;
-         i < (tc->id * collections_per_thread) + collections_per_thread && tc->running(); ++i) {
-        collection &coll = tc->db.get_collection(i);
+    uint64_t tc_collection_count = tc->get_assigned_collection_count();
+    uint64_t tc_first_collection_id = tc->get_assigned_first_collection_id();
+    /*
+     * Extra threads will keep idle if there are more threads than collections, so collection_count
+     * must be greater than or equal to thread_count.
+     */
+    testutil_assert(tc->db.get_collection_count() >= tc->thread_count);
+
+    for (uint64_t i = 0; i < tc_collection_count && tc->running(); ++i) {
+        collection &coll = tc->db.get_collection(tc_first_collection_id + i);
         scoped_cursor cursor = tc->session.open_scoped_cursor(coll.name);
         ccv.push_back({coll, std::move(cursor)});
     }
@@ -210,13 +237,12 @@ database_operation::insert_operation(thread_worker *tc)
         /* Reset our cursor to avoid pinning content. */
         testutil_check(cc.cursor->reset(cc.cursor.get()));
         counter++;
-        if (counter == collections_per_thread)
+        if (counter == tc_collection_count)
             counter = 0;
-        testutil_assert(counter < collections_per_thread);
+        testutil_assert(counter < tc_collection_count);
     }
     /* Make sure the last transaction is rolled back now the work is finished. */
-    if (tc->txn.active())
-        tc->txn.rollback();
+    tc->txn.try_rollback();
 }
 
 void
@@ -250,15 +276,15 @@ database_operation::read_operation(thread_worker *tc)
                     testutil_die(ret, "Unexpected error returned from cursor->next()");
             }
             tc->txn.add_op();
-            tc->txn.try_rollback();
+            if (tc->txn.get_op_count() >= tc->txn.get_target_op_count())
+                tc->txn.rollback();
             tc->sleep();
         }
         /* Reset our cursor to avoid pinning content. */
         testutil_check(cursor->reset(cursor.get()));
     }
     /* Make sure the last transaction is rolled back now the work is finished. */
-    if (tc->txn.active())
-        tc->txn.rollback();
+    tc->txn.try_rollback();
 }
 
 void
@@ -315,7 +341,7 @@ database_operation::remove_operation(thread_worker *tc)
              * one.
              */
             if (ret == WT_NOTFOUND) {
-                WT_IGNORE_RET_BOOL(tc->txn.commit());
+                testutil_ignore_ret_bool(tc->txn.commit());
             } else if (ret == WT_ROLLBACK) {
                 tc->txn.rollback();
             } else {
@@ -337,12 +363,11 @@ database_operation::remove_operation(thread_worker *tc)
 
         /* Commit the current transaction if we're able to. */
         if (tc->txn.can_commit())
-            WT_IGNORE_RET_BOOL(tc->txn.commit());
+            testutil_ignore_ret_bool(tc->txn.commit());
     }
 
     /* Make sure the last operation is rolled back now the work is finished. */
-    if (tc->txn.active())
-        tc->txn.rollback();
+    tc->txn.try_rollback();
 }
 
 void
@@ -397,19 +422,21 @@ database_operation::update_operation(thread_worker *tc)
 
         /* Commit the current transaction if we're able to. */
         if (tc->txn.can_commit())
-            WT_IGNORE_RET_BOOL(tc->txn.commit());
+            testutil_ignore_ret_bool(tc->txn.commit());
     }
 
     /* Make sure the last operation is rolled back now the work is finished. */
-    if (tc->txn.active())
-        tc->txn.rollback();
+    tc->txn.try_rollback();
 }
 
 void
-database_operation::validate(const std::string &operation_table_name,
-  const std::string &schema_table_name, const std::vector<uint64_t> &known_collection_ids)
+database_operation::validate(bool tracking_enabled, const std::string &operation_table_name,
+  const std::string &schema_table_name, database &db)
 {
+    // The default implementation requires the tracking component to be enabled.
+    if (!tracking_enabled)
+        return;
     validator wv;
-    wv.validate(operation_table_name, schema_table_name, known_collection_ids);
+    wv.validate(operation_table_name, schema_table_name, db);
 }
 } // namespace test_harness

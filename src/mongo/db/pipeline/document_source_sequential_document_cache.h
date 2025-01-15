@@ -29,8 +29,24 @@
 
 #pragma once
 
+#include <boost/smart_ptr.hpp>
+#include <set>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/sequential_document_cache.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -50,7 +66,11 @@ public:
         return DocumentSourceSequentialDocumentCache::kStageName.rawData();
     }
 
-    StageConstraints constraints(Pipeline::SplitState pipeState) const {
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kSequentialDocumentCache;
+    }
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const override {
         StageConstraints constraints(StreamType::kStreaming,
                                      _cache->isServing() ? PositionRequirement::kFirst
                                                          : PositionRequirement::kNone,
@@ -97,6 +117,12 @@ public:
         return newStage;
     }
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
+
+    bool hasOptimizedPos() const {
+        return _hasOptimizedPos;
+    }
+
 protected:
     GetNextResult doGetNext() final;
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
@@ -106,7 +132,7 @@ private:
     DocumentSourceSequentialDocumentCache(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                           SequentialDocumentCache* cache);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
 
     SequentialDocumentCache* _cache;
 

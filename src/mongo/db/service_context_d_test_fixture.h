@@ -29,32 +29,43 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "mongo/base/checked_cast.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/unittest/temp_dir.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/tick_source.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
 
-class ServiceContextMongoDTest : public virtual ServiceContextTest {
+class MongoDScopedGlobalServiceContextForTest : public ScopedGlobalServiceContextForTest {
 public:
     constexpr static StorageEngineInitFlags kDefaultStorageEngineInitFlags =
         StorageEngineInitFlags::kAllowNoLockFile | StorageEngineInitFlags::kSkipMetadataFile;
 
-protected:
     enum class RepairAction { kNoRepair, kRepair };
 
     class Options {
     public:
-        Options(){};
+        Options() = default;
+
+        Options(Options&&) = default;
+        Options& operator=(Options&&) = default;
 
         Options engine(std::string engine) {
             _engine = std::move(engine);
             return std::move(*this);
         }
-        Options repair(RepairAction repair) {
-            _repair = repair;
+        Options enableRepair() {
+            _repair = RepairAction::kRepair;
             return std::move(*this);
         }
         Options initFlags(StorageEngineInitFlags initFlags) {
@@ -87,7 +98,35 @@ protected:
             return std::move(*this);
         }
 
+        Options forceDisableTableLogging() {
+            _forceDisableTableLogging = true;
+            return std::move(*this);
+        }
+
+        Options useIndexBuildsCoordinator(
+            std::unique_ptr<IndexBuildsCoordinator> indexBuildsCoordinator) {
+            _indexBuildsCoordinator = std::move(indexBuildsCoordinator);
+            return std::move(*this);
+        }
+
+        Options setCreateShardingState(bool createShardingState) {
+            _createShardingState = createShardingState;
+            return std::move(*this);
+        }
+
+        Options setAuthEnabled(bool enableAuth) {
+            _setAuthEnabled = enableAuth;
+            return std::move(*this);
+        }
+
+        Options setAuthObjects(bool setAuthObjects) {
+            _setAuthObjects = setAuthObjects;
+            return std::move(*this);
+        }
+
     private:
+        friend class MongoDScopedGlobalServiceContextForTest;
+
         std::string _engine = "wiredTiger";
         // We use ephemeral instances by default to advise Storage Engines (in particular
         // WiredTiger) not to perform Disk I/O.
@@ -96,34 +135,76 @@ protected:
         StorageEngineInitFlags _initFlags = kDefaultStorageEngineInitFlags;
         bool _useReplSettings = false;
         bool _useMockClock = false;
+        bool _setAuthEnabled = true;
+        bool _setAuthObjects = false;
         Milliseconds _autoAdvancingMockClockIncrement{0};
         std::unique_ptr<TickSource> _mockTickSource;
         std::unique_ptr<JournalListener> _journalListener;
-
-        friend class ServiceContextMongoDTest;
+        std::unique_ptr<IndexBuildsCoordinator> _indexBuildsCoordinator;
+        bool _forceDisableTableLogging = false;
+        bool _createShardingState = true;
     };
 
-    explicit ServiceContextMongoDTest(Options options = {});
+    MongoDScopedGlobalServiceContextForTest(Options options, bool shouldSetupTL);
+    MongoDScopedGlobalServiceContextForTest(
+        ServiceContext::UniqueServiceContext serviceContextHolder,
+        Options options,
+        bool shouldSetupTL);
 
-    virtual ~ServiceContextMongoDTest();
+    ~MongoDScopedGlobalServiceContextForTest() override;
 
-    void tearDown() override;
+    JournalListener* journalListener() const {
+        return _journalListener.get();
+    }
+
+    OpObserverRegistry* opObserverRegistry() {
+        return _opObserverRegistry;
+    }
+
+private:
+    static ServiceContext::UniqueServiceContext makeServiceContext(
+        bool useMockClock,
+        Milliseconds autoAdvancingMockClockIncrement,
+        std::unique_ptr<TickSource> tickSource);
 
     // The JournalListener must stay alive as long as the storage engine is running.
     std::unique_ptr<JournalListener> _journalListener;
 
-private:
+    OpObserverRegistry* _opObserverRegistry;
+
     struct {
         std::string engine;
         bool engineSetByUser;
         bool repair;
     } _stashedStorageParams;
 
-    struct {
-        bool enableMajorityReadConcern;
-    } _stashedServerParams;
+    unittest::TempDir _tempDir{"service_context_d_test_fixture"};
+};
 
-    unittest::TempDir _tempDir;
+class ServiceContextMongoDTest : public ServiceContextTest {
+public:
+    using Options = MongoDScopedGlobalServiceContextForTest::Options;
+
+    ServiceContextMongoDTest() : ServiceContextMongoDTest{Options{}} {}
+    explicit ServiceContextMongoDTest(
+        std::unique_ptr<MongoDScopedGlobalServiceContextForTest> scopedServiceContext)
+        : ServiceContextTest(std::move(scopedServiceContext)) {}
+    explicit ServiceContextMongoDTest(Options options)
+        : ServiceContextTest(std::make_unique<MongoDScopedGlobalServiceContextForTest>(
+              std::move(options), shouldSetupTL)) {}
+
+    JournalListener* journalListener() const {
+        return mongoDscopedServiceContext()->journalListener();
+    }
+
+    OpObserverRegistry* opObserverRegistry() {
+        return mongoDscopedServiceContext()->opObserverRegistry();
+    }
+
+private:
+    MongoDScopedGlobalServiceContextForTest* mongoDscopedServiceContext() const {
+        return checked_cast<MongoDScopedGlobalServiceContextForTest*>(scopedServiceContext());
+    }
 };
 
 }  // namespace mongo

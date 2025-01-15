@@ -29,9 +29,19 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
+#include "mongo/db/exec/sbe/stages/plan_stats.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
+#include "mongo/db/exec/sbe/util/debug_print.h"
+#include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
+#include "mongo/db/query/stage_types.h"
 
 namespace mongo::sbe {
 /**
@@ -46,7 +56,7 @@ namespace mongo::sbe {
 class ProjectStage final : public PlanStage {
 public:
     ProjectStage(std::unique_ptr<PlanStage> input,
-                 value::SlotMap<std::unique_ptr<EExpression>> projects,
+                 SlotExprPairVector projects,
                  PlanNodeId planNodeId,
                  bool participateInTrialRunTracking = true);
 
@@ -65,9 +75,12 @@ public:
 
 protected:
     void doSaveState(bool relinquishCursor) final;
+    bool shouldOptimizeSaveState(size_t) const final {
+        return true;
+    }
 
 private:
-    const value::SlotMap<std::unique_ptr<EExpression>> _projects;
+    const SlotExprPairVector _projects;
     value::SlotMap<std::pair<std::unique_ptr<vm::CodeFragment>, value::OwnedValueAccessor>> _fields;
 
     vm::ByteCode _bytecode;
@@ -77,6 +90,7 @@ private:
 
 template <typename... Ts>
 inline auto makeProjectStage(std::unique_ptr<PlanStage> input, PlanNodeId nodeId, Ts&&... pack) {
-    return makeS<ProjectStage>(std::move(input), makeEM(std::forward<Ts>(pack)...), nodeId);
+    return makeS<ProjectStage>(
+        std::move(input), makeSlotExprPairVec(std::forward<Ts>(pack)...), nodeId);
 }
 }  // namespace mongo::sbe

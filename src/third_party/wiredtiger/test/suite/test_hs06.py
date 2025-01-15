@@ -97,7 +97,7 @@ class test_hs06(wttest.WiredTigerTestCase):
         self.session.checkpoint()
 
         # Check the checkpoint wrote the expected values. We should get the stable data by
-        # default. 
+        # default.
         cursor2 = self.session.open_cursor(uri, None, 'checkpoint=WiredTigerCheckpoint')
         for key, value in cursor2:
             self.assertEqual(value, value1)
@@ -287,12 +287,12 @@ class test_hs06(wttest.WiredTigerTestCase):
         # Specifically check that we can read between commit and durable.
         self.session.begin_transaction('read_timestamp=' + self.timestamp_str(5))
         for i in range(1, 11):
-            self.assertEquals(value2, cursor[self.create_key(i)])
+            self.assertEqual(value2, cursor[self.create_key(i)])
         self.session.rollback_transaction()
 
         self.session.begin_transaction('read_timestamp=' + self.timestamp_str(6))
         for i in range(1, 11):
-            self.assertEquals(value2, cursor[self.create_key(i)])
+            self.assertEqual(value2, cursor[self.create_key(i)])
         self.session.rollback_transaction()
 
     def test_hs_multiple_updates(self):
@@ -337,7 +337,7 @@ class test_hs06(wttest.WiredTigerTestCase):
         # Ensure that we see the last of the two updates that got applied.
         self.session.begin_transaction('read_timestamp=' + self.timestamp_str(3))
         for i in range(1, 11):
-            self.assertEquals(cursor[self.create_key(i)], value3)
+            self.assertEqual(cursor[self.create_key(i)], value3)
         self.session.rollback_transaction()
 
     def test_hs_multiple_modifies(self):
@@ -587,6 +587,3 @@ class test_hs06(wttest.WiredTigerTestCase):
         for i in range(1, 11):
             self.assertEqual(cursor[self.create_key(i)], expected)
         self.session.rollback_transaction()
-
-if __name__ == '__main__':
-    wttest.run()

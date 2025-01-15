@@ -5,13 +5,16 @@
 // test from running in the 'aggregation_facet_unwind_passthrough' suite.
 // @tags: [
 //   do_not_wrap_aggregations_in_facets,
+//
+//   # This test makes assertions about queries erroring or returning null depending on whether SBE
+//   # is used or not. SBE may be chosen if an implicit column index is created, so we ban this
+//   # tests from implicit index creation suites.
+//   assumes_no_implicit_index_creation,
 // ]
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-load("jstests/aggregation/extras/utils.js");        // For assertArrayEq.
-load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
-load("jstests/libs/sbe_util.js");                   // For checkSBEEnabled.
+import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
+import {checkSbeFullyEnabled} from "jstests/libs/query/sbe_util.js";
 
 const coll = db.projection_expr_concat_arrays;
 coll.drop();
@@ -39,7 +42,6 @@ function runAndAssert(operands, expectedResult) {
         expected: expectedResult
     });
 }
-
 function runAndAssertNull(operands) {
     runAndAssert(operands, [null]);
 }
@@ -48,6 +50,14 @@ function runAndAssertThrows(operands) {
     const error =
         assert.throws(() => coll.aggregate([{$project: {f: {$concatArrays: operands}}}]).toArray());
     assert.commandFailedWithCode(error, 28664);
+}
+
+function runAndAssertThrowsOrNull(operands) {
+    try {
+        runAndAssertNull(operands);
+    } catch (error) {
+        assert.commandFailedWithCode(error, 28664);
+    }
 }
 
 runAndAssert(["$int_arr"], [[1, 2, 3, 4]]);
@@ -128,15 +138,15 @@ runAndAssertThrows(["$int_arr", "$int_val"]);
 runAndAssertThrows(["$dbl_arr", "$dbl_val"]);
 
 // Confirm edge case where if invalid input precedes null or missing inputs, the command fails.
-// Note that when the SBE engine is enabled, null will be returned before invalid input because
-// we check if any values are null before checking whether all values are arrays.
-let evalFn = checkSBEEnabled(db, ["featureFlagSbeFull"]) ? runAndAssertNull : runAndAssertThrows;
-evalFn(["$int_arr", "$dbl_val", "$null_val"]);
-evalFn(["$int_arr", "some_string_value", "$null_val"]);
-evalFn(["$dbl_val", "$null_val"]);
-evalFn(["$int_arr", "$int_val", "$not_a_field"]);
-evalFn(["$int_val", "$not_a_field"]);
-evalFn(["$int_val", "$not_a_field", "$null_val"]);
+// Depending on execution engine null might be returned before we throw an error. A query might
+// execute in Classic or SBE depending on a lot of factors: plan cache, runtime planners and so
+// on, so we can't assert exactly what will happen.
+runAndAssertThrowsOrNull(["$int_arr", "$dbl_val", "$null_val"]);
+runAndAssertThrowsOrNull(["$int_arr", "some_string_value", "$null_val"]);
+runAndAssertThrowsOrNull(["$dbl_val", "$null_val"]);
+runAndAssertThrowsOrNull(["$int_arr", "$int_val", "$not_a_field"]);
+runAndAssertThrowsOrNull(["$int_val", "$not_a_field"]);
+runAndAssertThrowsOrNull(["$int_val", "$not_a_field", "$null_val"]);
 runAndAssertThrows(["$int_arr", 32]);
 
 // Clear collection.
@@ -170,4 +180,3 @@ runAndAssert(["$arr1", [1, 2, 3], "$arr2"], [
     null,
     null
 ]);
-}());

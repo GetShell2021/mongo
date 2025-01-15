@@ -9,11 +9,9 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/libs/fail_point_util.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Set the number of initial sync attempts to 2 so that the test fails on unplanned failures.
 const replTest =
@@ -22,7 +20,7 @@ replTest.startSet();
 
 // Increase the election timeout to 24 hours so that we do not accidentally trigger an election
 // while the secondary is restarting.
-replTest.initiateWithHighElectionTimeout();
+replTest.initiate();
 
 const primary = replTest.getPrimary();
 let secondary = replTest.getSecondary();
@@ -106,11 +104,10 @@ jsTestLog("Failing first initial sync attempt");
 assert.commandWorked(secondary.adminCommand(
     {configureFailPoint: "failInitialSyncBeforeApplyingBatch", mode: "off"}));
 
-replTest.waitForState(secondary, ReplSetTest.State.SECONDARY);
+replTest.awaitSecondaryNodes(null, [secondary]);
 
 jsTestLog("Initial sync completed");
 
 assert.commandWorked(session.abortTransaction_forTesting());
 
 replTest.stopSet();
-})();

@@ -27,39 +27,80 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/create_collection.h"
 
-#include <fmt/printf.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <fmt/printf.h>  // IWYU pragma: keep
+#include <memory>
+#include <string>
+#include <utility>
+#include <variant>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/json.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/catalog/clustered_collection_options_gen.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_catalog_helper.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/catalog/unique_collection_name.h"
+#include "mongo/db/catalog/virtual_collection_options.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/create_gen.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/exception_util.h"
-#include "mongo/db/curop.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/feature_flag.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/index_builds/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/ops/insert.h"
+#include "mongo/db/pipeline/change_stream_pre_and_post_images_options_gen.h"
+#include "mongo/db/profile_settings.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/write_ops/insert.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/server_feature_flags_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/stats/top.h"
+#include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 #include "mongo/db/timeseries/timeseries_options.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -68,8 +109,9 @@ namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(failTimeseriesViewCreation);
-MONGO_FAIL_POINT_DEFINE(failPreimagesCollectionCreation);
 MONGO_FAIL_POINT_DEFINE(clusterAllCollectionsByDefault);
+MONGO_FAIL_POINT_DEFINE(skipIdIndex);
+MONGO_FAIL_POINT_DEFINE(useRegularCreatePathForTimeseriesBucketsCreations);
 
 using IndexVersion = IndexDescriptor::IndexVersion;
 
@@ -119,7 +161,9 @@ Status validateClusteredIndexSpec(OperationContext* opCtx,
 
     if (expireAfterSeconds) {
         // Not included in the indexSpec itself.
-        auto status = index_key_validate::validateExpireAfterSeconds(*expireAfterSeconds);
+        auto status = index_key_validate::validateExpireAfterSeconds(
+            *expireAfterSeconds,
+            index_key_validate::ValidateExpireAfterSecondsMode::kClusteredTTLIndex);
         if (!status.isOK()) {
             return status;
         }
@@ -134,6 +178,62 @@ Status validateClusteredIndexSpec(OperationContext* opCtx,
     }
 
     return Status::OK();
+}
+
+Status validateCollectionOptions(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 const CollectionOptions& collectionOptions,
+                                 const boost::optional<BSONObj>& idIndex) {
+    if (collectionOptions.expireAfterSeconds && !collectionOptions.clusteredIndex &&
+        !collectionOptions.timeseries) {
+        return Status(ErrorCodes::InvalidOptions,
+                      "'expireAfterSeconds' can be used only for clustered collections or "
+                      "timeseries collections");
+    }
+
+    if (auto clusteredIndex = collectionOptions.clusteredIndex) {
+        if (clustered_util::requiresLegacyFormat(nss) != clusteredIndex->getLegacyFormat()) {
+            return Status(ErrorCodes::Error(5979703),
+                          "The 'clusteredIndex' legacy format {clusteredIndex: <bool>} is only "
+                          "supported for specific internal collections and vice versa");
+        }
+
+        if (idIndex && !idIndex->isEmpty()) {
+            return Status(ErrorCodes::InvalidOptions,
+                          "The 'clusteredIndex' option is not supported with the 'idIndex' option");
+        }
+        if (collectionOptions.autoIndexId == CollectionOptions::NO) {
+            return Status(ErrorCodes::Error(6026501),
+                          "The 'clusteredIndex' option does not support {autoIndexId: false}");
+        }
+
+        if (collectionOptions.recordIdsReplicated) {
+            return Status(ErrorCodes::InvalidOptions,
+                          "The 'clusteredIndex' option is not supported with the "
+                          "'recordIdsReplicated' option");
+        }
+
+        auto clusteredIndexStatus = validateClusteredIndexSpec(
+            opCtx, nss, clusteredIndex->getIndexSpec(), collectionOptions.expireAfterSeconds);
+        if (!clusteredIndexStatus.isOK()) {
+            return clusteredIndexStatus;
+        }
+    }
+    return Status::OK();
+}
+
+
+std::tuple<Lock::CollectionLock, Lock::CollectionLock> acquireCollLocksForRename(
+    OperationContext* opCtx, const NamespaceString& ns1, const NamespaceString& ns2) {
+    if (ResourceId{RESOURCE_COLLECTION, ns1} < ResourceId{RESOURCE_COLLECTION, ns2}) {
+        Lock::CollectionLock collLock1{opCtx, ns1, MODE_X};
+        Lock::CollectionLock collLock2{opCtx, ns2, MODE_X};
+        return {std::move(collLock1), std::move(collLock2)};
+    } else {
+        Lock::CollectionLock collLock2{opCtx, ns2, MODE_X};
+        Lock::CollectionLock collLock1{opCtx, ns1, MODE_X};
+        return {std::move(collLock1), std::move(collLock2)};
+    }
 }
 
 void _createSystemDotViewsIfNecessary(OperationContext* opCtx, const Database* db) {
@@ -157,52 +257,66 @@ Status _createView(OperationContext* opCtx,
                           << "': this is a reserved system namespace",
             !nss.isSystemDotViews());
 
-    return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
-        AutoGetDb autoDb(opCtx, nss.db(), MODE_IX);
+    return writeConflictRetry(opCtx, "create", nss, [&] {
+        AutoGetDb autoDb(opCtx, nss.dbName(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
         // Operations all lock system.views in the end to prevent deadlock.
         Lock::CollectionLock systemViewsLock(
-            opCtx,
-            NamespaceString(nss.db(), NamespaceString::kSystemDotViewsCollectionName),
-            MODE_X);
+            opCtx, NamespaceString::makeSystemDotViewsNamespace(nss.dbName()), MODE_X);
 
         auto db = autoDb.ensureDbExists(opCtx);
 
         if (opCtx->writesAreReplicated() &&
             !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
             return Status(ErrorCodes::NotWritablePrimary,
-                          str::stream() << "Not primary while creating collection " << nss);
+                          str::stream() << "Not primary while creating collection "
+                                        << nss.toStringForErrorMsg());
         }
+
+        // This is a top-level handler for collection creation name conflicts. New commands coming
+        // in, or commands that generated a WriteConflict must return a NamespaceExists error here
+        // on conflict.
+        Status statusNss = catalog::checkIfNamespaceExists(opCtx, nss);
+        if (!statusNss.isOK()) {
+            return statusNss;
+        }
+
+        CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, nss)
+            ->checkShardVersionOrThrow(opCtx);
 
         if (collectionOptions.changeStreamPreAndPostImagesOptions.getEnabled()) {
             return Status(ErrorCodes::InvalidOptions,
                           "option not supported on a view: changeStreamPreAndPostImages");
         }
 
-        // Cannot directly create a view on a system.buckets collection, only by creating a
-        // time-series collection.
-        auto viewOnNss = NamespaceString{collectionOptions.viewOn};
-        uassert(ErrorCodes::InvalidNamespace,
-                "Cannot create view on a system.buckets namespace except by creating a time-series "
-                "collection",
-                !viewOnNss.isTimeseriesBucketsCollection());
-
         _createSystemDotViewsIfNecessary(opCtx, db);
 
         WriteUnitOfWork wunit(opCtx);
 
-        AutoStatsTracker statsTracker(
-            opCtx,
-            nss,
-            Top::LockType::NotLocked,
-            AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-            CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.dbName()));
+        AutoStatsTracker statsTracker(opCtx,
+                                      nss,
+                                      Top::LockType::NotLocked,
+                                      AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                                      DatabaseProfileSettings::get(opCtx->getServiceContext())
+                                          .getDatabaseProfileLevel(nss.dbName()));
 
         // If the view creation rolls back, ensure that the Top entry created for the view is
         // deleted.
-        opCtx->recoveryUnit()->onRollback([nss, serviceContext = opCtx->getServiceContext()]() {
-            Top::get(serviceContext).collectionDropped(nss);
-        });
+        shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+            [nss](OperationContext* opCtx) { Top::getDecoration(opCtx).collectionDropped(nss); });
+
+        if (MONGO_unlikely(failTimeseriesViewCreation.shouldFail([&nss](const BSONObj& data) {
+                const auto fpNss = NamespaceStringUtil::parseFailPointData(data, "ns");
+                return fpNss == nss;
+            }))) {
+            LOGV2(5490200,
+                  "failTimeseriesViewCreation fail point enabled. Failing creation of view "
+                  "definition.");
+            return Status{ErrorCodes::OperationFailed,
+                          str::stream() << "View definition " << nss.toStringForErrorMsg()
+                                        << " creation failed due to 'failTimeseriesViewCreation' "
+                                           "fail point enabled."};
+        }
 
         // Even though 'collectionOptions' is passed by rvalue reference, it is not safe to move
         // because 'userCreateNS' may throw a WriteConflictException.
@@ -216,230 +330,364 @@ Status _createView(OperationContext* opCtx,
     });
 }
 
+Status _createDefaultTimeseriesIndex(OperationContext* opCtx,
+                                     CollectionWriter& collection,
+                                     BSONObj collation) {
+    auto tsOptions = collection->getCollectionOptions().timeseries;
+    if (!tsOptions->getMetaField()) {
+        return Status::OK();
+    }
+
+    StatusWith<BSONObj> swBucketsSpec = timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(
+        *tsOptions, BSON(*tsOptions->getMetaField() << 1 << tsOptions->getTimeField() << 1));
+    if (!swBucketsSpec.isOK()) {
+        return swBucketsSpec.getStatus();
+    }
+
+    const std::string indexName = str::stream()
+        << *tsOptions->getMetaField() << "_1_" << tsOptions->getTimeField() << "_1";
+
+    BSONObjBuilder builder;
+    builder.append("v", 2);
+    builder.append("name", indexName);
+    builder.append("key", swBucketsSpec.getValue());
+
+    // Add the collection collation when building the default timeseries index if the collation is
+    // non-empty.
+    if (!collation.isEmpty()) {
+        builder.append("collation", collation);
+    }
+
+    IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(opCtx,
+                                                                       collection,
+                                                                       {builder.obj()},
+                                                                       /*fromMigrate=*/false);
+    return Status::OK();
+}
+
+BSONObj _generateTimeseriesValidator(int bucketVersion, StringData timeField) {
+    if (bucketVersion != timeseries::kTimeseriesControlCompressedSortedVersion &&
+        bucketVersion != timeseries::kTimeseriesControlUncompressedVersion &&
+        bucketVersion != timeseries::kTimeseriesControlCompressedUnsortedVersion) {
+        MONGO_UNREACHABLE;
+    }
+    // '$jsonSchema' : {
+    //     bsonType: 'object',
+    //     required: ['_id', 'control', 'data'],
+    //     properties: {
+    //         _id: {bsonType: 'objectId'},
+    //         control: {
+    //             bsonType: 'object',
+    //             required: ['version', 'min', 'max'],
+    //             properties: {
+    //                 version: {bsonType: 'number'},
+    //                 min: {
+    //                     bsonType: 'object',
+    //                     required: ['%s'],
+    //                     properties: {'%s': {bsonType: 'date'}}
+    //                 },
+    //                 max: {
+    //                     bsonType: 'object',
+    //                     required: ['%s'],
+    //                     properties: {'%s': {bsonType: 'date'}}
+    //                 },
+    //                 closed: {bsonType: 'bool'},
+    //                 count: {bsonType: 'number', minimum: 1} // only if bucketVersion ==
+    //                 // timeseries::kTimeseriesControlCompressedSortedVersion or
+    //                 // timeseries::kTimeseriesControlCompressedUnsortedVersion
+    //             },
+    //             additionalProperties: false // only if bucketVersion ==
+    //             // timeseries::kTimeseriesControlCompressedSortedVersion or
+    //             // timeseries::kTimeseriesControlCompressedUnsortedVersion
+    //         },
+    //         data: {bsonType: 'object'},
+    //         meta: {}
+    //     },
+    //     additionalProperties: false
+    //   }
+    BSONObjBuilder validator;
+    BSONObjBuilder schema(validator.subobjStart("$jsonSchema"));
+    schema.append("bsonType", "object");
+    schema.append("required",
+                  BSON_ARRAY("_id"
+                             << "control"
+                             << "data"));
+    {
+        BSONObjBuilder properties(schema.subobjStart("properties"));
+        {
+            BSONObjBuilder _id(properties.subobjStart("_id"));
+            _id.append("bsonType", "objectId");
+            _id.done();
+        }
+        {
+            BSONObjBuilder control(properties.subobjStart("control"));
+            control.append("bsonType", "object");
+            control.append("required",
+                           BSON_ARRAY("version"
+                                      << "min"
+                                      << "max"));
+            {
+                BSONObjBuilder innerProperties(control.subobjStart("properties"));
+                {
+                    BSONObjBuilder version(innerProperties.subobjStart("version"));
+                    version.append("bsonType", "number");
+                    version.done();
+                }
+                {
+                    BSONObjBuilder min(innerProperties.subobjStart("min"));
+                    min.append("bsonType", "object");
+                    min.append("required", BSON_ARRAY(timeField));
+                    BSONObjBuilder minProperties(min.subobjStart("properties"));
+                    BSONObjBuilder timeFieldObj(minProperties.subobjStart(timeField));
+                    timeFieldObj.append("bsonType", "date");
+                    timeFieldObj.done();
+                    minProperties.done();
+                    min.done();
+                }
+
+                {
+                    BSONObjBuilder max(innerProperties.subobjStart("max"));
+                    max.append("bsonType", "object");
+                    max.append("required", BSON_ARRAY(timeField));
+                    BSONObjBuilder maxProperties(max.subobjStart("properties"));
+                    BSONObjBuilder timeFieldObj(maxProperties.subobjStart(timeField));
+                    timeFieldObj.append("bsonType", "date");
+                    timeFieldObj.done();
+                    maxProperties.done();
+                    max.done();
+                }
+                {
+                    BSONObjBuilder closed(innerProperties.subobjStart("closed"));
+                    closed.append("bsonType", "bool");
+                    closed.done();
+                }
+                if (bucketVersion == timeseries::kTimeseriesControlCompressedSortedVersion ||
+                    bucketVersion == timeseries::kTimeseriesControlCompressedUnsortedVersion) {
+                    BSONObjBuilder count(innerProperties.subobjStart("count"));
+                    count.append("bsonType", "number");
+                    count.append("minimum", 1);
+                    count.done();
+                }
+                innerProperties.done();
+            }
+            if (bucketVersion == timeseries::kTimeseriesControlCompressedSortedVersion ||
+                bucketVersion == timeseries::kTimeseriesControlCompressedUnsortedVersion) {
+                control.append("additionalProperties", false);
+            }
+            control.done();
+        }
+        {
+            BSONObjBuilder data(properties.subobjStart("data"));
+            data.append("bsonType", "object");
+            data.done();
+        }
+        properties.append("meta", BSONObj{});
+        properties.done();
+    }
+    schema.append("additionalProperties", false);
+    schema.done();
+    return validator.obj();
+}
+
 Status _createTimeseries(OperationContext* opCtx,
                          const NamespaceString& ns,
-                         const CollectionOptions& optionsArg) {
+                         const CollectionOptions& optionsArg,
+                         const boost::optional<BSONObj>& idIndex) {
+
     // This path should only be taken when a user creates a new time-series collection on the
     // primary. Secondaries replicate individual oplog entries.
-    invariant(!ns.isTimeseriesBucketsCollection());
     invariant(opCtx->writesAreReplicated());
 
-    auto bucketsNs = ns.makeTimeseriesBucketsNamespace();
+    const auto& bucketsNs =
+        (ns.isTimeseriesBucketsCollection()) ? ns : ns.makeTimeseriesBucketsNamespace();
+
+    Status bucketsAllowedStatus = userAllowedCreateNS(opCtx, bucketsNs);
+    if (!bucketsAllowedStatus.isOK()) {
+        return bucketsAllowedStatus;
+    }
+
+    Status validateStatus = validateCollectionOptions(opCtx, bucketsNs, optionsArg, idIndex);
+    if (!validateStatus.isOK()) {
+        return validateStatus;
+    }
 
     CollectionOptions options = optionsArg;
 
-    // Users may not pass a 'bucketMaxSpanSeconds' other than the default. Instead they should rely
-    // on the default behavior from the 'granularity'.
-    auto granularity = options.timeseries->getGranularity();
-    auto maxSpanSeconds = timeseries::getMaxSpanSecondsFromGranularity(granularity);
-    uassert(5510500,
-            fmt::format("Timeseries 'bucketMaxSpanSeconds' is not configurable to a value other "
-                        "than the default of {} for the provided granularity",
-                        maxSpanSeconds),
-            !options.timeseries->getBucketMaxSpanSeconds() ||
-                maxSpanSeconds == options.timeseries->getBucketMaxSpanSeconds());
-    options.timeseries->setBucketMaxSpanSeconds(maxSpanSeconds);
+    Status timeseriesOptionsValidateAndSetStatus =
+        timeseries::validateAndSetBucketingParameters(options.timeseries.get());
+
+    if (!timeseriesOptionsValidateAndSetStatus.isOK()) {
+        return timeseriesOptionsValidateAndSetStatus;
+    }
 
     // Set the validator option to a JSON schema enforcing constraints on bucket documents.
     // This validation is only structural to prevent accidental corruption by users and
     // cannot cover all constraints. Leave the validationLevel and validationAction to their
     // strict/error defaults.
     auto timeField = options.timeseries->getTimeField();
-    auto validatorObj = fromjson(fmt::sprintf(R"(
-{
-'$jsonSchema' : {
-    bsonType: 'object',
-    required: ['_id', 'control', 'data'],
-    properties: {
-        _id: {bsonType: 'objectId'},
-        control: {
-            bsonType: 'object',
-            required: ['version', 'min', 'max'],
-            properties: {
-                version: {bsonType: 'number'},
-                min: {
-                    bsonType: 'object',
-                    required: ['%s'],
-                    properties: {'%s': {bsonType: 'date'}}
-                },
-                max: {
-                    bsonType: 'object',
-                    required: ['%s'],
-                    properties: {'%s': {bsonType: 'date'}}
-                },
-                closed: {bsonType: 'bool'}
-            }
-        },
-        data: {bsonType: 'object'},
-        meta: {}
-    },
-    additionalProperties: false
-}
-})",
-                                              timeField,
-                                              timeField,
-                                              timeField,
-                                              timeField));
+    int bucketVersion = timeseries::kTimeseriesControlLatestVersion;
+    auto validatorObj = _generateTimeseriesValidator(bucketVersion, timeField);
 
     bool existingBucketCollectionIsCompatible = false;
 
-    Status ret =
-        writeConflictRetry(opCtx, "createBucketCollection", bucketsNs.ns(), [&]() -> Status {
-            AutoGetDb autoDb(opCtx, bucketsNs.db(), MODE_IX);
-            Lock::CollectionLock bucketsCollLock(opCtx, bucketsNs, MODE_IX);
-            auto db = autoDb.ensureDbExists(opCtx);
+    Status ret = writeConflictRetry(opCtx, "createBucketCollection", bucketsNs, [&]() -> Status {
+        AutoGetDb autoDb(opCtx, bucketsNs.dbName(), MODE_IX);
+        Lock::CollectionLock bucketsCollLock(opCtx, bucketsNs, MODE_X);
+        auto db = autoDb.ensureDbExists(opCtx);
 
-            // Check if there already exist a Collection on the namespace we will later create a
-            // view on. We're not holding a Collection lock for this Collection so we may only check
-            // if the pointer is null or not. The answer may also change at any point after this
-            // call which is fine as we properly handle an orphaned bucket collection. This check is
-            // just here to prevent it from being created in the common case.
-            Status status = catalog::checkIfNamespaceExists(opCtx, ns);
-            if (!status.isOK()) {
-                return status;
-            }
-
-            if (opCtx->writesAreReplicated() &&
-                !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, bucketsNs)) {
-                // Report the error with the user provided namespace
-                return Status(ErrorCodes::NotWritablePrimary,
-                              str::stream() << "Not primary while creating collection " << ns);
-            }
-
-            WriteUnitOfWork wuow(opCtx);
-            AutoStatsTracker bucketsStatsTracker(
-                opCtx,
-                bucketsNs,
-                Top::LockType::NotLocked,
-                AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns.dbName()));
-
-            // If the buckets collection and time-series view creation roll back, ensure that their
-            // Top entries are deleted.
-            opCtx->recoveryUnit()->onRollback(
-                [serviceContext = opCtx->getServiceContext(), bucketsNs]() {
-                    Top::get(serviceContext).collectionDropped(bucketsNs);
-                });
-
-
-            // Prepare collection option and index spec using the provided options. In case the
-            // collection already exist we use these to validate that they are the same as being
-            // requested here.
-            CollectionOptions bucketsOptions = options;
-            bucketsOptions.validator = validatorObj;
-
-            // Cluster time-series buckets collections by _id.
-            auto expireAfterSeconds = options.expireAfterSeconds;
-            if (expireAfterSeconds) {
-                uassertStatusOK(
-                    index_key_validate::validateExpireAfterSeconds(*expireAfterSeconds));
-                bucketsOptions.expireAfterSeconds = expireAfterSeconds;
-            }
-
-            bucketsOptions.clusteredIndex =
-                clustered_util::makeCanonicalClusteredInfoForLegacyFormat();
-
-            if (auto coll =
-                    CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, bucketsNs)) {
-                // Compare CollectionOptions and eventual TTL index to see if this bucket collection
-                // may be reused for this request.
-                existingBucketCollectionIsCompatible =
-                    coll->getCollectionOptions().matchesStorageOptions(
-                        bucketsOptions, CollatorFactoryInterface::get(opCtx->getServiceContext()));
-                return Status(ErrorCodes::NamespaceExists,
-                              str::stream() << "Bucket Collection already exists. NS: " << bucketsNs
-                                            << ". UUID: " << coll->uuid());
-            }
-
-            // Create the buckets collection that will back the view.
-            const bool createIdIndex = false;
-            uassertStatusOK(db->userCreateNS(opCtx, bucketsNs, bucketsOptions, createIdIndex));
-            wuow.commit();
-            return Status::OK();
-        });
-
-    // If compatible bucket collection already exists then proceed with creating view definition.
-    if (!ret.isOK() && !existingBucketCollectionIsCompatible)
-        return ret;
-
-    ret = writeConflictRetry(opCtx, "create", ns.ns(), [&]() -> Status {
-        AutoGetCollection autoColl(opCtx, ns, MODE_IX, AutoGetCollectionViewMode::kViewsPermitted);
-        Lock::CollectionLock systemDotViewsLock(
-            opCtx,
-            NamespaceString(ns.db(), NamespaceString::kSystemDotViewsCollectionName),
-            MODE_X);
-        auto db = autoColl.ensureDbExists(opCtx);
-
-        // This is a top-level handler for time-series creation name conflicts. New commands coming
-        // in, or commands that generated a WriteConflict must return a NamespaceExists error here
-        // on conflict.
+        // Check if there already exist a Collection on the namespace we will later create a
+        // view on. We're not holding a Collection lock for this Collection so we may only check
+        // if the pointer is null or not. The answer may also change at any point after this
+        // call which is fine as we properly handle an orphaned bucket collection. This check is
+        // just here to prevent it from being created in the common case.
         Status status = catalog::checkIfNamespaceExists(opCtx, ns);
         if (!status.isOK()) {
             return status;
         }
 
         if (opCtx->writesAreReplicated() &&
-            !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
-            return {ErrorCodes::NotWritablePrimary,
-                    str::stream() << "Not primary while creating collection " << ns};
+            !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, bucketsNs)) {
+            // Report the error with the user provided namespace
+            return Status(ErrorCodes::NotWritablePrimary,
+                          str::stream() << "Not primary while creating collection "
+                                        << ns.toStringForErrorMsg());
         }
 
+        CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, bucketsNs)
+            ->checkShardVersionOrThrow(opCtx);
 
-        _createSystemDotViewsIfNecessary(opCtx, db);
-
-        auto catalog = CollectionCatalog::get(opCtx);
         WriteUnitOfWork wuow(opCtx);
-
-        AutoStatsTracker statsTracker(opCtx,
-                                      ns,
-                                      Top::LockType::NotLocked,
-                                      AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                                      catalog->getDatabaseProfileLevel(ns.dbName()));
+        AutoStatsTracker bucketsStatsTracker(
+            opCtx,
+            bucketsNs,
+            Top::LockType::NotLocked,
+            AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+            DatabaseProfileSettings::get(opCtx->getServiceContext())
+                .getDatabaseProfileLevel(ns.dbName()));
 
         // If the buckets collection and time-series view creation roll back, ensure that their
         // Top entries are deleted.
-        opCtx->recoveryUnit()->onRollback([serviceContext = opCtx->getServiceContext(), ns]() {
-            Top::get(serviceContext).collectionDropped(ns);
-        });
+        shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+            [bucketsNs](OperationContext* opCtx) {
+                Top::getDecoration(opCtx).collectionDropped(bucketsNs);
+            });
 
-        if (MONGO_unlikely(failTimeseriesViewCreation.shouldFail(
-                [&ns](const BSONObj& data) { return data["ns"_sd].String() == ns.ns(); }))) {
-            LOGV2(5490200,
-                  "failTimeseriesViewCreation fail point enabled. Failing creation of view "
-                  "definition after bucket collection was created successfully.");
-            return {ErrorCodes::OperationFailed,
-                    str::stream() << "Timeseries view definition " << ns
-                                  << " creation failed due to 'failTimeseriesViewCreation' "
-                                     "fail point enabled."};
+
+        // Prepare collection option and index spec using the provided options. In case the
+        // collection already exist we use these to validate that they are the same as being
+        // requested here.
+        CollectionOptions bucketsOptions = options;
+        bucketsOptions.validator = validatorObj;
+
+        // Cluster time-series buckets collections by _id.
+        auto expireAfterSeconds = options.expireAfterSeconds;
+        if (expireAfterSeconds) {
+            uassertStatusOK(index_key_validate::validateExpireAfterSeconds(
+                *expireAfterSeconds,
+                index_key_validate::ValidateExpireAfterSecondsMode::kClusteredTTLIndex));
+            bucketsOptions.expireAfterSeconds = expireAfterSeconds;
         }
 
-        CollectionOptions viewOptions;
-        viewOptions.viewOn = bucketsNs.coll().toString();
-        viewOptions.collation = options.collation;
-        constexpr bool asArray = true;
-        viewOptions.pipeline = timeseries::generateViewPipeline(*options.timeseries, asArray);
+        bucketsOptions.clusteredIndex = clustered_util::makeCanonicalClusteredInfoForLegacyFormat();
 
-        // Create the time-series view.
-        status = db->userCreateNS(opCtx, ns, viewOptions);
-        if (!status.isOK()) {
-            return status.withContext(str::stream() << "Failed to create view on " << bucketsNs
-                                                    << " for time-series collection " << ns
-                                                    << " with options " << viewOptions.toBSON());
+        if (auto coll =
+                CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, bucketsNs)) {
+            // Compare CollectionOptions and eventual TTL index to see if this bucket collection
+            // may be reused for this request.
+            existingBucketCollectionIsCompatible =
+                coll->getCollectionOptions().matchesStorageOptions(
+                    bucketsOptions, CollatorFactoryInterface::get(opCtx->getServiceContext()));
+
+            // We may have a bucket collection created with a previous version of mongod, this
+            // is also OK as we do not convert bucket collections to latest version during
+            // upgrade.
+            while (!existingBucketCollectionIsCompatible &&
+                   bucketVersion > timeseries::kTimeseriesControlMinVersion) {
+                validatorObj = _generateTimeseriesValidator(--bucketVersion, timeField);
+                bucketsOptions.validator = validatorObj;
+
+                existingBucketCollectionIsCompatible =
+                    coll->getCollectionOptions().matchesStorageOptions(
+                        bucketsOptions, CollatorFactoryInterface::get(opCtx->getServiceContext()));
+            }
+
+            return Status(ErrorCodes::NamespaceExists,
+                          str::stream()
+                              << "Bucket Collection already exists. NS: "
+                              << bucketsNs.toStringForErrorMsg() << ". UUID: " << coll->uuid());
         }
 
+        // Create the buckets collection that will back the view.
+        const bool createIdIndex = false;
+        uassertStatusOK(db->userCreateNS(opCtx, bucketsNs, bucketsOptions, createIdIndex));
+
+        CollectionWriter collectionWriter(opCtx, bucketsNs);
+
+        // The collator validation occurs in userCreateNS and normalizes the collation (adding
+        // additional fields to the collation) when doing the validation.
+        //
+        // We call the collator validator but we need the normalized collator for the default
+        // timeseries index. We ensure that the collation is non-empty because validateCollator will
+        // return a nullptr.
+        auto validatedCollator = bucketsOptions.collation;
+        if (!bucketsOptions.collation.isEmpty()) {
+            auto swCollator = db->validateCollator(opCtx, bucketsOptions);
+
+            // The userCreateNS already has a uassertStatusOK and validateCollator is called in it,
+            // so we should have the case that the status of the swCollator is ok.
+            invariant(swCollator.getStatus());
+            validatedCollator = swCollator.getValue()->getSpec().toBSON();
+        }
+
+        uassertStatusOK(_createDefaultTimeseriesIndex(opCtx, collectionWriter, validatedCollator));
         wuow.commit();
         return Status::OK();
     });
 
-    return ret;
+    const auto& bucketCreationStatus = ret;
+    if (
+        // If we could not create the bucket collection and the pre-existing bucket collection is
+        // not compatible we bubble up the error
+        (!bucketCreationStatus.isOK() && !existingBucketCollectionIsCompatible) ||
+        // If the 'temp' flag is true, we are in the $out stage, and should return without creating
+        // the view defintion.
+        options.temp ||
+        // If the request came directly on the bucket namesapce we do not need to create the view.
+        ns.isTimeseriesBucketsCollection()) {
+        return bucketCreationStatus;
+    }
+
+
+    CollectionOptions viewOptions;
+    viewOptions.viewOn = bucketsNs.coll().toString();
+    viewOptions.collation = options.collation;
+    constexpr bool asArray = true;
+    viewOptions.pipeline = timeseries::generateViewPipeline(*options.timeseries, asArray);
+
+    const auto viewCreationStatus = _createView(opCtx, ns, viewOptions);
+    if (!viewCreationStatus.isOK()) {
+        return viewCreationStatus.withContext(
+            str::stream() << "Failed to create view on " << bucketsNs.toStringForErrorMsg()
+                          << " for time-series collection " << ns.toStringForErrorMsg()
+                          << " with options " << viewOptions.toBSON());
+    }
+
+    return Status::OK();
 }
 
-Status _createCollection(OperationContext* opCtx,
-                         const NamespaceString& nss,
-                         const CollectionOptions& collectionOptions,
-                         const boost::optional<BSONObj>& idIndex) {
-    return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
-        AutoGetDb autoDb(opCtx, nss.db(), MODE_IX);
+Status _createCollection(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CollectionOptions& collectionOptions,
+    const boost::optional<BSONObj>& idIndex,
+    const boost::optional<VirtualCollectionOptions>& virtualCollectionOptions = boost::none) {
+    return writeConflictRetry(opCtx, "create", nss, [&] {
+        // If a change collection is to be created, that is, the change streams are being enabled
+        // for a tenant, acquire exclusive tenant lock.
+        AutoGetDb autoDb(opCtx,
+                         nss.dbName(),
+                         MODE_IX /* database lock mode*/,
+                         boost::make_optional(nss.tenantId() && nss.isChangeCollection(), MODE_X));
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
         auto db = autoDb.ensureDbExists(opCtx);
 
@@ -451,85 +699,47 @@ Status _createCollection(OperationContext* opCtx,
             return status;
         }
 
-        // If the FCV has changed while executing the command to the version, where the feature flag
-        // is disabled, enabling changeStreamPreAndPostImagesOptions is not allowed.
-        // TODO SERVER-58584: remove the feature flag.
-        if (!feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabled(
-                serverGlobalParams.featureCompatibility) &&
-            collectionOptions.changeStreamPreAndPostImagesOptions.getEnabled()) {
-            return Status(ErrorCodes::InvalidOptions,
-                          "The 'changeStreamPreAndPostImages' is an unknown field.");
+        status = validateCollectionOptions(opCtx, nss, collectionOptions, idIndex);
+        if (!status.isOK()) {
+            return status;
         }
-
-        if (!collectionOptions.clusteredIndex && collectionOptions.expireAfterSeconds) {
-            return Status(ErrorCodes::InvalidOptions,
-                          "'expireAfterSeconds' requires clustering to be enabled");
-        }
-
-        if (auto clusteredIndex = collectionOptions.clusteredIndex) {
-            bool clusteredIndexesEnabled =
-                feature_flags::gClusteredIndexes.isEnabled(serverGlobalParams.featureCompatibility);
-            if (!clusteredIndexesEnabled && !clustered_util::requiresLegacyFormat(nss)) {
-                // The 'clusteredIndex' option is only supported in legacy format for specific
-                // internal collections when the gClusteredIndexes flag is disabled.
-                return Status(ErrorCodes::InvalidOptions,
-                              str::stream()
-                                  << "The 'clusteredIndex' option is not supported for namespace "
-                                  << nss);
-            }
-
-            if (clustered_util::requiresLegacyFormat(nss) != clusteredIndex->getLegacyFormat()) {
-                return Status(ErrorCodes::Error(5979703),
-                              "The 'clusteredIndex' legacy format {clusteredIndex: <bool>} is only "
-                              "supported for specific internal collections and vice versa");
-            }
-
-            if (idIndex && !idIndex->isEmpty()) {
-                return Status(
-                    ErrorCodes::InvalidOptions,
-                    "The 'clusteredIndex' option is not supported with the 'idIndex' option");
-            }
-            if (collectionOptions.autoIndexId == CollectionOptions::NO) {
-                return Status(ErrorCodes::Error(6026501),
-                              "The 'clusteredIndex' option does not support {autoIndexId: false}");
-            }
-
-            auto clusteredIndexStatus = validateClusteredIndexSpec(
-                opCtx, nss, clusteredIndex->getIndexSpec(), collectionOptions.expireAfterSeconds);
-            if (!clusteredIndexStatus.isOK()) {
-                return clusteredIndexStatus;
-            }
-        }
-
 
         if (opCtx->writesAreReplicated() &&
             !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
             return Status(ErrorCodes::NotWritablePrimary,
-                          str::stream() << "Not primary while creating collection " << nss);
+                          str::stream() << "Not primary while creating collection "
+                                        << nss.toStringForErrorMsg());
         }
+
+        CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, nss)
+            ->checkShardVersionOrThrow(opCtx);
 
         WriteUnitOfWork wunit(opCtx);
 
-        AutoStatsTracker statsTracker(
-            opCtx,
-            nss,
-            Top::LockType::NotLocked,
-            AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-            CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.dbName()));
+        AutoStatsTracker statsTracker(opCtx,
+                                      nss,
+                                      Top::LockType::NotLocked,
+                                      AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                                      DatabaseProfileSettings::get(opCtx->getServiceContext())
+                                          .getDatabaseProfileLevel(nss.dbName()));
 
         // If the collection creation rolls back, ensure that the Top entry created for the
         // collection is deleted.
-        opCtx->recoveryUnit()->onRollback([nss, serviceContext = opCtx->getServiceContext()]() {
-            Top::get(serviceContext).collectionDropped(nss);
-        });
+        shard_role_details::getRecoveryUnit(opCtx)->onRollback(
+            [nss](OperationContext* opCtx) { Top::getDecoration(opCtx).collectionDropped(nss); });
 
         // Even though 'collectionOptions' is passed by rvalue reference, it is not safe to move
         // because 'userCreateNS' may throw a WriteConflictException.
         if (idIndex == boost::none || collectionOptions.clusteredIndex) {
-            status = db->userCreateNS(opCtx, nss, collectionOptions, /*createIdIndex=*/false);
+            status = virtualCollectionOptions
+                ? db->userCreateVirtualNS(opCtx, nss, collectionOptions, *virtualCollectionOptions)
+                : db->userCreateNS(opCtx, nss, collectionOptions, /*createIdIndex=*/false);
         } else {
-            status =
-                db->userCreateNS(opCtx, nss, collectionOptions, /*createIdIndex=*/true, *idIndex);
+            bool createIdIndex = true;
+            if (MONGO_unlikely(skipIdIndex.shouldFail())) {
+                createIdIndex = false;
+            }
+            status = db->userCreateNS(opCtx, nss, collectionOptions, createIdIndex, *idIndex);
         }
         if (!status.isOK()) {
             return status;
@@ -544,10 +754,9 @@ CollectionOptions clusterByDefaultIfNecessary(const NamespaceString& nss,
                                               CollectionOptions collectionOptions,
                                               const boost::optional<BSONObj>& idIndex) {
     if (MONGO_unlikely(clusterAllCollectionsByDefault.shouldFail()) &&
-        !collectionOptions.isView() && !collectionOptions.clusteredIndex.is_initialized() &&
-        (!idIndex || idIndex->isEmpty()) && !collectionOptions.capped &&
-        !clustered_util::requiresLegacyFormat(nss) &&
-        feature_flags::gClusteredIndexes.isEnabled(serverGlobalParams.featureCompatibility)) {
+        !collectionOptions.isView() && !collectionOptions.timeseries &&
+        !collectionOptions.clusteredIndex.has_value() && (!idIndex || idIndex->isEmpty()) &&
+        !collectionOptions.capped && !clustered_util::requiresLegacyFormat(nss)) {
         // Capped, clustered collections differ in behavior significantly from normal
         // capped collections. Notably, they allow out-of-order insertion.
         //
@@ -610,7 +819,7 @@ Status createCollection(OperationContext* opCtx,
 }  // namespace
 
 Status createCollection(OperationContext* opCtx,
-                        const std::string& dbName,
+                        const DatabaseName& dbName,
                         const BSONObj& cmdObj,
                         const BSONObj& idIndex) {
     return createCollection(opCtx,
@@ -620,53 +829,31 @@ Status createCollection(OperationContext* opCtx,
                             CollectionOptions::parseForCommand);
 }
 
-Status createCollection(OperationContext* opCtx,
-                        const NamespaceString& ns,
-                        const CreateCommand& cmd) {
-    auto options = CollectionOptions::fromCreateCommand(ns, cmd);
+Status createCollection(OperationContext* opCtx, const CreateCommand& cmd) {
+    auto options = CollectionOptions::fromCreateCommand(cmd);
     auto idIndex = std::exchange(options.idIndex, {});
     bool hasExplicitlyDisabledClustering = cmd.getClusteredIndex() &&
-        stdx::holds_alternative<bool>(*cmd.getClusteredIndex()) &&
-        !stdx::get<bool>(*cmd.getClusteredIndex());
+        holds_alternative<bool>(*cmd.getClusteredIndex()) && !get<bool>(*cmd.getClusteredIndex());
     if (!hasExplicitlyDisabledClustering) {
-        options = clusterByDefaultIfNecessary(ns, std::move(options), idIndex);
+        options = clusterByDefaultIfNecessary(cmd.getNamespace(), std::move(options), idIndex);
     }
-    return createCollection(opCtx, ns, options, idIndex);
+    return createCollection(opCtx, cmd.getNamespace(), options, idIndex);
 }
 
-void createChangeStreamPreImagesCollection(OperationContext* opCtx) {
-    uassert(5868501,
-            "Failpoint failPreimagesCollectionCreation enabled. Throwing exception",
-            !MONGO_unlikely(failPreimagesCollectionCreation.shouldFail()));
-
-    const auto nss = NamespaceString::kChangeStreamPreImagesNamespace;
-    CollectionOptions preImagesCollectionOptions;
-
-    // Make the collection clustered by _id.
-    preImagesCollectionOptions.clusteredIndex.emplace(
-        clustered_util::makeCanonicalClusteredInfoForLegacyFormat());
-    const auto status = _createCollection(opCtx, nss, preImagesCollectionOptions, BSONObj());
-    uassert(status.code(),
-            str::stream() << "Failed to create the pre-images collection: " << nss.coll()
-                          << causedBy(status.reason()),
-            status.isOK() || status.code() == ErrorCodes::NamespaceExists);
-}
-
-// TODO SERVER-62880 pass DatabaseName instead of dbName.
 Status createCollectionForApplyOps(OperationContext* opCtx,
-                                   const std::string& dbName,
+                                   const DatabaseName& dbName,
                                    const boost::optional<UUID>& ui,
                                    const BSONObj& cmdObj,
                                    const bool allowRenameOutOfTheWay,
                                    const boost::optional<BSONObj>& idIndex) {
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IX));
+
+    invariant(shard_role_details::getLocker(opCtx)->isDbLockedForMode(dbName, MODE_IX));
 
     const NamespaceString newCollName(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
     auto newCmd = cmdObj;
 
     auto databaseHolder = DatabaseHolder::get(opCtx);
-    const DatabaseName tenantDbName(boost::none, dbName);
-    auto* const db = databaseHolder->getDb(opCtx, tenantDbName);
+    auto* const db = databaseHolder->getDb(opCtx, dbName);
 
     // If a UUID is given, see if we need to rename a collection out of the way, and whether the
     // collection already exists under a different name. If so, rename it into place. As this is
@@ -675,7 +862,7 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
     // create a database, which could result in createCollection failing if the database
     // does not yet exist.
     if (ui) {
-        auto uuid = ui.get();
+        auto uuid = ui.value();
         uassert(ErrorCodes::InvalidUUID,
                 "Invalid UUID in applyOps create command: " + uuid.toString(),
                 uuid.isRFC4122v4());
@@ -687,19 +874,6 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
         if (currentName && *currentName == newCollName)
             return Status::OK();
 
-        if (currentName && currentName->isDropPendingNamespace()) {
-            LOGV2(20308,
-                  "CMD: create -- existing collection with conflicting UUID is in a drop-pending "
-                  "state",
-                  "newCollection"_attr = newCollName,
-                  "conflictingUUID"_attr = uuid,
-                  "existingCollection"_attr = *currentName);
-            return Status(ErrorCodes::NamespaceExists,
-                          str::stream() << "existing collection " << currentName->toString()
-                                        << " with conflicting UUID " << uuid.toString()
-                                        << " is in a drop-pending state.");
-        }
-
         // In the case of oplog replay, a future command may have created or renamed a
         // collection with that same name. In that case, renaming this future collection to
         // a random temporary name is correct: once all entries are replayed no temporary
@@ -708,22 +882,29 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
         auto futureColl = db ? catalog->lookupCollectionByNamespace(opCtx, newCollName) : nullptr;
         bool needsRenaming(futureColl);
         invariant(!needsRenaming || allowRenameOutOfTheWay,
-                  str::stream() << "Current collection name: " << currentName << ", UUID: " << uuid
-                                << ". Future collection name: " << newCollName);
+                  str::stream() << "Name already exists. Collection name: "
+                                << newCollName.toStringForErrorMsg() << ", UUID: " << uuid
+                                << ", Future collection UUID: " << futureColl->uuid());
 
+        std::string tmpNssPattern("tmp%%%%%.create");
+        if (newCollName.isTimeseriesBucketsCollection()) {
+            tmpNssPattern =
+                NamespaceString::kTimeseriesBucketsCollectionPrefix.toString() + tmpNssPattern;
+        }
         for (int tries = 0; needsRenaming && tries < 10; ++tries) {
-            auto tmpNameResult = db->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.create");
+            auto tmpNameResult = makeUniqueCollectionName(opCtx, dbName, tmpNssPattern);
             if (!tmpNameResult.isOK()) {
                 return tmpNameResult.getStatus().withContext(str::stream()
                                                              << "Cannot generate temporary "
                                                                 "collection namespace for applyOps "
                                                                 "create command: collection: "
-                                                             << newCollName);
+                                                             << newCollName.toStringForErrorMsg());
             }
 
             const auto& tmpName = tmpNameResult.getValue();
-            AutoGetCollection tmpCollLock(opCtx, tmpName, LockMode::MODE_X);
-            if (tmpCollLock.getCollection()) {
+            auto [tmpCollLock, newCollLock] =
+                acquireCollLocksForRename(opCtx, tmpName, newCollName);
+            if (catalog->lookupCollectionByNamespace(opCtx, tmpName)) {
                 // Conflicting on generating a unique temp collection name. Try again.
                 continue;
             }
@@ -736,23 +917,25 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                   "conflictingUUID"_attr = uuid,
                   "tempName"_attr = tmpName);
             Status status =
-                writeConflictRetry(opCtx, "createCollectionForApplyOps", newCollName.ns(), [&] {
+                writeConflictRetry(opCtx, "createCollectionForApplyOps", newCollName, [&] {
                     WriteUnitOfWork wuow(opCtx);
                     Status status = db->renameCollection(opCtx, newCollName, tmpName, stayTemp);
                     if (!status.isOK())
                         return status;
-                    auto uuid = futureColl->uuid();
+                    auto futureCollUuid = futureColl->uuid();
                     opObserver->onRenameCollection(opCtx,
                                                    newCollName,
                                                    tmpName,
-                                                   uuid,
+                                                   futureCollUuid,
                                                    /*dropTargetUUID*/ {},
                                                    /*numRecords*/ 0U,
-                                                   stayTemp);
+                                                   stayTemp,
+                                                   /*markFromMigrate=*/false);
 
                     wuow.commit();
                     // Re-fetch collection after commit to get a valid pointer
-                    futureColl = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, uuid);
+                    futureColl = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(
+                        opCtx, futureCollUuid);
                     return Status::OK();
                 });
 
@@ -775,7 +958,7 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                           str::stream() << "Cannot generate temporary "
                                            "collection namespace for applyOps "
                                            "create command: collection: "
-                                        << newCollName);
+                                        << newCollName.toStringForErrorMsg());
         }
 
         // If the collection with the requested UUID already exists, but with a different
@@ -783,9 +966,12 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
         if (catalog->lookupCollectionByUUID(opCtx, uuid)) {
             invariant(currentName);
             uassert(40655,
-                    str::stream() << "Invalid name " << newCollName << " for UUID " << uuid,
-                    currentName->db() == newCollName.db());
-            return writeConflictRetry(opCtx, "createCollectionForApplyOps", newCollName.ns(), [&] {
+                    str::stream() << "Invalid name " << newCollName.toStringForErrorMsg()
+                                  << " for UUID " << uuid,
+                    currentName->isEqualDb(newCollName));
+            return writeConflictRetry(opCtx, "createCollectionForApplyOps", newCollName, [&] {
+                auto [currentCollLock, newCollLock] =
+                    acquireCollLocksForRename(opCtx, *currentName, newCollName);
                 WriteUnitOfWork wuow(opCtx);
                 Status status = db->renameCollection(opCtx, *currentName, newCollName, stayTemp);
                 if (!status.isOK())
@@ -796,7 +982,8 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                                uuid,
                                                /*dropTargetUUID*/ {},
                                                /*numRecords*/ 0U,
-                                               stayTemp);
+                                               stayTemp,
+                                               /*markFromMigrate=*/false);
 
                 wuow.commit();
                 return Status::OK();
@@ -822,7 +1009,19 @@ Status createCollection(OperationContext* opCtx,
         return status;
     }
 
+    uassert(ErrorCodes::CommandNotSupported,
+            "'recordIdsReplicated' option may not be run without featureFlagRecordIdsReplicated "
+            "enabled",
+            !options.recordIdsReplicated ||
+                gFeatureFlagRecordIdsReplicated.isEnabled(
+                    serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
+
     if (options.isView()) {
+        // system.profile will have new document inserts due to profiling. Inserts aren't supported
+        // on views.
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot create system.profile as a view",
+                !ns.isSystemDotProfile());
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
                 str::stream() << "Cannot create a view in a multi-document "
                                  "transaction.",
@@ -832,7 +1031,13 @@ Status createCollection(OperationContext* opCtx,
                 !options.clusteredIndex);
 
         return _createView(opCtx, ns, options);
-    } else if (options.timeseries && !ns.isTimeseriesBucketsCollection()) {
+    } else if (options.timeseries && opCtx->writesAreReplicated() &&
+               MONGO_likely(!useRegularCreatePathForTimeseriesBucketsCreations.shouldFail())) {
+        // system.profile must be a simple collection since new document insertions directly work
+        // against the usual collection API. See introspect.cpp for more details.
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot create system.profile as a timeseries collection",
+                !ns.isSystemDotProfile());
         // This helper is designed for user-created time-series collections on primaries. If a
         // time-series buckets collection is created explicitly or during replication, treat this as
         // a normal collection creation.
@@ -840,14 +1045,25 @@ Status createCollection(OperationContext* opCtx,
                 str::stream()
                     << "Cannot create a time-series collection in a multi-document transaction.",
                 !opCtx->inMultiDocumentTransaction());
-        return _createTimeseries(opCtx, ns, options);
+        return _createTimeseries(opCtx, ns, options, idIndex);
     } else {
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
-                str::stream() << "Cannot create system collection " << ns
+                str::stream() << "Cannot create system collection " << ns.toStringForErrorMsg()
                               << " within a transaction.",
                 !opCtx->inMultiDocumentTransaction() || !ns.isSystem());
         return _createCollection(opCtx, ns, options, idIndex);
     }
+}
+
+Status createVirtualCollection(OperationContext* opCtx,
+                               const NamespaceString& ns,
+                               const VirtualCollectionOptions& vopts) {
+    tassert(6968504,
+            "Virtual collection is available when the compute mode is enabled",
+            computeModeEnabled);
+    CollectionOptions options;
+    options.setNoIdIndex();
+    return _createCollection(opCtx, ns, options, boost::none, vopts);
 }
 
 }  // namespace mongo

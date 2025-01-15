@@ -29,8 +29,19 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+#include <cstddef>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/api_parameters_gen.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/util/decorable.h"
 
 namespace mongo {
 
@@ -55,6 +66,20 @@ public:
     };
 
     void appendInfo(BSONObjBuilder* builder) const;
+
+    /**
+     * Set the API parameters on an IDL-defined command or GenericArguments struct.
+     */
+    template <typename CommandType>
+    void setInfo(CommandType& request) const {
+        request.setApiStrict(getAPIStrict());
+        if (auto& apiVersion = getAPIVersion()) {
+            request.setApiVersion(StringData(*apiVersion));
+        } else {
+            request.setApiVersion(boost::none);
+        }
+        request.setApiDeprecationErrors(getAPIDeprecationErrors());
+    }
 
     BSONObj toBSON() const;
 

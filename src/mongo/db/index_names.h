@@ -44,12 +44,14 @@ enum IndexType {
     INDEX_BTREE,
     INDEX_COLUMN,
     INDEX_2D,
+    INDEX_ENCRYPTED_RANGE,
     INDEX_HAYSTACK,
     INDEX_2DSPHERE,
     INDEX_2DSPHERE_BUCKET,
     INDEX_TEXT,
     INDEX_HASHED,
     INDEX_WILDCARD,
+    INDEX_TYPE_COUNT,  // Count of IndexType, not a index
 };
 
 /**
@@ -67,6 +69,7 @@ public:
     static const std::string TEXT;
     static const std::string WILDCARD;
     static const std::string COLUMN;
+    static const std::string ENCRYPTED_RANGE;
 
     /**
      * Return the first std::string value in the provided object.  For an index key pattern,
@@ -83,6 +86,18 @@ public:
      * Convert an index name to an IndexType.
      */
     static IndexType nameToType(StringData accessMethod);
+};
+
+/**
+ * Contain utilities to work with wildcard fields used for Wildcard indexes.
+ */
+struct WildcardNames {
+    static constexpr StringData WILDCARD_FIELD_NAME = "$**"_sd;
+    static constexpr StringData WILDCARD_FIELD_NAME_SUFFIX = ".$**"_sd;
+
+    inline static bool isWildcardFieldName(StringData fieldName) {
+        return fieldName == WILDCARD_FIELD_NAME || fieldName.endsWith(WILDCARD_FIELD_NAME_SUFFIX);
+    }
 };
 
 }  // namespace mongo

@@ -6,8 +6,7 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "list_collections_own_collections";
 
@@ -215,7 +214,6 @@ function runSystemsBucketsTestOnConnection(conn, isMongod) {
 }
 
 function runNoAuthTestOnConnection(conn) {
-    const admin = conn.getDB("admin");
     const db = conn.getDB(dbName);
 
     assert.commandWorked(db.dropDatabase());
@@ -262,4 +260,3 @@ MongoRunner.stopMongod(mongodNoAuth);
 const stNoAuth = new ShardingTest({shards: 1, mongos: 1, config: 1});
 runNoAuthTestOnConnection(stNoAuth.s0);
 stNoAuth.stop();
-}());

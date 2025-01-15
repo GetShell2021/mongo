@@ -30,12 +30,19 @@
 
 #include "mongo/logv2/log_util.h"
 
-#include "mongo/logv2/log.h"
-#include "mongo/platform/atomic_word.h"
-#include "mongo/util/time_support.h"
-
+#include <map>
 #include <string>
-#include <vector>
+#include <utility>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/str.h"
+#include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kControl
 
@@ -70,7 +77,7 @@ Status rotateLogs(bool renameFiles,
     LOGV2(23166, "Log rotation initiated", "suffix"_attr = suffix, "logType"_attr = logType);
 
     if (logType) {
-        auto it = logRotateCallbacks.find(logType.get());
+        auto it = logRotateCallbacks.find(logType.value());
         if (it == logRotateCallbacks.end()) {
             LOGV2_WARNING(6221500, "Unknown log type for rotate", "logType"_attr = logType);
             return Status(ErrorCodes::NoSuchKey, "Unknown log type for rotate");
@@ -111,6 +118,22 @@ bool shouldRedactBinDataEncrypt() {
 
 void setShouldRedactBinDataEncrypt(bool enabled) {
     redactBinDataEncrypt.store(enabled);
+}
+
+/** Stores the callback that is used to determine whether log service should be emitted. */
+ShouldEmitLogServiceFn& emitLogServiceEnabled() {
+    static StaticImmortal<ShouldEmitLogServiceFn> f{};
+    return *f;
+}
+
+bool shouldEmitLogService() {
+    auto fn = emitLogServiceEnabled();
+    return fn && fn();
+}
+
+void setShouldEmitLogService(ShouldEmitLogServiceFn enabled) {
+    invariant(enabled);
+    emitLogServiceEnabled() = enabled;
 }
 
 }  // namespace mongo::logv2

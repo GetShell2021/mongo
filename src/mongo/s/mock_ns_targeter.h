@@ -29,8 +29,18 @@
 
 #pragma once
 
+#include <set>
+#include <vector>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/ns_targeter.h"
+#include "mongo/s/stale_exception.h"
+#include "mongo/s/write_ops/batched_command_request.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -62,7 +72,8 @@ public:
     }
 
     /**
-     * Returns a ShardEndpoint for the doc from the mock ranges
+     * Returns a ShardEndpoint for the doc from the mock ranges. If `chunkRanges` is not nullptr,
+     * also populates a set of ChunkRange for the chunks that are targeted.
      */
     ShardEndpoint targetInsert(OperationContext* opCtx, const BSONObj& doc) const override {
         auto endpoints = _targetQuery(doc);
@@ -72,20 +83,28 @@ public:
 
     /**
      * Returns the first ShardEndpoint for the query from the mock ranges.  Only can handle
-     * queries of the form { field : { $gte : <value>, $lt : <value> } }.
+     * queries of the form { field : { $gte : <value>, $lt : <value> } }. If `chunkRanges` is not
+     * nullptr, also populates a set of ChunkRange for the chunks that are targeted.
      */
-    std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
-                                            const BatchItemRef& itemRef) const override {
-        return _targetQuery(itemRef.getUpdate().getQ());
+    std::vector<ShardEndpoint> targetUpdate(
+        OperationContext* opCtx,
+        const BatchItemRef& itemRef,
+        bool* useTwoPhaseWriteProtocol = nullptr,
+        bool* isNonTargetedWriteWithoutShardKeyWithExactId = nullptr) const override {
+        return _targetQuery(itemRef.getUpdateRef().getFilter());
     }
 
     /**
      * Returns the first ShardEndpoint for the query from the mock ranges.  Only can handle
-     * queries of the form { field : { $gte : <value>, $lt : <value> } }.
+     * queries of the form { field : { $gte : <value>, $lt : <value> } }. If `chunkRanges` is not
+     * nullptr, also populates a set of ChunkRange for the chunks that are targeted.
      */
-    std::vector<ShardEndpoint> targetDelete(OperationContext* opCtx,
-                                            const BatchItemRef& itemRef) const override {
-        return _targetQuery(itemRef.getDelete().getQ());
+    std::vector<ShardEndpoint> targetDelete(
+        OperationContext* opCtx,
+        const BatchItemRef& itemRef,
+        bool* useTwoPhaseWriteProtocol = nullptr,
+        bool* isNonTargetedWriteWithoutShardKeyWithExactId = nullptr) const override {
+        return _targetQuery(itemRef.getDeleteRef().getFilter());
     }
 
     std::vector<ShardEndpoint> targetAllShards(OperationContext* opCtx) const override {
@@ -101,15 +120,23 @@ public:
         // No-op
     }
 
-    void noteStaleShardResponse(OperationContext* opCtx,
-                                const ShardEndpoint& endpoint,
-                                const StaleConfigInfo& staleInfo) override {
+    void noteStaleCollVersionResponse(OperationContext* opCtx,
+                                      const StaleConfigInfo& staleInfo) override {
         // No-op
     }
 
-    void noteStaleDbResponse(OperationContext* opCtx,
-                             const ShardEndpoint& endpoint,
-                             const StaleDbRoutingVersion& staleInfo) override {
+    void noteStaleDbVersionResponse(OperationContext* opCtx,
+                                    const StaleDbRoutingVersion& staleInfo) override {
+        // No-op
+    }
+
+    bool hasStaleShardResponse() override {
+        // No-op
+        return false;
+    }
+
+    void noteCannotImplicitlyCreateCollectionResponse(
+        OperationContext* opCtx, const CannotImplicitlyCreateCollectionInfo& createInfo) override {
         // No-op
     }
 
@@ -118,25 +145,42 @@ public:
         return false;
     }
 
-    int getNShardsOwningChunks() const override {
+    bool createCollectionIfNeeded(OperationContext* opCtx) override {
+        // No-op
+        return false;
+    }
+
+    int getAproxNShardsOwningChunks() const override {
         // No-op
         return 0;
     }
 
-    bool isShardedTimeSeriesBucketsNamespace() const override {
+    bool isTargetedCollectionSharded() const override {
+        // No-op
         return false;
+    }
+
+    bool isTrackedTimeSeriesBucketsNamespace() const override {
+        return _isTrackedTimeSeriesBucketsNamespace;
+    }
+
+    void setIsTrackedTimeSeriesBucketsNamespace(bool isTrackedTimeSeriesBucketsNamespace) {
+        _isTrackedTimeSeriesBucketsNamespace = isTrackedTimeSeriesBucketsNamespace;
     }
 
 private:
     /**
      * Returns the first ShardEndpoint for the query from the mock ranges. Only handles queries of
-     * the form { field : { $gte : <value>, $lt : <value> } }.
+     * the form { field : { $gte : <value>, $lt : <value> } }. If chunkRanges is not nullptr, also
+     * populates set of ChunkRange for the chunks that are targeted.
      */
     std::vector<ShardEndpoint> _targetQuery(const BSONObj& query) const;
 
     NamespaceString _nss;
 
     std::vector<MockRange> _mockRanges;
+
+    bool _isTrackedTimeSeriesBucketsNamespace = false;
 };
 
 void assertEndpointsEqual(const ShardEndpoint& endpointA, const ShardEndpoint& endpointB);

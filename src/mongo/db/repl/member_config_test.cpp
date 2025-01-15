@@ -27,14 +27,29 @@
  *    it in the license file.
  */
 
+#include <absl/container/flat_hash_map.h>
 #include <algorithm>
-#include <vector>
+#include <boost/move/utility_core.hpp>
+#include <cstddef>
+#include <iterator>
+#include <map>
+#include <ostream>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/repl/member_config.h"
-#include "mongo/db/repl/repl_server_parameters_gen.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/repl/member_id.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -66,7 +81,7 @@ TEST(MemberConfig, ParseFailsWithIllegalFieldName) {
                                                << "frim" << 1),
                                     &tagConfig),
                        AssertionException,
-                       40415);
+                       ErrorCodes::IDLUnknownField);
 }
 
 TEST(MemberConfig, ParseFailsWithMissingIdField) {
@@ -75,7 +90,7 @@ TEST(MemberConfig, ParseFailsWithMissingIdField) {
                                          << "localhost:12345"),
                                     &tagConfig),
                        AssertionException,
-                       40414);
+                       ErrorCodes::IDLFailedToParse);
 }
 
 TEST(MemberConfig, ParseMemberConfigId) {
@@ -114,7 +129,7 @@ TEST(MemberConfig, ParseFailsWithBadIdField) {
                                          << "localhost:12345"),
                                     &tagConfig),
                        AssertionException,
-                       40414);
+                       ErrorCodes::IDLFailedToParse);
     ASSERT_THROWS(MemberConfig(BSON("_id"
                                     << "0"
                                     << "host"
@@ -175,7 +190,9 @@ TEST(MemberConfig, ParseAcceptsAnyNumberId) {
 
 TEST(MemberConfig, ParseFailsWithMissingHostField) {
     ReplSetTagConfig tagConfig;
-    ASSERT_THROWS_CODE(MemberConfig(BSON("_id" << 0), &tagConfig), AssertionException, 40414);
+    ASSERT_THROWS_CODE(MemberConfig(BSON("_id" << 0), &tagConfig),
+                       AssertionException,
+                       ErrorCodes::IDLFailedToParse);
 }
 
 TEST(MemberConfig, ParseFailsWithBadHostField) {
@@ -229,7 +246,7 @@ TEST(MemberConfig, ParseArbiterOnly) {
 }
 }  // namespace
 
-void setNewlyAdded_ForTest(MemberConfig* mc, boost::optional<bool> newlyAdded) {
+void setNewlyAdded_forTest(MemberConfig* mc, boost::optional<bool> newlyAdded) {
     mc->setNewlyAdded(newlyAdded);
 }
 
@@ -243,7 +260,7 @@ TEST(MemberConfig, ParseAndSetNewlyAddedField) {
         // Verify that the 'newlyAdded' field is not added by default.
         ASSERT_FALSE(mc.isNewlyAdded());
 
-        setNewlyAdded_ForTest(&mc, true);
+        setNewlyAdded_forTest(&mc, true);
         ASSERT_TRUE(mc.isNewlyAdded());
     }
     {
@@ -587,7 +604,7 @@ TEST(MemberConfig, ParseVotes) {
                                                    << "votes" << 2 << "priority" << 0),
                                         &tagConfig),
                            AssertionException,
-                           51024);
+                           ErrorCodes::BadValue);
     }
     {
         ASSERT_THROWS(MemberConfig(BSON("_id" << 0 << "host"
@@ -609,7 +626,7 @@ TEST(MemberConfig, ParseVotes) {
                                                    << "votes" << -1 << "priority" << 0),
                                         &tagConfig),
                            AssertionException,
-                           51024);
+                           ErrorCodes::BadValue);
     }
 }
 
@@ -656,7 +673,7 @@ TEST(MemberConfig, ParsePriority) {
                                                    << "priority" << -1),
                                         &tagConfig),
                            AssertionException,
-                           51024);
+                           ErrorCodes::BadValue);
     }
     {
         ASSERT_THROWS_CODE(MemberConfig(BSON("_id" << 0 << "host"
@@ -664,7 +681,7 @@ TEST(MemberConfig, ParsePriority) {
                                                    << "priority" << 1001),
                                         &tagConfig),
                            AssertionException,
-                           51024);
+                           ErrorCodes::BadValue);
     }
 }
 
@@ -703,7 +720,7 @@ TEST(MemberConfig, ParseSecondaryDelay) {
                                     << "priority" << 0 << "secondaryDelaySecs" << -1),
                          &tagConfig),
             AssertionException,
-            51024);
+            ErrorCodes::BadValue);
     }
     {
         ASSERT_THROWS_CODE(
@@ -712,7 +729,7 @@ TEST(MemberConfig, ParseSecondaryDelay) {
                                     << "priority" << 0 << "secondaryDelaySecs" << 3600 * 24 * 400),
                          &tagConfig),
             AssertionException,
-            51024);
+            ErrorCodes::BadValue);
     }
 }
 
@@ -753,7 +770,7 @@ TEST(MemberConfig, ParseAcceptsAnyNumberSecondaryDelay) {
                                     << "priority" << 0 << "secondaryDelaySecs" << -1.5),
                          &tagConfig),
             AssertionException,
-            51024);
+            ErrorCodes::BadValue);
     }
     {
         MemberConfig mc(BSON("_id" << 0 << "host"

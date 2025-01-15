@@ -1,4 +1,5 @@
 """Unit tests for the packager script."""
+
 from dataclasses import dataclass
 from unittest import TestCase
 
@@ -6,14 +7,15 @@ from buildscripts.packager import Spec
 
 
 class TestPackager(TestCase):
-    """Test packager.py"""
+    """Test packager.py."""
 
     def test_is_nightly(self) -> None:
         """Test is_nightly."""
 
         @dataclass
         class Case:
-            """Test case data"""
+            """Test case data."""
+
             name: str
             version: str
             want: bool

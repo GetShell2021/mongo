@@ -29,6 +29,14 @@
 
 #include "mongo/db/exec/unpack_timeseries_bucket.h"
 
+#include <utility>
+#include <vector>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/snapshot.h"
+
 namespace mongo {
 namespace {
 
@@ -45,7 +53,7 @@ const char* UnpackTimeseriesBucket::kStageType = "UNPACK_BUCKET";
 UnpackTimeseriesBucket::UnpackTimeseriesBucket(ExpressionContext* expCtx,
                                                WorkingSet* ws,
                                                std::unique_ptr<PlanStage> child,
-                                               BucketUnpacker bucketUnpacker)
+                                               timeseries::BucketUnpacker bucketUnpacker)
     : PlanStage{kStageType, expCtx}, _ws{*ws}, _bucketUnpacker{std::move(bucketUnpacker)} {
     _children.emplace_back(std::move(child));
 }

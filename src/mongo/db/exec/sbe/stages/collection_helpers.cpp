@@ -27,49 +27,67 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/cstdint.hpp>
+#include <memory>
 
-#include "mongo/db/exec/sbe/stages/collection_helpers.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/exec/sbe/stages/collection_helpers.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo::sbe {
 
-std::tuple<CollectionPtr, NamespaceString, uint64_t> acquireCollection(OperationContext* opCtx,
-                                                                       const UUID& collUuid) {
+void CollectionRef::getConsistentCollection(OperationContext* opCtx,
+                                            const DatabaseName& dbName,
+                                            const UUID& collUuid) {
+    auto timestamp = shard_role_details::getRecoveryUnit(opCtx)->getPointInTimeReadTimestamp();
+    _collPtr.emplace(CollectionCatalog::get(opCtx)->establishConsistentCollection(
+        opCtx, NamespaceStringOrUUID{dbName, collUuid}, timestamp));
+}
+
+void CollectionRef::acquireCollection(OperationContext* opCtx,
+                                      const DatabaseName& dbName,
+                                      const UUID& collUuid) {
     // The collection is either locked at a higher level or a snapshot of the catalog (consistent
     // with the storage engine snapshot from which we are reading) has been stashed on the
     // 'OperationContext'. Either way, this means that the UUID must still exist in our view of the
     // collection catalog.
-    CollectionPtr collPtr = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, collUuid);
-    tassert(5071000, str::stream() << "Collection uuid " << collUuid << " does not exist", collPtr);
+    getConsistentCollection(opCtx, dbName, collUuid);
+    tassert(
+        5071000, str::stream() << "Collection uuid " << collUuid << " does not exist", getPtr());
 
-    return std::make_tuple(
-        std::move(collPtr), collPtr->ns(), CollectionCatalog::get(opCtx)->getEpoch());
+    _collName = getPtr()->ns();
+    _catalogEpoch = CollectionCatalog::get(opCtx)->getEpoch();
 }
 
-CollectionPtr restoreCollection(OperationContext* opCtx,
-                                const NamespaceString& collName,
-                                const UUID& collUuid,
-                                uint64_t catalogEpoch) {
-    // Re-lookup the collection pointer, by UUID. If the collection has been dropped, then this UUID
-    // lookup will result in a null pointer. If the collection has been renamed, then the resulting
-    // collection object should have a different name from the original 'collName'. In either
-    // scenario, we throw a 'QueryPlanKilled' error and terminate the query.
-    CollectionPtr collPtr = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, collUuid);
-    if (!collPtr) {
+void CollectionRef::restoreCollection(OperationContext* opCtx,
+                                      const DatabaseName& dbName,
+                                      const UUID& collUuid) {
+    tassert(5777401, "Collection name should be initialized", _collName);
+    tassert(5777402, "Catalog epoch should be initialized", _catalogEpoch);
+
+    // Establish a consistent collection instance and restore the collection pointer. If the
+    // collection has been dropped, then this UUID lookup will result in a null pointer. If the
+    // collection has been renamed, then the resulting collection object should have a different
+    // name from the original '_collName'. In either scenario, we throw a 'QueryPlanKilled' error
+    // and terminate the query.
+    getConsistentCollection(opCtx, dbName, collUuid);
+    if (!getPtr()) {
         PlanYieldPolicy::throwCollectionDroppedError(collUuid);
     }
 
-    if (collName != collPtr->ns()) {
-        PlanYieldPolicy::throwCollectionRenamedError(collName, collPtr->ns(), collUuid);
+    if (*_collName != getPtr()->ns()) {
+        PlanYieldPolicy::throwCollectionRenamedError(*_collName, getPtr()->ns(), collUuid);
     }
 
     uassert(ErrorCodes::QueryPlanKilled,
             "the catalog was closed and reopened",
-            CollectionCatalog::get(opCtx)->getEpoch() == catalogEpoch);
-
-    return collPtr;
+            CollectionCatalog::get(opCtx)->getEpoch() == *_catalogEpoch);
 }
 
 }  // namespace mongo::sbe

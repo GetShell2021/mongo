@@ -1,10 +1,8 @@
 /**
  * This test simulates workflows for adding a new node and resyncing a node recommended by docs.
  */
-(function() {
-"use strict";
-
-load('jstests/replsets/rslib.js');  // waitForState.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {disconnectSecondaries, reconnectSecondaries, waitForState} from "jstests/replsets/rslib.js";
 
 const testName = TestData.testName;
 const rst = new ReplSetTest({
@@ -29,7 +27,7 @@ function testAddWithInitialSync(secondariesDown) {
     const majorityDown = secondariesDown > 1;
     if (majorityDown) {
         // Wait for the set to become unhealthy.
-        rst.waitForState(primary, ReplSetTest.State.SECONDARY);
+        rst.awaitSecondaryNodes(null, [primary]);
     }
     // Add a new, voting node.
     const newNode = rst.add({rsConfig: {priority: 0}});
@@ -43,7 +41,7 @@ function testAddWithInitialSync(secondariesDown) {
         {replSetReconfig: config, maxTimeMS: ReplSetTest.kDefaultTimeoutMS, force: majorityDown}));
 
     jsTestLog("Waiting for node to sync.");
-    rst.waitForState(newNode, ReplSetTest.State.SECONDARY);
+    rst.awaitSecondaryNodes(null, [newNode]);
 
     // Make sure the set is still consistent after adding the node.
     reconnectSecondaries(rst);
@@ -71,7 +69,7 @@ function testReplaceWithInitialSync(secondariesDown) {
     disconnectSecondaries(rst, secondariesDown);
     if (majorityDown) {
         // Wait for the set to become unhealthy.
-        rst.waitForState(primary, ReplSetTest.State.SECONDARY);
+        rst.awaitSecondaryNodes(null, [primary]);
     }
 
     let nodeId = rst.getNodeId(nodeToBeReplaced);
@@ -109,7 +107,7 @@ function testReplaceWithInitialSync(secondariesDown) {
         {replSetReconfig: config, maxTimeMS: ReplSetTest.kDefaultTimeoutMS, force: majorityDown}));
 
     jsTestLog("Waiting for the replacement node to sync.");
-    rst.waitForState(replacementNode, ReplSetTest.State.SECONDARY);
+    rst.awaitSecondaryNodes(null, [replacementNode]);
 
     if (!majorityDown) {
         // Make sure we can replicate to it, if the set is otherwise healthy.
@@ -148,4 +146,3 @@ jsTestLog("Test replacing a node with initial sync with two secondaries unreacha
 testReplaceWithInitialSync(2);
 
 rst.stopSet();
-})();

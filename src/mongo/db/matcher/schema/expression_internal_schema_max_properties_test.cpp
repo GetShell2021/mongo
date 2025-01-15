@@ -27,12 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/matcher/expression.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_max_properties.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_min_properties.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -52,6 +55,18 @@ TEST(InternalSchemaMaxPropertiesMatchExpression, AcceptsObjectWithLessThanOrEqua
     ASSERT_TRUE(maxProperties.matchesBSON(BSON("b" << BSONNULL)));
     ASSERT_TRUE(maxProperties.matchesBSON(BSON("b" << 21)));
     ASSERT_TRUE(maxProperties.matchesBSON(BSON("b" << 21 << "c" << 3)));
+}
+
+TEST(InternalSchemaMaxPropertiesMatchExpression, MatchesSingleElementTest) {
+    InternalSchemaMaxPropertiesMatchExpression maxProperties(2);
+
+    // Only BSON elements that are embedded objects can match.
+    BSONObj match = BSON("a" << BSON("a" << 5 << "b" << 10));
+    BSONObj notMatch1 = BSON("a" << 1);
+    BSONObj notMatch2 = BSON("a" << BSON("a" << 5 << "b" << 10 << "c" << 25));
+    ASSERT_TRUE(maxProperties.matchesSingleElement(match.firstElement()));
+    ASSERT_FALSE(maxProperties.matchesSingleElement(notMatch1.firstElement()));
+    ASSERT_FALSE(maxProperties.matchesSingleElement(notMatch2.firstElement()));
 }
 
 TEST(InternalSchemaMaxPropertiesMatchExpression, MaxPropertiesZeroAllowsEmptyObjects) {
@@ -87,6 +102,15 @@ TEST(InternalSchemaMaxPropertiesMatchExpression, MinPropertiesNotEquivalentToMax
     InternalSchemaMinPropertiesMatchExpression minProperties(5);
 
     ASSERT_FALSE(maxProperties.equivalent(&minProperties));
+}
+
+DEATH_TEST_REGEX(InternalSchemaMaxPropertiesMatchExpression,
+                 GetChildFailsIndexGreaterThanZero,
+                 "Tripwire assertion.*6400216") {
+    InternalSchemaMaxPropertiesMatchExpression maxProperties(5);
+
+    ASSERT_EQ(maxProperties.numChildren(), 0);
+    ASSERT_THROWS_CODE(maxProperties.getChild(0), AssertionException, 6400216);
 }
 
 }  // namespace

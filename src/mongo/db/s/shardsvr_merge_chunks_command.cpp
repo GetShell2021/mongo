@@ -28,237 +28,149 @@
  */
 
 
+#include <memory>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog_raii.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/field_parser.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/generic_argument_util.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/active_migrations_registry.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/chunk_operation_precondition_checks.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/db/vector_clock.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/service_context.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/client/shard_registry.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/merge_chunk_request_gen.h"
-#include "mongo/util/str.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-
 namespace mongo {
+
 namespace {
 
-Shard::CommandResponse commitMergeOnConfigServer(OperationContext* opCtx,
-                                                 const NamespaceString& nss,
-                                                 const OID& epoch,
-                                                 const boost::optional<Timestamp>& timestamp,
-                                                 const ChunkRange& chunkRange,
-                                                 const CollectionMetadata& metadata) {
-    auto const shardingState = ShardingState::get(opCtx);
-    const auto currentTime = VectorClock::get(opCtx)->getTime();
-
-    ConfigSvrMergeChunks request{nss, shardingState->shardId(), metadata.getUUID(), chunkRange};
-    request.setValidAfter(currentTime.clusterTime().asTimestamp());
-    request.setEpoch(epoch);
-    request.setTimestamp(timestamp);
-
-    auto cmdResponse =
-        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommand(
-            opCtx,
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            NamespaceString::kAdminDb.toString(),
-            request.toBSON(BSON(WriteConcernOptions::kWriteConcernField
-                                << ShardingCatalogClient::kMajorityWriteConcern.toBSON())),
-            Shard::RetryPolicy::kIdempotent));
-
-    return cmdResponse;
-}
-
-void mergeChunks(OperationContext* opCtx,
-                 const NamespaceString& nss,
-                 const BSONObj& minKey,
-                 const BSONObj& maxKey,
-                 const OID& expectedEpoch,
-                 const boost::optional<Timestamp>& expectedTimestamp) {
-    auto scopedSplitOrMergeChunk(
-        uassertStatusOK(ActiveMigrationsRegistry::get(opCtx).registerSplitOrMergeChunk(
-            opCtx, nss, ChunkRange(minKey, maxKey))));
-
-    auto& oss = OperationShardingState::get(opCtx);
-    if (!oss.getShardVersion(nss)) {
-        onShardVersionMismatch(opCtx, nss, boost::none);
-    }
-
-    const auto metadataBeforeMerge = [&] {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        auto csr = CollectionShardingRuntime::get(opCtx, nss);
-
-        // If there is a version attached to the OperationContext, validate it
-        if (oss.getShardVersion(nss)) {
-            csr->checkShardVersionOrThrow(opCtx);
-        } else {
-            auto optMetadata = csr->getCurrentMetadataIfKnown();
-
-            ShardId shardId = ShardingState::get(opCtx)->shardId();
-
-            uassert(StaleConfigInfo(nss,
-                                    ChunkVersion::IGNORED() /* receivedVersion */,
-                                    boost::none /* wantedVersion */,
-                                    shardId),
-                    str::stream() << "Collection " << nss.ns() << " needs to be recovered",
-                    optMetadata);
-            uassert(StaleConfigInfo(nss,
-                                    ChunkVersion::IGNORED() /* receivedVersion */,
-                                    ChunkVersion::UNSHARDED() /* wantedVersion */,
-                                    shardId),
-                    str::stream() << "Collection " << nss.ns() << " is not sharded",
-                    optMetadata->isSharded());
-            const auto epoch = optMetadata->getShardVersion().epoch();
-            uassert(StaleConfigInfo(nss,
-                                    ChunkVersion::IGNORED() /* receivedVersion */,
-                                    optMetadata->getShardVersion() /* wantedVersion */,
-                                    shardId),
-                    str::stream() << "Could not merge chunks because collection " << nss.ns()
-                                  << " has changed since merge was sent (sent epoch: "
-                                  << expectedEpoch << ", current epoch: " << epoch << ")",
-                    epoch == expectedEpoch &&
-                        (!expectedTimestamp ||
-                         optMetadata->getShardVersion().getTimestamp() == expectedTimestamp));
-        }
-
-        return *csr->getCurrentMetadataIfKnown();
-    }();
-
-    ChunkRange chunkRange(minKey, maxKey);
-
-    uassert(ErrorCodes::IllegalOperation,
-            str::stream() << "could not merge chunks, the range " << chunkRange.toString()
-                          << " is not valid for collection " << nss.ns() << " with key pattern "
-                          << metadataBeforeMerge.getKeyPattern().toString(),
-            metadataBeforeMerge.isValidKey(minKey) && metadataBeforeMerge.isValidKey(maxKey));
-
-    auto cmdResponse = commitMergeOnConfigServer(
-        opCtx, nss, expectedEpoch, expectedTimestamp, chunkRange, metadataBeforeMerge);
-
-    auto shardVersionReceived = [&]() -> boost::optional<ChunkVersion> {
-        // Old versions might not have the shardVersion field
-        if (cmdResponse.response[ChunkVersion::kShardVersionField]) {
-            return ChunkVersion::parse(cmdResponse.response[ChunkVersion::kShardVersionField]);
-        }
-        return boost::none;
-    }();
-    onShardVersionMismatch(opCtx, nss, std::move(shardVersionReceived));
-
-    uassertStatusOKWithContext(cmdResponse.commandStatus, "Failed to commit chunk merge");
-    uassertStatusOKWithContext(cmdResponse.writeConcernStatus, "Failed to commit chunk merge");
-}
-
-class MergeChunksCommand : public ErrmsgCommandDeprecated {
+class ShardsvrMergeChunksCommand : public TypedCommand<ShardsvrMergeChunksCommand> {
 public:
-    MergeChunksCommand() : ErrmsgCommandDeprecated("mergeChunks", "_shardsvrMergeChunks") {}
+    using Request = ShardsvrMergeChunks;
 
-    std::string help() const override {
-        return "Internal command to merge a contiguous range of chunks.\n"
-               "Usage: { mergeChunks: <ns>, epoch: <epoch>, bounds: [<min key>, <max key>] }";
-    }
+    ShardsvrMergeChunksCommand() : TypedCommand(Request::kCommandName, Request::kCommandAlias) {}
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
-            return Status(ErrorCodes::Unauthorized, "Unauthorized");
-        }
-        return Status::OK();
-    }
-
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
         return true;
     }
 
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
+    std::string help() const override {
+        return "Internal command to merge a contiguous range of chunks.\n"
+               "Usage: { _shardsvrMergeChunks: <ns>, epoch: <epoch>, bounds: [<min key>, <max "
+               "key>] }";
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
 
-    static BSONField<std::string> nsField;
-    static BSONField<std::vector<BSONObj>> boundsField;
-    static BSONField<OID> epochField;
-    static BSONField<Timestamp> timestampField;
+        void typedRun(OperationContext* opCtx) {
+            auto bounds = request().getBounds();
+            uassertStatusOK(ChunkRange::validate(bounds));
 
-    bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
-                   std::string& errmsg,
-                   BSONObjBuilder& result) override {
-        uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ChunkRange chunkRange(bounds[0], bounds[1]);
 
-        const NamespaceString nss(parseNs(dbname, cmdObj));
+            auto scopedSplitOrMergeChunk(
+                uassertStatusOK(ActiveMigrationsRegistry::get(opCtx).registerSplitOrMergeChunk(
+                    opCtx, ns(), chunkRange)));
 
-        std::vector<BSONObj> bounds;
-        if (!FieldParser::extract(cmdObj, boundsField, &bounds, &errmsg)) {
+            auto expectedEpoch = request().getEpoch();
+            auto expectedTimestamp = request().getTimestamp();
+
+            // Check that the preconditions for merge chunks are met and throw StaleShardVersion
+            // otherwise.
+            const auto metadataBeforeMerge = [&]() {
+                uassertStatusOK(
+                    FilteringMetadataCache::get(opCtx)->onCollectionPlacementVersionMismatch(
+                        opCtx, ns(), boost::none));
+                const auto [metadata, indexInfo] =
+                    checkCollectionIdentity(opCtx, ns(), expectedEpoch, expectedTimestamp);
+                checkShardKeyPattern(opCtx, ns(), metadata, indexInfo, chunkRange);
+                checkRangeOwnership(opCtx, ns(), metadata, indexInfo, chunkRange);
+                return metadata;
+            }();
+
+            auto const shardingState = ShardingState::get(opCtx);
+
+            ConfigSvrMergeChunks request{
+                ns(), shardingState->shardId(), metadataBeforeMerge.getUUID(), chunkRange};
+            request.setEpoch(expectedEpoch);
+            request.setTimestamp(expectedTimestamp);
+            request.setWriteConcern(generic_argument_util::kMajorityWriteConcern);
+
+            auto cmdResponse =
+                uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommand(
+                    opCtx,
+                    ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                    DatabaseName::kAdmin,
+                    request.toBSON(),
+                    Shard::RetryPolicy::kIdempotent));
+
+            auto chunkVersionReceived = [&]() -> boost::optional<ChunkVersion> {
+                // Old versions might not have the shardVersion field
+                if (cmdResponse.response[ChunkVersion::kChunkVersionField]) {
+                    return ChunkVersion::parse(
+                        cmdResponse.response[ChunkVersion::kChunkVersionField]);
+                }
+                return boost::none;
+            }();
+            uassertStatusOK(
+                FilteringMetadataCache::get(opCtx)->onCollectionPlacementVersionMismatch(
+                    opCtx, ns(), std::move(chunkVersionReceived)));
+
+            uassertStatusOKWithContext(cmdResponse.commandStatus, "Failed to commit chunk merge");
+            uassertStatusOKWithContext(cmdResponse.writeConcernStatus,
+                                       "Failed to commit chunk merge");
+        }
+
+    private:
+        NamespaceString ns() const override {
+            return request().getCommandParameter();
+        }
+
+        bool supportsWriteConcern() const override {
             return false;
         }
 
-        if (bounds.size() == 0) {
-            errmsg = "no bounds were specified";
-            return false;
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "Unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
-
-        if (bounds.size() != 2) {
-            errmsg = "only a min and max bound may be specified";
-            return false;
-        }
-
-        BSONObj minKey = bounds[0];
-        BSONObj maxKey = bounds[1];
-
-        if (minKey.isEmpty()) {
-            errmsg = "no min key specified";
-            return false;
-        }
-
-        if (maxKey.isEmpty()) {
-            errmsg = "no max key specified";
-            return false;
-        }
-
-        OID epoch;
-        if (!FieldParser::extract(cmdObj, epochField, &epoch, &errmsg)) {
-            return false;
-        }
-
-        boost::optional<Timestamp> timestamp;
-        if (cmdObj[timestampField()]) {
-            timestamp.emplace();
-            if (!FieldParser::extract(cmdObj, timestampField, timestamp.get_ptr(), &errmsg)) {
-                return false;
-            }
-        }
-
-        mergeChunks(opCtx, nss, minKey, maxKey, epoch, timestamp);
-        return true;
-    }
-
-} mergeChunksCmd;
-
-BSONField<std::string> MergeChunksCommand::nsField("mergeChunks");
-BSONField<std::vector<BSONObj>> MergeChunksCommand::boundsField("bounds");
-BSONField<OID> MergeChunksCommand::epochField("epoch");
-BSONField<Timestamp> MergeChunksCommand::timestampField("timestamp");
+    };
+};
+MONGO_REGISTER_COMMAND(ShardsvrMergeChunksCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

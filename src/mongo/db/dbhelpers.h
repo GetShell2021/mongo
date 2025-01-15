@@ -29,8 +29,12 @@
 
 #pragma once
 
+#include <memory>
+
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/update_result.h"
+#include "mongo/db/query/write_ops/update_result.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
@@ -40,6 +44,7 @@ class CollectionPtr;
 class Database;
 class OperationContext;
 class FindCommandRequest;
+class CollectionAcquisition;
 
 /**
  * db helpers are helper functions and classes that let us easily manipulate the local
@@ -82,17 +87,12 @@ struct Helpers {
                             std::unique_ptr<FindCommandRequest> qr);
 
     /**
-     * If 'indexFound' is not nullptr,  will be set to true if the query was answered using the _id
-     * index or using a clustered _id index.
-     *
      * Returns true if a matching document was found.
      */
     static bool findById(OperationContext* opCtx,
-                         StringData ns,
+                         const NamespaceString& nss,
                          BSONObj query,
-                         BSONObj& result,
-                         bool* nsFound = nullptr,
-                         bool* indexFound = nullptr);
+                         BSONObj& result);
 
     /* TODO: should this move into Collection?
      * uasserts if no _id index.
@@ -110,18 +110,18 @@ struct Helpers {
      *
      * Returns false if there is no such object.
      */
-    static bool getSingleton(OperationContext* opCtx, const char* ns, BSONObj& result);
+    static bool getSingleton(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result);
 
     /**
      * Same as getSingleton, but with a reverse natural-order scan on "ns".
      */
-    static bool getLast(OperationContext* opCtx, const char* ns, BSONObj& result);
+    static bool getLast(OperationContext* opCtx, const NamespaceString& nss, BSONObj& result);
 
     /**
      * Performs an upsert of "obj" into the collection "ns", with an empty update predicate.
      * Callers must have "ns" locked.
      */
-    static void putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj);
+    static void putSingleton(OperationContext* opCtx, CollectionAcquisition& coll, BSONObj obj);
 
     /**
      * Callers are expected to hold the collection lock.
@@ -129,7 +129,7 @@ struct Helpers {
      * o has to have an _id field or will assert
      */
     static UpdateResult upsert(OperationContext* opCtx,
-                               const std::string& ns,
+                               CollectionAcquisition& coll,
                                const BSONObj& o,
                                bool fromMigrate = false);
 
@@ -140,7 +140,7 @@ struct Helpers {
      * on the same storage snapshot.
      */
     static UpdateResult upsert(OperationContext* opCtx,
-                               const std::string& ns,
+                               CollectionAcquisition& coll,
                                const BSONObj& filter,
                                const BSONObj& updateMod,
                                bool fromMigrate = false);
@@ -152,10 +152,17 @@ struct Helpers {
      * on the same storage snapshot.
      */
     static void update(OperationContext* opCtx,
-                       const std::string& ns,
+                       CollectionAcquisition& coll,
                        const BSONObj& filter,
                        const BSONObj& updateMod,
                        bool fromMigrate = false);
+
+    /**
+     * Inserts document 'doc' into collection 'coll'.
+     */
+    static Status insert(OperationContext* opCtx,
+                         const CollectionAcquisition& coll,
+                         const BSONObj& doc);
 
     // TODO: this should be somewhere else probably
     /* Takes object o, and returns a new object with the
@@ -176,12 +183,17 @@ struct Helpers {
      * You do not need to set the database before calling.
      * Does not oplog the operation.
      */
-    static void emptyCollection(OperationContext* opCtx, const NamespaceString& nss);
+    static void emptyCollection(OperationContext* opCtx, const CollectionAcquisition& coll);
 
     /*
      * Finds the doc and then runs a no-op update by running an update using the doc just read. Used
      * in order to force a conflict if a concurrent storage transaction writes to the doc we're
      * reading.
+     *
+     * This no-op update has no associated timestamp. This results in a mixed-mode update chain
+     * within WT that is problematic with durable history. Callers must not commit the
+     * `WriteUnitOfWork` when there are no other writes that set the timestamp.
+     *
      * Callers must hold the collection lock in MODE_IX.
      * Uasserts if no _id index.
      * Returns true if object found

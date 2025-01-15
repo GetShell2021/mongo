@@ -6,12 +6,8 @@
  *  - failure in subsequent batches
  *  - multiple resumable failures during the same clone
  */
-(function() {
-"use strict";
-
-load("jstests/replsets/rslib.js");  // For setLogVerbosity()
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/logv2_helpers.js");
+import {configureFailPoint, kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Verify the 'find' command received by the primary includes a resume token request.
 function checkHasRequestResumeToken() {
@@ -27,11 +23,7 @@ function checkNoResumeAfter() {
 
 // Verify the 'find' command received by the primary has resumeAfter set with the given recordId.
 function checkHasResumeAfter(recordId) {
-    if (isJsonLogNoConn()) {
-        checkLog.contains(primary, `"$_resumeAfter":{"$recordId":${recordId}}`);
-    } else {
-        checkLog.contains(primary, "$_resumeAfter: { $recordId: " + recordId + " }");
-    }
+    checkLog.contains(primary, new RegExp(`"\\$_resumeAfter":\\{.*"\\$recordId":${recordId}.*\\}`));
 }
 
 const beforeRetryFailPointName = "hangBeforeRetryingClonerStage";
@@ -201,7 +193,6 @@ assert.commandWorked(
     secondaryDb.adminCommand({configureFailPoint: "hangBeforeStartingOplogFetcher", mode: "off"}));
 
 jsTestLog("Waiting for initial sync to complete.");
-rst.waitForState(secondary, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [secondary]);
 
 rst.stopSet();
-})();

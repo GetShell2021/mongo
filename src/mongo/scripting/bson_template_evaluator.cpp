@@ -29,11 +29,15 @@
 
 #include "mongo/scripting/bson_template_evaluator.h"
 
-#include <cstddef>
-#include <cstdlib>
+#include <cstring>
+#include <utility>
+#include <vector>
 
 #include "mongo/base/static_assert.h"
-#include "mongo/util/str.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -80,7 +84,7 @@ BsonTemplateEvaluator::OperatorFn BsonTemplateEvaluator::operatorEvaluator(
  */
 BsonTemplateEvaluator::Status BsonTemplateEvaluator::evaluate(const BSONObj& in,
                                                               BSONObjBuilder& builder) {
-    BSONForEach(e, in) {
+    for (auto&& e : in) {
         Status st = _evalElem(e, builder);
         if (st != StatusSuccess)
             return st;
@@ -149,7 +153,7 @@ BsonTemplateEvaluator::Status BsonTemplateEvaluator::_evalElem(const BSONElement
 
 BsonTemplateEvaluator::Status BsonTemplateEvaluator::_evalObj(const BSONObj& in,
                                                               BSONObjBuilder& out) {
-    BSONForEach(e, in) {
+    for (auto&& e : in) {
         Status st = _evalElem(e, out);
         if (st != StatusSuccess)
             return st;
@@ -296,7 +300,7 @@ BsonTemplateEvaluator::Status BsonTemplateEvaluator::evalConcat(BsonTemplateEval
     if (parts.nFields() <= 1)
         return StatusOpEvaluationError;
     StringBuilder stringBuilder;
-    BSONForEach(part, parts) {
+    for (auto&& part : parts) {
         if (part.type() == String)
             stringBuilder << part.String();
         else

@@ -23,10 +23,6 @@ if (!Mongo.prototype.update)
         throw Error("update not implemented");
     };
 
-if (typeof mongoInject == "function") {
-    mongoInject(Mongo.prototype);
-}
-
 Mongo.prototype.setSlaveOk = function(value) {
     print(
         "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
@@ -97,7 +93,14 @@ Mongo.prototype.getDBs = function(driverSession = this._getDefaultSession(),
     return function(driverSession, filter, nameOnly, authorizedDatabases) {
         'use strict';
 
-        let cmdObj = {listDatabases: 1};
+        const multitenancyRes = this.adminCommand({getParameter: 1, multitenancySupport: 1});
+        const multitenancy = multitenancyRes.ok && multitenancyRes["multitenancySupport"];
+
+        // Calling listDatases is only valid if we have a security token in multitenancy mode.
+        // Otherwise we call listDatabasesForAllTenants which list db.name and db.tenantId
+        // separately. The result never has a tenant prefix.
+        let cmdObj = multitenancy && !this._securityToken ? {listDatabasesForAllTenants: 1}
+                                                          : {listDatabases: 1};
         if (filter !== undefined) {
             cmdObj.filter = filter;
         }
@@ -188,7 +191,7 @@ Mongo.prototype.getLogComponents = function(driverSession = this._getDefaultSess
  */
 Mongo.prototype.setLogLevel = function(
     logLevel, component, driverSession = this._getDefaultSession()) {
-    componentNames = [];
+    let componentNames = [];
     if (typeof component === "string") {
         componentNames = component.split(".");
     } else if (component !== undefined) {
@@ -241,27 +244,20 @@ Mongo.prototype.tojson = Mongo.prototype.toString;
  * @param mode {string} read preference mode to use. Pass null to disable read
  *     preference.
  * @param tagSet {Array.<Object>} optional. The list of tags to use, order matters.
- * @param hedgeOptions {<Object>} optional. The hedge options of the form {enabled: <bool>}.
  */
-Mongo.prototype.setReadPref = function(mode, tagSet, hedgeOptions) {
-    if (this._readPrefMode === "primary") {
-        if ((typeof (tagSet) !== "undefined") && (Object.keys(tagSet).length > 0)) {
-            // we allow empty arrays/objects or no tagSet for compatibility reasons
-            throw Error("Cannot supply tagSet with readPref mode \"primary\"");
-        }
-        if ((typeof (hedgeOptions) === "object") && hedgeOptions.enabled) {
-            throw Error("Cannot enable hedging with readPref mode \"primary\"");
-        }
+Mongo.prototype.setReadPref = function(mode, tagSet) {
+    if (this._readPrefMode === "primary" && typeof tagSet !== "undefined" &&
+        Object.keys(tagSet).length > 0) {
+        // we allow empty arrays/objects or no tagSet for compatibility reasons
+        throw Error("Cannot supply tagSet with readPref mode \"primary\"");
     }
-
-    this._setReadPrefUnsafe(mode, tagSet, hedgeOptions);
+    this._setReadPrefUnsafe(mode, tagSet);
 };
 
 // Set readPref without validating. Exposed so we can test the server's readPref validation.
-Mongo.prototype._setReadPrefUnsafe = function(mode, tagSet, hedgeOptions) {
+Mongo.prototype._setReadPrefUnsafe = function(mode, tagSet) {
     this._readPrefMode = mode;
     this._readPrefTagSet = tagSet;
-    this._readPrefHedgeOptions = hedgeOptions;
 };
 
 Mongo.prototype.getReadPrefMode = function() {
@@ -270,10 +266,6 @@ Mongo.prototype.getReadPrefMode = function() {
 
 Mongo.prototype.getReadPrefTagSet = function() {
     return this._readPrefTagSet;
-};
-
-Mongo.prototype.getReadPrefHedgeOptions = function() {
-    return this._readPrefHedgeOptions;
 };
 
 // Returns a readPreference object of the type expected by mongos.
@@ -292,13 +284,6 @@ Mongo.prototype.getReadPref = function() {
     const tagSet = this.getReadPrefTagSet();
     if (Array.isArray(tagSet)) {
         obj.tags = tagSet;
-    }
-
-    // Hedged Reads Spec: - if readPref mode is "primary" then the hegde.enabled MUST
-    // be false. Ensured by setReadPref.
-    const hedgeOptions = this.getReadPrefHedgeOptions();
-    if (typeof (hedgeOptions) === "object") {
-        obj.hedge = hedgeOptions;
     }
 
     return obj;
@@ -326,7 +311,7 @@ Mongo.prototype.getReadConcern = function() {
     return this._readConcernLevel;
 };
 
-connect = function(url, user, pass, apiParameters) {
+globalThis.connect = function(url, user, pass, apiParameters) {
     if (url instanceof MongoURI) {
         user = url.user;
         pass = url.password;
@@ -418,6 +403,10 @@ connect = function(url, user, pass, apiParameters) {
         var shellVersion = version();
         if (serverVersion.slice(0, 3) != shellVersion.slice(0, 3)) {
             chatty("WARNING: shell and server versions do not match");
+        }
+    } catch (e) {
+        if (e.code == ErrorCodes.Unauthorized) {
+            chatty("WARNING: shell could not get the server version: " + e.message);
         }
     } finally {
         TestData = originalTestData;
@@ -610,6 +599,13 @@ Mongo.prototype._extractChangeStreamOptions = function(options) {
         delete options.showRawUpdateDescription;
     }
 
+    // If no maxAwaitTimeMS is set in the options, we set a high wait timeout, so that there won't
+    // be any issues with no data being available on the server side due to limited processing
+    // resources during testing.
+    if (!options.hasOwnProperty("maxAwaitTimeMS") && TestData && TestData.inEvergreen) {
+        options.maxAwaitTimeMS = 15 * 1000;
+    }
+
     return [{$changeStream: changeStreamOptions}, options];
 };
 
@@ -617,9 +613,8 @@ Mongo.prototype.watch = function(pipeline, options) {
     pipeline = pipeline || [];
     assert(pipeline instanceof Array, "'pipeline' argument must be an array");
 
-    let changeStreamStage;
-    [changeStreamStage, aggOptions] = this._extractChangeStreamOptions(options);
+    const [changeStreamStage, aggOptions] = this._extractChangeStreamOptions(options);
     changeStreamStage.$changeStream.allChangesForCluster = true;
-    pipeline.unshift(changeStreamStage);
-    return this.getDB("admin")._runAggregate({aggregate: 1, pipeline: pipeline}, aggOptions);
+    return this.getDB("admin")._runAggregate(
+        {aggregate: 1, pipeline: [changeStreamStage, ...pipeline]}, aggOptions);
 };

@@ -1,10 +1,12 @@
 /**
  * Test that the 'n' family of accumulators work as window functions.
  */
-(function() {
-"use strict";
+import "jstests/libs/query/sbe_assert_error_override.js";
 
-load("jstests/aggregation/extras/window_function_helpers.js");
+import {
+    seedWithTickerData,
+    testAccumAgainstGroup
+} from "jstests/aggregation/extras/window_function_helpers.js";
 
 const coll = db[jsTestName()];
 coll.drop();
@@ -48,7 +50,7 @@ for (const acc of Object.keys(nAccumulators)) {
     }
 
     // Verify that the accumulator will not throw if the 'n' expression evaluates to a constant.
-    const pipeline = [
+    let pipeline = [
         {
             $setWindowFields: {
                 partitionBy: "$ticker",
@@ -60,11 +62,28 @@ for (const acc of Object.keys(nAccumulators)) {
 
     assert.doesNotThrow(() => coll.aggregate(pipeline).toArray());
 
+    // Verify that the accumulator will fail if the 'n' expression is non-constant.
+    // Skip testing $top/$bottom as these window functions don't take 'n' expression arguments (and
+    // so cannot possibly)
+    // TODO SERVER-94694 Support allowing 'n' expression to reference the partition key.
+    if (acc !== "$top" && acc !== "$bottom") {
+        pipeline = [
+            {
+                $setWindowFields: {
+                    partitionBy: "$partIndex",
+                    sortBy: {_id: 1},
+                    output: {res: {[acc]: nAccumulators[acc]({$add: ["$partIndex", 2]}, "price")}}
+                },
+            },
+        ];
+
+        assert.throwsWithCode(() => coll.aggregate(pipeline).toArray(), 5787902);
+    }
     // Error cases.
     function testError(accSpec, expectedCode) {
         assert.throwsWithCode(() => coll.aggregate([{
             $setWindowFields: {
-                partitionBy: "$ticket",
+                partitionBy: "$ticker",
                 sortBy: {ts: 1},
                 output: {outputField: accSpec},
             }
@@ -91,7 +110,7 @@ for (const acc of Object.keys(nAccumulators)) {
         testError({[acc]: {input: "$foo", n: "$a"}, window: {documents: [-1, 1]}}, 5787902);
 
         // Can't reference partition key.
-        testError({[acc]: {input: "$foo", n: "$ticket"}, window: {documents: [-1, 1]}}, 5787902);
+        testError({[acc]: {input: "$foo", n: "$ticker"}, window: {documents: [-1, 1]}}, 5787902);
 
         // n = 0
         testError({[acc]: {input: "$foo", n: 0}, window: {documents: [-1, 1]}}, 5787908);
@@ -119,7 +138,7 @@ for (const acc of Object.keys(nAccumulators)) {
         testError({[acc]: {output, sortBy, n: "$a"}, window: {documents: [-1, 1]}}, 5787902);
 
         // Can't reference partition key.
-        testError({[acc]: {output, sortBy, n: "$ticket"}, window: {documents: [-1, 1]}}, 5787902);
+        testError({[acc]: {output, sortBy, n: "$ticker"}, window: {documents: [-1, 1]}}, 5787902);
 
         // n = 0
         testError({[acc]: {output, sortBy, n: 0}, window: {documents: [-1, 1]}}, 5787908);
@@ -139,4 +158,3 @@ for (const acc of Object.keys(nAccumulators)) {
         testError({[acc]: {output}, window: {documents: [-1, 1]}}, 5788005);
     }
 }
-})();

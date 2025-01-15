@@ -31,7 +31,7 @@ global:
   - "mongo/db/mirror_maestro.h"
 
 imports:
-  - "mongo/idl/basic_types.idl"
+  - "mongo/db/basic_types.idl"
 
 structs:
   MirroredReadsParameters:
@@ -62,3 +62,4 @@ server_parameters:
         name: "MirroredReadsServerParameter"
         data: "synchronized_value<MirroredReadsParameters>"
         override_set: true
+    redact: false

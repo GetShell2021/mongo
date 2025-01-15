@@ -27,35 +27,75 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <cmath>
+#include <cstddef>
+#include <fmt/format.h>
 #include <memory>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/cached_plan.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/mock_stage.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/working_set.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/mock_yield_policies.h"
-#include "mongo/db/query/plan_cache.h"
-#include "mongo/db/query/plan_cache_key_factory.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache_key_factory.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner_params.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/snapshot.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/platform/atomic_proxy.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/scopeguard.h"
+
+namespace mongo {
+
+using unittest::assertGet;
 
 namespace QueryStageCachedPlan {
 
-static const NamespaceString nss("unittests.QueryStageCachedPlan");
+static const NamespaceString nss =
+    NamespaceString::createNamespaceString_forTest("unittests.QueryStageCachedPlan");
 
 namespace {
 std::unique_ptr<CanonicalQuery> canonicalQueryFromFilterObj(OperationContext* opCtx,
@@ -63,9 +103,9 @@ std::unique_ptr<CanonicalQuery> canonicalQueryFromFilterObj(OperationContext* op
                                                             BSONObj filter) {
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setFilter(filter);
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(findCommand));
-    uassertStatusOK(statusWithCQ.getStatus());
-    return std::move(statusWithCQ.getValue());
+    return std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx, *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
 }
 }  // namespace
 
@@ -73,7 +113,7 @@ class QueryStageCachedPlan : public unittest::Test {
 public:
     QueryStageCachedPlan() : _client(&_opCtx) {}
 
-    void setUp() {
+    void setUp() override {
         // If collection exists already, we need to drop it.
         dropCollection();
 
@@ -81,7 +121,7 @@ public:
         addIndex(BSON("a" << 1));
         addIndex(BSON("b" << 1));
 
-        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns_forTest());
         CollectionPtr collection = ctx.getCollection();
         ASSERT(collection);
 
@@ -92,11 +132,11 @@ public:
     }
 
     void addIndex(const BSONObj& obj) {
-        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns(), obj));
+        ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns_forTest(), obj));
     }
 
     void dropIndex(BSONObj keyPattern) {
-        _client.dropIndex(nss.ns(), std::move(keyPattern));
+        _client.dropIndex(nss, std::move(keyPattern));
     }
 
     void dropCollection() {
@@ -116,7 +156,8 @@ public:
         WriteUnitOfWork wuow(&_opCtx);
 
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(&_opCtx, InsertStatement(obj), nullOpDebug));
+        ASSERT_OK(collection_internal::insertDocument(
+            &_opCtx, collection, InsertStatement(obj), nullOpDebug));
         wuow.commit();
     }
 
@@ -135,7 +176,7 @@ public:
 
             if (state == PlanStage::ADVANCED) {
                 auto member = ws.get(id);
-                ASSERT(cq->root()->matchesBSON(member->doc.value().toBson()));
+                ASSERT(cq->getPrimaryMatchExpression()->matchesBSON(member->doc.value().toBson()));
                 numResults++;
             }
         }
@@ -143,11 +184,22 @@ public:
         return numResults;
     }
 
+    QueryPlannerParams makePlannerParams(const CollectionPtr& collection,
+                                         const CanonicalQuery& canonicalQuery) {
+        MultipleCollectionAccessor collections(collection);
+        return QueryPlannerParams{
+            QueryPlannerParams::ArgsForSingleCollectionQuery{
+                .opCtx = opCtx(),
+                .canonicalQuery = canonicalQuery,
+                .collections = collections,
+                .plannerOptions = QueryPlannerParams::DEFAULT,
+            },
+        };
+    }
+
     void forceReplanning(const CollectionPtr& collection, CanonicalQuery* cq) {
         // Get planner params.
-        QueryPlannerParams plannerParams;
-        fillOutPlannerParams(&_opCtx, collection, cq, &plannerParams);
-
+        auto plannerParams = makePlannerParams(collection, *cq);
         const size_t decisionWorks = 10;
         const size_t mockWorks =
             1U + static_cast<size_t>(internalQueryCacheEvictionRatio * decisionWorks);
@@ -156,17 +208,12 @@ public:
             mockChild->enqueueStateCode(PlanStage::NEED_TIME);
         }
 
-        CachedPlanStage cachedPlanStage(_expCtx.get(),
-                                        collection,
-                                        &_ws,
-                                        cq,
-                                        plannerParams,
-                                        decisionWorks,
-                                        std::move(mockChild));
+        CachedPlanStage cachedPlanStage(
+            _expCtx.get(), &collection, &_ws, cq, decisionWorks, std::move(mockChild));
 
         // This should succeed after triggering a replan.
-        NoopYieldPolicy yieldPolicy(_opCtx.getServiceContext()->getFastClockSource());
-        ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
+        NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
+        ASSERT_OK(cachedPlanStage.pickBestPlan(plannerParams, &yieldPolicy));
     }
 
 protected:
@@ -176,7 +223,7 @@ protected:
     DBDirectClient _client{&_opCtx};
 
     boost::intrusive_ptr<ExpressionContext> _expCtx =
-        make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss);
+        ExpressionContextBuilder{}.opCtx(&_opCtx).ns(nss).build();
 };
 
 /**
@@ -190,9 +237,9 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanFailureMemoryLimitExceeded) {
     // Query can be answered by either index on "a" or index on "b".
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setFilter(fromjson("{a: {$gte: 8}, b: 1}"));
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
-    ASSERT_OK(statusWithCQ.getStatus());
-    const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
     auto key = plan_cache_key_factory::make<PlanCacheKey>(*cq, collection.getCollection());
 
     // We shouldn't have anything in the plan cache for this shape yet.
@@ -200,11 +247,8 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanFailureMemoryLimitExceeded) {
     ASSERT(cache);
     ASSERT_EQ(cache->get(key).state, PlanCache::CacheEntryState::kNotPresent);
 
-    // Get planner params.
-    QueryPlannerParams plannerParams;
-    fillOutPlannerParams(&_opCtx, collection.getCollection(), cq.get(), &plannerParams);
-
     // Mock stage will return a failure during the cached plan trial period.
+    auto plannerParams = makePlannerParams(collection.getCollection(), *cq);
     auto mockChild = std::make_unique<MockStage>(_expCtx.get(), &_ws);
     mockChild->enqueueError(
         Status{ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed, "mock error"});
@@ -212,16 +256,15 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanFailureMemoryLimitExceeded) {
     // High enough so that we shouldn't trigger a replan based on works.
     const size_t decisionWorks = 50;
     CachedPlanStage cachedPlanStage(_expCtx.get(),
-                                    collection.getCollection(),
+                                    &collection.getCollection(),
                                     &_ws,
                                     cq.get(),
-                                    plannerParams,
                                     decisionWorks,
                                     std::move(mockChild));
 
     // This should succeed after triggering a replan.
-    NoopYieldPolicy yieldPolicy(_opCtx.getServiceContext()->getFastClockSource());
-    ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
+    NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
+    ASSERT_OK(cachedPlanStage.pickBestPlan(plannerParams, &yieldPolicy));
 
     ASSERT_EQ(getNumResultsForStage(_ws, &cachedPlanStage, cq.get()), 2U);
 
@@ -241,9 +284,9 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanHitMaxWorks) {
     // Query can be answered by either index on "a" or index on "b".
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setFilter(fromjson("{a: {$gte: 8}, b: 1}"));
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
-    ASSERT_OK(statusWithCQ.getStatus());
-    const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
     auto key = plan_cache_key_factory::make<PlanCacheKey>(*cq, collection.getCollection());
 
     // We shouldn't have anything in the plan cache for this shape yet.
@@ -251,12 +294,9 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanHitMaxWorks) {
     ASSERT(cache);
     ASSERT_EQ(cache->get(key).state, PlanCache::CacheEntryState::kNotPresent);
 
-    // Get planner params.
-    QueryPlannerParams plannerParams;
-    fillOutPlannerParams(&_opCtx, collection.getCollection(), cq.get(), &plannerParams);
-
     // Set up queued data stage to take a long time before returning EOF. Should be long
     // enough to trigger a replan.
+    auto plannerParams = makePlannerParams(collection.getCollection(), *cq);
     const size_t decisionWorks = 10;
     const size_t mockWorks =
         1U + static_cast<size_t>(internalQueryCacheEvictionRatio * decisionWorks);
@@ -266,16 +306,15 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanHitMaxWorks) {
     }
 
     CachedPlanStage cachedPlanStage(_expCtx.get(),
-                                    collection.getCollection(),
+                                    &collection.getCollection(),
                                     &_ws,
                                     cq.get(),
-                                    plannerParams,
                                     decisionWorks,
                                     std::move(mockChild));
 
     // This should succeed after triggering a replan.
-    NoopYieldPolicy yieldPolicy(_opCtx.getServiceContext()->getFastClockSource());
-    ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
+    NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
+    ASSERT_OK(cachedPlanStage.pickBestPlan(plannerParams, &yieldPolicy));
 
     ASSERT_EQ(getNumResultsForStage(_ws, &cachedPlanStage, cq.get()), 2U);
 
@@ -317,8 +356,8 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanAddsActiveCacheEntries) {
     // The works should be 1 for the entry since the query we ran should not have any results.
     auto entry = assertGet(cache->getEntry(planCacheKey));
     size_t works = 1U;
-    ASSERT_TRUE(entry->works);
-    ASSERT_EQ(entry->works.get(), works);
+    ASSERT_TRUE(entry->readsOrWorks);
+    ASSERT_EQ(entry->readsOrWorks->rawValue(), works);
 
     const size_t kExpectedNumWorks = 10;
     for (int i = 0; i < std::ceil(std::log(kExpectedNumWorks) / std::log(2)); ++i) {
@@ -332,8 +371,8 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanAddsActiveCacheEntries) {
         ASSERT_EQ(cache->get(planCacheKey).state, PlanCache::CacheEntryState::kPresentInactive);
         // The works on the cache entry should have doubled.
         entry = assertGet(cache->getEntry(planCacheKey));
-        ASSERT_TRUE(entry->works);
-        ASSERT_EQ(entry->works.get(), works);
+        ASSERT_TRUE(entry->readsOrWorks);
+        ASSERT_EQ(entry->readsOrWorks->rawValue(), works);
     }
 
     // Run another query which takes less time, and be sure an active entry is created.
@@ -345,8 +384,8 @@ TEST_F(QueryStageCachedPlan, QueryStageCachedPlanAddsActiveCacheEntries) {
     ASSERT_EQ(cache->get(planCacheKey).state, PlanCache::CacheEntryState::kPresentActive);
     entry = assertGet(cache->getEntry(planCacheKey));
     // This will query will match {a: 6} through {a:9} (4 works), plus one for EOF = 5 works.
-    ASSERT_TRUE(entry->works);
-    ASSERT_EQ(entry->works.get(), 5U);
+    ASSERT_TRUE(entry->readsOrWorks);
+    ASSERT_EQ(entry->readsOrWorks->rawValue(), 5U);
 }
 
 
@@ -388,8 +427,8 @@ TEST_F(QueryStageCachedPlan, DeactivatesEntriesOnReplan) {
               PlanCache::CacheEntryState::kPresentActive);
     auto entry = assertGet(cache->getEntry(planCacheKey));
     size_t works = 1U;
-    ASSERT_TRUE(entry->works);
-    ASSERT_EQ(entry->works.get(), works);
+    ASSERT_TRUE(entry->readsOrWorks);
+    ASSERT_EQ(entry->readsOrWorks->rawValue(), works);
 
     // Run another query which takes long enough to evict the active cache entry. The current
     // cache entry's works value is a very low number. When replanning is triggered, the cache
@@ -401,8 +440,8 @@ TEST_F(QueryStageCachedPlan, DeactivatesEntriesOnReplan) {
     forceReplanning(collection.getCollection(), highWorksCq.get());
     ASSERT_EQ(cache->get(planCacheKey).state, PlanCache::CacheEntryState::kPresentInactive);
     entry = assertGet(cache->getEntry(planCacheKey));
-    ASSERT_TRUE(entry->works);
-    ASSERT_EQ(entry->works.get(), 2U);
+    ASSERT_TRUE(entry->readsOrWorks);
+    ASSERT_EQ(entry->readsOrWorks->rawValue(), 2U);
 
     // Again, force replanning. This time run the initial query which finds no results. The multi
     // planner will choose a plan with works value lower than the existing inactive
@@ -411,8 +450,8 @@ TEST_F(QueryStageCachedPlan, DeactivatesEntriesOnReplan) {
     forceReplanning(collection.getCollection(), noResultsCq.get());
     ASSERT_EQ(cache->get(planCacheKey).state, PlanCache::CacheEntryState::kPresentActive);
     entry = assertGet(cache->getEntry(planCacheKey));
-    ASSERT_TRUE(entry->works);
-    ASSERT_EQ(entry->works.get(), 1U);
+    ASSERT_TRUE(entry->readsOrWorks);
+    ASSERT_EQ(entry->readsOrWorks->rawValue(), 1U);
 }
 
 TEST_F(QueryStageCachedPlan, EntriesAreNotDeactivatedWhenInactiveEntriesDisabled) {
@@ -472,24 +511,20 @@ TEST_F(QueryStageCachedPlan, ThrowsOnYieldRecoveryWhenIndexIsDroppedBeforePlanSe
 
     // Query can be answered by either index on "a" or index on "b".
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
-    ASSERT_OK(statusWithCQ.getStatus());
-    const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
 
     // We shouldn't have anything in the plan cache for this shape yet.
     PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
 
-    // Get planner params.
-    QueryPlannerParams plannerParams;
-    fillOutPlannerParams(&_opCtx, collection, cq.get(), &plannerParams);
-
     const size_t decisionWorks = 10;
+    auto plannerParams = makePlannerParams(collection, *cq);
     CachedPlanStage cachedPlanStage(_expCtx.get(),
-                                    collection,
+                                    &collection,
                                     &_ws,
                                     cq.get(),
-                                    plannerParams,
                                     decisionWorks,
                                     std::make_unique<MockStage>(_expCtx.get(), &_ws));
 
@@ -504,7 +539,7 @@ TEST_F(QueryStageCachedPlan, ThrowsOnYieldRecoveryWhenIndexIsDroppedBeforePlanSe
                        ErrorCodes::QueryPlanKilled);
 }
 
-TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAferPlanSelection) {
+TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAfterPlanSelection) {
     // Create an index which we will drop later on.
     BSONObj keyPattern = BSON("c" << 1);
     addIndex(keyPattern);
@@ -516,29 +551,25 @@ TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAferPl
 
     // Query can be answered by either index on "a" or index on "b".
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(findCommand));
-    ASSERT_OK(statusWithCQ.getStatus());
-    const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+    auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx(), *findCommand).build(),
+        .parsedFind = ParsedFindCommandParams{std::move(findCommand)}});
 
     // We shouldn't have anything in the plan cache for this shape yet.
     PlanCache* cache = CollectionQueryInfo::get(collection).getPlanCache();
     ASSERT(cache);
 
-    // Get planner params.
-    QueryPlannerParams plannerParams;
-    fillOutPlannerParams(&_opCtx, collection, cq.get(), &plannerParams);
-
     const size_t decisionWorks = 10;
+    auto plannerParams = makePlannerParams(collection, *cq);
     CachedPlanStage cachedPlanStage(_expCtx.get(),
-                                    collection,
+                                    &collection,
                                     &_ws,
                                     cq.get(),
-                                    plannerParams,
                                     decisionWorks,
                                     std::make_unique<MockStage>(_expCtx.get(), &_ws));
 
-    NoopYieldPolicy yieldPolicy(_opCtx.getServiceContext()->getFastClockSource());
-    ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
+    NoopYieldPolicy yieldPolicy(&_opCtx, _opCtx.getServiceContext()->getFastClockSource());
+    ASSERT_OK(cachedPlanStage.pickBestPlan(plannerParams, &yieldPolicy));
 
     // Drop an index while the CachedPlanStage is in a saved state. We should be able to restore
     // successfully.
@@ -550,3 +581,4 @@ TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAferPl
 }
 
 }  // namespace QueryStageCachedPlan
+}  // namespace mongo

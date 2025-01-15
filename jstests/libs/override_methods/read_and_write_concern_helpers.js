@@ -1,7 +1,7 @@
 /**
  * Commands supporting read and write concern.
  */
-var kCommandsSupportingReadConcern = new Set([
+export var kCommandsSupportingReadConcern = new Set([
     "aggregate",
     "count",
     "distinct",
@@ -11,7 +11,7 @@ var kCommandsSupportingReadConcern = new Set([
 /**
  * Write commands supporting snapshot readConcern in a transaction.
  */
-var kWriteCommandsSupportingSnapshotInTransaction = new Set([
+export var kWriteCommandsSupportingSnapshotInTransaction = new Set([
     "delete",
     "findAndModify",
     "findandmodify",
@@ -22,20 +22,22 @@ var kWriteCommandsSupportingSnapshotInTransaction = new Set([
 /**
  * Commands supporting snapshot readConcern outside of transactions.
  */
-var kCommandsSupportingSnapshot = new Set([
+export var kCommandsSupportingSnapshot = new Set([
     "aggregate",
     "distinct",
     "find",
 ]);
 
-var kCommandsSupportingWriteConcern = new Set([
+export var kCommandsSupportingWriteConcern = new Set([
     "_configsvrAddShard",
     "_configsvrAddShardToZone",
     "_configsvrCommitChunksMerge",
     "_configsvrCommitChunkMigration",
     "_configsvrCommitChunkSplit",
+    "_configsvrCommitIndex",
+    "_configsvrCommitMergeAllChunksOnShard",
     "_configsvrCreateDatabase",
-    "_configsvrMoveChunk",
+    "_configsvrDropIndexCatalogEntry",
     "_configsvrMoveRange",
     "_configsvrRemoveShard",
     "_configsvrRemoveShardFromZone",
@@ -46,7 +48,6 @@ var kCommandsSupportingWriteConcern = new Set([
     "appendOplogNote",
     "applyOps",
     "aggregate",
-    "captrunc",
     "cleanupOrphaned",
     "clone",
     "cloneCollectionAsCapped",
@@ -66,7 +67,6 @@ var kCommandsSupportingWriteConcern = new Set([
     "dropIndexes",
     "dropRole",
     "dropUser",
-    "emptycapped",
     "findAndModify",
     "findandmodify",
     "godinsert",
@@ -88,5 +88,5 @@ var kCommandsSupportingWriteConcern = new Set([
     "updateUser",
 ]);
 
-var kCommandsSupportingWriteConcernInTransaction =
+export var kCommandsSupportingWriteConcernInTransaction =
     new Set(["abortTransaction", "commitTransaction"]);

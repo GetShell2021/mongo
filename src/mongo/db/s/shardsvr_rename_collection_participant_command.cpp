@@ -28,17 +28,37 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/forwardable_operation_metadata.h"
 #include "mongo/db/s/rename_collection_participant_service.h"
 #include "mongo/db/s/sharded_rename_collection_gen.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/db/transaction_participant.h"
-#include "mongo/db/write_concern.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/future.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -86,13 +106,14 @@ public:
                     txnParticipant);
 
             auto const shardingState = ShardingState::get(opCtx);
-            uassertStatusOK(shardingState->canAcceptShardedCommands());
+            shardingState->assertCanAcceptShardedCommands();
             auto const& req = request();
 
             const NamespaceString& fromNss = ns();
             RenameCollectionParticipantDocument participantDoc(
                 fromNss, ForwardableOperationMetadata(opCtx), req.getSourceUUID());
             participantDoc.setTargetUUID(req.getTargetUUID());
+            participantDoc.setNewTargetCollectionUuid(req.getNewTargetCollectionUuid());
             participantDoc.setRenameCollectionRequest(req.getRenameCollectionRequest());
 
             const auto service = RenameCollectionParticipantService::getService(opCtx);
@@ -101,7 +122,8 @@ public:
                 RenameParticipantInstance::getOrCreate(opCtx, service, participantDocBSON);
             bool hasSameOptions = renameCollectionParticipant->hasSameOptions(participantDocBSON);
             uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "Another rename participant for namespace " << fromNss
+                    str::stream() << "Another rename participant for namespace "
+                                  << fromNss.toStringForErrorMsg()
                                   << "is instantiated with different parameters: `"
                                   << renameCollectionParticipant->doc() << "` vs `"
                                   << participantDocBSON << "`",
@@ -113,7 +135,7 @@ public:
             // txnNumber happened, we need to make a dummy write so that the session gets durably
             // persisted on the oplog. This must be the last operation done on this command.
             DBDirectClient client(opCtx);
-            client.update(NamespaceString::kServerConfigurationNamespace.ns(),
+            client.update(NamespaceString::kServerConfigurationNamespace,
                           BSON("_id" << Request::kCommandName),
                           BSON("$inc" << BSON("count" << 1)),
                           true /* upsert */,
@@ -133,12 +155,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-
-} shardsvrRenameCollectionParticipantCommand;
+};
+MONGO_REGISTER_COMMAND(ShardsvrRenameCollectionParticipantCommand).forShard();
 
 class ShardsvrRenameCollectionUnblockParticipantCommand final
     : public TypedCommand<ShardsvrRenameCollectionUnblockParticipantCommand> {
@@ -181,20 +204,25 @@ public:
                     txnParticipant);
 
             auto const shardingState = ShardingState::get(opCtx);
-            uassertStatusOK(shardingState->canAcceptShardedCommands());
+            shardingState->assertCanAcceptShardedCommands();
 
             const NamespaceString& fromNss = ns();
             const auto& req = request();
 
             const auto service = RenameCollectionParticipantService::getService(opCtx);
-            const auto id = BSON("_id" << fromNss.ns());
-            const auto optRenameCollectionParticipant =
+            const auto id = BSON("_id" << NamespaceStringUtil::serialize(
+                                     fromNss, SerializationContext::stateDefault()));
+            const auto [optRenameCollectionParticipant, _] =
                 RenameParticipantInstance::lookup(opCtx, service, id);
             if (optRenameCollectionParticipant) {
+
+                auto optUnblockCrudFuture =
+                    optRenameCollectionParticipant.value()->getUnblockCrudFutureFor(
+                        req.getSourceUUID());
                 uassert(ErrorCodes::CommandFailed,
                         "Provided UUID does not match",
-                        optRenameCollectionParticipant.get()->sourceUUID() == req.getSourceUUID());
-                optRenameCollectionParticipant.get()->getUnblockCrudFuture().get(opCtx);
+                        optUnblockCrudFuture.has_value());
+                optUnblockCrudFuture->get(opCtx);
             }
 
             // Since no write that generated a retryable write oplog entry with this sessionId
@@ -202,7 +230,7 @@ public:
             // durably persisted on the oplog. This must be the last operation done on this
             // command.
             DBDirectClient client(opCtx);
-            client.update(NamespaceString::kServerConfigurationNamespace.ns(),
+            client.update(NamespaceString::kServerConfigurationNamespace,
                           BSON("_id" << Request::kCommandName),
                           BSON("$inc" << BSON("count" << 1)),
                           true /* upsert */,
@@ -222,12 +250,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-
-} shardsvrRenameCollectionUnblockParticipantCommand;
+};
+MONGO_REGISTER_COMMAND(ShardsvrRenameCollectionUnblockParticipantCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

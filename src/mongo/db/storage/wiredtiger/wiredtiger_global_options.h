@@ -29,9 +29,11 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 #include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/util/options_parser/environment.h"
 
 namespace mongo {
@@ -58,6 +60,7 @@ public:
     bool directoryForIndexes;
     double maxCacheOverflowFileSizeGBDeprecated;
     std::string engineConfig;
+    std::string liveRestoreSource;
 
     std::string collectionBlockCompressor;
     bool useCollectionPrefixCompression;

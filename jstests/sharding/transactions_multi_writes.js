@@ -7,11 +7,16 @@
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {
+    withAbortAndRetryOnTransientTxnError
+} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {assertDropCollection} from "jstests/libs/collection_drop_recreate.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    disableStaleVersionAndSnapshotRetriesWithinTransactions,
+    enableCoordinateCommitReturnImmediatelyAfterPersistingDecision,
+    enableStaleVersionAndSnapshotRetriesWithinTransactions,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -25,8 +30,8 @@ enableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 // Set up a sharded collection with 3 chunks, [min, 0), [0, 10), [10, max), one on each shard,
 // with one document in each.
 
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 function setupCollection() {
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {skey: 1}}));
@@ -73,18 +78,21 @@ function runTest(st, session, writeCmd, staleRouter) {
 
     // Start a transaction with majority read concern to ensure the orphan will be visible if
     // its shard is targeted and send the multi-write.
-    session.startTransaction({readConcern: {level: "majority"}});
-    assert.commandWorked(sessionDB.runCommand(writeCmd));
+    withAbortAndRetryOnTransientTxnError(session, () => {
+        session.startTransaction({readConcern: {level: "majority"}});
+        assert.commandWorked(sessionDB.runCommand(writeCmd));
 
-    // The write shouldn't be visible until the transaction commits.
-    assert.sameMembers(st.getDB(dbName)[collName].find().toArray(), [
-        {_id: 1, counter: 0, skey: -5},
-        {_id: 2, counter: 0, skey: 5},
-        {_id: 3, counter: 0, skey: 15}
-    ]);
+        // The write shouldn't be visible until the transaction commits.
+        assert.sameMembers(st.getDB(dbName)[collName].find().toArray(), [
+            {_id: 1, counter: 0, skey: -5},
+            {_id: 2, counter: 0, skey: 5},
+            {_id: 3, counter: 0, skey: 15}
+        ]);
 
-    // Commit the transaction and verify the write was successful.
-    assert.commandWorked(session.commitTransaction_forTesting());
+        // Commit the transaction and verify the write was successful.
+        assert.commandWorked(session.commitTransaction_forTesting());
+    });
+
     if (isUpdate) {
         assert.sameMembers(
             sessionDB[collName].find().toArray(),
@@ -142,4 +150,3 @@ runTest(st, session, multiDelete, false /*staleRouter*/);
 disableStaleVersionAndSnapshotRetriesWithinTransactions(st);
 
 st.stop();
-})();

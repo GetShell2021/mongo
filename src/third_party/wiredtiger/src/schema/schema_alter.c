@@ -219,7 +219,7 @@ __alter_tiered(WT_SESSION_IMPL *session, const char *uri, const char *newcfg[], 
      */
     if (FLD_ISSET(flags, WT_DHANDLE_EXCLUSIVE)) {
         WT_WITH_HANDLE_LIST_WRITE_LOCK(
-          session, ret = __wt_conn_dhandle_close_all(session, uri, false, false));
+          session, ret = __wt_conn_dhandle_close_all(session, uri, false, false, false));
         WT_RET(ret);
     }
 
@@ -394,6 +394,9 @@ __schema_alter(WT_SESSION_IMPL *session, const char *uri, const char *newcfg[])
     const char *cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_alter), newcfg[0], NULL};
     bool exclusive_refreshed;
 
+    WT_ASSERT_SPINLOCK_OWNED(session, &S2C(session)->checkpoint_lock);
+    WT_ASSERT_SPINLOCK_OWNED(session, &S2C(session)->schema_lock);
+
     /*
      * Determine what configuration says about exclusive access. A non exclusive alter that doesn't
      * refresh in-memory configuration is only valid for the table objects.
@@ -407,24 +410,21 @@ __schema_alter(WT_SESSION_IMPL *session, const char *uri, const char *newcfg[])
           "is applicable only on simple tables");
 
     /*
-     * The alter flag is used so LSM can apply some special logic, the exclusive flag avoids
-     * conflicts with other operations and the lock only flag is required because we don't need to
-     * have a handle to update the metadata and opening the handle causes problems when meta
-     * tracking is enabled.
+     * The exclusive flag avoids conflicts with other operations and the lock only flag is required
+     * because we don't need to have a handle to update the metadata and opening the handle causes
+     * problems when meta tracking is enabled.
      */
-    flags = WT_BTREE_ALTER | WT_DHANDLE_EXCLUSIVE | WT_DHANDLE_LOCK_ONLY;
+    flags = WT_DHANDLE_EXCLUSIVE | WT_DHANDLE_LOCK_ONLY;
     if (WT_PREFIX_MATCH(uri, "file:"))
-        return (__wt_exclusive_handle_operation(session, uri, __alter_file, newcfg, flags));
+        return (__wti_execute_handle_operation(session, uri, __alter_file, newcfg, flags));
     if (WT_PREFIX_MATCH(uri, "colgroup:") || WT_PREFIX_MATCH(uri, "index:"))
         return (__alter_tree(session, uri, newcfg));
-    if (WT_PREFIX_MATCH(uri, "lsm:"))
-        return (__wt_lsm_tree_worker(session, uri, __alter_file, NULL, newcfg, flags));
     if (WT_PREFIX_MATCH(uri, "object:"))
         return (__alter_object(session, uri, newcfg));
     if (WT_PREFIX_MATCH(uri, "table:"))
         return (__alter_table(session, uri, newcfg, exclusive_refreshed));
     if (WT_PREFIX_MATCH(uri, "tier:"))
-        return (__wt_exclusive_handle_operation(session, uri, __alter_tier, newcfg, flags));
+        return (__wti_execute_handle_operation(session, uri, __alter_tier, newcfg, flags));
     if (WT_PREFIX_MATCH(uri, "tiered:"))
         return (__alter_tiered(session, uri, newcfg, flags));
     return (__wt_bad_object_type(session, uri));
@@ -440,11 +440,14 @@ __wt_schema_alter(WT_SESSION_IMPL *session, const char *uri, const char *newcfg[
     WT_DECL_RET;
     WT_SESSION_IMPL *int_session;
 
-    WT_RET(__wt_schema_internal_session(session, &int_session));
+    WT_ASSERT_SPINLOCK_OWNED(session, &S2C(session)->checkpoint_lock);
+    WT_ASSERT_SPINLOCK_OWNED(session, &S2C(session)->schema_lock);
+
+    WT_RET(__wti_schema_internal_session(session, &int_session));
     WT_ERR(__wt_meta_track_on(int_session));
     ret = __schema_alter(int_session, uri, newcfg);
     WT_TRET(__wt_meta_track_off(int_session, true, ret != 0));
 err:
-    WT_TRET(__wt_schema_session_release(session, int_session));
+    WT_TRET(__wti_schema_session_release(session, int_session));
     return (ret);
 }

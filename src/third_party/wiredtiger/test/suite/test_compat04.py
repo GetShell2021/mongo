@@ -54,6 +54,10 @@ class test_compat04(wttest.WiredTigerTestCase, suite_subprocess):
     #
     create_release = [
         ('def_rel', dict(create_rel='none', log_crrel=5)),
+        ('120_rel', dict(create_rel="12.0", log_crrel=5)),
+        ('113_rel', dict(create_rel="11.3", log_crrel=5)),
+        ('112_rel', dict(create_rel="11.2", log_crrel=5)),
+        ('111_rel', dict(create_rel="11.1", log_crrel=5)),
         ('110_rel', dict(create_rel="11.0", log_crrel=5)),
         ('100_rel', dict(create_rel="10.0", log_crrel=5)),
         ('33_rel', dict(create_rel="3.3", log_crrel=4)),
@@ -63,6 +67,10 @@ class test_compat04(wttest.WiredTigerTestCase, suite_subprocess):
         ('26_rel', dict(create_rel="2.6", log_crrel=1)),
     ]
     reconfig_release = [
+        ('120_rel', dict(rel="12.0", log_rel=5)),
+        ('113_rel', dict(rel="11.3", log_rel=5)),
+        ('112_rel', dict(rel="11.2", log_rel=5)),
+        ('111_rel', dict(rel="11.1", log_rel=5)),
         ('110_rel', dict(rel="11.0", log_rel=5)),
         ('100_rel', dict(rel="10.0", log_rel=5)),
         ('33_rel', dict(rel="3.3", log_rel=4)),
@@ -114,9 +122,3 @@ class test_compat04(wttest.WiredTigerTestCase, suite_subprocess):
         config_str = 'compatibility=(release=%s,require_max=%s)' % (self.rel, self.rel)
         conn = self.wiredtiger_open('.', config_str)
         conn.close()
-
-if __name__ == '__main__':
-    wttest.run()
-
-if __name__ == '__main__':
-    wttest.run()

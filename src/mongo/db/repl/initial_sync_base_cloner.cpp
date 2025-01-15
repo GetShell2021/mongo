@@ -28,12 +28,32 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <boost/optional.hpp>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/initial_sync_base_cloner.h"
+#include "mongo/db/repl/repl_sync_shared_data.h"
 #include "mongo/db/repl/replication_consistency_markers_gen.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
@@ -60,6 +80,15 @@ void InitialSyncBaseCloner::clearRetryingState() {
     _retryableOp = boost::none;
 }
 
+int InitialSyncBaseCloner::getRetryableOperationCount_forTest() {
+    if (!_retryableOp) {
+        return 0;
+    }
+
+    stdx::lock_guard<InitialSyncSharedData> lk(*_retryableOp->getSharedData());
+    return _retryableOp->getSharedData()->getRetryingOperationsCount(lk);
+}
+
 void InitialSyncBaseCloner::handleStageAttemptFailed(BaseClonerStage* stage, Status lastError) {
     auto isThisStageFailPoint = [this, stage](const BSONObj& data) {
         return data["stage"].str() == stage->getName() && isMyFailPoint(data);
@@ -80,8 +109,6 @@ void InitialSyncBaseCloner::handleStageAttemptFailed(BaseClonerStage* stage, Sta
     hangBeforeCheckingRollBackIdClonerStage.executeIf(
         [&](const BSONObj& data) {
             LOGV2(21076,
-                  "Initial sync cloner {cloner} hanging before checking rollBackId for stage "
-                  "{stage}",
                   "Initial sync cloner hanging before checking rollBackId",
                   "cloner"_attr = getClonerName(),
                   "stage"_attr = stage->getName());
@@ -116,9 +143,8 @@ Status InitialSyncBaseCloner::checkSyncSourceIsStillValid() {
 Status InitialSyncBaseCloner::checkInitialSyncIdIsUnchanged() {
     BSONObj initialSyncId;
     try {
-        initialSyncId = getClient()->findOne(
-            NamespaceString{ReplicationConsistencyMarkersImpl::kDefaultInitialSyncIdNamespace},
-            BSONObj{});
+        initialSyncId =
+            getClient()->findOne(NamespaceString::kDefaultInitialSyncIdNamespace, BSONObj{});
     } catch (DBException& e) {
         if (ErrorCodes::isRetriableError(e)) {
             auto status = e.toStatus().withContext(
@@ -133,7 +159,7 @@ Status InitialSyncBaseCloner::checkInitialSyncIdIsUnchanged() {
             "Cannot retrieve sync source initial sync ID",
             !initialSyncId.isEmpty());
     InitialSyncIdDocument initialSyncIdDoc =
-        InitialSyncIdDocument::parse(IDLParserErrorContext("initialSyncId"), initialSyncId);
+        InitialSyncIdDocument::parse(IDLParserContext("initialSyncId"), initialSyncId);
 
     stdx::lock_guard<ReplSyncSharedData> lk(*getSharedData());
     uassert(ErrorCodes::InitialSyncFailure,
@@ -145,7 +171,7 @@ Status InitialSyncBaseCloner::checkInitialSyncIdIsUnchanged() {
 Status InitialSyncBaseCloner::checkRollBackIdIsUnchanged() {
     BSONObj info;
     try {
-        getClient()->runCommand("admin", BSON("replSetGetRBID" << 1), info);
+        getClient()->runCommand(DatabaseName::kAdmin, BSON("replSetGetRBID" << 1), info);
     } catch (DBException& e) {
         if (ErrorCodes::isRetriableError(e)) {
             static constexpr char errorMsg[] =
@@ -181,7 +207,6 @@ void InitialSyncBaseCloner::pauseForFuzzer(BaseClonerStage* stage) {
             // initial_sync_test_fixture_test.js, so if you change it here you will need to change
             // it there.
             LOGV2(21066,
-                  "Collection Cloner scheduled a remote command on the {stage}",
                   "Collection Cloner scheduled a remote command",
                   "stage"_attr = describeForFuzzer(stage));
             LOGV2(21067, "initialSyncFuzzerSynchronizationPoint1 fail point enabled");

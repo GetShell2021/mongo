@@ -28,17 +28,62 @@
  */
 
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
 #include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/db/field_ref.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/multikey_metadata_access_stats.h"
+#include "mongo/db/index_builds/multi_index_block.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/query/wildcard_multikey_paths.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/record_id_helpers.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/db/storage/snapshot.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/inline_auto_update.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -52,7 +97,8 @@ static const RecordId kMetadataId = record_id_helpers::reservedIdFor(
     record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::Long);
 
 static const int kIndexVersion = static_cast<int>(IndexDescriptor::kLatestIndexVersion);
-static const NamespaceString kDefaultNSS{"wildcard_multikey_persistence.test"};
+static const NamespaceString kDefaultNSS =
+    NamespaceString::createNamespaceString_forTest("wildcard_multikey_persistence.test");
 static const std::string kDefaultIndexName{"wildcard_multikey"};
 static const BSONObj kDefaultIndexKey = fromjson("{'$**': 1}");
 static const BSONObj kDefaultPathProjection;
@@ -73,7 +119,7 @@ public:
         _opCtx = cc().makeOperationContext();
     }
 
-    virtual ~WildcardMultikeyPersistenceTestFixture() {
+    ~WildcardMultikeyPersistenceTestFixture() override {
         _opCtx.reset();
     }
 
@@ -109,8 +155,9 @@ protected:
         // Obtain a cursor over the index, and confirm that the keys are present in order.
         auto indexCursor = getIndexCursor(collection.getCollection(), indexName);
 
-        KeyString::Value keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
-            BSONObj(), KeyString::Version::V1, Ordering::make(BSONObj()), true, true);
+        key_string::Builder builder(key_string::Version::V1);
+        auto keyStringForSeek = IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
+            BSONObj(), Ordering::make(BSONObj()), true, true, builder);
 
         auto indexKey = indexCursor->seek(keyStringForSeek);
         try {
@@ -139,7 +186,7 @@ protected:
      * Verifes that the index access method associated with 'indexName' in the collection identified
      * by 'nss' reports 'expectedPaths' as the set of multikey paths.
      */
-    void assertMultikeyPathSetEquals(const std::set<std::string>& expectedPaths,
+    void assertMultikeyPathSetEquals(const OrderedPathSet& expectedPaths,
                                      const NamespaceString& nss = kDefaultNSS,
                                      const std::string& indexName = kDefaultIndexName) {
         // Convert the set of std::string to a set of FieldRef.
@@ -150,11 +197,9 @@ protected:
         ASSERT_EQ(expectedPaths.size(), expectedFieldRefs.size());
 
         AutoGetCollectionForRead collection(opCtx(), nss);
-        auto indexAccessMethod = getIndex(collection.getCollection(), indexName);
+        auto indexEntry = getIndexCatalogEntry(collection.getCollection(), indexName);
         MultikeyMetadataAccessStats stats;
-        auto wam = dynamic_cast<const WildcardAccessMethod*>(indexAccessMethod);
-        ASSERT(wam != nullptr);
-        auto multikeyPathSet = getWildcardMultikeyPathSet(wam, opCtx(), &stats);
+        auto multikeyPathSet = getWildcardMultikeyPathSet(opCtx(), indexEntry, &stats);
 
         ASSERT(expectedFieldRefs == multikeyPathSet);
     }
@@ -199,9 +244,9 @@ protected:
         BSONObjBuilder bob = std::move(BSONObjBuilder() << "name" << name << "key" << key);
 
         if (!pathProjection.isEmpty())
-            bob << IndexDescriptor::kPathProjectionFieldName << pathProjection;
+            bob << IndexDescriptor::kWildcardProjectionFieldName << pathProjection;
 
-        auto indexSpec = (bob << "v" << kIndexVersion << "background" << background).obj();
+        auto indexSpec = (bob << "v" << kIndexVersion).obj();
 
         Lock::DBLock dbLock(opCtx(), nss.dbName(), MODE_X);
         AutoGetCollection autoColl(opCtx(), nss, MODE_X);
@@ -240,17 +285,17 @@ protected:
         return collection->getIndexCatalog()->findIndexByName(opCtx(), indexName);
     }
 
-    const SortedDataIndexAccessMethod* getIndex(const CollectionPtr& collection,
-                                                const StringData indexName) {
-        return collection->getIndexCatalog()
-            ->getEntry(getIndexDesc(collection, indexName))
-            ->accessMethod()
-            ->asSortedData();
+    const IndexCatalogEntry* getIndexCatalogEntry(const CollectionPtr& collection,
+                                                  const StringData indexName) {
+        return collection->getIndexCatalog()->getEntry(getIndexDesc(collection, indexName));
     }
 
     std::unique_ptr<SortedDataInterface::Cursor> getIndexCursor(const CollectionPtr& collection,
                                                                 const StringData indexName) {
-        return getIndex(collection, indexName)->newCursor(opCtx());
+        return getIndexCatalogEntry(collection, indexName)
+            ->accessMethod()
+            ->asSortedData()
+            ->newCursor(opCtx());
     }
 
     CollectionOptions collOptions() {

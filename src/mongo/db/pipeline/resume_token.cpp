@@ -27,35 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional.hpp>
+#include <ostream>
+#include <set>
 
-#include "mongo/db/pipeline/resume_token.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
-#include <boost/optional/optional_io.hpp>
-#include <limits>
-
-#include "mongo/bson/bsonmisc.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/exec/document_value/value_comparator.h"
-#include "mongo/db/pipeline/change_stream_helpers_legacy.h"
-#include "mongo/db/pipeline/document_source_change_stream_gen.h"
-#include "mongo/db/storage/key_string.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
+#include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/storage/key_string/key_string.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/bufreader.h"
 #include "mongo/util/hex.h"
+#include "mongo/util/optional_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 constexpr StringData ResumeToken::kDataFieldName;
 constexpr StringData ResumeToken::kTypeBitsFieldName;
-
-namespace {
-// Helper function for makeHighWaterMarkToken and isHighWaterMarkToken.
-ResumeTokenData makeHighWaterMarkResumeTokenData(Timestamp clusterTime, int version) {
-    ResumeTokenData tokenData;
-    tokenData.version = version;
-    tokenData.clusterTime = clusterTime;
-    tokenData.tokenType = ResumeTokenData::kHighWaterMarkToken;
-    return tokenData;
-}
-}  // namespace
 
 ResumeTokenData::ResumeTokenData(Timestamp clusterTimeIn,
                                  int versionIn,
@@ -70,7 +67,7 @@ ResumeTokenData::ResumeTokenData(Timestamp clusterTimeIn,
             documentKey.missing() || opDescription.missing());
 
     // For v1 classic change events, the eventIdentifier is always the documentKey, even if missing.
-    if (change_stream_legacy::kClassicOperationTypes.count(opType) && version <= 1) {
+    if (change_stream::kClassicOperationTypes.count(opType) && version <= 1) {
         eventIdentifier = documentKey;
         return;
     }
@@ -88,22 +85,33 @@ bool ResumeTokenData::operator==(const ResumeTokenData& other) const {
     return clusterTime == other.clusterTime && version == other.version &&
         tokenType == other.tokenType && txnOpIndex == other.txnOpIndex &&
         fromInvalidate == other.fromInvalidate && uuid == other.uuid &&
-        (Value::compare(this->eventIdentifier, other.eventIdentifier, nullptr) == 0);
+        (Value::compare(this->eventIdentifier, other.eventIdentifier, nullptr) == 0) &&
+        fragmentNum == other.fragmentNum;
+}
+
+BSONObj ResumeTokenData::toBSON() const {
+    // TODO SERVER-96418: Make ResumeTokenData an IDL type so that this method is auto-generated.
+    BSONObjBuilder builder;
+    builder.append("clusterTime", clusterTime);
+    builder.append("tokenData", tokenType);
+    builder.append("version", version);
+    builder.append("txnOpIndex", static_cast<int64_t>(txnOpIndex));
+    if (version > 0) {
+        builder.append("tokenType", tokenType);
+        builder.append("fromInvalidate", static_cast<bool>(fromInvalidate));
+    }
+    if (uuid) {
+        builder.append("uuid", uuid->toBSON());
+    }
+    if (fragmentNum) {
+        builder.append("fragmentNum", static_cast<int64_t>(*fragmentNum));
+    }
+    eventIdentifier.addToBsonObj(&builder, "eventIdentifier");
+    return builder.obj();
 }
 
 std::ostream& operator<<(std::ostream& out, const ResumeTokenData& tokenData) {
-    out << "{clusterTime: " << tokenData.clusterTime.toString();
-    out << ", version: " << tokenData.version;
-    if (tokenData.version > 0) {
-        out << ", tokenType: " << tokenData.tokenType;
-    }
-    out << ", txnOpIndex: " << tokenData.txnOpIndex;
-    if (tokenData.version > 0) {
-        out << ", fromInvalidate: " << static_cast<bool>(tokenData.fromInvalidate);
-    }
-    out << ", uuid: " << tokenData.uuid;
-    out << ", eventIdentifier: " << tokenData.eventIdentifier << "}";
-    return out;
+    return out << tokenData.toBSON();
 }
 
 ResumeToken::ResumeToken(const Document& resumeDoc) {
@@ -163,9 +171,17 @@ ResumeToken::ResumeToken(const ResumeTokenData& data) {
     }
     data.eventIdentifier.addToBsonObj(&builder, "");
 
+    if (data.fragmentNum) {
+        uassert(7182504,
+                str::stream() << "Tokens of version " << data.version
+                              << " cannot have a fragmentNum",
+                data.version >= 2);
+        builder.appendNumber("", static_cast<long long>(*data.fragmentNum));
+    }
+
     auto keyObj = builder.obj();
-    KeyString::Builder encodedToken(KeyString::Version::V1, keyObj, Ordering::make(BSONObj()));
-    _hexKeyString = hexblob::encode(encodedToken.getBuffer(), encodedToken.getSize());
+    key_string::Builder encodedToken(key_string::Version::V1, keyObj, Ordering::make(BSONObj()));
+    _hexKeyString = encodedToken.toString();
     const auto& typeBits = encodedToken.getTypeBits();
     if (!typeBits.isAllZeros())
         _typeBits = Value(
@@ -184,7 +200,7 @@ bool ResumeToken::operator==(const ResumeToken& other) const {
 }
 
 ResumeTokenData ResumeToken::getData() const {
-    KeyString::TypeBits typeBits(KeyString::Version::V1);
+    key_string::TypeBits typeBits(key_string::Version::V1);
     if (!_typeBits.missing()) {
         BSONBinData typeBitsBinData = _typeBits.getBinData();
         BufReader typeBitsReader(typeBitsBinData.data, typeBitsBinData.length);
@@ -197,12 +213,8 @@ ResumeTokenData ResumeToken::getData() const {
 
     BufBuilder hexDecodeBuf;  // Keep this in scope until we've decoded the bytes.
     hexblob::decode(_hexKeyString, &hexDecodeBuf);
-    BSONBinData keyStringBinData =
-        BSONBinData(hexDecodeBuf.buf(), hexDecodeBuf.len(), BinDataType::BinDataGeneral);
-    auto internalBson = KeyString::toBsonSafe(static_cast<const char*>(keyStringBinData.data),
-                                              keyStringBinData.length,
-                                              Ordering::make(BSONObj()),
-                                              typeBits);
+    auto internalBson = key_string::toBsonSafe(
+        std::span(hexDecodeBuf.buf(), hexDecodeBuf.len()), Ordering::allAscending(), typeBits);
 
     BSONObjIterator i(internalBson);
     ResumeTokenData result;
@@ -285,24 +297,58 @@ ResumeTokenData ResumeToken::getData() const {
             "Resume Token eventIdentifier is not an object",
             result.eventIdentifier.getType() == BSONType::Object);
 
+    if (i.more() && result.version >= 2) {
+        auto fragmentNum = i.next();
+        uassert(7182501,
+                "Resume token 'fragmentNum' must be a non-negative integer.",
+                fragmentNum.type() == BSONType::NumberInt && fragmentNum.numberInt() >= 0);
+        result.fragmentNum = fragmentNum.numberInt();
+    }
+
     uassert(40646, "invalid oversized resume token", !i.more());
     return result;
 }
 
-Document ResumeToken::toDocument() const {
-    return Document{{kDataFieldName, _hexKeyString}, {kTypeBitsFieldName, _typeBits}};
+Document ResumeToken::toDocument(const SerializationOptions& options) const {
+    // This is our default resume token for the representative query shape.
+    static const auto kDefaultTokenQueryStats = makeHighWaterMarkToken(Timestamp(), 1);
+
+    return Document{
+        {kDataFieldName,
+         options.serializeLiteral(_hexKeyString, Value(kDefaultTokenQueryStats._hexKeyString))},
+
+        // When serializing with 'kToDebugTypeString' 'serializeLiteral' will return an
+        // incorrect result. Therefore, we prefer to always exclude '_typeBits'  when serializing
+        // the debug string by passing an empty value, since '_typeBits' is rarely set and will
+        // always be either missing or of type BinData.
+        {kTypeBitsFieldName,
+         options.literalPolicy == LiteralSerializationPolicy::kToDebugTypeString
+             ? Value()
+             : options.serializeLiteral(_typeBits, kDefaultTokenQueryStats._typeBits)}};
+}
+
+BSONObj ResumeToken::toBSON(const SerializationOptions& options) const {
+    return toDocument(options).toBson();
 }
 
 ResumeToken ResumeToken::parse(const Document& resumeDoc) {
     return ResumeToken(resumeDoc);
 }
 
+ResumeTokenData ResumeToken::makeHighWaterMarkTokenData(Timestamp clusterTime, int version) {
+    ResumeTokenData tokenData;
+    tokenData.version = version;
+    tokenData.clusterTime = clusterTime;
+    tokenData.tokenType = ResumeTokenData::kHighWaterMarkToken;
+    return tokenData;
+}
+
 ResumeToken ResumeToken::makeHighWaterMarkToken(Timestamp clusterTime, int version) {
-    return ResumeToken(makeHighWaterMarkResumeTokenData(clusterTime, version));
+    return ResumeToken(makeHighWaterMarkTokenData(clusterTime, version));
 }
 
 bool ResumeToken::isHighWaterMarkToken(const ResumeTokenData& tokenData) {
-    return tokenData == makeHighWaterMarkResumeTokenData(tokenData.clusterTime, tokenData.version);
+    return tokenData == makeHighWaterMarkTokenData(tokenData.clusterTime, tokenData.version);
 }
 
 }  // namespace mongo

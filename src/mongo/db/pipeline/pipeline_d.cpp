@@ -27,222 +27,154 @@
  *    it in the license file.
  */
 
-#include "mongo/db/query/projection_parser.h"
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/pipeline_d.h"
 
+#include <algorithm>
+#include <bitset>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iterator>
+#include <list>
+#include <string>
+#include <tuple>
+#include <type_traits>
+#include <vector>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/base/exact_cast.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/db/basic_types.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/collection_scan.h"
-#include "mongo/db/exec/fetch.h"
+#include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/multi_iterator.h"
 #include "mongo/db/exec/multi_plan.h"
-#include "mongo/db/exec/queued_data_stage.h"
+#include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sample_from_timeseries_bucket.h"
 #include "mongo/db/exec/shard_filter.h"
+#include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/exec/shard_filterer_impl.h"
-#include "mongo/db/exec/subplan.h"
 #include "mongo/db/exec/trial_stage.h"
 #include "mongo/db/exec/unpack_timeseries_bucket.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_expr.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/write_ops_exec.h"
-#include "mongo/db/ops/write_ops_gen.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/document_source_geo_near.h"
 #include "mongo/db/pipeline/document_source_geo_near_cursor.h"
 #include "mongo/db/pipeline/document_source_group.h"
+#include "mongo/db/pipeline/document_source_group_base.h"
+#include "mongo/db/pipeline/document_source_internal_projection.h"
+#include "mongo/db/pipeline/document_source_internal_replace_root.h"
 #include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
 #include "mongo/db/pipeline/document_source_lookup.h"
 #include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_replace_root.h"
 #include "mongo/db/pipeline/document_source_sample.h"
 #include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
+#include "mongo/db/pipeline/document_source_set_window_fields.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/document_source_sort.h"
-#include "mongo/db/pipeline/inner_pipeline_stage_impl.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/search/search_helper.h"
 #include "mongo/db/pipeline/skip_and_limit.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/transformer_interface.h"
+#include "mongo/db/query/canonical_distinct.h"
+#include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/plan_executor_impl.h"
-#include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/db/query/planner_analysis.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/plan_yield_policy_impl.h"
+#include "mongo/db/query/plan_yield_policy_remote_cursor.h"
+#include "mongo/db/query/projection.h"
+#include "mongo/db/query/projection_parser.h"
+#include "mongo/db/query/projection_policies.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_knob_configuration.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_params.h"
+#include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/query/query_settings.h"
+#include "mongo/db/query/query_utils.h"
+#include "mongo/db/query/record_id_bound.h"
 #include "mongo/db/query/sort_pattern.h"
 #include "mongo/db/query/stage_types.h"
+#include "mongo/db/query/tailable_mode_gen.h"
+#include "mongo/db/query/timeseries/bucket_spec.h"
+#include "mongo/db/query/util/make_data_structure.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/scoped_collection_metadata.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/stats/top.h"
+#include "mongo/db/server_parameter.h"
+#include "mongo/db/server_parameter_with_storage.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/db/transaction_resources.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/s/query/document_source_merge_cursors.h"
+#include "mongo/s/query/exec/document_source_merge_cursors.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/scopeguard.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
-
 namespace mongo {
 
 using boost::intrusive_ptr;
-using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
-using write_ops::InsertCommandRequest;
-
 namespace {
-/**
- * Extracts a prefix of 'DocumentSourceGroup' and 'DocumentSourceLookUp' stages from the given
- * pipeline to prepare for pushdown of $group and $lookup into the inner query layer so that it
- * can be executed using SBE.
- * Group stages are extracted from the pipeline when all of the following conditions are met:
- *    - When the 'internalQueryForceClassicEngine' feature flag is 'false'.
- *    - When the 'internalQuerySlotBasedExecutionDisableGroupPushdown' query knob is 'false'.
- *    - When the DocumentSourceGroup has 'doingMerge=false'.
- *
- * Lookup stages are extracted from the pipeline when all of the following conditions are met:
- *    - When the 'internalQueryForceClassicEngine' feature flag is 'false'.
- *    - When the 'internalQuerySlotBasedExecutionDisableLookupPushdown' query knob is 'false'.
- *    - The $lookup uses only the 'localField'/'foreignField' syntax (no pipelines).
- *    - The foreign collection is neither sharded nor a view.
- */
-std::vector<std::unique_ptr<InnerPipelineStageInterface>> extractSbeCompatibleStagesForPushdown(
+std::unique_ptr<FindCommandRequest> createFindCommand(
     const intrusive_ptr<ExpressionContext>& expCtx,
-    const MultipleCollectionAccessor& collections,
-    const CanonicalQuery* cq,
-    Pipeline* pipeline) {
-    // We will eventually use the extracted group stages to populate 'CanonicalQuery::pipeline'
-    // which requires stages to be wrapped in an interface.
-    std::vector<std::unique_ptr<InnerPipelineStageInterface>> stagesForPushdown;
-
-    // This handles the case of unionWith against an unknown collection.
-    if (!collections.getMainCollection()) {
-        return {};
-    }
-
-    // No pushdown if we're using the classic engine.
-    if (cq->getForceClassicEngine()) {
-        return {};
-    }
-
-    auto&& sources = pipeline->getSources();
-
-    bool isMainCollectionSharded = false;
-    if (const auto& mainColl = collections.getMainCollection()) {
-        isMainCollectionSharded = mainColl.isSharded();
-    }
-
-    // If lookup pushdown isn't enabled or the main collection is sharded or any of the secondary
-    // namespaces are sharded or are a view, then no $lookup stage will be eligible for pushdown.
-    //
-    // When acquiring locks for multiple collections, it is the case that we can only determine
-    // whether any secondary collection is a view or is sharded, not which ones are a view or are
-    // sharded and which ones aren't. As such, if any secondary collection is a view or is sharded,
-    // no $lookup will be eligible for pushdown.
-    const bool disallowLookupPushdown =
-        internalQuerySlotBasedExecutionDisableLookupPushdown.load() || isMainCollectionSharded ||
-        collections.isAnySecondaryNamespaceAViewOrSharded();
-
-    std::map<NamespaceString, SecondaryCollectionInfo> secondaryCollInfo;
-    for (auto itr = sources.begin(); itr != sources.end();) {
-        const bool isLastSource = itr->get() == sources.back().get();
-
-        // $group pushdown logic.
-        if (auto groupStage = dynamic_cast<DocumentSourceGroup*>(itr->get())) {
-            if (internalQuerySlotBasedExecutionDisableGroupPushdown.load()) {
-                break;
-            }
-
-            if (groupStage->sbeCompatible() && !groupStage->doingMerge()) {
-                stagesForPushdown.push_back(
-                    std::make_unique<InnerPipelineStageImpl>(groupStage, isLastSource));
-                sources.erase(itr++);
-                continue;
-            }
-            break;
-        }
-
-        // $lookup pushdown logic.
-        if (auto lookupStage = dynamic_cast<DocumentSourceLookUp*>(itr->get())) {
-            if (disallowLookupPushdown) {
-                break;
-            }
-
-            // Note that 'lookupStage->sbeCompatible()' encodes whether the foreign collection is a
-            // view.
-            if (lookupStage->sbeCompatible()) {
-                // Fill out secondary collection information to assist in deciding whether we should
-                // push down any $lookup stages into SBE.
-                // TODO SERVER-67024: This should be removed once NLJ is re-enabled by default.
-                if (secondaryCollInfo.empty()) {
-                    secondaryCollInfo =
-                        fillOutSecondaryCollectionsInformation(expCtx->opCtx, collections, cq);
-                }
-
-                auto [strategy, _] = QueryPlannerAnalysis::determineLookupStrategy(
-                    lookupStage->getFromNs().toString(),
-                    lookupStage->getForeignField()->fullPath(),
-                    secondaryCollInfo,
-                    cq->getExpCtx()->allowDiskUse,
-                    cq->getCollator());
-
-                // While we do support executing NLJ in SBE, this join algorithm does not currently
-                // perform as well as executing $lookup in the classic engine, so fall back to
-                // classic unless 'gFeatureFlagSbeFull' is enabled.
-                if (strategy != EqLookupNode::LookupStrategy::kNestedLoopJoin ||
-                    feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV()) {
-                    stagesForPushdown.push_back(
-                        std::make_unique<InnerPipelineStageImpl>(lookupStage, isLastSource));
-                    sources.erase(itr++);
-                    continue;
-                }
-            }
-            break;
-        }
-
-        // Current stage cannot be pushed down.
-        break;
-    }
-
-    return stagesForPushdown;
-}
-
-StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExecutor(
-    const intrusive_ptr<ExpressionContext>& expCtx,
-    const MultipleCollectionAccessor& collections,
     const NamespaceString& nss,
     BSONObj queryObj,
     BSONObj projectionObj,
-    const QueryMetadataBitSet& metadataRequested,
     BSONObj sortObj,
     SkipThenLimit skipThenLimit,
-    boost::optional<std::string> groupIdForDistinctScan,
-    const AggregateCommandRequest* aggRequest,
-    const QueryPlannerParams& plannerOpts,
-    const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
-    Pipeline* pipeline) {
+    const AggregateCommandRequest* aggRequest) {
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
-    query_request_helper::setTailableMode(expCtx->tailableMode, findCommand.get());
+
+    query_request_helper::setTailableMode(expCtx->getTailableMode(), findCommand.get());
     findCommand->setFilter(queryObj.getOwned());
     findCommand->setProjection(projectionObj.getOwned());
     findCommand->setSort(sortObj.getOwned());
@@ -253,10 +185,16 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
         findCommand->setLimit(static_cast<std::int64_t>(*limit));
     }
 
-    const bool isExplain = static_cast<bool>(expCtx->explain);
     if (aggRequest) {
         findCommand->setAllowDiskUse(aggRequest->getAllowDiskUse());
         findCommand->setHint(aggRequest->getHint().value_or(BSONObj()).getOwned());
+        findCommand->setRequestResumeToken(aggRequest->getRequestResumeToken());
+        if (aggRequest->getResumeAfter()) {
+            findCommand->setResumeAfter(*aggRequest->getResumeAfter());
+        }
+        if (aggRequest->getStartAt()) {
+            findCommand->setStartAt(*aggRequest->getStartAt());
+        }
     }
 
     // The collation on the ExpressionContext has been resolved to either the user-specified
@@ -264,72 +202,44 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     // collator is simple.
     findCommand->setCollation(expCtx->getCollatorBSON().getOwned());
 
-    const ExtensionsCallbackReal extensionsCallback(expCtx->opCtx, &nss);
+    return findCommand;
+}
 
-    // Reset the 'sbeCompatible' flag before canonicalizing the 'findCommand' to potentially allow
-    // SBE to execute the portion of the query that's pushed down, even if the portion of the query
-    // that is not pushed down contains expressions not supported by SBE.
-    expCtx->sbeCompatible = true;
-
-    auto cq = CanonicalQuery::canonicalize(expCtx->opCtx,
-                                           std::move(findCommand),
-                                           isExplain,
-                                           expCtx,
-                                           extensionsCallback,
-                                           matcherFeatures,
-                                           ProjectionPolicies::aggregateProjectionPolicies());
-
-    if (!cq.isOK()) {
-        // Return an error instead of uasserting, since there are cases where the combination of
-        // sort and projection will result in a bad query, but when we try with a different
-        // combination it will be ok. e.g. a sort by {$meta: 'textScore'}, without any projection
-        // will fail, but will succeed when the corresponding '$meta' projection is passed in
-        // another attempt.
-        return {cq.getStatus()};
-    }
-
-    // Mark the metadata that's requested by the pipeline on the CQ.
-    cq.getValue()->requestAdditionalMetadata(metadataRequested);
-
-    if (groupIdForDistinctScan) {
-        // When the pipeline includes a $group that groups by a single field
-        // (groupIdForDistinctScan), we use getExecutorDistinct() to attempt to get an executor that
-        // uses a DISTINCT_SCAN to scan exactly one document for each group. When that's not
-        // possible, we return nullptr, and the caller is responsible for trying again without
-        // passing a 'groupIdForDistinctScan' value.
-        ParsedDistinct parsedDistinct(std::move(cq.getValue()), *groupIdForDistinctScan);
-
-        // Note that we request a "strict" distinct plan because:
-        // 1) We do not want to have to de-duplicate the results of the plan.
-        //
-        // 2) We not want a plan that will return separate values for each array element. For
-        // example, if we have a document {a: [1,2]} and group by "a" a DISTINCT_SCAN on an "a"
-        // index would produce one result for '1' and another for '2', which would be incorrect.
-        auto distinctExecutor =
-            getExecutorDistinct(&collections.getMainCollection(),
-                                plannerOpts.options | QueryPlannerParams::STRICT_DISTINCT_ONLY,
-                                &parsedDistinct);
-        if (!distinctExecutor.isOK()) {
-            return distinctExecutor.getStatus().withContext(
-                "Unable to use distinct scan to optimize $group stage");
-        } else if (!distinctExecutor.getValue()) {
-            return {ErrorCodes::NoQueryExecutionPlans,
-                    "Unable to use distinct scan to optimize $group stage"};
-        } else {
-            return distinctExecutor;
+/**
+ * Searches for indexes of a given geo type in 'collection' for use in $geoNear. Ignores hidden
+ * collections, and throws if there are more than one relevant non-hidden indexes.
+ *
+ * Returns the field name of a geo-indexed field, or boost::none if none were found.
+ */
+boost::optional<StringData> extractGeoNearFieldFromIndexesByType(OperationContext* opCtx,
+                                                                 const CollectionPtr& collection,
+                                                                 const string indexType) {
+    std::vector<const IndexDescriptor*> idxs;
+    const IndexDescriptor* idxToUse = nullptr;
+    collection->getIndexCatalog()->findIndexByType(opCtx, indexType, idxs);
+    for (auto it = idxs.begin(); it != idxs.end(); it++) {
+        // Ignore hidden indexes, which are indexes that users have explicitly marked as should be
+        // ignored/hidden from the query planner.
+        if (!(*it)->hidden()) {
+            uassert(ErrorCodes::IndexNotFound,
+                    str::stream() << "There is more than one " << indexType << " index on "
+                                  << collection->ns().toStringForErrorMsg()
+                                  << "; unsure which to use for $geoNear",
+                    !idxToUse);
+            idxToUse = *it;
         }
     }
 
-    auto permitYield = true;
-    return getExecutorFind(expCtx->opCtx,
-                           collections,
-                           std::move(cq.getValue()),
-                           [&](auto* canonicalQuery) {
-                               canonicalQuery->setPipeline(extractSbeCompatibleStagesForPushdown(
-                                   expCtx, collections, canonicalQuery, pipeline));
-                           },
-                           permitYield,
-                           plannerOpts);
+    if (idxToUse) {
+        for (auto&& elem : idxToUse->keyPattern()) {
+            if (elem.type() == BSONType::String && elem.valueStringData() == indexType) {
+                return elem.fieldNameStringData();
+            }
+        }
+        MONGO_UNREACHABLE;
+    }
+
+    return boost::none;
 }
 
 /**
@@ -342,39 +252,17 @@ StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx,
                                           const CollectionPtr& collection) {
     invariant(collection);
 
-    std::vector<const IndexDescriptor*> idxs;
-    collection->getIndexCatalog()->findIndexByType(opCtx, IndexNames::GEO_2D, idxs);
-    uassert(ErrorCodes::IndexNotFound,
-            str::stream() << "There is more than one 2d index on " << collection->ns().ns()
-                          << "; unsure which to use for $geoNear",
-            idxs.size() <= 1U);
-    if (idxs.size() == 1U) {
-        for (auto&& elem : idxs.front()->keyPattern()) {
-            if (elem.type() == BSONType::String && elem.valueStringData() == IndexNames::GEO_2D) {
-                return elem.fieldNameStringData();
-            }
-        }
-        MONGO_UNREACHABLE;
+    // Look for relevant 2d index first. If none, look for relevant 2dsphere index.
+    auto geoNearField = extractGeoNearFieldFromIndexesByType(opCtx, collection, IndexNames::GEO_2D);
+    if (!geoNearField) {
+        geoNearField =
+            extractGeoNearFieldFromIndexesByType(opCtx, collection, IndexNames::GEO_2DSPHERE);
     }
-
-    // If there are no 2d indexes, look for a 2dsphere index.
-    idxs.clear();
-    collection->getIndexCatalog()->findIndexByType(opCtx, IndexNames::GEO_2DSPHERE, idxs);
     uassert(ErrorCodes::IndexNotFound,
             "$geoNear requires a 2d or 2dsphere index, but none were found",
-            !idxs.empty());
-    uassert(ErrorCodes::IndexNotFound,
-            str::stream() << "There is more than one 2dsphere index on " << collection->ns().ns()
-                          << "; unsure which to use for $geoNear",
-            idxs.size() <= 1U);
+            geoNearField);
 
-    invariant(idxs.size() == 1U);
-    for (auto&& elem : idxs.front()->keyPattern()) {
-        if (elem.type() == BSONType::String && elem.valueStringData() == IndexNames::GEO_2DSPHERE) {
-            return elem.fieldNameStringData();
-        }
-    }
-    MONGO_UNREACHABLE;
+    return *geoNearField;
 }
 
 /**
@@ -410,33 +298,89 @@ std::pair<DocumentSourceSample*, DocumentSourceInternalUnpackBucket*> extractSam
     return std::pair{sampleStage, unpackStage};
 }
 
-std::tuple<DocumentSourceInternalUnpackBucket*, DocumentSourceSort*> findUnpackThenSort(
-    const Pipeline::SourceContainer& sources) {
-    DocumentSourceSort* sortStage = nullptr;
-    DocumentSourceInternalUnpackBucket* unpackStage = nullptr;
-
-    auto sourcesIt = sources.begin();
-    while (sourcesIt != sources.end()) {
-        if (!sortStage) {
-            sortStage = dynamic_cast<DocumentSourceSort*>(sourcesIt->get());
-
-            if (sortStage) {
-                // Do not double optimize
-                if (sortStage->isBoundedSortStage()) {
-                    return {nullptr, nullptr};
-                }
-
-                return {unpackStage, sortStage};
-            }
+bool areSortFieldsModifiedByEventProjection(const SortPattern& sortPattern,
+                                            const DocumentSource::GetModPathsReturn& modPaths) {
+    return std::any_of(sortPattern.begin(), sortPattern.end(), [&](const auto& sortPatternPart) {
+        const auto& fieldPath = sortPatternPart.fieldPath;
+        // We don't support the bounded sort optimization for sort by $meta.
+        if (!fieldPath) {
+            return true;
         }
 
-        if (!unpackStage) {
-            unpackStage = dynamic_cast<DocumentSourceInternalUnpackBucket*>(sourcesIt->get());
+        if (modPaths.canModify(*fieldPath)) {
+            return true;
         }
-        ++sourcesIt;
+
+        auto&& fieldPathStr = fieldPath->fullPath();
+        return (modPaths.renames.contains(fieldPathStr) ||
+                modPaths.complexRenames.contains(fieldPathStr));
+    });
+}
+
+bool areSortFieldsModifiedByBucketProjection(const SortPattern& sortPattern,
+                                             const DocumentSource::GetModPathsReturn& modPaths) {
+    // The time field maps to control.min.[time], control.max.[time], or
+    // _id, and $_internalUnpackBucket assumes that all of those fields are
+    // preserved. (We never push down a stage that would overwrite them.)
+
+    // Each field [meta].a.b.c maps to 'meta.a.b.c'.
+    auto rename = [&](const FieldPath& eventField) -> FieldPath {
+        if (eventField.getPathLength() == 1)
+            return timeseries::kBucketMetaFieldName;
+        return FieldPath{timeseries::kBucketMetaFieldName}.concat(eventField.tail());
+    };
+
+    return std::any_of(sortPattern.begin(),
+                       // Skip the last field, which is time: only check the meta fields
+                       std::prev(sortPattern.end()),
+                       [&](const auto& sortPatternPart) {
+                           auto bucketFieldPath = rename(*sortPatternPart.fieldPath);
+                           return modPaths.canModify(bucketFieldPath);
+                       });
+}
+
+bool areSortFieldsModifiedByProjection(bool seenUnpack,
+                                       const SortPattern& sortPattern,
+                                       const DocumentSource::GetModPathsReturn& modPaths) {
+    if (seenUnpack) {
+        // This stage operates on events: check the event-level field names.
+        return areSortFieldsModifiedByEventProjection(sortPattern, modPaths);
+    } else {
+        // This stage operates on buckets: check the bucket-level field names.
+        return areSortFieldsModifiedByBucketProjection(sortPattern, modPaths);
     }
+}
 
-    return {unpackStage, sortStage};
+// There can be exactly one unpack stage in a pipeline but multiple sort stages. We'll find the
+// _first_ sort.
+struct SortAndUnpackInPipeline {
+    DocumentSourceInternalUnpackBucket* unpack = nullptr;
+    DocumentSourceSort* sort = nullptr;
+    int unpackIdx = -1;
+    int sortIdx = -1;
+};
+SortAndUnpackInPipeline findUnpackAndSort(const Pipeline::SourceContainer& sources) {
+    SortAndUnpackInPipeline su;
+
+    int idx = 0;
+    auto itr = sources.begin();
+    while (itr != sources.end()) {
+        if (!su.unpack) {
+            su.unpack = dynamic_cast<DocumentSourceInternalUnpackBucket*>(itr->get());
+            su.unpackIdx = idx;
+        }
+        if (!su.sort) {
+            su.sort = dynamic_cast<DocumentSourceSort*>(itr->get());
+            su.sortIdx = idx;
+        }
+        if (su.unpack && su.sort) {
+            break;
+        }
+
+        ++itr;
+        ++idx;
+    }
+    return su;
 }
 }  // namespace
 
@@ -446,15 +390,27 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
     Pipeline* pipeline,
     long long sampleSize,
     long long numRecords,
-    boost::optional<BucketUnpacker> bucketUnpacker) {
-    OperationContext* opCtx = expCtx->opCtx;
+    boost::optional<timeseries::BucketUnpacker> bucketUnpacker) {
+    OperationContext* opCtx = expCtx->getOperationContext();
 
-    // Verify that we are already under a collection lock. We avoid taking locks ourselves in this
-    // function because double-locking forces any PlanExecutor we create to adopt a NO_YIELD policy.
-    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_IS));
+    // Verify that we are already under a collection lock or in a lock-free read. We avoid taking
+    // locks ourselves in this function because double-locking forces any PlanExecutor we create to
+    // adopt an INTERRUPT_ONLY policy.
+    invariant(opCtx->isLockFreeReadsOp() ||
+              shard_role_details::getLocker(opCtx)->isCollectionLockedForMode(coll->ns(), MODE_IS));
 
-    static const double kMaxSampleRatioForRandCursor = 0.05;
-    if (!expCtx->ns.isTimeseriesBucketsCollection()) {
+    auto* clusterParameters = ServerParameterSet::getClusterParameterSet();
+    auto* randomCursorSampleRatioParam =
+        clusterParameters
+            ->get<ClusterParameterWithStorage<InternalQueryCutoffForSampleFromRandomCursorStorage>>(
+                "internalQueryCutoffForSampleFromRandomCursor");
+
+    auto maxSampleRatioClusterParameter =
+        randomCursorSampleRatioParam->getValue(expCtx->getNamespaceString().tenantId());
+
+    const double kMaxSampleRatioForRandCursor = maxSampleRatioClusterParameter.getSampleCutoff();
+
+    if (!expCtx->getNamespaceString().isTimeseriesBucketsCollection()) {
         if (sampleSize > numRecords * kMaxSampleRatioForRandCursor || numRecords <= 100) {
             return nullptr;
         }
@@ -484,20 +440,28 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
     // Build a MultiIteratorStage and pass it the random-sampling RecordCursor.
     auto ws = std::make_unique<WorkingSet>();
     std::unique_ptr<PlanStage> root =
-        std::make_unique<MultiIteratorStage>(expCtx.get(), ws.get(), coll);
+        std::make_unique<MultiIteratorStage>(expCtx.get(), ws.get(), &coll);
     static_cast<MultiIteratorStage*>(root.get())->addIterator(std::move(rsRandCursor));
 
     TrialStage* trialStage = nullptr;
 
-    auto css = CollectionShardingState::get(opCtx, coll->ns());
-    const auto isSharded = css->getCollectionDescription(opCtx).isSharded();
+    const auto [isSharded, optOwnershipFilter] = [&]() {
+        auto scopedCss =
+            CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, coll->ns());
+        const bool isSharded = scopedCss->getCollectionDescription(opCtx).isSharded();
+        boost::optional<ScopedCollectionFilter> optFilter = isSharded
+            ? boost::optional<ScopedCollectionFilter>(scopedCss->getOwnershipFilter(
+                  opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup))
+            : boost::none;
+        return std::pair(isSharded, std::move(optFilter));
+    }();
 
     // Because 'numRecords' includes orphan documents, our initial decision to optimize the $sample
     // cursor may have been mistaken. For sharded collections, build a TRIAL plan that will switch
     // to a collection scan if the ratio of orphaned to owned documents encountered over the first
     // 100 works() is such that we would have chosen not to optimize.
     static const size_t kMaxPresampleSize = 100;
-    if (expCtx->ns.isTimeseriesBucketsCollection()) {
+    if (expCtx->getNamespaceString().isTimeseriesBucketsCollection()) {
         // We can't take ARHASH optimization path for a direct $sample on the system.buckets
         // collection because data is in compressed form. If we did have a direct $sample on the
         // system.buckets collection, then the 'bucketUnpacker' would not be set up properly. We
@@ -544,8 +508,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
         if (isSharded) {
             // In the sharded case, we need to use a ShardFilterer within the ARHASH plan to
             // eliminate orphans from the working set, since the stage owns the cursor.
-            maybeShardFilter = std::make_unique<ShardFiltererImpl>(css->getOwnershipFilter(
-                opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup));
+            invariant(optOwnershipFilter);
+            maybeShardFilter = std::make_unique<ShardFiltererImpl>(*optOwnershipFilter);
         }
 
         auto arhashPlan = std::make_unique<SampleFromTimeseriesBucket>(
@@ -562,15 +526,14 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
             gTimeseriesBucketMaxCount);
 
         std::unique_ptr<PlanStage> collScanPlan = std::make_unique<CollectionScan>(
-            expCtx.get(), coll, CollectionScanParams{}, ws.get(), nullptr);
+            expCtx.get(), &coll, CollectionScanParams{}, ws.get(), nullptr);
 
         if (isSharded) {
             // In the sharded case, we need to add a shard-filterer stage to the backup plan to
             // eliminate orphans. The trial plan is thus SHARDING_FILTER-COLLSCAN.
-            auto collectionFilter = css->getOwnershipFilter(
-                opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
+            invariant(optOwnershipFilter);
             collScanPlan = std::make_unique<ShardFilterStage>(
-                expCtx.get(), std::move(collectionFilter), ws.get(), std::move(collScanPlan));
+                expCtx.get(), *optOwnershipFilter, ws.get(), std::move(collScanPlan));
         }
 
         auto topkSortPlan = std::make_unique<UnpackTimeseriesBucket>(
@@ -609,16 +572,15 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
         // Since the incoming operation is sharded, use the CSS to infer the filtering metadata for
         // the collection. We get the shard ownership filter after checking to see if the collection
         // is sharded to avoid an invariant from being fired in this call.
-        auto collectionFilter = css->getOwnershipFilter(
-            opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
+        invariant(optOwnershipFilter);
         // The trial plan is SHARDING_FILTER-MULTI_ITERATOR.
         auto randomCursorPlan = std::make_unique<ShardFilterStage>(
-            expCtx.get(), collectionFilter, ws.get(), std::move(root));
+            expCtx.get(), *optOwnershipFilter, ws.get(), std::move(root));
         // The backup plan is SHARDING_FILTER-COLLSCAN.
         std::unique_ptr<PlanStage> collScanPlan = std::make_unique<CollectionScan>(
-            expCtx.get(), coll, CollectionScanParams{}, ws.get(), nullptr);
+            expCtx.get(), &coll, CollectionScanParams{}, ws.get(), nullptr);
         collScanPlan = std::make_unique<ShardFilterStage>(
-            expCtx.get(), collectionFilter, ws.get(), std::move(collScanPlan));
+            expCtx.get(), *optOwnershipFilter, ws.get(), std::move(collScanPlan));
         // Place a TRIAL stage at the root of the plan tree, and pass it the trial and backup plans.
         root = std::make_unique<TrialStage>(expCtx.get(),
                                             ws.get(),
@@ -629,16 +591,16 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
         trialStage = static_cast<TrialStage*>(root.get());
     }
 
-    auto execStatus = plan_executor_factory::make(expCtx,
-                                                  std::move(ws),
-                                                  std::move(root),
-                                                  &coll,
-                                                  opCtx->inMultiDocumentTransaction()
-                                                      ? PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY
-                                                      : PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
-                                                  QueryPlannerParams::RETURN_OWNED_DATA);
-    if (!execStatus.isOK()) {
-        return execStatus.getStatus();
+    constexpr auto yieldPolicy = PlanYieldPolicy::YieldPolicy::YIELD_AUTO;
+    if (trialStage) {
+        auto classicTrialPolicy = makeClassicYieldPolicy(expCtx->getOperationContext(),
+                                                         coll->ns(),
+                                                         static_cast<PlanStage*>(trialStage),
+                                                         yieldPolicy,
+                                                         VariantCollectionPtrOrAcquisition{&coll});
+        if (auto status = trialStage->pickBestPlan(classicTrialPolicy.get()); !status.isOK()) {
+            return status;
+        }
     }
 
     // For sharded collections, the root of the plan tree is a TrialStage that may have chosen
@@ -670,24 +632,30 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::createRan
         }
     }
 
-    return std::move(execStatus.getValue());
+    return plan_executor_factory::make(expCtx,
+                                       std::move(ws),
+                                       std::move(root),
+                                       &coll,
+                                       yieldPolicy,
+                                       QueryPlannerParams::RETURN_OWNED_DATA,
+                                       coll->ns());
 }
 
-std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-PipelineD::buildInnerQueryExecutorSample(DocumentSourceSample* sampleStage,
-                                         DocumentSourceInternalUnpackBucket* unpackBucketStage,
-                                         const CollectionPtr& collection,
-                                         Pipeline* pipeline) {
+PipelineD::BuildQueryExecutorResult PipelineD::buildInnerQueryExecutorSample(
+    DocumentSourceSample* sampleStage,
+    DocumentSourceInternalUnpackBucket* unpackBucketStage,
+    const CollectionPtr& collection,
+    Pipeline* pipeline) {
     tassert(5422105, "sampleStage cannot be a nullptr", sampleStage);
 
     auto expCtx = pipeline->getContext();
 
     const long long sampleSize = sampleStage->getSampleSize();
-    const long long numRecords = collection->getRecordStore()->numRecords(expCtx->opCtx);
+    const long long numRecords = collection->getRecordStore()->numRecords();
 
-    boost::optional<BucketUnpacker> bucketUnpacker;
+    boost::optional<timeseries::BucketUnpacker> bucketUnpacker;
     if (unpackBucketStage) {
-        bucketUnpacker = unpackBucketStage->bucketUnpacker();
+        bucketUnpacker = unpackBucketStage->bucketUnpacker().copy();
     }
     auto exec = uassertStatusOK(createRandomCursorExecutor(
         collection, expCtx, pipeline, sampleSize, numRecords, std::move(bucketUnpacker)));
@@ -711,22 +679,28 @@ PipelineD::buildInnerQueryExecutorSample(DocumentSourceSample* sampleStage,
                     collections, std::move(exec), pipeline->getContext(), cursorType);
                 pipeline->addInitialSource(std::move(cursor));
             };
-        return std::pair(std::move(attachExecutorCallback), std::move(exec));
+        return {std::move(exec), std::move(attachExecutorCallback), {}};
     }
-    return std::pair(std::move(attachExecutorCallback), nullptr);
+    return {nullptr, std::move(attachExecutorCallback), {}};
 }
 
-std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-PipelineD::buildInnerQueryExecutor(const MultipleCollectionAccessor& collections,
-                                   const NamespaceString& nss,
-                                   const AggregateCommandRequest* aggRequest,
-                                   Pipeline* pipeline) {
+PipelineD::BuildQueryExecutorResult PipelineD::buildInnerQueryExecutor(
+    const MultipleCollectionAccessor& collections,
+    const NamespaceString& nss,
+    const AggregateCommandRequest* aggRequest,
+    Pipeline* pipeline,
+    ExecShardFilterPolicy shardFilterPolicy) {
     auto expCtx = pipeline->getContext();
 
     // We will be modifying the source vector as we go.
     Pipeline::SourceContainer& sources = pipeline->_sources;
 
-    if (!sources.empty() && !sources.front()->constraints().requiresInputDocSource) {
+    // We skip the 'requiresInputDocSource' check in the case of pushing $search down into SBE,
+    // as $search has 'requiresInputDocSource' as false.
+    bool skipRequiresInputDocSourceCheck = isSearchPresentAndEligibleForSbe(pipeline);
+
+    if (!skipRequiresInputDocSourceCheck && !sources.empty() &&
+        !sources.front()->constraints().requiresInputDocSource) {
         return {};
     }
 
@@ -738,10 +712,10 @@ PipelineD::buildInnerQueryExecutor(const MultipleCollectionAccessor& collections
 
         // Optimize an initial $sample stage if possible.
         if (collection && sampleStage) {
-            auto [attachExecutorCallback, exec] =
+            auto queryExecutors =
                 buildInnerQueryExecutorSample(sampleStage, unpackBucketStage, collection, pipeline);
-            if (exec) {
-                return std::make_pair(std::move(attachExecutorCallback), std::move(exec));
+            if (queryExecutors.mainExecutor) {
+                return queryExecutors;
             }
         }
     }
@@ -752,8 +726,12 @@ PipelineD::buildInnerQueryExecutor(const MultipleCollectionAccessor& collections
         sources.empty() ? nullptr : dynamic_cast<DocumentSourceGeoNear*>(sources.front().get());
     if (geoNearStage) {
         return buildInnerQueryExecutorGeoNear(collections, nss, aggRequest, pipeline);
+    } else if (search_helpers::isSearchPipeline(pipeline) ||
+               search_helpers::isSearchMetaPipeline(pipeline)) {
+        return buildInnerQueryExecutorSearch(collections, nss, aggRequest, pipeline);
     } else {
-        return buildInnerQueryExecutorGeneric(collections, nss, aggRequest, pipeline);
+        return buildInnerQueryExecutorGeneric(
+            collections, nss, aggRequest, pipeline, shardFilterPolicy);
     }
 }
 
@@ -774,48 +752,51 @@ void PipelineD::buildAndAttachInnerQueryExecutorToPipeline(
     const MultipleCollectionAccessor& collections,
     const NamespaceString& nss,
     const AggregateCommandRequest* aggRequest,
-    Pipeline* pipeline) {
+    Pipeline* pipeline,
+    ExecShardFilterPolicy shardFilterPolicy) {
 
-    auto callback = PipelineD::buildInnerQueryExecutor(collections, nss, aggRequest, pipeline);
-    PipelineD::attachInnerQueryExecutorToPipeline(
-        collections, callback.first, std::move(callback.second), pipeline);
+    auto [executor, callback, additionalExec] =
+        buildInnerQueryExecutor(collections, nss, aggRequest, pipeline, shardFilterPolicy);
+    tassert(7856010, "Unexpected additional executors", additionalExec.empty());
+    attachInnerQueryExecutorToPipeline(collections, callback, std::move(executor), pipeline);
 }
 
 namespace {
 
 /**
- * Look for $sort, $group at the beginning of the pipeline, potentially returning either or both.
- * Returns nullptr for any of the stages that are not found. Note that we are not looking for the
- * opposite pattern ($group, $sort). In that case, this function will return only the $group stage.
+ * Checks if $group or $sort+$group at the beginning of the pipeline that could qualify for the
+ * DISTINCT_SCAN plan that visits the first document in each group (SERVER-9507). If found, return
+ * the stage that would replace them in the pipeline on top of DISTINCT_SCAN.
  *
- * This function will not return the $group in the case that there is an initial $sort with
- * intermediate stages that separate it from the $group (e.g.: $sort, $limit, $group). That includes
- * the case of a $sort with a non-null value for getLimitSrc(), indicating that there was previously
- * a $limit stage that was optimized away.
+ * Returns a pair of:
+ * - first: the optional sort pattern of $group's $top and/or $bottom's common sort pattern.
+ * - second: the stage that would replace $group in the pipeline on top of DISTINCT_SCAN.
  */
-std::pair<boost::intrusive_ptr<DocumentSourceSort>, boost::intrusive_ptr<DocumentSourceGroup>>
-getSortAndGroupStagesFromPipeline(const Pipeline::SourceContainer& sources) {
-    boost::intrusive_ptr<DocumentSourceSort> sortStage = nullptr;
-    boost::intrusive_ptr<DocumentSourceGroup> groupStage = nullptr;
-
+std::pair<boost::optional<SortPattern>, std::unique_ptr<GroupFromFirstDocumentTransformation>>
+tryDistinctGroupRewrite(const Pipeline::SourceContainer& sources) {
     auto sourcesIt = sources.begin();
     if (sourcesIt != sources.end()) {
-        sortStage = dynamic_cast<DocumentSourceSort*>(sourcesIt->get());
+        auto sortStage = dynamic_cast<DocumentSourceSort*>(sourcesIt->get());
         if (sortStage) {
             if (!sortStage->hasLimit()) {
                 ++sourcesIt;
             } else {
-                // This $sort stage was previously followed by a $limit stage.
-                sourcesIt = sources.end();
+                // This $sort stage was previously followed by a $limit stage which disqualifies it
+                // from DISTINCT_SCAN.
+                return {boost::none, nullptr};
             }
         }
     }
 
-    if (sourcesIt != sources.end()) {
-        groupStage = dynamic_cast<DocumentSourceGroup*>(sourcesIt->get());
+    if (sourcesIt == sources.end()) {
+        return {boost::none, nullptr};
     }
 
-    return std::make_pair(sortStage, groupStage);
+    if (auto groupStage = dynamic_cast<DocumentSourceGroupBase*>(sourcesIt->get()); groupStage) {
+        return groupStage->rewriteGroupAsTransformOnFirstDocument();
+    } else {
+        return {boost::none, nullptr};
+    }
 }
 
 boost::optional<long long> extractSkipForPushdown(Pipeline* pipeline) {
@@ -862,16 +843,21 @@ SkipThenLimit extractSkipAndLimitForPushdown(Pipeline* pipeline) {
  *       as is.
  *    2. If there is no inclusion projection at the front of the pipeline, but there is a finite
  *       dependency set, a projection representing this dependency set will be pushed down.
- *    3. Otherwise, an empty projection is returned and no projection push down will happen.
+ *    3. If there is an exclusion projection at the front of the pipeline, it will be pushed down.
+ *    4. Otherwise, an empty projection is returned and no projection push down will happen.
  *
  * If 'allowExpressions' is true, the returned projection may include expressions (which can only
  * happen in case 1). If 'allowExpressions' is false and the projection we find has expressions,
  * then we fall through to case 2 and attempt to push down a pure-inclusion projection based on its
  * dependencies.
+ *
+ * If 'timeseriesBoundedSortOptimization' is true, an exclusion projection won't be pushed down,
+ * because it breaks PlanExecutorImpl analysis required to enable this optimization.
  */
 auto buildProjectionForPushdown(const DepsTracker& deps,
                                 Pipeline* pipeline,
-                                bool allowExpressions) {
+                                bool allowExpressions,
+                                bool timeseriesBoundedSortOptimization) {
     auto&& sources = pipeline->getSources();
 
     // Short-circuit if the pipeline is empty: there is no projection and nothing to push down.
@@ -879,35 +865,545 @@ auto buildProjectionForPushdown(const DepsTracker& deps,
         return BSONObj();
     }
 
-    if (const auto projStage =
-            exact_pointer_cast<DocumentSourceSingleDocumentTransformation*>(sources.front().get());
-        projStage) {
-        if (projStage->getType() == TransformerInterface::TransformerType::kInclusionProjection) {
-            auto projObj =
-                projStage->getTransformer().serializeTransformation(boost::none).toBson();
-            auto projAst =
-                projection_ast::parseAndAnalyze(projStage->getContext(),
-                                                projObj,
-                                                ProjectionPolicies::aggregateProjectionPolicies());
-            if (!projAst.hasExpressions() || allowExpressions) {
-                // If there is an inclusion projection at the front of the pipeline, we have case 1.
-                sources.pop_front();
-                return projObj;
-            }
+    const auto projStage =
+        exact_pointer_cast<DocumentSourceSingleDocumentTransformation*>(sources.front().get());
+    const auto getProjectionObj = [&]() {
+        return projStage->getTransformer().serializeTransformation().toBson();
+    };
+    const auto parseProjection = [&](const BSONObj& projObj) {
+        return projection_ast::parseAndAnalyze(
+            projStage->getContext(), projObj, ProjectionPolicies::aggregateProjectionPolicies());
+    };
+
+    // If there is an inclusion projection at the front of the pipeline, we have case 1.
+    if (projStage &&
+        projStage->getTransformerType() ==
+            TransformerInterface::TransformerType::kInclusionProjection) {
+        auto projObj = getProjectionObj();
+        if (allowExpressions || !parseProjection(projObj).hasExpressions()) {
+            sources.pop_front();
+            return projObj;
         }
     }
 
-    // Depending of whether there is a finite dependency set, either return a projection
-    // representing this dependency set, or an empty BSON, meaning no projection push down will
-    // happen. This covers cases 2 and 3.
-    if (deps.getNeedsAnyMetadata())
-        return BSONObj();
-    return deps.toProjectionWithoutMetadata();
+    // If there is a finite dependency set, return a projection representing this dependency set.
+    // This is case 2.
+    if (!deps.getNeedsAnyMetadata()) {
+        BSONObj depsProjObj = deps.toProjectionWithoutMetadata();
+        if (!depsProjObj.isEmpty()) {
+            return depsProjObj;
+        }
+    }
+
+    // If there is an exclusion projection at the front of the pipeline, we have case 3.
+    if (projStage &&
+        projStage->getTransformerType() ==
+            TransformerInterface::TransformerType::kExclusionProjection &&
+        // TODO SERVER-70655: Remove this check and argument when it is no longer needed.
+        !timeseriesBoundedSortOptimization) {
+        auto projObj = getProjectionObj();
+        if (allowExpressions || !parseProjection(projObj).hasExpressions()) {
+            sources.pop_front();
+            return projObj;
+        }
+    }
+
+    // Case 4: no projection to push down
+    return BSONObj();
 }
+
+/**
+ * Does the last-minute analysis of the pipeline to see if any sort, skip and limit stages could be
+ * pushed down into the PlanStage layer and creates a CanonicalQuery that represents the plan.
+ *
+ * Side effect: this function modifies 'pipeline' for the last-minute optimization but those
+ * modifications are visible only when this function succeeds to generate a canonical query.
+ */
+StatusWith<std::unique_ptr<CanonicalQuery>> createCanonicalQuery(
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& nss,
+    Pipeline* pipeline,
+    QueryMetadataBitSet unavailableMetadata,
+    const BSONObj& queryObj,
+    boost::intrusive_ptr<DocumentSourceMatch> leadingMatch,
+    const boost::optional<SortPattern>& sortPattern,
+    const AggregateCommandRequest* aggRequest,
+    const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
+    bool timeseriesBoundedSortOptimization,
+    bool* shouldProduceEmptyDocs) {
+    invariant(shouldProduceEmptyDocs);
+
+    // =============================================================================================
+    // Do a few last-minute optimizations that push some of the stages from the pipeline into the
+    // PlanStage layer.
+    // =============================================================================================
+    // We check for sort before we might push down and remove skip and limit from the pipeline
+    // because... this is how it's been done historically.
+    boost::intrusive_ptr<DocumentSourceSort> sortStage =
+        dynamic_cast<DocumentSourceSort*>(pipeline->peekFront());
+
+    // If there is a $limit or $skip stage (or multiple of them) that could be pushed down into
+    // the PlanStage layer, obtain the value of the limit and skip and remove the $limit and $skip
+    // stages from the pipeline.
+    //
+    // This analysis is done here rather than in 'optimizePipeline()' because swapping $limit before
+    // stages such as $project is not always useful, and can sometimes defeat other optimizations.
+    // In particular, in a sharded scenario a pipeline such as [$project, $limit] is preferable to
+    // [$limit, $project]. The former permits the execution of the projection operation to be
+    // parallelized across all targeted shards, whereas the latter would bring all of the data to a
+    // merging shard first, and then apply the projection serially. See SERVER-24981 for a more
+    // detailed discussion.
+    //
+    // This only handles the case in which the $limit or $skip can logically be swapped to the front
+    // of the pipeline. Note, that these cannot be swapped with $sort but if there was a $limit
+    // after a $sort it should have been handled already (in the case 'sortStage' would have
+    // hasLimit() set on it).
+    auto skipThenLimit = extractSkipAndLimitForPushdown(pipeline);
+
+    // If there is a sort stage or a sort pattern eligible for pushdown, serialize its SortPattern
+    // to a BSONObj. The BSONObj format is currently necessary to request that the sort is computed
+    // by the query layer inside the inner PlanExecutor. We also remove the $sort stage from the
+    // Pipeline, since it will be handled instead by PlanStage execution.
+    BSONObj sortObj;
+    if (sortStage) {
+        sortObj = sortStage->getSortKeyPattern()
+                      .serialize(SortPattern::SortKeySerialization::kForPipelineSerialization)
+                      .toBson();
+
+        pipeline->popFrontWithName(DocumentSourceSort::kStageName);
+
+        // Since all $limit stages were already incorporated into the sort stage, we are only
+        // looking for $skip stages.
+        auto skip = extractSkipForPushdown(pipeline);
+
+        // Since the limit from $sort is going before the extracted $skip stages, we construct
+        // 'LimitThenSkip' object and then convert it 'SkipThenLimit'.
+        skipThenLimit = LimitThenSkip(sortStage->getLimit(), skip).flip();
+    } else if (sortPattern) {
+        sortObj =
+            sortPattern->serialize(SortPattern::SortKeySerialization::kForPipelineSerialization)
+                .toBson();
+    }
+    // =============================================================================================
+    // The end of last-minute pipeline optimizations.
+    // =============================================================================================
+
+    // Perform dependency analysis. In order to minimize the dependency set, we only analyze the
+    // stages that remain in the pipeline after pushdown. In particular, any dependencies for a
+    // $match or $sort pushed down into the query layer will not be reflected here.
+    auto deps = pipeline->getDependencies(unavailableMetadata);
+    *shouldProduceEmptyDocs = deps.hasNoRequirements();
+
+    BSONObj projObj;
+    if (!*shouldProduceEmptyDocs) {
+        // Build a BSONObj representing a projection eligible for pushdown. If there is an inclusion
+        // projection at the front of the pipeline, it will be removed and handled by the PlanStage
+        // layer. If a projection cannot be pushed down, an empty BSONObj will be returned.
+        //
+        // In most cases .find() behaves as if it evaluates in a predictable order:
+        //     predicate, sort, skip, limit, projection.
+        // But there is at least one case where it runs the projection before the sort/skip/limit:
+        // when the predicate has a rooted $or.  (In that case we plan each branch of the $or
+        // separately, using Subplan, and include the projection on each branch.)
+        //
+        // To work around this behavior, don't allow pushing down expressions if we are also going
+        // to push down a sort, skip or limit. We don't want the expressions to be evaluated on any
+        // documents that the sort/skip/limit would have filtered out. (The sort stage can be a
+        // top-k sort, which both sorts and limits.)
+        const bool allowExpressions =
+            !sortStage && !skipThenLimit.getSkip() && !skipThenLimit.getLimit();
+        projObj = buildProjectionForPushdown(
+            deps, pipeline, allowExpressions, timeseriesBoundedSortOptimization);
+    }
+
+    std::unique_ptr<FindCommandRequest> findCommand =
+        createFindCommand(expCtx, nss, queryObj, projObj, sortObj, skipThenLimit, aggRequest);
+
+    auto parsedFind = [&](auto leadingMatch,
+                          auto findCommand) -> std::unique_ptr<ParsedFindCommand> {
+        // We can only re-use the parsed MatchExpression if the filter does not require the special
+        // $text extension since the $match stage by default will use the no-op extensions callback.
+        // Do not need to worry about $where extension since it's not allowed within the $match
+        // stage.
+        if (leadingMatch && !leadingMatch->isTextQuery()) {
+            // The $match stage manages its own state for SBE compatibility without modifying the
+            // ExpressionContext. Instead of re-parsing the MatchExpression to set the
+            // compatibility we manually set it here.
+            expCtx->setSbeCompatibility(leadingMatch->sbeCompatibility());
+            tassert(8897900,
+                    "Expected non-empty query for pushing down leading $match stage",
+                    !queryObj.isEmpty());
+            return uassertStatusOK(ParsedFindCommand::withExistingFilter(
+                expCtx,
+                expCtx->getCollator() ? expCtx->getCollator()->clone() : nullptr,
+                leadingMatch->getMatchExpression()->clone(),
+                std::move(findCommand),
+                ProjectionPolicies::aggregateProjectionPolicies()));
+        } else {
+            // Reset the 'sbeCompatible' flag before canonicalizing the 'findCommand' to potentially
+            // allow SBE to execute the portion of the query that's pushed down, even if the portion
+            // of the query that is not pushed down contains expressions not supported by SBE.
+            expCtx->setSbeCompatibility(SbeCompatibility::noRequirements);
+            return uassertStatusOK(parsed_find_command::parse(
+                expCtx,
+                ParsedFindCommandParams{
+                    .findCommand = std::move(findCommand),
+                    .extensionsCallback =
+                        ExtensionsCallbackReal(expCtx->getOperationContext(), &nss),
+                    .allowedFeatures = matcherFeatures,
+                    .projectionPolicies = ProjectionPolicies::aggregateProjectionPolicies()}));
+        }
+    }(std::move(leadingMatch), std::move(findCommand));
+
+    StatusWith<std::unique_ptr<CanonicalQuery>> swCq = CanonicalQuery::make(
+        {.expCtx = expCtx,
+         .parsedFind = std::move(parsedFind),
+         .isCountLike = *shouldProduceEmptyDocs,
+         .isSearchQuery = PipelineD::isSearchPresentAndEligibleForSbe(pipeline)});
+
+    if (!swCq.isOK()) {
+        return swCq.getStatus();
+    }
+
+    swCq.getValue()->requestAdditionalMetadata(deps.metadataDeps());
+    swCq.getValue()->setSearchMetadata(deps.searchMetadataDeps());
+
+    return swCq;
+}
+
+/**
+ * Tries to generate a distinct query executor for $sort+$group with $first/$last or $group with
+ * $top/$bottom if a proper index exists for the $sort or $top/$bottom's sortBy sort pattern. For
+ * example, the following pipeline
+ *
+ * [
+ *   {$sort: {a: 1, b: 1}},
+ *   {$group: {_id: "$a", fc: {$first: "$c"}}}
+ * ]
+ *
+ * can be optimized into
+ *
+ * [
+ *   {$cursor: {DISTINCT_SCAN over a_1_b_1 index}},     --> distinct_scan query executor
+ *   {$groupByDistinct {newRoot: {id: "$a", fc: "$c"}}}
+ * ]
+ *
+ * The same optimization can be applied to $group with $top or $bottom. For example, the following
+ * pipeline
+ *
+ * [{$group: {_id: "$a", tc: {$top: {sortBy: {a: 1, b: 1}, output: "$c"}}}}]
+ *
+ * can be optimized into
+ *
+ * [
+ *   {$cursor: {DISTINCT_SCAN over a_1_b_1 index}},     --> distinct_scan query executor
+ *   {$groupByDistinct {newRoot: {id: "$a", tc: "$c"}}}
+ * ]
+ *
+ * Returns:
+ * 1) Status::OK() and a distinct executor if succeeds to generate a distinct executor.
+ * 2) NoQueryExecutionPlans error code if fails to generate a canonical query. This should be
+ *    considered as a final failure of prepareExecutor().
+ * 3) Status::OK() and an optimized CanonicalQuery if fails to generate a distinct executor in any
+ *    reason other than 2) and need to continue to generate a non-distinct executor.
+ */
+StatusWith<std::variant<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>,
+                        std::unique_ptr<CanonicalQuery>>>
+tryPrepareDistinctExecutor(const intrusive_ptr<ExpressionContext>& expCtx,
+                           const MultipleCollectionAccessor& collections,
+                           const NamespaceString& nss,
+                           Pipeline* pipeline,
+                           QueryMetadataBitSet unavailableMetadata,
+                           const BSONObj& queryObj,
+                           boost::intrusive_ptr<DocumentSourceMatch> leadingMatch,
+                           const AggregateCommandRequest* aggRequest,
+                           const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
+                           bool* shouldProduceEmptyDocs,
+                           bool timeseriesBoundedSortOptimization,
+                           std::size_t plannerOpts) {
+    // We want to do this before createCanonicalQuery() which does the last-minute optimization to
+    // 'pipeline' and hence modifies it.
+    auto [sortPattern, rewrittenGroupStage] = tryDistinctGroupRewrite(pipeline->getSources());
+
+    const bool isDistinctMultiplanningEnabled =
+        expCtx->isFeatureFlagShardFilteringDistinctScanEnabled();
+
+    auto sortPatternForCanonicalQuery = (isDistinctMultiplanningEnabled || !rewrittenGroupStage)
+        // If the pipeline has a $sort, the sort pattern for the canonical
+        // query will be pulled from that stage directly. Otherwise sorting is required only when a
+        // distinct scan plan is selected so we attach the sort pattern to the CanonicalDistinct
+        // instead.
+        ? boost::optional<SortPattern>()
+        // If the feature flag is disabled, preserve old behavior by passing the sortPattern to the
+        // canonical query when the distinct scan optimization is applicable. No multiplanning will
+        // be done in this case.
+        : sortPattern;
+
+    auto swCq = createCanonicalQuery(expCtx,
+                                     nss,
+                                     pipeline,
+                                     unavailableMetadata,
+                                     queryObj,
+                                     leadingMatch,
+                                     std::move(sortPatternForCanonicalQuery),
+                                     aggRequest,
+                                     matcherFeatures,
+                                     timeseriesBoundedSortOptimization,
+                                     shouldProduceEmptyDocs);
+    if (!swCq.isOK()) {
+        // Return an error instead of uasserting, since there are cases where the combination of
+        // sort and projection will result in a bad query, but when we try with a different
+        // combination it will be ok. e.g. a sort by {$meta: 'textScore'}, without any projection
+        // will fail, but will succeed when the corresponding '$meta' projection is passed in
+        // another attempt.
+        return {swCq.getStatus()};
+    }
+
+    auto cq = std::move(swCq.getValue());
+
+    // If the pipeline is not eligible for distinct executor, returns the CanonicalQuery so that we
+    // can create a non-distinct executor. We don't want to lose the work done inside
+    // createCanonicalQuery()
+    if (!rewrittenGroupStage) {
+        return StatusWith{std::move(cq)};
+    }
+
+    // If the feature flag is disabled, preserve the old behavior where we reset planner options
+    // when constructing an executor for distinct.
+    plannerOpts = isDistinctMultiplanningEnabled ? plannerOpts : QueryPlannerParams::DEFAULT;
+    plannerOpts |= QueryPlannerParams::STRICT_DISTINCT_ONLY;
+
+    if (!*shouldProduceEmptyDocs) {
+        plannerOpts |= QueryPlannerParams::RETURN_OWNED_DATA;
+    }
+
+    // If the GroupFromFirst transformation was generated for the $last or $bottom case, we will
+    // need to flip the direction of any generated DISTINCT_SCAN to preserve the semantics of
+    // the query.
+    const bool flipDistinctScanDirection = [&, groupStage = rewrittenGroupStage.get()] {
+        const auto docsNeeded = groupStage->docsNeeded();
+        return docsNeeded == AccumulatorDocumentsNeeded::kLastInputDocument ||
+            docsNeeded == AccumulatorDocumentsNeeded::kLastOutputDocument;
+    }();
+
+    cq->setDistinct(CanonicalDistinct(rewrittenGroupStage->groupId(),
+                                      false,
+                                      boost::optional<UUID>(),
+                                      boost::optional<BSONObj>(),
+                                      flipDistinctScanDirection));
+
+    if (isDistinctMultiplanningEnabled) {
+        // In the context of distinct multiplanning, if there are no indexes suitable for distinct
+        // scans, we can omit the distinct part of the canonical query. For example, this will
+        // remove the SBE ineligibilty criteria for queries that have a distinct component.
+        auto plannerParams =
+            std::make_unique<QueryPlannerParams>(QueryPlannerParams::ArgsForDistinct{
+                cq->getExpCtx()->getOperationContext(),
+                *cq,
+                collections,
+                plannerOpts | QueryPlannerParams::IGNORE_QUERY_SETTINGS,
+                flipDistinctScanDirection,
+            });
+
+        // If the results need to be merged, we need to generate sort key metadata.
+        if (sortPattern && cq->getExpCtx()->getNeedsMerge()) {
+            auto sortKeyMetadataDeps = sortPattern->metadataDeps();
+            sortKeyMetadataDeps.set(DocumentMetadataFields::kSortKey);
+            cq->requestAdditionalMetadata(sortKeyMetadataDeps);
+        }
+
+        if (plannerParams->mainCollectionInfo.indexes.empty()) {
+            // Can't generate a distinct scan plan without indexes.
+            cq->resetDistinct();
+        } else {
+            // In some cases, the distinct scan must be able to provide a sort to produce correct
+            // results for a $group query.
+            cq->getDistinct()->setSortRequirement(std::move(sortPattern));
+            // If we have the possibilty of getting a distinct scan, we also want to pass
+            // the `rewrittenGroupStage` to the caller to be able to rewrite the pipeline to
+            // $groupByDistinct in case a distinct scan is generated via multiplanning.
+            cq->getDistinct()->setRewrittenGroupStage(std::move(rewrittenGroupStage));
+        }
+        return std::move(cq);
+    }
+
+    // We have to request a "strict" distinct plan because:
+    // 1) $group with distinct semantics doesn't de-duplicate the results.
+    // 2) Non-strict parameter would allow use of multikey indexes for DISTINCT_SCAN, which
+    //    means that for {a: [1, 2]} two distinct values would be returned, but for group keys
+    //    arrays shouldn't be traversed.
+    auto swQuerySolution =
+        tryGetQuerySolutionForDistinct(collections, plannerOpts, *cq, flipDistinctScanDirection);
+    if (swQuerySolution.isOK()) {
+        auto swExecutorGrouped = getExecutorDistinct(
+            collections, plannerOpts, std::move(cq), std::move(swQuerySolution.getValue()));
+        if (!swExecutorGrouped.isOK()) {
+            return swExecutorGrouped.getStatus().withContext(
+                "Failed to determine whether query system can provide a DISTINCT_SCAN grouping");
+        }
+
+        pipeline->popFrontWithName(rewrittenGroupStage->originalStageName());
+
+        boost::intrusive_ptr<DocumentSource> groupTransform(
+            new DocumentSourceSingleDocumentTransformation(expCtx,
+                                                           std::move(rewrittenGroupStage),
+                                                           "$groupByDistinctScan",
+                                                           false /* independentOfAnyCollection */));
+        pipeline->addInitialSource(std::move(groupTransform));
+
+        return StatusWith{std::move(swExecutorGrouped.getValue())};
+    }
+
+    if (swQuerySolution != ErrorCodes::NoQueryExecutionPlans) {
+        return swQuerySolution.getStatus().withContext(
+            "Failed to determine whether query system can provide a DISTINCT_SCAN grouping");
+    }
+
+    // Couldn't find a viable distinct executor for the query. This is not a final failure because
+    // it's possible to generate a non-distinct executor and so we return Status::OK() with the
+    // CanonicalQuery. We return the CanonicalQuery since we don't want to lose the work done inside
+    // createCanonicalQuery().
+
+    // Non-empty sortPattern can be returned only from the case of $group with $top or $bottom, when
+    // the 'sortPattern' is artificially added to leverage the DISTINCT_SCAN inside
+    // createCanonicalQuery() though there is no $sort stage. Now given that we can't generate a
+    // distinct executor, we should remove the 'sortPattern' in this case. Otherwise, a SORT stage
+    // is unnecessarily added to the final plan.
+    if (sortPattern) {
+        cq->resetSortPattern();
+    }
+
+    return StatusWith{std::move(cq)};
+}
+
+/**
+ * Creates a PlanExecutor to be used in the initial cursor source. This function will try to push
+ * down the $sort, $project, $match and $limit stages into the PlanStage layer whenever possible. In
+ * this case, these stages will be incorporated into the PlanExecutor. Note that this function takes
+ * a 'MultipleCollectionAccessor' because certain $lookup stages that reference multiple collections
+ * may be eligible for pushdown in the PlanExecutor.
+ *
+ * Sets the 'shouldProduceEmptyDocs' out-parameter based on whether the dependency set is both
+ * finite and empty. In this case, the query has count semantics.
+ */
+StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> prepareExecutor(
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    const MultipleCollectionAccessor& collections,
+    const NamespaceString& nss,
+    Pipeline* pipeline,
+    QueryMetadataBitSet unavailableMetadata,
+    const BSONObj& queryObj,
+    boost::intrusive_ptr<DocumentSourceMatch> leadingMatch,
+    const AggregateCommandRequest* aggRequest,
+    const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
+    bool* shouldProduceEmptyDocs,
+    bool timeseriesBoundedSortOptimization,
+    std::size_t plannerOpts = QueryPlannerParams::DEFAULT,
+    boost::optional<TraversalPreference> traversalPreference = boost::none,
+    ExecShardFilterPolicy shardFilterPolicy = AutomaticShardFiltering{}) {
+    // See if could use DISTINCT_SCAN with the pipeline (SERVER-9507 & SERVER-84347).
+    auto swExecOrCq = tryPrepareDistinctExecutor(expCtx,
+                                                 collections,
+                                                 nss,
+                                                 pipeline,
+                                                 unavailableMetadata,
+                                                 queryObj,
+                                                 leadingMatch,
+                                                 aggRequest,
+                                                 matcherFeatures,
+                                                 shouldProduceEmptyDocs,
+                                                 timeseriesBoundedSortOptimization,
+                                                 plannerOpts);
+
+    // This signifies that a non-recoverable error has happened and so we pass through the error.
+    if (!swExecOrCq.isOK()) {
+        if (swExecOrCq != ErrorCodes::NoQueryExecutionPlans) {
+            return swExecOrCq.getStatus().withContext(
+                "Failed to determine whether query system can provide a DISTINCT_SCAN grouping");
+        }
+        return swExecOrCq.getStatus();
+    }
+
+    // This signifies that the tryPrepareDistinctExecutor() has succeeded to generate a distinct
+    // executor and so we're done.
+    auto&& execOrCq = swExecOrCq.getValue();
+    if (std::holds_alternative<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>(execOrCq)) {
+        return std::move(std::get<0>(execOrCq));
+    }
+
+    // This signifies that we couldn't find a viable distinct executor for the query. It's still
+    // possible to generate a non-distinct executor. Try to generate one.
+
+    if (!*shouldProduceEmptyDocs) {
+        plannerOpts |= QueryPlannerParams::RETURN_OWNED_DATA;
+    }
+
+    // If this pipeline is a change stream, then the cursor must use the simple collation, so we
+    // temporarily switch the collator on the ExpressionContext to nullptr. We do this here because
+    // by this point, all the necessary pipeline analyses and optimizations have already been
+    // performed. Note that 'collatorStash' restores the original collator when it leaves scope.
+    const bool isChangeStream =
+        pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage();
+    std::unique_ptr<CollatorInterface> collatorForCursor = nullptr;
+    auto collatorStash =
+        isChangeStream ? expCtx->temporarilyChangeCollator(std::move(collatorForCursor)) : nullptr;
+
+    auto cq = std::move(std::get<1>(execOrCq));
+    std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage = nullptr;
+    if (cq->getDistinct()) {
+        rewrittenGroupStage = cq->getDistinct()->releaseRewrittenGroupStage();
+        plannerOpts |= QueryPlannerParams::STRICT_DISTINCT_ONLY;
+    }
+
+    // For performance, we pass a null callback instead of 'extractAndAttachPipelineStages' when
+    // 'pipeline' is empty. The 'extractAndAttachPipelineStages' is a no-op when there are no
+    // pipeline stages, so we can save some work by skipping it. The 'getExecutorFind()' function is
+    // responsible for checking that the callback is non-null before calling it.
+    auto executor = getExecutorFind(expCtx->getOperationContext(),
+                                    collections,
+                                    std::move(cq),
+                                    PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                                    plannerOpts,
+                                    pipeline,
+                                    expCtx->getNeedsMerge(),
+                                    unavailableMetadata,
+                                    std::move(traversalPreference),
+                                    shardFilterPolicy);
+
+    if (executor.isOK() && executor.getValue()->isUsingDistinctScan()) {
+        tassert(9261500,
+                "The pipeline of an executor that has a distinct scan needs to have a rewritten "
+                "group stage component.",
+                rewrittenGroupStage);
+
+        if (!executor.getValue()->getCanonicalQuery()->metadataDeps().any()) {
+            // $groupByDistinctScan doesn't preserve metadata. Thus we can only apply the rewrite if
+            // no metadata is requested.
+            pipeline->popFrontWithName(rewrittenGroupStage->originalStageName());
+
+            auto groupTransform = make_intrusive<DocumentSourceSingleDocumentTransformation>(
+                expCtx,
+                std::move(rewrittenGroupStage),
+                "$groupByDistinctScan",
+                false /* independentOfAnyCollection */);
+            pipeline->addInitialSource(std::move(groupTransform));
+        }
+    }
+
+    // While constructing the executor, some stages might have been lowered from the 'pipeline' into
+    // the executor, so we need to recheck whether the executor's layer can still produce an empty
+    // document.
+    *shouldProduceEmptyDocs = pipeline->getDependencies(unavailableMetadata).hasNoRequirements();
+    if (executor.isOK()) {
+        executor.getValue()->setReturnOwnedData(!*shouldProduceEmptyDocs);
+    }
+
+    return executor;
+}  // prepareExecutor
 }  // namespace
 
 boost::optional<std::pair<PipelineD::IndexSortOrderAgree, PipelineD::IndexOrderedByMinTime>>
-PipelineD::supportsSort(const BucketUnpacker& bucketUnpacker,
+PipelineD::supportsSort(const timeseries::BucketUnpacker& bucketUnpacker,
                         PlanStage* root,
                         const SortPattern& sort) {
     using SortPatternPart = SortPattern::SortPatternPart;
@@ -920,8 +1416,10 @@ PipelineD::supportsSort(const BucketUnpacker& bucketUnpacker,
             const CollectionScan* scan = static_cast<CollectionScan*>(root);
             if (sort.size() == 1) {
                 auto part = sort[0];
-                // Check the sort we're asking for is on time.
-                if (part.fieldPath && *part.fieldPath == bucketUnpacker.getTimeField()) {
+                // Check the sort we're asking for is on time, and that the buckets are actually
+                // ordered on time.
+                if (part.fieldPath && *part.fieldPath == bucketUnpacker.getTimeField() &&
+                    !bucketUnpacker.bucketSpec().usesExtendedRange()) {
                     // Check that the directions agree.
                     if ((scan->getDirection() == CollectionScanParams::Direction::FORWARD) ==
                         part.isAscending)
@@ -1028,6 +1526,15 @@ PipelineD::supportsSort(const BucketUnpacker& bucketUnpacker,
                     if (ixField != controlMinTime && ixField != controlMaxTime)
                         return boost::none;
 
+                    // If we've inserted a date before 1-1-1970, we round the min up towards 1970,
+                    // rather then down, which has the effect of increasing the control.min.t.
+                    // This means the minimum time in the bucket is likely to be lower than
+                    // indicated and thus, actual dates may be out of order relative to what's
+                    // indicated by the bucket bounds.
+                    if (ixField == controlMinTime &&
+                        bucketUnpacker.bucketSpec().usesExtendedRange())
+                        return boost::none;
+
                     if (!directionCompatible(*keyPatternIter, *sortIter))
                         return boost::none;
 
@@ -1053,7 +1560,7 @@ PipelineD::supportsSort(const BucketUnpacker& bucketUnpacker,
 }  // namespace mongo
 
 boost::optional<std::pair<PipelineD::IndexSortOrderAgree, PipelineD::IndexOrderedByMinTime>>
-PipelineD::checkTimeHelper(const BucketUnpacker& bucketUnpacker,
+PipelineD::checkTimeHelper(const timeseries::BucketUnpacker& bucketUnpacker,
                            BSONObj::iterator& keyPatternIter,
                            bool scanIsForward,
                            const FieldPath& timeSortFieldPath,
@@ -1079,9 +1586,10 @@ PipelineD::checkTimeHelper(const BucketUnpacker& bucketUnpacker,
     return boost::none;
 }
 
-bool PipelineD::sortAndKeyPatternPartAgreeAndOnMeta(const BucketUnpacker& bucketUnpacker,
-                                                    StringData keyPatternFieldName,
-                                                    const FieldPath& sortFieldPath) {
+bool PipelineD::sortAndKeyPatternPartAgreeAndOnMeta(
+    const timeseries::BucketUnpacker& bucketUnpacker,
+    StringData keyPatternFieldName,
+    const FieldPath& sortFieldPath) {
     FieldPath keyPatternFieldPath = FieldPath(keyPatternFieldName);
 
     // If they don't have the same path length they cannot agree.
@@ -1140,13 +1648,64 @@ boost::optional<TraversalPreference> createTimeSeriesTraversalPreference(
     return traversalPreference;
 }
 
-std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-PipelineD::buildInnerQueryExecutorGeneric(const MultipleCollectionAccessor& collections,
-                                          const NamespaceString& nss,
-                                          const AggregateCommandRequest* aggRequest,
-                                          Pipeline* pipeline) {
-    // Make a last effort to optimize pipeline stages before potentially detaching them to be pushed
-    // down into the query executor.
+PipelineD::BuildQueryExecutorResult PipelineD::buildInnerQueryExecutorSearch(
+    const MultipleCollectionAccessor& collections,
+    const NamespaceString& nss,
+    const AggregateCommandRequest* aggRequest,
+    Pipeline* pipeline) {
+    uassert(7856009,
+            "Cannot have exchange specified in a $search pipeline",
+            !aggRequest || !aggRequest->getExchange());
+
+    auto expCtx = pipeline->getContext();
+
+    DocumentSource* searchStage = pipeline->peekFront();
+    auto yieldPolicy = PlanYieldPolicyRemoteCursor::make(
+        expCtx->getOperationContext(), PlanYieldPolicy::YieldPolicy::YIELD_AUTO, collections, nss);
+
+    if (!expCtx->getExplain()) {
+        if (search_helpers::isSearchPipeline(pipeline)) {
+            search_helpers::establishSearchCursorsSBE(expCtx, searchStage, std::move(yieldPolicy));
+        } else if (search_helpers::isSearchMetaPipeline(pipeline)) {
+            search_helpers::establishSearchMetaCursorSBE(
+                expCtx, searchStage, std::move(yieldPolicy));
+        } else {
+            tasserted(7856008, "Not search pipeline in buildInnerQueryExecutorSearch");
+        }
+    }
+
+    auto [executor, callback, additionalExecutors] =
+        buildInnerQueryExecutorGeneric(collections, nss, aggRequest, pipeline);
+
+    const CanonicalQuery* cq = executor->getCanonicalQuery();
+
+    if (!cq->cqPipeline().empty() &&
+        search_helpers::isSearchStage(cq->cqPipeline().front().get())) {
+        // The $search is pushed down into SBE executor.
+        if (auto cursor = search_helpers::getSearchMetadataCursor(searchStage)) {
+            // Create a yield policy for metadata cursor.
+            auto metadataYieldPolicy =
+                PlanYieldPolicyRemoteCursor::make(expCtx->getOperationContext(),
+                                                  PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                                                  collections,
+                                                  nss);
+            cursor->updateYieldPolicy(std::move(metadataYieldPolicy));
+
+            additionalExecutors.push_back(uassertStatusOK(getSearchMetadataExecutorSBE(
+                expCtx->getOperationContext(), collections, nss, *cq, std::move(cursor))));
+        }
+    }
+    return {std::move(executor), callback, std::move(additionalExecutors)};
+}
+
+PipelineD::BuildQueryExecutorResult PipelineD::buildInnerQueryExecutorGeneric(
+    const MultipleCollectionAccessor& collections,
+    const NamespaceString& nss,
+    const AggregateCommandRequest* aggRequest,
+    Pipeline* pipeline,
+    ExecShardFilterPolicy shardFilterPolicy) {
+    // Make a last effort to optimize pipeline stages before potentially detaching them to be
+    // pushed down into the query executor.
     pipeline->optimizePipeline();
 
     Pipeline::SourceContainer& sources = pipeline->_sources;
@@ -1155,57 +1714,79 @@ PipelineD::buildInnerQueryExecutorGeneric(const MultipleCollectionAccessor& coll
     // Look for an initial match. This works whether we got an initial query or not. If not, it
     // results in a "{}" query, which will be what we want in that case.
     const BSONObj queryObj = pipeline->getInitialQuery();
+    boost::intrusive_ptr<DocumentSourceMatch> leadingMatch;
+    bool isTextQuery = false;
+    const bool isChangeStream =
+        pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage();
+    // If a $match query is pulled into the cursor, the $match is redundant, and can be
+    // removed from the pipeline.
+    // We avoid performing further optimizations on change stream MatchExpressions to avoid
+    // causing lifetime issues to the BSONObj included in the relevant MatchExpressions.
     if (!queryObj.isEmpty()) {
-        auto matchStage = dynamic_cast<DocumentSourceMatch*>(sources.front().get());
-        if (matchStage) {
-            // If a $match query is pulled into the cursor, the $match is redundant, and can be
-            // removed from the pipeline.
+        auto firstStage = sources.front();
+        if (auto matchStage = dynamic_cast<DocumentSourceMatch*>(firstStage.get())) {
+            if (!isChangeStream) {
+                leadingMatch = boost::intrusive_ptr<DocumentSourceMatch>(matchStage);
+                isTextQuery = matchStage->isTextQuery();
+            }
             sources.pop_front();
         } else {
             // A $geoNear stage, the only other stage that can produce an initial query, is also
-            // a valid initial stage. However, we should be in prepareGeoNearCursorSource() instead.
+            // a valid initial stage. However, we should be in buildInnerQueryExecutorGeoNear()
+            // instead.
             MONGO_UNREACHABLE;
         }
     }
 
-    auto&& [sortStage, groupStage] = getSortAndGroupStagesFromPipeline(pipeline->_sources);
-    std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage;
-    if (groupStage) {
-        rewrittenGroupStage = groupStage->rewriteGroupAsTransformOnFirstDocument();
-    }
-
-    // If there is a $limit or $skip stage (or multiple of them) that could be pushed down into the
-    // PlanStage layer, obtain the value of the limit and skip and remove the $limit and $skip
-    // stages from the pipeline.
-    //
-    // This analysis is done here rather than in 'optimizePipeline()' because swapping $limit before
-    // stages such as $project is not always useful, and can sometimes defeat other optimizations.
-    // In particular, in a sharded scenario a pipeline such as [$project, $limit] is preferable to
-    // [$limit, $project]. The former permits the execution of the projection operation to be
-    // parallelized across all targeted shards, whereas the latter would bring all of the data to a
-    // merging shard first, and then apply the projection serially. See SERVER-24981 for a more
-    // detailed discussion.
-    //
-    // This only handles the case in which the the $limit or $skip can logically be swapped to the
-    // front of the pipeline. We can also push down a $limit which comes after a $sort into the
-    // PlanStage layer, but that is handled elsewhere.
-    const auto skipThenLimit = extractSkipAndLimitForPushdown(pipeline);
-
-    auto unavailableMetadata = DocumentSourceMatch::isTextQuery(queryObj)
+    auto unavailableMetadata = isTextQuery
         ? DepsTracker::kDefaultUnavailableMetadata & ~DepsTracker::kOnlyTextScore
         : DepsTracker::kDefaultUnavailableMetadata;
 
-    // If this is a query on a time-series collection then it may be eligible for a post-planning
-    // sort optimization. We check eligibility and perform the rewrite here.
-    auto [unpack, sort] = findUnpackThenSort(pipeline->_sources);
-    QueryPlannerParams plannerOpts;
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-            multiversion::FeatureCompatibilityVersion::kVersion_6_0) &&
-        feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabled(
-            serverGlobalParams.featureCompatibility) &&
-        unpack && sort) {
-        plannerOpts.traversalPreference = createTimeSeriesTraversalPreference(unpack, sort);
+    // If this is a query on a time-series collection we might need to keep it fully classic to
+    // ensure no perf regressions until we implement the corresponding scenarios fully in SBE.
+    SortAndUnpackInPipeline su = findUnpackAndSort(pipeline->_sources);
+    // Do not double-optimize the sort.
+    auto sort = (su.sort && su.sort->isBoundedSortStage()) ? nullptr : su.sort;
+    auto unpack = su.unpack;
+    if (unpack && !unpack->isSbeCompatible()) {
+        expCtx->setSbePipelineCompatibility(SbeCompatibility::notCompatible);
+    }
+
+    // But in classic it may be eligible for a post-planning sort optimization. We check eligibility
+    // and perform the rewrite here.
+    const bool timeseriesBoundedSortOptimization = unpack && sort && (su.unpackIdx < su.sortIdx);
+    std::size_t plannerOpts = QueryPlannerParams::DEFAULT;
+    boost::optional<TraversalPreference> traversalPreference = boost::none;
+    if (timeseriesBoundedSortOptimization) {
+        traversalPreference = createTimeSeriesTraversalPreference(unpack, sort);
+
+        // Whether to use bounded sort or not is determined _after_ the executor is created, based
+        // on whether the chosen collection access stage would support it. Because bounded sort and
+        // streaming group aren't implemented in SBE yet we have to block the whole pipeline from
+        // lowering to SBE so that it has the chance of doing the optimization. To allow as many
+        // sort + group pipelines over time-series to lower to SBE we'll only block those that sort
+        // on time as these are the only ones that _might_ end up using bounded sort.
+        // Note: This check (sort on time after unpacking) also disables the streaming group
+        // optimization, that might happen w/o bounded sort.
+        for (const auto& sortKey : sort->getSortKeyPattern()) {
+            if (sortKey.fieldPath &&
+                *(sortKey.fieldPath) == unpack->bucketUnpacker().getTimeField()) {
+                expCtx->setSbePipelineCompatibility(SbeCompatibility::notCompatible);
+                break;
+            }
+        }
+    }
+
+    if (isChangeStream) {
+        invariant(expCtx->getTailableMode() == TailableModeEnum::kTailableAndAwaitData);
+        plannerOpts |= (QueryPlannerParams::TRACK_LATEST_OPLOG_TS |
+                        QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG);
+    }
+
+    // The $_requestReshardingResumeToken parameter is only valid for an oplog scan.
+    if (aggRequest && aggRequest->getRequestReshardingResumeToken()) {
+        plannerOpts |= (QueryPlannerParams::TRACK_LATEST_OPLOG_TS |
+                        QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG);
     }
 
     // Create the PlanExecutor.
@@ -1214,249 +1795,23 @@ PipelineD::buildInnerQueryExecutorGeneric(const MultipleCollectionAccessor& coll
                                                 collections,
                                                 nss,
                                                 pipeline,
-                                                sortStage,
-                                                std::move(rewrittenGroupStage),
                                                 unavailableMetadata,
                                                 queryObj,
-                                                skipThenLimit,
+                                                std::move(leadingMatch),
                                                 aggRequest,
                                                 Pipeline::kAllowedMatcherFeatures,
                                                 &shouldProduceEmptyDocs,
-                                                std::move(plannerOpts)));
+                                                timeseriesBoundedSortOptimization,
+                                                plannerOpts,
+                                                std::move(traversalPreference),
+                                                shardFilterPolicy));
 
     // If this is a query on a time-series collection then it may be eligible for a post-planning
     // sort optimization. We check eligibility and perform the rewrite here.
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-            multiversion::FeatureCompatibilityVersion::kVersion_6_0) &&
-        feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabled(
-            serverGlobalParams.featureCompatibility) &&
-        unpack && sort) {
+    if (timeseriesBoundedSortOptimization) {
         auto execImpl = dynamic_cast<PlanExecutorImpl*>(exec.get());
         if (execImpl) {
-            // Get source stage
-            PlanStage* rootStage = execImpl->getRootStage();
-            while (rootStage &&
-                   (rootStage->getChildren().size() == 1 ||
-                    rootStage->stageType() == STAGE_MULTI_PLAN)) {
-                switch (rootStage->stageType()) {
-                    case STAGE_FETCH:
-                        rootStage = rootStage->child().get();
-                        break;
-                    case STAGE_SHARDING_FILTER:
-                        rootStage = rootStage->child().get();
-                        break;
-                    case STAGE_MULTI_PLAN: {
-                        auto mps = static_cast<MultiPlanStage*>(rootStage);
-                        if (mps->bestPlanChosen() && mps->bestPlanIdx()) {
-                            rootStage = (mps->getChildren())[*(mps->bestPlanIdx())].get();
-                        } else {
-                            rootStage = nullptr;
-                            tasserted(6655801,
-                                      "Expected multiplanner to have selected a bestPlan.");
-                        }
-                        break;
-                    }
-                    case STAGE_CACHED_PLAN: {
-                        auto cp = static_cast<CachedPlanStage*>(rootStage);
-                        if (cp->bestPlanChosen()) {
-                            rootStage = rootStage->child().get();
-                        } else {
-                            rootStage = nullptr;
-                            tasserted(6655802, "Expected cached plan to have selected a bestPlan.");
-                        }
-                        break;
-                    }
-                    default:
-                        rootStage = nullptr;
-                }
-            }
-
-            if (rootStage && rootStage->getChildren().size() != 0) {
-                rootStage = nullptr;
-            }
-
-            const auto& sortPattern = sort->getSortKeyPattern();
-            if (auto agree = supportsSort(unpack->bucketUnpacker(), rootStage, sortPattern)) {
-                // Scan the pipeline to check if it's compatible with the  optimization.
-                bool badStage = false;
-                bool seenSort = false;
-                bool seenUnpack = false;
-                std::list<boost::intrusive_ptr<DocumentSource>>::iterator iter =
-                    pipeline->_sources.begin();
-                std::list<boost::intrusive_ptr<DocumentSource>>::iterator unpackIter =
-                    pipeline->_sources.end();
-                for (; !badStage && iter != pipeline->_sources.end() && !seenSort; ++iter) {
-                    if (dynamic_cast<const DocumentSourceSort*>(iter->get())) {
-                        seenSort = true;
-                    } else if (dynamic_cast<const DocumentSourceMatch*>(iter->get())) {
-                        // do nothing
-                    } else if (const auto* unpack =
-                                   dynamic_cast<const DocumentSourceInternalUnpackBucket*>(
-                                       iter->get())) {
-                        unpackIter = iter;
-                        uassert(6505001,
-                                str::stream()
-                                    << "Expected at most one "
-                                    << DocumentSourceInternalUnpackBucket::kStageNameInternal
-                                    << " stage in the pipeline",
-                                !seenUnpack);
-                        seenUnpack = true;
-
-                        // Check that the time field is preserved.
-                        if (!unpack->includeTimeField())
-                            badStage = true;
-
-                        // If the sort is compound, check that the entire meta field is preserved.
-                        if (sortPattern.size() > 1) {
-                            // - Is there a meta field?
-                            // - Will it be unpacked?
-                            // - Will it be overwritten by 'computedMetaProjFields'?
-                            auto&& unpacker = unpack->bucketUnpacker();
-                            const boost::optional<std::string>& metaField = unpacker.getMetaField();
-                            if (!metaField || !unpack->includeMetaField() ||
-                                unpacker.bucketSpec().fieldIsComputed(*metaField)) {
-                                badStage = true;
-                            }
-                        }
-                    } else if (auto projection =
-                                   dynamic_cast<const DocumentSourceSingleDocumentTransformation*>(
-                                       iter->get())) {
-                        auto modPaths = projection->getModifiedPaths();
-
-                        // Check to see if the sort paths are modified.
-                        if (seenUnpack) {
-                            // This stage operates on events: check the event-level field names.
-                            for (auto sortIter = sortPattern.begin();
-                                 !badStage && sortIter != sortPattern.end();
-                                 ++sortIter) {
-
-                                auto fieldPath = sortIter->fieldPath;
-                                // If they are then escape the loop & don't optimize.
-                                if (!fieldPath || modPaths.canModify(*fieldPath)) {
-                                    badStage = true;
-                                }
-                            }
-                        } else {
-                            // This stage operates on buckets: check the bucket-level field names.
-
-                            // The time field maps to control.min.[time], control.max.[time], or
-                            // _id, and $_internalUnpackBucket assumes that all of those fields are
-                            // preserved. (We never push down a stage that would overwrite them.)
-
-                            // Each field [meta].a.b.c maps to 'meta.a.b.c'.
-                            auto rename = [&](const FieldPath& eventField) -> FieldPath {
-                                if (eventField.getPathLength() == 1)
-                                    return timeseries::kBucketMetaFieldName;
-                                return FieldPath{timeseries::kBucketMetaFieldName}.concat(
-                                    eventField.tail());
-                            };
-
-                            for (auto sortIter = sortPattern.begin(),
-                                      // Skip the last field, which is time: only check the meta
-                                      // fields.
-                                 end = std::prev(sortPattern.end());
-                                 !badStage && sortIter != end;
-                                 ++sortIter) {
-                                auto bucketFieldPath = rename(*sortIter->fieldPath);
-                                if (modPaths.canModify(bucketFieldPath))
-                                    badStage = true;
-                            }
-                        }
-                    } else {
-                        badStage = true;
-                    }
-                }
-                if (!badStage && seenSort) {
-                    auto [indexSortOrderAgree, indexOrderedByMinTime] = *agree;
-                    // This is safe because we have seen a sort so we must have at least one stage
-                    // to the left of the current iterator position.
-                    --iter;
-
-                    if (indexOrderedByMinTime) {
-                        unpack->setIncludeMinTimeAsMetadata();
-                    } else {
-                        unpack->setIncludeMaxTimeAsMetadata();
-                    }
-
-                    if (indexSortOrderAgree) {
-                        pipeline->_sources.insert(
-                            iter,
-                            DocumentSourceSort::createBoundedSort(sort->getSortKeyPattern(),
-                                                                  (indexOrderedByMinTime
-                                                                       ? DocumentSourceSort::kMin
-                                                                       : DocumentSourceSort::kMax),
-                                                                  0,
-                                                                  sort->getLimit(),
-                                                                  expCtx));
-                    } else {
-                        // Since the sortPattern and the direction of the index don't agree we must
-                        // use the offset to get an estimate on the bounds of the bucket.
-                        pipeline->_sources.insert(
-                            iter,
-                            DocumentSourceSort::createBoundedSort(
-                                sort->getSortKeyPattern(),
-                                (indexOrderedByMinTime ? DocumentSourceSort::kMin
-                                                       : DocumentSourceSort::kMax),
-                                static_cast<long long>((indexOrderedByMinTime)
-                                                           ? unpack->getBucketMaxSpanSeconds()
-                                                           : -unpack->getBucketMaxSpanSeconds()) *
-                                    1000,
-                                sort->getLimit(),
-                                expCtx));
-
-                        /**
-                         * We wish to create the following predicate to avoid returning incorrect
-                         * results in the unlikely event bucketMaxSpanSeconds changes under us.
-                         *
-                         * {$expr:
-                         *   {$lte: [
-                         *     {$subtract: [$control.max.timeField, $control.min.timeField]},
-                         *     {$const: bucketMaxSpanSeconds, in milliseconds}
-                         * ]}}
-                         */
-                        auto minTime = unpack->getMinTimeField();
-                        auto maxTime = unpack->getMaxTimeField();
-                        auto match = std::make_unique<ExprMatchExpression>(
-                            // This produces {$lte: ... }
-                            make_intrusive<ExpressionCompare>(
-                                expCtx.get(),
-                                ExpressionCompare::CmpOp::LTE,
-                                // This produces [...]
-                                makeVector<boost::intrusive_ptr<Expression>>(
-                                    // This produces {$subtract: ... }
-                                    make_intrusive<ExpressionSubtract>(
-                                        expCtx.get(),
-                                        // This produces [...]
-                                        makeVector<boost::intrusive_ptr<Expression>>(
-                                            // This produces "$control.max.timeField"
-                                            ExpressionFieldPath::createPathFromString(
-                                                expCtx.get(), maxTime, expCtx->variablesParseState),
-                                            // This produces "$control.min.timeField"
-                                            ExpressionFieldPath::createPathFromString(
-                                                expCtx.get(),
-                                                minTime,
-                                                expCtx->variablesParseState))),
-                                    // This produces {$const: maxBucketSpanSeconds}
-                                    make_intrusive<ExpressionConstant>(
-                                        expCtx.get(),
-                                        Value{static_cast<long long>(
-                                                  unpack->getBucketMaxSpanSeconds()) *
-                                              1000}))),
-                            expCtx);
-                        pipeline->_sources.insert(
-                            unpackIter,
-                            make_intrusive<DocumentSourceMatch>(std::move(match), expCtx));
-                    }
-                    // Ensure we're erasing the sort source.
-                    tassert(6434901,
-                            "we must erase a $sort stage and replace it with a bounded sort stage",
-                            strcmp((*iter)->getSourceName(),
-                                   DocumentSourceSort::kStageName.rawData()) == 0);
-                    pipeline->_sources.erase(iter);
-                    pipeline->stitch();
-                }
-            }
+            performBoundedSortOptimization(execImpl->getRootStage(), pipeline, sort, unpack);
         }
     }
 
@@ -1470,27 +1825,34 @@ PipelineD::buildInnerQueryExecutorGeneric(const MultipleCollectionAccessor& coll
         (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) ||
         (aggRequest && aggRequest->getRequestReshardingResumeToken());
 
-    auto attachExecutorCallback =
-        [cursorType, trackOplogTS](const MultipleCollectionAccessor& collections,
-                                   std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-                                   Pipeline* pipeline) {
-            auto cursor = DocumentSourceCursor::create(
-                collections, std::move(exec), pipeline->getContext(), cursorType, trackOplogTS);
-            pipeline->addInitialSource(std::move(cursor));
-        };
-    return std::make_pair(std::move(attachExecutorCallback), std::move(exec));
+    auto resumeTrackingType = DocumentSourceCursor::ResumeTrackingType::kNone;
+    if (trackOplogTS) {
+        resumeTrackingType = DocumentSourceCursor::ResumeTrackingType::kOplog;
+    } else if (aggRequest && aggRequest->getRequestResumeToken()) {
+        resumeTrackingType = DocumentSourceCursor::ResumeTrackingType::kNonOplog;
+    }
+
+    auto attachExecutorCallback = [cursorType, resumeTrackingType](
+                                      const MultipleCollectionAccessor& collections,
+                                      std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+                                      Pipeline* pipeline) {
+        auto cursor = DocumentSourceCursor::create(
+            collections, std::move(exec), pipeline->getContext(), cursorType, resumeTrackingType);
+        pipeline->addInitialSource(std::move(cursor));
+    };
+    return {std::move(exec), std::move(attachExecutorCallback), {}};
 }
 
-std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
-PipelineD::buildInnerQueryExecutorGeoNear(const MultipleCollectionAccessor& collections,
-                                          const NamespaceString& nss,
-                                          const AggregateCommandRequest* aggRequest,
-                                          Pipeline* pipeline) {
+PipelineD::BuildQueryExecutorResult PipelineD::buildInnerQueryExecutorGeoNear(
+    const MultipleCollectionAccessor& collections,
+    const NamespaceString& nss,
+    const AggregateCommandRequest* aggRequest,
+    Pipeline* pipeline) {
     // $geoNear can only run over the main collection.
     const auto& collection = collections.getMainCollection();
     uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "$geoNear requires a geo index to run, but " << nss.ns()
-                          << " does not exist",
+            str::stream() << "$geoNear requires a geo index to run, but "
+                          << nss.toStringForErrorMsg() << " does not exist",
             collection);
 
     Pipeline::SourceContainer& sources = pipeline->_sources;
@@ -1501,8 +1863,9 @@ PipelineD::buildInnerQueryExecutorGeoNear(const MultipleCollectionAccessor& coll
     // If the user specified a "key" field, use that field to satisfy the "near" query. Otherwise,
     // look for a geo-indexed field in 'collection' that can.
     auto nearFieldName =
-        (geoNearStage->getKeyField() ? geoNearStage->getKeyField()->fullPath()
-                                     : extractGeoNearFieldFromIndexes(expCtx->opCtx, collection))
+        (geoNearStage->getKeyField()
+             ? geoNearStage->getKeyField()->fullPath()
+             : extractGeoNearFieldFromIndexes(expCtx->getOperationContext(), collection))
             .toString();
 
     // Create a PlanExecutor whose query is the "near" predicate on 'nearFieldName' combined with
@@ -1515,14 +1878,13 @@ PipelineD::buildInnerQueryExecutorGeoNear(const MultipleCollectionAccessor& coll
                         collections,
                         nss,
                         pipeline,
-                        nullptr, /* sortStage */
-                        nullptr, /* rewrittenGroupStage */
                         DepsTracker::kDefaultUnavailableMetadata & ~DepsTracker::kAllGeoNearData,
-                        std::move(fullQuery),
-                        SkipThenLimit{boost::none, boost::none},
+                        fullQuery,
+                        nullptr,
                         aggRequest,
                         Pipeline::kGeoNearMatcherFeatures,
-                        &shouldProduceEmptyDocs));
+                        &shouldProduceEmptyDocs,
+                        false /* timeseriesBoundedSortOptimization */));
 
     auto attachExecutorCallback = [distanceField = geoNearStage->getDistanceField(),
                                    locationField = geoNearStage->getLocationField(),
@@ -1541,162 +1903,199 @@ PipelineD::buildInnerQueryExecutorGeoNear(const MultipleCollectionAccessor& coll
     };
     // Remove the initial $geoNear; it will be replaced by $geoNearCursor.
     sources.pop_front();
-    return std::make_pair(std::move(attachExecutorCallback), std::move(exec));
+    return {std::move(exec), std::move(attachExecutorCallback), {}};
 }
 
-StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prepareExecutor(
-    const intrusive_ptr<ExpressionContext>& expCtx,
-    const MultipleCollectionAccessor& collections,
-    const NamespaceString& nss,
-    Pipeline* pipeline,
-    const boost::intrusive_ptr<DocumentSourceSort>& sortStage,
-    std::unique_ptr<GroupFromFirstDocumentTransformation> rewrittenGroupStage,
-    QueryMetadataBitSet unavailableMetadata,
-    const BSONObj& queryObj,
-    SkipThenLimit skipThenLimit,
-    const AggregateCommandRequest* aggRequest,
-    const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
-    bool* hasNoRequirements,
-    QueryPlannerParams plannerOpts) {
-    invariant(hasNoRequirements);
+void PipelineD::performBoundedSortOptimization(PlanStage* rootStage,
+                                               Pipeline* pipeline,
+                                               const DocumentSourceSort* sort,
+                                               DocumentSourceInternalUnpackBucket* unpack) {
+    auto expCtx = pipeline->getContext();
 
-    bool isChangeStream =
-        pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage();
-    if (isChangeStream) {
-        invariant(expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData);
-        plannerOpts.options |= (QueryPlannerParams::TRACK_LATEST_OPLOG_TS |
-                                QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG);
-    }
-
-    // The $_requestReshardingResumeToken parameter is only valid for an oplog scan.
-    if (aggRequest && aggRequest->getRequestReshardingResumeToken()) {
-        plannerOpts.options |= (QueryPlannerParams::TRACK_LATEST_OPLOG_TS |
-                                QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG);
-    }
-
-    // If there is a sort stage eligible for pushdown, serialize its SortPattern to a BSONObj. The
-    // BSONObj format is currently necessary to request that the sort is computed by the query layer
-    // inside the inner PlanExecutor. We also remove the $sort stage from the Pipeline, since it
-    // will be handled instead by PlanStage execution.
-    BSONObj sortObj;
-    if (sortStage) {
-        sortObj = sortStage->getSortKeyPattern()
-                      .serialize(SortPattern::SortKeySerialization::kForPipelineSerialization)
-                      .toBson();
-
-        pipeline->popFrontWithName(DocumentSourceSort::kStageName);
-
-        // Now that we've pushed down the sort, see if there is a $limit and $skip to push down
-        // also. We should not already have a limit or skip here, otherwise it would be incorrect
-        // for the caller to pass us a sort stage to push down, since the order matters.
-        invariant(!skipThenLimit.getLimit());
-        invariant(!skipThenLimit.getSkip());
-
-        // Since all $limit stages were already pushdowned to the sort stage, we are only looking
-        // for $skip stages.
-        auto skip = extractSkipForPushdown(pipeline);
-
-        // Since the limit from $sort is going before the extracted $skip stages, we construct
-        // 'LimitThenSkip' object and then convert it 'SkipThenLimit'.
-        skipThenLimit = LimitThenSkip(sortStage->getLimit(), skip).flip();
-    }
-
-    // Perform dependency analysis. In order to minimize the dependency set, we only analyze the
-    // stages that remain in the pipeline after pushdown. In particular, any dependencies for a
-    // $match or $sort pushed down into the query layer will not be reflected here.
-    auto deps = pipeline->getDependencies(unavailableMetadata);
-    *hasNoRequirements = deps.hasNoRequirements();
-
-    BSONObj projObj;
-    if (*hasNoRequirements) {
-        // This query might be eligible for count optimizations, since the remaining stages in the
-        // pipeline don't actually need to read any data produced by the query execution layer.
-        plannerOpts.options |= QueryPlannerParams::IS_COUNT;
-    } else {
-        // Build a BSONObj representing a projection eligible for pushdown. If there is an inclusion
-        // projection at the front of the pipeline, it will be removed and handled by the PlanStage
-        // layer. If a projection cannot be pushed down, an empty BSONObj will be returned.
-
-        // In most cases .find() behaves as if it evaluates in a predictable order:
-        //     predicate, sort, skip, limit, projection.
-        // But there is at least one case where it runs the projection before the sort/skip/limit:
-        // when the predicate has a rooted $or.  (In that case we plan each branch of the $or
-        // separately, using Subplan, and include the projection on each branch.)
-
-        // To work around this behavior, don't allow pushing down expressions if we are also going
-        // to push down a sort, skip or limit. We don't want the expressions to be evaluated on any
-        // documents that the sort/skip/limit would have filtered out. (The sort stage can be a
-        // top-k sort, which both sorts and limits.)
-        bool allowExpressions = !sortStage && !skipThenLimit.getSkip() && !skipThenLimit.getLimit();
-        projObj = buildProjectionForPushdown(deps, pipeline, allowExpressions);
-        plannerOpts.options |= QueryPlannerParams::RETURN_OWNED_DATA;
-    }
-
-    if (rewrittenGroupStage) {
-        // See if the query system can handle the $group and $sort stage using a DISTINCT_SCAN
-        // (SERVER-9507).
-        auto swExecutorGrouped = attemptToGetExecutor(expCtx,
-                                                      collections,
-                                                      nss,
-                                                      queryObj,
-                                                      projObj,
-                                                      deps.metadataDeps(),
-                                                      sortObj,
-                                                      SkipThenLimit{boost::none, boost::none},
-                                                      rewrittenGroupStage->groupId(),
-                                                      aggRequest,
-                                                      plannerOpts,
-                                                      matcherFeatures,
-                                                      pipeline);
-
-        if (swExecutorGrouped.isOK()) {
-            // Any $limit stage before the $group stage should make the pipeline ineligible for this
-            // optimization.
-            invariant(!sortStage || !sortStage->hasLimit());
-
-            // We remove the $sort and $group stages that begin the pipeline, because the executor
-            // will handle the sort, and the groupTransform (added below) will handle the $group
-            // stage.
-            pipeline->popFrontWithName(DocumentSourceSort::kStageName);
-            pipeline->popFrontWithName(DocumentSourceGroup::kStageName);
-
-            boost::intrusive_ptr<DocumentSource> groupTransform(
-                new DocumentSourceSingleDocumentTransformation(
-                    expCtx,
-                    std::move(rewrittenGroupStage),
-                    "$groupByDistinctScan",
-                    false /* independentOfAnyCollection */));
-            pipeline->addInitialSource(groupTransform);
-
-            return swExecutorGrouped;
-        } else if (swExecutorGrouped != ErrorCodes::NoQueryExecutionPlans) {
-            return swExecutorGrouped.getStatus().withContext(
-                "Failed to determine whether query system can provide a "
-                "DISTINCT_SCAN grouping");
+    while (rootStage &&
+           (rootStage->getChildren().size() == 1 || rootStage->stageType() == STAGE_MULTI_PLAN)) {
+        switch (rootStage->stageType()) {
+            case STAGE_FETCH:
+                rootStage = rootStage->child().get();
+                break;
+            case STAGE_SHARDING_FILTER:
+                rootStage = rootStage->child().get();
+                break;
+            case STAGE_MULTI_PLAN: {
+                auto mps = static_cast<MultiPlanStage*>(rootStage);
+                if (mps->bestPlanChosen() && mps->bestPlanIdx()) {
+                    rootStage = (mps->getChildren())[*(mps->bestPlanIdx())].get();
+                } else {
+                    rootStage = nullptr;
+                    tasserted(6655801, "Expected multiplanner to have selected a bestPlan.");
+                }
+                break;
+            }
+            case STAGE_CACHED_PLAN: {
+                auto cp = static_cast<CachedPlanStage*>(rootStage);
+                if (cp->bestPlanChosen()) {
+                    rootStage = rootStage->child().get();
+                } else {
+                    rootStage = nullptr;
+                    tasserted(6655802, "Expected cached plan to have selected a bestPlan.");
+                }
+                break;
+            }
+            default:
+                rootStage = nullptr;
         }
     }
 
-    // If this pipeline is a change stream, then the cursor must use the simple collation, so we
-    // temporarily switch the collator on the ExpressionContext to nullptr. We do this here because
-    // by this point, all the necessary pipeline analyses and optimizations have already been
-    // performed. Note that 'collatorStash' restores the original collator when it leaves scope.
-    std::unique_ptr<CollatorInterface> collatorForCursor = nullptr;
-    auto collatorStash =
-        isChangeStream ? expCtx->temporarilyChangeCollator(std::move(collatorForCursor)) : nullptr;
+    if (rootStage && rootStage->getChildren().size() != 0) {
+        rootStage = nullptr;
+    }
 
-    return attemptToGetExecutor(expCtx,
-                                collections,
-                                nss,
-                                queryObj,
-                                projObj,
-                                deps.metadataDeps(),
-                                sortObj,
-                                skipThenLimit,
-                                boost::none, /* groupIdForDistinctScan */
-                                aggRequest,
-                                plannerOpts,
-                                matcherFeatures,
-                                pipeline);
+    const auto& sortPattern = sort->getSortKeyPattern();
+    if (auto agree = supportsSort(unpack->bucketUnpacker(), rootStage, sortPattern)) {
+        // Scan the pipeline to check if it's compatible with the optimization.
+        bool unsupportedStage = false;
+        bool seenSort = false;
+        bool seenUnpack = false;
+        auto iter = pipeline->_sources.begin();
+        auto unpackIter = pipeline->_sources.end();
+        for (; !unsupportedStage && iter != pipeline->_sources.end() && !seenSort; ++iter) {
+            const auto* source = iter->get();
+            switch (source->getType()) {
+                case DocumentSourceType::kSort:
+                    seenSort = true;
+                    break;
+                case DocumentSourceType::kMatch:
+                    // do nothing
+                    break;
+                case DocumentSourceType::kInternalUnpackBucket: {
+                    const auto* unpack =
+                        static_cast<const DocumentSourceInternalUnpackBucket*>(source);
+                    unpackIter = iter;
+                    tassert(6505001,
+                            str::stream() << "Expected at most one "
+                                          << DocumentSourceInternalUnpackBucket::kStageNameInternal
+                                          << " stage in the pipeline",
+                            !seenUnpack);
+                    seenUnpack = true;
+
+                    // Check that the time field is preserved.
+                    if (!unpack->includeTimeField())
+                        unsupportedStage = true;
+
+                    // If the sort is compound, check that the entire meta field is preserved.
+                    if (sortPattern.size() > 1) {
+                        // - Is there a meta field?
+                        // - Will it be unpacked?
+                        // - Will it be overwritten by 'computedMetaProjFields'?
+                        auto&& unpacker = unpack->bucketUnpacker();
+                        const boost::optional<std::string>& metaField = unpacker.getMetaField();
+                        if (!metaField || !unpack->includeMetaField() ||
+                            unpacker.bucketSpec().fieldIsComputed(*metaField)) {
+                            unsupportedStage = true;
+                        }
+                    }
+                    break;
+                }
+                case DocumentSourceType::kSingleDocumentTransformation: {
+                    auto projection =
+                        static_cast<const DocumentSourceSingleDocumentTransformation*>(source);
+                    auto modPaths = projection->getModifiedPaths();
+                    if (areSortFieldsModifiedByProjection(seenUnpack, sortPattern, modPaths)) {
+                        unsupportedStage = true;
+                    }
+                    break;
+                }
+                default:
+                    unsupportedStage = true;
+                    break;
+            }
+        }
+        if (!unsupportedStage && seenSort) {
+            auto [indexSortOrderAgree, indexOrderedByMinTime] = *agree;
+            // This is safe because we have seen a sort so we must have at least one stage to the
+            // left of the current iterator position.
+            --iter;
+
+            if (indexOrderedByMinTime) {
+                unpack->setIncludeMinTimeAsMetadata();
+            } else {
+                unpack->setIncludeMaxTimeAsMetadata();
+            }
+
+            if (indexSortOrderAgree) {
+                pipeline->_sources.insert(iter,
+                                          DocumentSourceSort::createBoundedSort(
+                                              sort->getSortKeyPattern(),
+                                              (indexOrderedByMinTime ? DocumentSourceSort::kMin
+                                                                     : DocumentSourceSort::kMax),
+                                              0,
+                                              sort->getLimit(),
+                                              expCtx));
+            } else {
+                // Since the sortPattern and the direction of the index don't agree we must use the
+                // offset to get an estimate on the bounds of the bucket.
+                pipeline->_sources.insert(
+                    iter,
+                    DocumentSourceSort::createBoundedSort(
+                        sort->getSortKeyPattern(),
+                        (indexOrderedByMinTime ? DocumentSourceSort::kMin
+                                               : DocumentSourceSort::kMax),
+                        static_cast<long long>((indexOrderedByMinTime)
+                                                   ? unpack->getBucketMaxSpanSeconds()
+                                                   : -unpack->getBucketMaxSpanSeconds()) *
+                            1000,
+                        sort->getLimit(),
+                        expCtx));
+
+                /**
+                 * We wish to create the following predicate to avoid returning incorrect
+                 * results in the unlikely event bucketMaxSpanSeconds changes under us.
+                 *
+                 * {$expr:
+                 *   {$lte: [
+                 *     {$subtract: [$control.max.timeField, $control.min.timeField]},
+                 *     {$const: bucketMaxSpanSeconds, in milliseconds}
+                 * ]}}
+                 */
+                auto minTime = unpack->getMinTimeField();
+                auto maxTime = unpack->getMaxTimeField();
+                auto match = std::make_unique<ExprMatchExpression>(
+                    // This produces {$lte: ... }
+                    make_intrusive<ExpressionCompare>(
+                        expCtx.get(),
+                        ExpressionCompare::CmpOp::LTE,
+                        // This produces [...]
+                        makeVector<boost::intrusive_ptr<Expression>>(
+                            // This produces {$subtract: ... }
+                            make_intrusive<ExpressionSubtract>(
+                                expCtx.get(),
+                                // This produces [...]
+                                makeVector<boost::intrusive_ptr<Expression>>(
+                                    // This produces "$control.max.timeField"
+                                    ExpressionFieldPath::createPathFromString(
+                                        expCtx.get(), maxTime, expCtx->variablesParseState),
+                                    // This produces "$control.min.timeField"
+                                    ExpressionFieldPath::createPathFromString(
+                                        expCtx.get(), minTime, expCtx->variablesParseState))),
+                            // This produces {$const: maxBucketSpanSeconds}
+                            make_intrusive<ExpressionConstant>(
+                                expCtx.get(),
+                                Value{static_cast<long long>(unpack->getBucketMaxSpanSeconds()) *
+                                      1000}))),
+                    expCtx);
+                pipeline->_sources.insert(
+                    unpackIter, make_intrusive<DocumentSourceMatch>(std::move(match), expCtx));
+            }
+            // Ensure we're erasing the sort source.
+            tassert(6434901,
+                    "we must erase a $sort stage and replace it with a bounded sort stage",
+                    strncmp((*iter)->getSourceName(),
+                            DocumentSourceSort::kStageName.rawData(),
+                            DocumentSourceSort::kStageName.length()) == 0);
+            pipeline->_sources.erase(iter);
+            pipeline->stitch();
+        }
+    }
 }
 
 Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {
@@ -1713,5 +2112,20 @@ BSONObj PipelineD::getPostBatchResumeToken(const Pipeline* pipeline) {
         return docSourceCursor->getPostBatchResumeToken();
     }
     return BSONObj{};
+}
+
+bool PipelineD::isSearchPresentAndEligibleForSbe(const Pipeline* pipeline) {
+    auto expCtx = pipeline->getContext();
+
+    auto firstStageIsSearch = search_helpers::isSearchPipeline(pipeline) ||
+        search_helpers::isSearchMetaPipeline(pipeline);
+
+    auto searchInSbeEnabled = feature_flags::gFeatureFlagSearchInSbe.isEnabled(
+        serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
+    auto forceClassicEngine =
+        expCtx->getQueryKnobConfiguration().getInternalQueryFrameworkControlForOp() ==
+        QueryFrameworkControlEnum::kForceClassicEngine;
+
+    return firstStageIsSearch && searchInSbeEnabled && !forceClassicEngine;
 }
 }  // namespace mongo

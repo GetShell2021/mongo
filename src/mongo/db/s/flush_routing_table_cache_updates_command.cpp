@@ -27,29 +27,41 @@
  *    it in the license file.
  */
 
+#include <memory>
+#include <string>
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/db/auth/action_set.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog_raii.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/catalog_shard_feature_flag_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_migration_critical_section.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/catalog_cache_loader.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/flush_routing_table_cache_updates_gen.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 
 namespace mongo {
 namespace {
@@ -93,16 +105,18 @@ public:
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
-            uassert(ErrorCodes::Unauthorized,
-                    "Unauthorized",
-                    AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+            uassert(
+                ErrorCodes::Unauthorized,
+                "Unauthorized",
+                AuthorizationSession::get(opCtx->getClient())
+                    ->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forClusterResource(Base::request().getDbName().tenantId()),
+                        ActionType::internal));
         }
 
         void typedRun(OperationContext* opCtx) {
             auto const shardingState = ShardingState::get(opCtx);
-            uassertStatusOK(shardingState->canAcceptShardedCommands());
+            shardingState->assertCanAcceptShardedCommands();
 
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << "Can't issue " << Derived::Request::kCommandName
@@ -114,35 +128,60 @@ public:
                                   << " if in read-only mode",
                     !opCtx->readOnly());
 
+            uassert(ErrorCodes::IllegalOperation,
+                    str::stream() << "Can only call " << Derived::Request::kCommandName
+                                  << " on collections",
+                    !ns().coll().empty());
+
             boost::optional<SharedSemiFuture<void>> criticalSectionSignal;
 
             {
-                AutoGetCollection autoColl(
-                    opCtx, ns(), MODE_IS, AutoGetCollectionViewMode::kViewsPermitted);
+                // TODO (SERVER-74313): Replace with AutoGetCollection
+                Lock::DBLock dbLock(opCtx, ns().dbName(), MODE_IS);
+                Lock::CollectionLock collLock(opCtx, ns(), MODE_IS);
 
                 // If the primary is in the critical section, secondaries must wait for the commit
                 // to finish on the primary in case a secondary's caller has an afterClusterTime
                 // inclusive of the commit (and new writes to the committed chunk) that hasn't yet
                 // propagated back to this shard. This ensures the read your own writes causal
                 // consistency guarantee.
-                auto const csr = CollectionShardingRuntime::get(opCtx, ns());
-                criticalSectionSignal =
-                    csr->getCriticalSectionSignal(opCtx, ShardingMigrationCriticalSection::kWrite);
+                const auto scopedCsr =
+                    CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, ns());
+                criticalSectionSignal = scopedCsr->getCriticalSectionSignal(
+                    opCtx, ShardingMigrationCriticalSection::kWrite);
             }
 
             if (criticalSectionSignal)
                 criticalSectionSignal->get(opCtx);
 
             if (Base::request().getSyncFromConfig()) {
-                LOGV2_DEBUG(21982,
-                            1,
-                            "Forcing remote routing table refresh for {namespace}",
-                            "Forcing remote routing table refresh",
-                            "namespace"_attr = ns());
-                onShardVersionMismatch(opCtx, ns(), boost::none);
+                LOGV2_DEBUG(21982, 1, "Forcing remote routing table refresh", logAttrs(ns()));
+                uassertStatusOK(
+                    FilteringMetadataCache::get(opCtx)->onCollectionPlacementVersionMismatch(
+                        opCtx, ns(), boost::none));
+
+                // TODO (SERVER-97511): Remove the refresh of the routing information.
+                // (Ignore FCV check): this feature flag is not FCV-gated.
+                if (feature_flags::gDualCatalogCache.isEnabledAndIgnoreFCVUnsafe()) {
+                    const auto catalogCache = Grid::get(opCtx)->catalogCache();
+                    catalogCache->onStaleCollectionVersion(ns(), boost::none /* wantedVersion */);
+                    (void)catalogCache->getCollectionRoutingInfo(opCtx, ns());
+                }
             }
 
-            CatalogCacheLoader::get(opCtx).waitForCollectionFlush(opCtx, ns());
+            // A config server could receive this command even if not in config shard mode if the CS
+            // secondary is on an older binary version running a ShardServerCatalogCacheLoader. In
+            // that case we don't want to hit the MONGO_UNREACHABLE in
+            // ConfigServerCatalogCacheLoader::waitForCollectionFlush() but throw an error instead
+            // so that the secondaries know they don't have updated metadata yet.
+
+            // (Ignore FCV check): TODO(SERVER-75389): add why FCV is ignored here.
+            if (!gFeatureFlagTransitionToCatalogShard.isEnabledAndIgnoreFCVUnsafe() &&
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+                uasserted(8454802, "config server is not storing cached metadata");
+            }
+
+            FilteringMetadataCache::get(opCtx)->waitForCollectionFlush(opCtx, ns());
 
             repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
         }
@@ -157,8 +196,8 @@ public:
     static bool supportsWriteConcern() {
         return false;
     }
-
-} _flushRoutingTableCacheUpdatesCmd;
+};
+MONGO_REGISTER_COMMAND(FlushRoutingTableCacheUpdatesCmd).forShard();
 
 class FlushRoutingTableCacheUpdatesCmdWithWriteConcern
     : public FlushRoutingTableCacheUpdatesCmdBase<
@@ -169,8 +208,8 @@ public:
     static bool supportsWriteConcern() {
         return true;
     }
-
-} _flushRoutingTableCacheUpdatesWithWriteConcernCmd;
+};
+MONGO_REGISTER_COMMAND(FlushRoutingTableCacheUpdatesCmdWithWriteConcern).forShard();
 
 }  // namespace
 }  // namespace mongo

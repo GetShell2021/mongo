@@ -10,8 +10,7 @@
 // run on ephemeral storage engines.
 // @tags: [requires_persistence]
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
@@ -40,7 +39,9 @@ replTest.initiate({
         {"_id": 1, "host": nodes[1]},
         {"_id": 2, "host": nodes[2], arbiterOnly: true}
     ]
-});
+},
+                  null,
+                  {initiateWithDefaultElectionTimeout: true});
 
 // Make sure we have a primary
 replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY);
@@ -124,6 +125,8 @@ assert.commandFailedWithCode(B_test.runCommand({collStats: 'bar'}), authzErrorCo
 assert.commandFailedWithCode(B_test.runCommand({collStats: 'baz'}), authzErrorCode);
 assert.commandFailedWithCode(B_test.runCommand({collStats: 'foobar'}), authzErrorCode);
 
+replTest.awaitLastOpCommitted();
+
 jsTestLog("Doing writes that will eventually be rolled back");
 
 // down A and wait for B to become primary
@@ -171,8 +174,11 @@ replTest.stop(1);
 replTest.restart(0);
 assert.soon(function() {
     try {
-        return A_admin.hello().isWritablePrimary;
+        const helloResponse = A_admin.hello();
+        jsTestLog("A hello response: " + tojson(helloResponse));
+        return helloResponse.isWritablePrimary;
     } catch (e) {
+        jsTestLog("hello() threw an exception when waiting for A to become primary: " + tojson(e));
         return false;
     }
 }, "A didn't become primary");
@@ -233,4 +239,3 @@ authutil.asCluster(replTest.nodes, 'jstests/libs/key1', function() {
 
 // DB hash check is done in stopSet.
 replTest.stopSet();
-}());

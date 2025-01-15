@@ -27,40 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/db/rs_local_client.h"
+#include <fmt/format.h>
+#include <memory>
+#include <vector>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index/index_constants.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/index_on_config.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
 
 using unittest::assertGet;
 
-class ConfigIndexTest : public ConfigServerTestFixture {
-protected:
-    /*
-     * Initializes the sharding state and locks both the config db and rstl.
-     */
-    void setUp() override {
-        // Prevent DistLockManager from writing to lockpings collection before we create the
-        // indexes.
-        // TODO (SERVER-64987): Remove lock acquisition.
-        _autoDb = setUpAndLockConfigDb();
-    }
-
-    void tearDown() override {
-        _autoDb = {};
-        ConfigServerTestFixture::tearDown();
-    }
-
-    std::unique_ptr<AutoGetDb> _autoDb;
-};
+using ConfigIndexTest = ConfigServerTestFixture;
 
 TEST_F(ConfigIndexTest, CompatibleIndexAlreadyExists) {
     createIndexOnConfigCollection(operationContext(),
@@ -73,8 +62,7 @@ TEST_F(ConfigIndexTest, CompatibleIndexAlreadyExists) {
                   ->initializeConfigDatabaseIfNeeded(operationContext()));
 
     auto expectedShardsIndexes = std::vector<BSONObj>{
-        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
-                 << "_id_"),
+        BSON("v" << 2 << "key" << BSON("_id" << 1) << "name" << IndexConstants::kIdIndexName),
         BSON("v" << 2 << "unique" << true << "key" << BSON("host" << 1) << "name"
                  << "host_1")};
 
@@ -99,7 +87,7 @@ TEST_F(ConfigIndexTest, IncompatibleIndexAlreadyExists) {
 }
 
 TEST_F(ConfigIndexTest, CreateIndex) {
-    NamespaceString nss("config.foo");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("config.foo");
 
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, getIndexes(operationContext(), nss).getStatus());
 
@@ -129,13 +117,13 @@ TEST_F(ConfigIndexTest, CreateIndex) {
 }
 
 TEST_F(ConfigIndexTest, CreateIndexNonEmptyCollection) {
-    NamespaceString nss("config.foo");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("config.foo");
 
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, getIndexes(operationContext(), nss).getStatus());
 
     // Inserting the document should implicitly create the collection
     DBDirectClient dbDirectClient(operationContext());
-    dbDirectClient.insert(nss.toString(), BSON("_id" << 1 << "a" << 1));
+    dbDirectClient.insert(nss, BSON("_id" << 1 << "a" << 1));
 
     auto status = createIndexOnConfigCollection(operationContext(), nss, BSON("a" << 1), false);
     ASSERT_OK(status);

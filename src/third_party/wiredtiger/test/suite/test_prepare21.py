@@ -26,9 +26,8 @@
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
 
-import threading, time
-from helper import simulate_crash_restart
-from test_rollback_to_stable01 import test_rollback_to_stable_base
+import threading
+from rollback_to_stable_util import test_rollback_to_stable_base
 from wiredtiger import stat
 from wtdataset import SimpleDataSet
 from wtscenario import make_scenarios
@@ -118,7 +117,7 @@ class test_prepare21(test_rollback_to_stable_base):
             ckpt_started = 0
             while not ckpt_started:
                 stat_cursor = self.session.open_cursor('statistics:', None, None)
-                ckpt_started = stat_cursor[stat.conn.txn_checkpoint_running][2]
+                ckpt_started = stat_cursor[stat.conn.checkpoint_state][2] != 0
                 stat_cursor.close()
 
             self.evict_cursor(uri, nrows)
@@ -130,6 +129,3 @@ class test_prepare21(test_rollback_to_stable_base):
         self.check(value_a, uri, nrows, None, 20)
         self.check(value_b, uri, nrows, None, 30)
         self.check(value_d, uri, nrows, None, 60)
-
-if __name__ == '__main__':
-    wttest.run()

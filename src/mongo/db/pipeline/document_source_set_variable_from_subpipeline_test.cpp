@@ -27,32 +27,26 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <array>
-#include <deque>
-#include <list>
-#include <set>
 #include <vector>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/document_comparator.h"
-#include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document_source_add_fields.h"
-#include "mongo/db/pipeline/document_source_documents.h"
-#include "mongo/db/pipeline/document_source_facet.h"
-#include "mongo/db/pipeline/document_source_geo_near.h"
-#include "mongo/db/pipeline/document_source_lookup.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/document_source_replace_root.h"
 #include "mongo/db/pipeline/document_source_set_variable_from_subpipeline.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/process_interface/stub_lookup_single_document_process_interface.h"
-#include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
@@ -92,14 +86,14 @@ TEST_F(DocumentSourceSetVariableFromSubPipelineTest, testParserErrors) {
     ASSERT_THROWS_CODE(DocumentSourceSetVariableFromSubPipeline::createFromBson(
                            missingSetVar.firstElement(), expCtx),
                        AssertionException,
-                       40414);
+                       ErrorCodes::IDLFailedToParse);
 
     auto missingPipeline = BSON("$setVariableFromSubPipeline" << BSON("setVariable"
                                                                       << "$$SEARCH_META"));
     ASSERT_THROWS_CODE(DocumentSourceSetVariableFromSubPipeline::createFromBson(
                            missingPipeline.firstElement(), expCtx),
                        AssertionException,
-                       40414);
+                       ErrorCodes::IDLFailedToParse);
 
     auto wrongType =
         BSON("$setVariableFromSubPipeline"
@@ -137,7 +131,7 @@ TEST_F(DocumentSourceSetVariableFromSubPipelineTest, testDoGetNext) {
         std::vector{Document{{"a", 1}}, Document{{"b", 1}}, Document{{"c", 1}}, Document{{"d", 1}}};
     auto expCtx = getExpCtx();
     const auto mockSourceForSetVarStage = DocumentSourceMock::createForTest(inputDocs[1], expCtx);
-    auto ctxForSubPipeline = expCtx->copyForSubPipeline(expCtx->ns);
+    auto ctxForSubPipeline = expCtx->copyForSubPipeline(expCtx->getNamespaceString());
     const auto mockSourceForSubPipeline =
         DocumentSourceMock::createForTest(inputDocs, ctxForSubPipeline);
     auto setVariableFromSubPipeline = DocumentSourceSetVariableFromSubPipeline::create(
@@ -158,6 +152,62 @@ TEST_F(DocumentSourceSetVariableFromSubPipelineTest, testDoGetNext) {
                                Value((BSON("d" << 1))),
                                nullptr) == 0);
 }
+TEST_F(DocumentSourceSetVariableFromSubPipelineTest, QueryShape) {
+    const auto inputDocs =
+        std::vector{Document{{"a", 1}}, Document{{"b", 1}}, Document{{"c", 1}}, Document{{"d", 1}}};
+    auto expCtx = getExpCtx();
+    const auto mockSourceForSetVarStage = DocumentSourceMock::createForTest(inputDocs[1], expCtx);
+    auto ctxForSubPipeline = expCtx->copyForSubPipeline(expCtx->getNamespaceString());
+    const auto mockSourceForSubPipeline =
+        DocumentSourceMock::createForTest(inputDocs, ctxForSubPipeline);
+    auto setVariableFromSubPipeline = DocumentSourceSetVariableFromSubPipeline::create(
+        expCtx,
+        Pipeline::create({DocumentSourceMatch::create(BSON("d" << 1), ctxForSubPipeline)},
+                         ctxForSubPipeline),
+        Variables::kSearchMetaId);
 
+    setVariableFromSubPipeline->addSubPipelineInitialSource(mockSourceForSubPipeline);
+    setVariableFromSubPipeline->setSource(mockSourceForSetVarStage.get());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$setVariableFromSubPipeline": {
+                "setVariable": "HASH<$$SEARCH_META>",
+                "pipeline": [
+                    {
+                        "$mock": {}
+                    },
+                    {
+                        "$match": {
+                            "HASH<d>": {
+                                "$eq": "?number"
+                            }
+                        }
+                    }
+                ]
+            }
+        })",
+        redact(*setVariableFromSubPipeline));
+}
+
+TEST_F(DocumentSourceSetVariableFromSubPipelineTest, ShouldPropagateDisposeThroughToSubpipeline) {
+    auto expCtx = getExpCtx();
+
+    const auto mockSourceForSetVarStage = DocumentSourceMock::createForTest(expCtx);
+
+    auto ctxForSubPipeline = expCtx->copyForSubPipeline(expCtx->getNamespaceString());
+    const auto mockSourceForSubPipeline = DocumentSourceMock::createForTest(ctxForSubPipeline);
+
+    auto setVariableFromSubPipeline = DocumentSourceSetVariableFromSubPipeline::create(
+        expCtx,
+        Pipeline::create({mockSourceForSubPipeline}, ctxForSubPipeline),
+        Variables::kSearchMetaId);
+
+    setVariableFromSubPipeline->setSource(mockSourceForSetVarStage.get());
+
+    // Make sure that if we call dispose on the outer pipeline, which includes
+    // $setVariableFromSubPipeline, the subpipeline will also be properly disposed.
+    setVariableFromSubPipeline->dispose();
+    ASSERT_TRUE(mockSourceForSetVarStage->isDisposed);
+}
 }  // namespace
 }  // namespace mongo

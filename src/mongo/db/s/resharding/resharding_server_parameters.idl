@@ -32,7 +32,7 @@ global:
     cpp_namespace: "mongo::resharding"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
 
 server_parameters:
     reshardingCoordinatorServiceMaxThreadCount:
@@ -44,6 +44,7 @@ server_parameters:
         validator:
             gte: 1
             lte: 256
+        redact: false
 
     reshardingDonorServiceMaxThreadCount:
         description: The max number of threads in the resharding donor's thread pool.
@@ -54,6 +55,7 @@ server_parameters:
         validator:
             gte: 1
             lte: 256
+        redact: false
 
     reshardingRecipientServiceMaxThreadCount:
         description: The max number of threads in the resharding recipient's thread pool.
@@ -64,6 +66,7 @@ server_parameters:
         validator:
             gte: 1
             lte: 256
+        redact: false
 
     reshardingCollectionClonerBatchSizeInBytes:
         description: >-
@@ -76,6 +79,19 @@ server_parameters:
             expr: 100 * 1024
         validator:
             gte: 1
+        redact: false
+
+    reshardingCollectionClonerWriteThreadCount:
+        description: >-
+            Number of writer threads used by ReshardingCollectionCloner.
+        set_at: runtime
+        cpp_vartype: int
+        cpp_varname: gReshardingCollectionClonerWriteThreadCount
+        default:
+            expr: 2
+        validator:
+            gte: 1
+        redact: false
 
     reshardingTxnClonerProgressBatchSize:
         description: >-
@@ -87,6 +103,34 @@ server_parameters:
         default: 1000
         validator:
             gte: 1
+        redact: false
+
+    reshardingOplogFetcherInsertBatchLimitOperations:
+        description: >-
+            The maximum number of operations for ReshardingOplogFetcher to insert in a single batch.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: gReshardingOplogFetcherInsertBatchLimitOperations
+        default:
+            expr: 5 * 1000
+        validator:
+            gte: 1
+            lte:
+                expr: 1000 * 1000
+        redact: false
+
+    reshardingOplogFetcherInsertBatchLimitBytes:
+        description: >-
+            The maximum size in bytes for ReshardingOplogFetcher to insert in a single batch.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: gReshardingOplogFetcherInsertBatchLimitBytes
+        default:
+            expr: 15 * 1024 * 1024
+        validator:
+            lte:
+                expr: 16 * 1024 * 1024
+        redact: false
 
     reshardingOplogBatchTaskCount:
         description: >-
@@ -101,6 +145,7 @@ server_parameters:
         validator:
             gte: 1
             lte: 256
+        redact: false
 
     reshardingOplogBatchLimitOperations:
         description: >-
@@ -114,6 +159,7 @@ server_parameters:
             gte: 1
             lte:
                 expr: 1000 * 1000
+        redact: false
 
     reshardingOplogBatchLimitBytes:
         description: >-
@@ -128,6 +174,7 @@ server_parameters:
                 expr: 16 * 1024 * 1024
             lte:
                 expr: 100 * 1024 * 1024
+        redact: false
 
     reshardingOplogApplierMaxLockRequestTimeoutMillis:
         description: >-
@@ -137,12 +184,14 @@ server_parameters:
         cpp_vartype: AtomicWord<int>
         cpp_varname: gReshardingOplogApplierMaxLockRequestTimeoutMillis
         default: 5
+        redact: false
 
     reshardingMinimumOperationDurationMillis:
         description: >-
-            Controls the minimum duration of resharding operations, and allows transactions and 
-            retryable writes started after the current resharding operation to complete within the 
-            period defined by the parameter.
+            Controls the minimum duration of resharding operations, and allows transactions and
+            retryable writes started after the current resharding operation to complete within the
+            period defined by the parameter. If this value is lowered then you will likely want to lower
+            reshardingDelayBeforeRemainingOperationTimeQueryMillis as well.
         set_at: [startup, runtime]
         cpp_vartype: AtomicWord<int>
         cpp_varname: gReshardingMinimumOperationDurationMillis
@@ -150,7 +199,23 @@ server_parameters:
             expr: 5 * 60 * 1000
         validator:
             gte: 0
-    
+        redact: false
+
+    reshardingDelayBeforeRemainingOperationTimeQueryMillis:
+        description: >-
+            Initial delay before querying for remaining operation time from recipient shards.
+            The delay allows for applying more oplog entries before calculating time remaining, giving
+            a more accurate value.
+            Note we will have this delay every time we happen to have a failover occur.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: gReshardingDelayBeforeRemainingOperationTimeQueryMillis
+        default:
+            expr: 30 * 1000
+        validator:
+            gte: 0
+        redact: false
+
     reshardingCriticalSectionTimeoutMillis:
         description: >-
             The upper limit on how long to wait to hear back from recipient shards reaching strict
@@ -162,11 +227,12 @@ server_parameters:
             expr: 5 * 1000
         validator:
             gte: 0
+        redact: false
 
     remainingReshardingOperationTimeThresholdMillis:
         description: >-
-            Controls the threshold for engaging the critical section of resharding operations. 
-            Once the remaining operation time on all recipients falls below this threshold, the 
+            Controls the threshold for engaging the critical section of resharding operations.
+            Once the remaining operation time on all recipients falls below this threshold, the
             resharding coordinator will engage the critical section and block incoming writes.
         set_at: [startup, runtime]
         cpp_vartype: AtomicWord<int>
@@ -175,3 +241,19 @@ server_parameters:
             expr: 2 * 1000
         validator:
             gte: 0
+        redact: false
+
+    reshardingCoordinatorQuiescePeriodMillis:
+        description: >-
+            Controls the amount of time a resharding operation will remain in a quiesced state on
+            the coordinator, after it completes or aborts, to allow a user to reconnect to it and
+            retrieve the result. This applies only to resharding operations where the user
+            provided a reshardingUUID; if no UUID is provided there is no quiesce period.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: gReshardingCoordinatorQuiescePeriodMillis
+        default:
+            expr: 15 * 60 * 1000
+        validator:
+            gte: 0
+        redact: false

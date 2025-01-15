@@ -40,7 +40,6 @@ class test_schema06(TieredConfigMixin, wttest.WiredTigerTestCase):
 
     types = [
         ('normal', { 'type': 'normal', 'idx_config' : '' }),
-        ('lsm', { 'type': 'lsm', 'idx_config' : ',type=lsm' }),
     ]
 
     tiered_storage_sources = gen_tiered_storage_sources()
@@ -71,9 +70,6 @@ class test_schema06(TieredConfigMixin, wttest.WiredTigerTestCase):
         self.dropUntilSuccess(self.session, "index:schema06:" + colname)
 
     def test_index_stress(self):
-        if self.is_tiered_scenario() and self.type == 'lsm':
-            self.skipTest('Tiered storage does not support LSM URIs.')
-
         self.session.create("table:schema06",
                             "key_format=S,value_format=SSSSSS," +
                             "columns=(key,s0,s1,s2,s3,s4,s5),colgroups=(c1,c2)")
@@ -169,6 +165,3 @@ class test_schema06(TieredConfigMixin, wttest.WiredTigerTestCase):
                 count += 1
             cursor.close()
             self.assertEqual(count, n)
-
-if __name__ == '__main__':
-    wttest.run()

@@ -29,8 +29,11 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <vector>
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/atomic_word.h"
@@ -71,6 +74,9 @@ public:
      * called after startup().
      */
     void shutdownAndJoin();
+
+    void shutdown_forTest();
+    void join_forTest();
 
     /**
      * Adds 'executors' and 'fixedExecutor' to the pool. May be called at most once to initialize an

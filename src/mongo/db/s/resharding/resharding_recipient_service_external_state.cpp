@@ -27,28 +27,51 @@
  *    it in the license file.
  */
 
-
 #include "mongo/db/s/resharding/resharding_recipient_service_external_state.h"
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/feature_flag.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_index_catalog_ddl_util.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_index_catalog_gen.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/index_version.h"
 #include "mongo/s/resharding/common_types_gen.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/sharding_state.h"
 #include "mongo/s/stale_shard_version_helpers.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
-
 namespace mongo {
-
 namespace {
+
 const WriteConcernOptions kMajorityWriteConcern{
     WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, Seconds(0)};
-}
+
+}  // namespace
 
 void ReshardingRecipientService::RecipientStateMachineExternalState::
     ensureTempReshardingCollectionExistsWithIndexes(OperationContext* opCtx,
@@ -80,16 +103,40 @@ void ReshardingRecipientService::RecipientStateMachineExternalState::
     // Set the temporary resharding collection's UUID to the resharding UUID. Note that
     // BSONObj::addFields() replaces any fields that already exist.
     collOptions = collOptions.addFields(BSON("uuid" << metadata.getReshardingUUID()));
+    CollectionOptionsAndIndexes collOptionsAndIndexes{metadata.getReshardingUUID(),
+                                                      std::move(indexes),
+                                                      std::move(idIndex),
+                                                      std::move(collOptions)};
+    if (resharding::gFeatureFlagReshardingImprovements.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        // The indexSpecs are cleared here so we don't create those indexes when creating temp
+        // collections. These indexes will be fetched and built during building-index stage.
+        collOptionsAndIndexes.indexSpecs = {};
+    }
     MigrationDestinationManager::cloneCollectionIndexesAndOptions(
-        opCtx,
-        metadata.getTempReshardingNss(),
-        CollectionOptionsAndIndexes{metadata.getReshardingUUID(),
-                                    std::move(indexes),
-                                    std::move(idIndex),
-                                    std::move(collOptions)});
+        opCtx, metadata.getTempReshardingNss(), collOptionsAndIndexes);
+
+    if (feature_flags::gGlobalIndexesShardingCatalog.isEnabled(
+            serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
+        auto optSii = getCollectionIndexInfoWithRefresh(opCtx, metadata.getTempReshardingNss());
+
+        if (optSii) {
+            std::vector<IndexCatalogType> indexes;
+            optSii->forEachIndex([&](const auto& index) {
+                indexes.push_back(index);
+                return true;
+            });
+            replaceCollectionShardingIndexCatalog(opCtx,
+                                                  metadata.getTempReshardingNss(),
+                                                  metadata.getReshardingUUID(),
+                                                  optSii->getCollectionIndexes().indexVersion(),
+                                                  indexes);
+        }
+    }
 
     AutoGetCollection autoColl(opCtx, metadata.getTempReshardingNss(), MODE_IX);
-    CollectionShardingRuntime::get(opCtx, metadata.getTempReshardingNss())
+    CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(
+        opCtx, metadata.getTempReshardingNss())
         ->clearFilteringMetadata(opCtx);
 }
 
@@ -108,31 +155,51 @@ ShardId RecipientStateMachineExternalStateImpl::myShardId(ServiceContext* servic
 
 void RecipientStateMachineExternalStateImpl::refreshCatalogCache(OperationContext* opCtx,
                                                                  const NamespaceString& nss) {
-    auto catalogCache = Grid::get(opCtx)->catalogCache();
-    uassertStatusOK(catalogCache->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss));
+    uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getCollectionPlacementInfoWithRefresh(opCtx, nss));
 }
 
-ChunkManager RecipientStateMachineExternalStateImpl::getShardedCollectionRoutingInfo(
+CollectionRoutingInfo RecipientStateMachineExternalStateImpl::getTrackedCollectionRoutingInfo(
     OperationContext* opCtx, const NamespaceString& nss) {
-    auto catalogCache = Grid::get(opCtx)->catalogCache();
-    return catalogCache->getShardedCollectionRoutingInfo(opCtx, nss);
+    auto cri =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Expected collection " << nss.toStringForErrorMsg()
+                          << " to be tracked",
+            cri.cm.hasRoutingTable());
+    return cri;
 }
 
 MigrationDestinationManager::CollectionOptionsAndUUID
-RecipientStateMachineExternalStateImpl::getCollectionOptions(OperationContext* opCtx,
-                                                             const NamespaceString& nss,
-                                                             const UUID& uuid,
-                                                             Timestamp afterClusterTime,
-                                                             StringData reason) {
+RecipientStateMachineExternalStateImpl::getCollectionOptions(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const UUID& uuid,
+    boost::optional<Timestamp> afterClusterTime,
+    StringData reason) {
     // Load the collection options from the primary shard for the database.
     return _withShardVersionRetry(opCtx, nss, reason, [&] {
-        auto cm = getShardedCollectionRoutingInfo(opCtx, nss);
         return MigrationDestinationManager::getCollectionOptions(
-            opCtx,
-            NamespaceStringOrUUID{nss.db().toString(), uuid},
-            cm.dbPrimary(),
-            cm,
-            afterClusterTime);
+            opCtx, NamespaceStringOrUUID{nss.dbName(), uuid}, afterClusterTime);
+    });
+}
+
+MigrationDestinationManager::CollectionOptionsAndUUID
+RecipientStateMachineExternalStateImpl::getCollectionOptions(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const UUID& uuid,
+    boost::optional<Timestamp> afterClusterTime,
+    StringData reason,
+    const ShardId& fromShardId) {
+    // Load the collection options from the specified shard for the database.
+    return _withShardVersionRetry(opCtx, nss, reason, [&] {
+        const auto nssOrUUID = NamespaceStringOrUUID{nss.dbName(), uuid};
+        const auto dbInfo = uassertStatusOK(
+            Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, nssOrUUID.dbName()));
+        return MigrationDestinationManager::getCollectionOptions(
+            opCtx, nssOrUUID, fromShardId, dbInfo->getVersion(), afterClusterTime);
     });
 }
 
@@ -141,17 +208,26 @@ RecipientStateMachineExternalStateImpl::getCollectionIndexes(OperationContext* o
                                                              const NamespaceString& nss,
                                                              const UUID& uuid,
                                                              Timestamp afterClusterTime,
-                                                             StringData reason) {
+                                                             StringData reason,
+                                                             bool expandSimpleCollation) {
     // Load the list of indexes from the shard which owns the global minimum chunk.
     return _withShardVersionRetry(opCtx, nss, reason, [&] {
-        auto cm = getShardedCollectionRoutingInfo(opCtx, nss);
+        auto cri = getTrackedCollectionRoutingInfo(opCtx, nss);
         return MigrationDestinationManager::getCollectionIndexes(
             opCtx,
-            NamespaceStringOrUUID{nss.db().toString(), uuid},
-            cm.getMinKeyShardIdWithSimpleCollation(),
-            cm,
-            afterClusterTime);
+            nss,
+            cri.cm.getMinKeyShardIdWithSimpleCollation(),
+            cri,
+            afterClusterTime,
+            expandSimpleCollation);
     });
+}
+
+boost::optional<ShardingIndexesCatalogCache>
+RecipientStateMachineExternalStateImpl::getCollectionIndexInfoWithRefresh(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    auto catalogCache = Grid::get(opCtx)->catalogCache();
+    return uassertStatusOK(catalogCache->getCollectionIndexInfoWithRefresh(opCtx, nss));
 }
 
 void RecipientStateMachineExternalStateImpl::withShardVersionRetry(
@@ -186,11 +262,9 @@ void RecipientStateMachineExternalStateImpl::updateCoordinatorDocument(Operation
     }
 }
 
-void RecipientStateMachineExternalStateImpl::clearFilteringMetadata(
-    OperationContext* opCtx,
-    const NamespaceString& sourceNss,
-    const NamespaceString& tempReshardingNss) {
-    stdx::unordered_set<NamespaceString> namespacesToRefresh{sourceNss, tempReshardingNss};
+void RecipientStateMachineExternalStateImpl::clearFilteringMetadataOnTempReshardingCollection(
+    OperationContext* opCtx, const NamespaceString& tempReshardingNss) {
+    stdx::unordered_set<NamespaceString> namespacesToRefresh{tempReshardingNss};
     resharding::clearFilteringMetadata(opCtx, namespacesToRefresh, true /* scheduleAsyncRefresh */);
 }
 

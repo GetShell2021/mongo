@@ -28,14 +28,18 @@
  */
 
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "cxxabi.h"
+#include <utility>
 
-#include "mongo/executor/network_interface_thread_pool.h"
-
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/destructor_guard.h"
-#include "mongo/util/scopeguard.h"
+#include "mongo/util/functional.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kExecutor
 
@@ -51,7 +55,7 @@ NetworkInterfaceThreadPool::~NetworkInterfaceThreadPool() {
 
 void NetworkInterfaceThreadPool::_dtorImpl() {
     {
-        stdx::unique_lock<Latch> lk(_mutex);
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
 
         if (_tasks.empty())
             return;
@@ -65,7 +69,7 @@ void NetworkInterfaceThreadPool::_dtorImpl() {
 }
 
 void NetworkInterfaceThreadPool::startup() {
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     if (_started) {
         LOGV2_FATAL(34358, "Attempting to start pool, but it has already started");
     }
@@ -76,7 +80,7 @@ void NetworkInterfaceThreadPool::startup() {
 
 void NetworkInterfaceThreadPool::shutdown() {
     {
-        stdx::lock_guard<Latch> lk(_mutex);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _inShutdown = true;
     }
 
@@ -85,7 +89,7 @@ void NetworkInterfaceThreadPool::shutdown() {
 
 void NetworkInterfaceThreadPool::join() {
     {
-        stdx::unique_lock<Latch> lk(_mutex);
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
 
         if (_joining) {
             LOGV2_FATAL(34357, "Attempted to join pool more than once");
@@ -100,13 +104,13 @@ void NetworkInterfaceThreadPool::join() {
 
     _net->signalWorkAvailable();
 
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     _joiningCondition.wait(
         lk, [&] { return _tasks.empty() && (_consumeState == ConsumeState::kNeutral); });
 }
 
 void NetworkInterfaceThreadPool::schedule(Task task) {
-    stdx::unique_lock<Latch> lk(_mutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
     if (_inShutdown) {
         lk.unlock();
         task({ErrorCodes::ShutdownInProgress, "Shutdown in progress"});
@@ -127,7 +131,7 @@ void NetworkInterfaceThreadPool::schedule(Task task) {
  * allows us to use the network interface's threads as our own pool, which should reduce context
  * switches if our tasks are getting scheduled by network interface tasks.
  */
-void NetworkInterfaceThreadPool::_consumeTasks(stdx::unique_lock<Latch> lk) {
+void NetworkInterfaceThreadPool::_consumeTasks(stdx::unique_lock<stdx::mutex> lk) {
     if ((_consumeState != ConsumeState::kNeutral) || _tasks.empty())
         return;
 
@@ -140,7 +144,7 @@ void NetworkInterfaceThreadPool::_consumeTasks(stdx::unique_lock<Latch> lk) {
     _consumeState = ConsumeState::kScheduled;
     lk.unlock();
     auto ret = _net->schedule([this](Status status) {
-        stdx::unique_lock<Latch> lk(_mutex);
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
 
         if (_consumeState != ConsumeState::kScheduled)
             return;
@@ -149,7 +153,7 @@ void NetworkInterfaceThreadPool::_consumeTasks(stdx::unique_lock<Latch> lk) {
     invariant(ret.isOK() || ErrorCodes::isShutdownError(ret.code()));
 }
 
-void NetworkInterfaceThreadPool::_consumeTasksInline(stdx::unique_lock<Latch> lk) noexcept {
+void NetworkInterfaceThreadPool::_consumeTasksInline(stdx::unique_lock<stdx::mutex> lk) noexcept {
     _consumeState = ConsumeState::kConsuming;
     const ScopeGuard consumingTasksGuard([&] { _consumeState = ConsumeState::kNeutral; });
 

@@ -1,10 +1,13 @@
+#!/usr/bin/env python3
+
 # This file is a python script that describes the WiredTiger API.
 
 class Method:
-    def __init__(self, config):
+    def __init__(self, config, compilable=False):
         # Deal with duplicates: with complex configurations (like WT_SESSION::create), it's simpler
         # to deal with duplicates once than manually as configurations are defined.
         self.config = []
+        self.compilable = compilable
         lastname = None
         for c in sorted(config):
             if '.' in c.name:
@@ -101,8 +104,8 @@ source_meta = [
     Config('type', 'file', r'''
         set the type of data source used to store a column group, index or simple table.
         By default, a \c "file:" URI is derived from the object name. The \c type configuration
-        can be used to switch to a different data source, such as LSM or an extension configured
-        by the application'''),
+        can be used to switch to a different data source or an extension configured by the 
+        application'''),
 ]
 
 format_meta = common_meta + [
@@ -119,65 +122,6 @@ format_meta = common_meta + [
         manipulate raw byte arrays. Value items of type 't' are bitfields, and when configured
         with record number type keys, will be stored using a fixed-length store''',
         type='format', func='__wt_struct_confchk'),
-]
-
-lsm_config = [
-    Config('lsm', '', r'''
-        options only relevant for LSM data sources''',
-        type='category', subconfig=[
-        Config('auto_throttle', 'true', r'''
-            Throttle inserts into LSM trees if flushing to disk isn't keeping up''',
-            type='boolean'),
-        Config('bloom', 'true', r'''
-            create Bloom filters on LSM tree chunks as they are merged''',
-            type='boolean'),
-        Config('bloom_bit_count', '16', r'''
-            the number of bits used per item for LSM Bloom filters''',
-            min='2', max='1000'),
-        Config('bloom_config', '', r'''
-            config string used when creating Bloom filter files, passed to WT_SESSION::create'''),
-        Config('bloom_hash_count', '8', r'''
-            the number of hash values per item used for LSM Bloom filters''',
-            min='2', max='100'),
-        Config('bloom_oldest', 'false', r'''
-            create a Bloom filter on the oldest LSM tree chunk. Only supported if Bloom filters
-            are enabled''',
-            type='boolean'),
-        Config('chunk_count_limit', '0', r'''
-            the maximum number of chunks to allow in an LSM tree. This option automatically
-            times out old data. As new chunks are added old chunks will be removed. Enabling
-            this option disables LSM background merges''',
-            type='int'),
-        Config('chunk_max', '5GB', r'''
-            the maximum size a single chunk can be. Chunks larger than this size are not
-            considered for further merges. This is a soft limit, and chunks larger than this
-            value can be created. Must be larger than chunk_size''',
-            min='100MB', max='10TB'),
-        Config('chunk_size', '10MB', r'''
-            the maximum size of the in-memory chunk of an LSM tree. This limit is soft, it is
-            possible for chunks to be temporarily larger than this value. This overrides the
-            \c memory_page_max setting''',
-            min='512K', max='500MB'),
-        Config('merge_custom', '', r'''
-            configure the tree to merge into a custom data source''',
-            type='category', subconfig=[
-            Config('prefix', '', r'''
-                custom data source prefix instead of \c "file"'''),
-            Config('start_generation', '0', r'''
-                merge generation at which the custom data source is used (zero indicates no
-                custom data source)''',
-                min='0', max='10'),
-            Config('suffix', '', r'''
-                custom data source suffix instead of \c ".lsm"'''),
-            ]),
-        Config('merge_max', '15', r'''
-            the maximum number of chunks to include in a merge operation''',
-            min='2', max='100'),
-        Config('merge_min', '0', r'''
-            the minimum number of chunks to include in a merge operation. If set to 0 or 1 half
-            the value of merge_max is used''',
-            max='100'),
-    ]),
 ]
 
 tiered_config = [
@@ -205,6 +149,9 @@ tiered_config = [
         Config('object_target_size', '0', r'''
             this option is no longer supported, retained for backward compatibility''',
             min='0', undoc=True),
+        Config('shared', 'false', r'''
+            enable sharing tiered tables across other WiredTiger instances.''',
+            type='boolean'),
         ]),
 ]
 
@@ -227,8 +174,8 @@ file_runtime_config = common_runtime_config + [
         to an appropriate operating system advisory call where available''',
         choices=['none', 'random', 'sequential']),
     Config('cache_resident', 'false', r'''
-        do not ever evict the object's pages from cache. Not compatible with LSM tables; see
-        @ref tuning_cache_resident for more information''',
+        do not ever evict the object's pages from cache, see @ref tuning_cache_resident for more
+        information''',
         type='boolean'),
     Config('log', '', r'''
         the transaction log configuration for this object. Only valid if \c log is enabled in
@@ -276,8 +223,8 @@ file_config = format_meta + file_runtime_config + tiered_config + [
         tune_checksum for more information.''',
         choices=['on', 'off', 'uncompressed', 'unencrypted']),
     Config('dictionary', '0', r'''
-        the maximum number of unique values remembered in the Btree row-store leaf page value
-        dictionary; see @ref file_formats_compression for more information''',
+        the maximum number of unique values remembered in the row-store/variable-length column-store
+        leaf page value dictionary; see @ref file_formats_compression for more information''',
         min='0'),
     Config('encryption', '', r'''
         configure an encryptor for file blocks. When a table is created, its encryptor is not
@@ -296,10 +243,9 @@ file_config = format_meta + file_runtime_config + tiered_config + [
         the file format''',
         choices=['btree']),
     Config('huffman_key', 'none', r'''
-        This option is no longer supported, retained for backward compatibility'''),
+        This option is no longer supported, retained for backward compatibility''', undoc=True),
     Config('huffman_value', 'none', r'''
-        configure Huffman encoding for values. Permitted values are \c "none", \c "english",
-        \c "utf8<file>" or \c "utf16<file>". See @ref huffman for more information'''),
+        This option is no longer supported, retained for backward compatibility''', undoc=True),
     Config('ignore_in_memory_cache_size', 'false', r'''
         allow update and insert operations to proceed even if the cache is already at
         capacity. Only valid in conjunction with in-memory databases. Should be used with caution -
@@ -358,8 +304,7 @@ file_config = format_meta + file_runtime_config + tiered_config + [
         the maximum size a page can grow to in memory before being reconciled to disk. The
         specified size will be adjusted to a lower bound of <code>leaf_page_max</code>, and an
         upper bound of <code>cache_size / 10</code>. This limit is soft - it is possible for
-        pages to be temporarily larger than this value. This setting is ignored for LSM trees,
-        see \c chunk_size''',
+        pages to be temporarily larger than this value.''',
         min='512B', max='10TB'),
     Config('prefix_compression', 'false', r'''
         configure prefix compression on row-store leaf pages''',
@@ -404,15 +349,6 @@ file_meta = file_config + [
         the file version'''),
 ]
 
-lsm_meta = file_config + lsm_config + [
-    Config('last', '0', r'''
-        the last allocated chunk ID'''),
-    Config('chunks', '', r'''
-        active chunks in the LSM tree'''),
-    Config('old_chunks', '', r'''
-        obsolete chunks in the LSM tree'''),
-]
-
 tiered_meta = file_meta + tiered_config + [
     Config('flush_time', '0', r'''
         indicates the time this tree was flushed to shared storage or 0 if unflushed'''),
@@ -449,9 +385,6 @@ table_only_config = [
 ]
 
 index_only_config = [
-    Config('extractor', 'none', r'''
-        configure a custom extractor for indices. Permitted values are \c "none" or an extractor
-        name created with WT_CONNECTION::add_extractor'''),
     Config('immutable', 'false', r'''
         configure the index to be immutable -- that is, the index is not changed by any update to
         a record in the table''',
@@ -460,11 +393,7 @@ index_only_config = [
 
 colgroup_meta = common_meta + source_meta
 
-index_meta = format_meta + source_meta + index_only_config + [
-    Config('index_key_columns', '', r'''
-        number of public key columns''',
-        type='int', undoc=True),
-]
+index_meta = format_meta + source_meta + index_only_config
 
 table_meta = format_meta + table_only_config
 
@@ -492,7 +421,7 @@ connection_runtime_config = [
         Config('size', '0', r'''
             maximum memory to allocate for the block cache''',
             min='0', max='10TB'),
-        Config('hashsize', '0', r'''
+        Config('hashsize', '32768', r'''
             number of buckets in the hashtable that keeps track of blocks''',
             min='512', max='256K'),
         Config('max_percent_overhead', '10', r'''
@@ -520,17 +449,10 @@ connection_runtime_config = [
         the maximum number of milliseconds an application thread will wait for space to be
         available in cache before giving up. Default will wait forever''',
         min=0),
-    Config('history_store', '', r'''
-        history store configuration options''',
-        type='category', subconfig=[
-        Config('file_max', '0', r'''
-            the maximum number of bytes that WiredTiger is allowed to use for its history store
-            mechanism. If the history store file exceeds this size, a panic will be triggered. The
-            default value means that the history store file is unbounded and may use as much
-            space as the filesystem will accommodate. The minimum non-zero setting is 100MB.''',
-            # !!! Must match WT_HS_FILE_MIN
-            min='0')
-        ]),
+    Config('cache_stuck_timeout_ms', '300000', r'''
+        the number of milliseconds to wait before a stuck cache times out in diagnostic mode.
+        Default will wait for 5 minutes, 0 will wait forever''',
+        min=0),
     Config('cache_overhead', '8', r'''
         assume the heap allocator overhead is the specified percentage, and adjust the cache
         usage by that amount (for example, if there is 10GB of data in cache, a percentage of
@@ -554,9 +476,24 @@ connection_runtime_config = [
             periodic checkpoints''',
             min='0', max='100000'),
         ]),
+    Config('checkpoint_cleanup', '', r'''
+        periodically checkpoint cleanup the database.''',
+        type='category', subconfig=[
+        Config('method', 'none', r'''
+            control how aggressively obsolete content is removed by reading the internal pages.
+            Default to none, which means no additional work is done to find obsolete content.
+            ''', choices=['none', 'reclaim_space']),
+        Config('wait', '300', r'''
+            seconds to wait between each checkpoint cleanup''',
+            min='60', max='100000'),
+        ]),
     Config('debug_mode', '', r'''
         control the settings of various extended debugging features''',
         type='category', subconfig=[
+        Config('background_compact', 'false', r'''
+               if true, background compact aggressively removes compact statistics for a file and
+               decreases the max amount of time a file can be skipped for.''',
+               type='boolean'),
         Config('corruption_abort', 'true', r'''
             if true and built in diagnostic mode, dump core in the case of data corruption''',
             type='boolean'),
@@ -564,6 +501,9 @@ connection_runtime_config = [
             adjust log removal to retain the log records of this number of checkpoints. Zero
             or one means perform normal removal.''',
             min='0', max='1024'),
+        Config('configuration', 'false', r'''
+               if true, display invalid cache configuration warnings.''',
+               type='boolean'),
         Config('cursor_copy', 'false', r'''
             if true, use the system allocator to make a copy of any data returned by a cursor
             operation and return the copy instead. The copy is freed on the next cursor
@@ -581,10 +521,6 @@ connection_runtime_config = [
             to happen more aggressively. This includes but is not limited to not skewing newest,
             not favoring leaf pages, and modifying the eviction score mechanism.''',
             type='boolean'),
-        Config('flush_checkpoint', 'false', r'''
-            if true, call a system wide checkpoint immediately after a flush_tier completes to
-            force objects out to disk so that a flush_tier can work single-threaded''',
-            type='boolean'),
         Config('log_retention', '0', r'''
             adjust log removal to retain at least this number of log files.
             (Warning: this option can remove log files required for recovery if no checkpoints
@@ -597,6 +533,9 @@ connection_runtime_config = [
             if true, reallocation of memory will only provide the exact amount requested. This
             will help with spotting memory allocation issues more easily.''',
             type='boolean'),
+        Config('realloc_malloc', 'false', r'''
+            if true, every realloc call will force a new memory allocation by using malloc.''',
+            type='boolean'),
         Config('rollback_error', '0', r'''
             return a WT_ROLLBACK error from a transaction operation about every Nth operation
             to simulate a collision''',
@@ -604,14 +543,25 @@ connection_runtime_config = [
         Config('slow_checkpoint', 'false', r'''
             if true, slow down checkpoint creation by slowing down internal page processing.''',
             type='boolean'),
+        Config('stress_skiplist', 'false', r'''
+            Configure various internal parameters to encourage race conditions and other issues
+            with internal skip lists, e.g. using a more dense representation.''',
+            type='boolean'),
         Config('table_logging', 'false', r'''
             if true, write transaction related information to the log for all operations, even
             operations for tables with logging turned off. This additional logging information
             is intended for debugging and is informational only, that is, it is ignored during
             recovery''',
             type='boolean'),
+        Config('tiered_flush_error_continue', 'false', r'''
+            on a write to tiered storage, continue when an error occurs.''',
+            type='boolean'),
         Config('update_restore_evict', 'false', r'''
             if true, control all dirty page evictions through forcing update restore eviction.''',
+            type='boolean'),
+        Config('eviction_checkpoint_ts_ordering', 'false', r'''
+            if true, act as if eviction is being run in parallel to checkpoint. We should return
+            EBUSY in eviction if we detect any timestamp ordering issue.''',
             type='boolean'),
         ]),
     Config('error_prefix', '', r'''
@@ -623,12 +573,22 @@ connection_runtime_config = [
                 maximum number of threads WiredTiger will start to help evict pages from cache. The
                 number of threads started will vary depending on the current eviction load. Each
                 eviction worker thread uses a session from the configured session_max''',
-                min=1, max=20),
+                min=1, max=20), # !!! Must match WT_EVICT_MAX_WORKERS
             Config('threads_min', '1', r'''
                 minimum number of threads WiredTiger will start to help evict pages from
                 cache. The number of threads currently running will vary depending on the
                 current eviction load''',
                 min=1, max=20),
+            Config('evict_sample_inmem', 'true', r'''
+                If no in-memory ref is found on the root page, attempt to locate a random
+                in-memory page by examining all entries on the root page.''',
+                type='boolean'),
+            Config('evict_use_softptr', 'false', r'''
+                Experimental: Use "soft pointers" instead of hard hazard
+                pointers in eviction server to remember its walking position in the tree. This might
+                be preferable to set to "true" if there are many collections. It can improve or
+                degrade performance depending on the workload.''',
+                type='boolean', undoc=True),
             ]),
     Config('eviction_checkpoint_target', '1', r'''
         perform eviction at the beginning of checkpoints to bring the dirty content in cache
@@ -676,6 +636,19 @@ connection_runtime_config = [
         cache_size and has to be greater than its counterpart \c eviction_updates_target. This
         setting only alters behavior if it is lower than \c eviction_trigger''',
         min=0, max='10TB'),
+    Config('extra_diagnostics', '[]', r'''
+        enable additional diagnostics in WiredTiger. These additional diagnostics include
+        diagnostic assertions that can cause WiredTiger to abort when an invalid state
+        is detected.
+        Options are given as a list, such as
+        <code>"extra_diagnostics=[out_of_order,visibility]"</code>.
+        Choosing \c all enables all assertions. When WiredTiger is compiled with
+        \c HAVE_DIAGNOSTIC=1 all assertions are enabled and cannot be reconfigured
+        ''',
+        type='list', choices=[
+            "all", "checkpoint_validate", "cursor_check", "disk_validate", "eviction_check",
+            "generation_check", "hs_validate", "key_out_of_order", "log_validate", "prepared",
+            "slow_operation", "txn_visibility"]),
     Config('file_manager', '', r'''
         control how file handles are managed''',
         type='category', subconfig=[
@@ -690,6 +663,39 @@ connection_runtime_config = [
             interval in seconds at which to check for files that are inactive and close them''',
             min=1, max=100000),
         ]),
+    Config('generation_drain_timeout_ms', '240000', r'''
+        the number of milliseconds to wait for a resource to drain before timing out in diagnostic
+        mode. Default will wait for 4 minutes, 0 will wait forever''',
+        min=0),
+    Config('heuristic_controls', '', r'''
+        control the behavior of various optimizations. This is primarily used as a mechanism for
+        rolling out changes to internal heuristics while providing a mechanism for quickly
+        reverting to prior behavior in the field''',
+        type='category', subconfig=[
+            Config('checkpoint_cleanup_obsolete_tw_pages_dirty_max', '100', r'''
+                maximum number of obsolete time window pages that can be marked as dirty per btree
+                in a single checkpoint by the checkpoint cleanup''',
+                min=0, max=100000),
+            Config('eviction_obsolete_tw_pages_dirty_max', '100', r'''
+                maximum number of obsolete time window pages that can be marked dirty per btree in a
+                single checkpoint by the eviction threads''',
+                min=0, max=100000),
+            Config('obsolete_tw_btree_max', '100', r'''
+                maximum number of btrees that can be checked for obsolete time window cleanup in a
+                single checkpoint''',
+                min=0, max=500000),
+        ]),
+    Config('history_store', '', r'''
+        history store configuration options''',
+        type='category', subconfig=[
+        Config('file_max', '0', r'''
+            the maximum number of bytes that WiredTiger is allowed to use for its history store
+            mechanism. If the history store file exceeds this size, a panic will be triggered. The
+            default value means that the history store file is unbounded and may use as much
+            space as the filesystem will accommodate. The minimum non-zero setting is 100MB.''',
+            # !!! Must match WT_HS_FILE_MIN
+            min='0')
+        ]),
     Config('io_capacity', '', r'''
         control how many bytes per second are written and read. Exceeding the capacity results
         in throttling.''',
@@ -699,32 +705,18 @@ connection_runtime_config = [
             decisions about what subsystems are throttled, and in what proportion, are made
             internally. The minimum non-zero setting is 1MB.''',
             min='0', max='1TB'),
+        Config('chunk_cache', '0', r'''
+            number of bytes per second available to the chunk cache. The minimum non-zero setting
+            is 1MB.''',
+            min='0', max='1TB'),
         ]),
     Config('json_output', '[]', r'''
         enable JSON formatted messages on the event handler interface. Options are given as a
         list, where each option specifies an event handler category e.g. 'error' represents
         the messages from the WT_EVENT_HANDLER::handle_error method.''',
         type='list', choices=['error', 'message']),
-    Config('lsm_manager', '', r'''
-        configure database wide options for LSM tree management. The LSM manager is started
-        automatically the first time an LSM tree is opened. The LSM manager uses a session
-        from the configured session_max''',
-        type='category', subconfig=[
-        Config('worker_thread_max', '4', r'''
-            Configure a set of threads to manage merging LSM trees in the database. Each worker
-            thread uses a session handle from the configured session_max''',
-            min='3',     # !!! Must match WT_LSM_MIN_WORKERS
-            max='20'),     # !!! Must match WT_LSM_MAX_WORKERS
-        Config('merge', 'true', r'''
-            merge LSM chunks where possible''',
-            type='boolean')
-        ]),
     Config('operation_timeout_ms', '0', r'''
-        if non-zero, a requested limit on the number of elapsed real time milliseconds
-        application threads will take to complete database operations. Time is measured from the
-        start of each WiredTiger API call. There is no guarantee any operation will not take
-        longer than this amount of time. If WiredTiger notices the limit has been exceeded, an
-        operation may return a WT_ROLLBACK error. The default of 0 is to have no limit''',
+        this option is no longer supported, retained for backward compatibility.''',
         min=0),
     Config('operation_tracking', '', r'''
         enable tracking of performance-critical functions. See @ref operation_tracking for
@@ -737,6 +729,16 @@ connection_runtime_config = [
                 the name of a directory into which operation tracking files are written. The
                 directory must already exist. If the value is not an absolute path, the path
                 is relative to the database home (see @ref absolute_path for more information)'''),
+        ]),
+    Config('rollback_to_stable', '', r'''
+        rollback tables to an earlier point in time, discarding all updates to checkpoint durable
+        tables that have durable times more recent than the current global stable timestamp''',
+        type='category', subconfig=[
+            Config('threads', 4, r'''
+                maximum number of threads WiredTiger will start to help RTS. Each
+                RTS worker thread uses a session from the configured WT_RTS_MAX_WORKERS''',
+                min=0,
+                max=10),    # !!! Must match WT_RTS_MAX_WORKERS
         ]),
     Config('shared_cache', '', r'''
         shared cache configuration options. A database should configure either a cache_size
@@ -780,17 +782,23 @@ connection_runtime_config = [
         stress testing of WiredTiger.''',
         type='list', undoc=True,
         choices=[
-        'aggressive_sweep', 'backup_rename', 'checkpoint_reserved_txnid_delay', 'checkpoint_slow',
-        'checkpoint_stop', 'compact_slow', 'evict_reposition',
+        'aggressive_stash_free', 'aggressive_sweep', 'backup_rename', 'checkpoint_evict_page',
+        'checkpoint_handle', 'checkpoint_slow', 'checkpoint_stop', 'commit_transaction_slow',
+        'compact_slow', 'evict_reposition', 'failpoint_eviction_split',
         'failpoint_history_store_delete_key_from_ts', 'history_store_checkpoint_delay',
-        'history_store_search', 'history_store_sweep_race', 'prepare_checkpoint_delay', 'split_1',
-        'split_2', 'split_3', 'split_4', 'split_5', 'split_6', 'split_7', 'tiered_flush_finish']),
+        'history_store_search', 'history_store_sweep_race', 'prefetch_1', 'prefetch_2',
+        'prefetch_3', 'prefix_compare', 'prepare_checkpoint_delay', 'prepare_resolution_1',
+        'prepare_resolution_2', 'sleep_before_read_overflow_onpage','split_1', 'split_2',
+        'split_3', 'split_4', 'split_5', 'split_6', 'split_7', 'split_8','tiered_flush_finish']),
     Config('verbose', '[]', r'''
         enable messages for various subsystems and operations. Options are given as a list,
         where each message type can optionally define an associated verbosity level, such as
-        <code>"verbose=[evictserver,read:1,rts:0]"</code>. Verbosity levels that can be provided
-        include <code>0</code> (INFO) and <code>1</code> (DEBUG).''',
+        <code>"verbose=[eviction,read:1,rts:0]"</code>. Verbosity levels that can be provided
+        include <code>0</code> (INFO) and <code>1</code> through <code>5</code>, corresponding to
+        (DEBUG_1) to (DEBUG_5). \c all is a special case that defines the verbosity level for all
+        categories not explicitly set in the config string.''',
         type='list', choices=[
+            'all',
             'api',
             'backup',
             'block',
@@ -798,24 +806,23 @@ connection_runtime_config = [
             'checkpoint',
             'checkpoint_cleanup',
             'checkpoint_progress',
+            'chunkcache',
             'compact',
             'compact_progress',
+            'configuration',
             'error_returns',
-            'evict',
-            'evict_stuck',
-            'evictserver',
+            'eviction',
             'fileops',
             'generation',
             'handleops',
             'history_store',
             'history_store_activity',
             'log',
-            'lsm',
-            'lsm_manager',
             'metadata',
             'mutex',
             'out_of_order',
             'overflow',
+            'prefetch',
             'read',
             'reconcile',
             'recovery',
@@ -877,6 +884,9 @@ log_configuration_common = [
     Config('prealloc', 'true', r'''
         pre-allocate log files''',
         type='boolean'),
+    Config('prealloc_init_count', '1', r'''
+        initial number of pre-allocated log files''',
+        min='1', max='500'),
     Config('remove', 'true', r'''
         automatically remove unneeded log files''',
         type='boolean'),
@@ -930,9 +940,8 @@ statistics_log_configuration_common = [
     Config('on_close', 'false', r'''log statistics on database close''',
         type='boolean'),
     Config('sources', '', r'''
-        if non-empty, include statistics for the list of data source URIs, if they are open at the
-        time of the statistics logging. The list may include URIs matching a single data source
-        ("table:mytable"), or a URI matching all data sources of a particular type ("table:")''',
+        if non-empty, include statistics for the list of "file:" data source URIs,
+        if they are open at the time of the statistics logging.''',
         type='list'),
     Config('timestamp', '"%b %d %H:%M:%S"', r'''
         a timestamp prepended to each log record. May contain \c strftime conversion specifications.
@@ -949,6 +958,19 @@ connection_reconfigure_statistics_log_configuration = [
         the configured session_max''',
         type='category', subconfig=
         statistics_log_configuration_common)
+]
+wiredtiger_open_statistics_log_configuration = [
+    Config('statistics_log', '', r'''
+        log any statistics the database is configured to maintain, to a file. See @ref
+        statistics for more information. Enabling the statistics log server uses a session from
+        the configured session_max''',
+        type='category', subconfig=
+        statistics_log_configuration_common + [
+        Config('path', '"."', r'''
+            the name of a directory into which statistics files are written. The directory
+            must already exist. If the value is not an absolute path, the path is relative to
+            the database home (see @ref absolute_path for more information)''')
+        ])
 ]
 
 tiered_storage_configuration_common = [
@@ -986,21 +1008,73 @@ wiredtiger_open_tiered_storage_configuration = [
         Config('name', 'none', r'''
             Permitted values are \c "none" or a custom storage name created with
             WT_CONNECTION::add_storage_source'''),
+        Config('shared', 'false', r'''
+            enable sharing tiered tables across other WiredTiger instances.''',
+            type='boolean'),
     ]),
 ]
 
-wiredtiger_open_statistics_log_configuration = [
-    Config('statistics_log', '', r'''
-        log any statistics the database is configured to maintain, to a file. See @ref
-        statistics for more information. Enabling the statistics log server uses a session from
-        the configured session_max''',
+# At this stage live restore intentionally does not support reconfiguring the number of worker
+# threads. If that becomes necessary in the future we'll need to break out the thread count config
+# and add it to the reconfigure items too. That will also introduce the need for a MAX_WORKER or
+# similar macro.
+wiredtiger_open_live_restore_configuration = [
+    Config('live_restore', '', r'''Live restore configuration options. These options control the
+    behavior of WiredTiger when live restoring from a backup.''', type='category', subconfig = [
+        Config('enabled', 'false', r'''whether live restore is enabled or not.''', type='boolean'),
+        Config('path', '', r'''the path to the backup that will be restored from.'''),
+        Config('threads_max', '8', r'''
+            maximum number of threads WiredTiger will start to migrate data from the backup to the
+            running WiredTiger database. Each worker thread uses a session handle from the
+            configured session_max''',
+            min=0, max=12)
+    ])
+]
+
+chunk_cache_configuration_common = [
+    Config('pinned', '', r'''
+        List of "table:" URIs exempt from cache eviction. Capacity config overrides this,
+        tables exceeding capacity will not be fully retained. Table names can appear
+        in both this and the preload list, but not in both this and the exclude list.
+        Duplicate names are allowed.''',
+        type='list'),
+]
+connection_reconfigure_chunk_cache_configuration = [
+    Config('chunk_cache', '', r'''
+        chunk cache reconfiguration options''',
+        type='category', subconfig=chunk_cache_configuration_common)
+]
+wiredtiger_open_chunk_cache_configuration = [
+    Config('chunk_cache', '', r'''
+        chunk cache configuration options''',
         type='category', subconfig=
-        statistics_log_configuration_common + [
-        Config('path', '"."', r'''
-            the name of a directory into which statistics files are written. The directory
-            must already exist. If the value is not an absolute path, the path is relative to
-            the database home (see @ref absolute_path for more information)''')
-        ])
+        chunk_cache_configuration_common + [
+        Config('capacity', '10GB', r'''
+            maximum memory or storage to use for the chunk cache''',
+            min='512KB', max='100TB'),
+        Config('chunk_cache_evict_trigger', '90', r'''
+            chunk cache percent full that triggers eviction''',
+            min='0', max='100'),
+        Config('chunk_size', '1MB', r'''
+            size of cached chunks''',
+            min='512KB', max='100GB'),
+        Config('storage_path', '', r'''
+            the path (absolute or relative) to the file used as cache location. This should be on a
+            filesystem that supports file truncation. All filesystems in common use
+            meet this criteria.'''),
+        Config('enabled', 'false', r'''
+            enable chunk cache''',
+            type='boolean'),
+        Config('hashsize', '1024', r'''
+            number of buckets in the hashtable that keeps track of objects''',
+            min='64', max='1048576'),
+        Config('flushed_data_cache_insertion', 'true', r'''
+            enable caching of freshly-flushed data, before it is removed locally.''',
+            type='boolean', undoc=True),
+        Config('type', 'FILE', r'''
+            cache location, defaults to the file system.''',
+            choices=['FILE', 'DRAM'], undoc=True),
+    ]),
 ]
 
 session_config = [
@@ -1014,6 +1088,9 @@ session_config = [
         configure debug specific behavior on a session. Generally only used for internal testing
         purposes.''',
         type='category', subconfig=[
+        Config('checkpoint_fail_before_turtle_update', 'false', r'''
+            Fail before writing a turtle file at the end of a checkpoint.''',
+            type='boolean'),
         Config('release_evict_page', 'false', r'''
             Configure the session to evict the page when it is released and no longer needed.''',
             type='boolean'),
@@ -1031,12 +1108,22 @@ session_config = [
     Config('isolation', 'snapshot', r'''
         the default isolation level for operations in this session''',
         choices=['read-uncommitted', 'read-committed', 'snapshot']),
+    Config('prefetch', '', r'''
+        Enable automatic detection of scans by applications, and attempt to pre-fetch future
+        content into the cache''',
+        type='category', subconfig=[
+        Config('enabled', 'false', r'''
+            whether pre-fetch is enabled for this session''',
+            type='boolean'),
+        ]),
 ]
 
 wiredtiger_open_common =\
     connection_runtime_config +\
+    wiredtiger_open_chunk_cache_configuration +\
     wiredtiger_open_compatibility_configuration +\
     wiredtiger_open_log_configuration +\
+    wiredtiger_open_live_restore_configuration +\
     wiredtiger_open_tiered_storage_configuration +\
     wiredtiger_open_statistics_log_configuration + [
     Config('backup_restore_target', '', r'''
@@ -1045,14 +1132,9 @@ wiredtiger_open_common =\
         the list from the reconstructed metadata. The target list must include URIs of type
         \c table:''',
         type='list'),
-    Config('buffer_alignment', '-1', r'''
-        in-memory alignment (in bytes) for buffers used for I/O. The default value of -1
-        indicates a platform-specific alignment value should be used (4KB on Linux systems when
-        direct I/O is configured, zero elsewhere). If the configured alignment is larger than
-        default or configured object page sizes, file allocation and page sizes are silently
-        increased to the buffer alignment size. Requires the \c posix_memalign API. See @ref
-        tuning_system_buffer_cache_direct_io''',
-        min='-1', max='1MB'),
+    Config('buffer_alignment', '', r'''
+        this option is no longer supported, retained for backward compatibility.''',
+        min='-1', max='1MB', undoc=True),
     Config('builtin_extension_config', '', r'''
         A structure where the keys are the names of builtin extensions and the values are
         passed to WT_CONNECTION::load_extension as the \c config parameter (for example,
@@ -1064,16 +1146,13 @@ wiredtiger_open_common =\
     Config('checkpoint_sync', 'true', r'''
         flush files to stable storage when closing or writing checkpoints''',
         type='boolean'),
+    Config('compile_configuration_count', '1000', r'''
+        the number of configuration strings that can be precompiled. Some configuration strings
+        are compiled internally when the connection is opened.''',
+        min='500'),
     Config('direct_io', '', r'''
-        Use \c O_DIRECT on POSIX systems, and \c FILE_FLAG_NO_BUFFERING on Windows to access files.
-        Options are given as a list, such as <code>"direct_io=[data]"</code>. Configuring \c
-        direct_io requires care; see @ref tuning_system_buffer_cache_direct_io for important
-        warnings. Including \c "data" will cause WiredTiger data files, including WiredTiger
-        internal data files, to use direct I/O; including \c "log" will cause WiredTiger log
-        files to use direct I/O; including \c "checkpoint" will cause WiredTiger data files
-        opened using a (read-only) checkpoint cursor to use direct I/O. \c direct_io should
-        be combined with \c write_through to get the equivalent of \c O_DIRECT on Windows''',
-        type='list', choices=['checkpoint', 'data', 'log']),
+        this option is no longer supported, retained for backward compatibility.''',
+        type='list', undoc=True),
     Config('encryption', '', r'''
         configure an encryptor for system wide metadata and logs. If a system wide encryptor is
         set, it is also used for encrypting data files and tables, unless encryption configuration
@@ -1123,13 +1202,23 @@ wiredtiger_open_common =\
         Use memory mapping when accessing files in a read-only mode''',
         type='boolean'),
     Config('mmap_all', 'false', r'''
-        Use memory mapping to read and write all data files. May not be configured with direct
-        I/O''',
+        Use memory mapping to read and write all data files.''',
         type='boolean'),
     Config('multiprocess', 'false', r'''
         permit sharing between processes (will automatically start an RPC server for primary
         processes and use RPC for secondary processes). <b>Not yet supported in WiredTiger</b>''',
         type='boolean'),
+    Config('prefetch', '', r'''
+        Enable automatic detection of scans by applications, and attempt to pre-fetch future
+        content into the cache''',
+        type='category', subconfig=[
+        Config('available', 'false', r'''
+            whether the thread pool for the pre-fetch functionality is started''',
+            type='boolean'),
+        Config('default', 'false', r'''
+            whether pre-fetch is enabled for all sessions by default''',
+            type='boolean'),
+        ]),
     Config('readonly', 'false', r'''
         open connection in read-only mode. The database must exist. All methods that may
         modify a database are disabled. See @ref readonly for more information''',
@@ -1168,12 +1257,11 @@ wiredtiger_open_common =\
         type='boolean'),
     Config('write_through', '', r'''
         Use \c FILE_FLAG_WRITE_THROUGH on Windows to write to files. Ignored on non-Windows
-        systems. Options are given as a list, such as <code>"write_through=[data]"</code>.
-        Configuring \c write_through requires care; see @ref tuning_system_buffer_cache_direct_io
-        for important warnings. Including \c "data" will cause WiredTiger data files to write
-        through cache, including \c "log" will cause WiredTiger log files to write through
-        cache. \c write_through should be combined with \c direct_io to get the equivalent of
-        POSIX \c O_DIRECT on Windows''',
+        systems. Options are given as a list, such as <code>"write_through=[data]"</code>. 
+        Configuring \c write_through requires care; see @ref write_through
+        Including \c "data" will cause WiredTiger data files to write through cache, including 
+        \c "log" will cause WiredTiger log files to write through
+        cache.''',
         type='list', choices=['data', 'log']),
 ]
 
@@ -1206,18 +1294,15 @@ cursor_bound_config = [
     Config('action', 'set', r'''
         configures whether this call into the API will set or clear range bounds on the given
         cursor. It takes one of two values, "set" or "clear". If "set" is specified then "bound"
-        must also be specified. If "clear" is specified without any bounds then both bounds will
-        be cleared. The keys relevant to the given bound must have been set prior to the call using
-        WT_CURSOR::set_key. This configuration is currently a work in progress and should not be
-        used.''',
+        must also be specified. The keys relevant to the given bound must have been set prior to the
+        call using WT_CURSOR::set_key.''',
         choices=['clear','set']),
     Config('inclusive', 'true', r'''
-        configures whether the given bound is inclusive or not. This configuration is currently a
-        work in progress and should not be used.''',
+        configures whether the given bound is inclusive or not.''',
         type='boolean'),
     Config('bound', '', r'''
         configures which bound is being operated on. It takes one of two values, "lower" or "upper".
-        This configuration is currently a work in progress and should not be used.''',
+        ''',
         choices=['lower','upper']),
 ]
 
@@ -1233,11 +1318,7 @@ cursor_runtime_config = [
         not exist''',
         type='boolean'),
     Config('prefix_search', 'false', r'''
-        when performing a search near for a prefix, if set to true this configuration will allow
-        the search near to exit early if it has left the key range defined by the prefix. This
-        is relevant when the table contains a large number of records which potentially aren't
-        visible to the caller of search near, as such a large number of records could be skipped.
-        The prefix_search configuration provides a fast exit in this scenario.''',
+        this option is no longer supported, retained for backward compatibility.''',
         type='boolean', undoc=True),
 ]
 
@@ -1249,8 +1330,6 @@ methods = {
 'file.meta' : Method(file_meta),
 
 'index.meta' : Method(index_meta),
-
-'lsm.meta' : Method(lsm_meta),
 
 'object.meta' : Method(object_meta),
 
@@ -1264,7 +1343,7 @@ methods = {
 
 'WT_CURSOR.reconfigure' : Method(cursor_runtime_config),
 
-'WT_CURSOR.bound' : Method(cursor_bound_config),
+'WT_CURSOR.bound' : Method(cursor_bound_config, compilable=True),
 
 'WT_SESSION.alter' : Method(file_runtime_config + [
     Config('checkpoint', '', r'''
@@ -1281,13 +1360,30 @@ methods = {
 'WT_SESSION.close' : Method([]),
 
 'WT_SESSION.compact' : Method([
+    Config('background', '', r'''
+        enable/disabled the background compaction server.''',
+        type='boolean'),
+    Config('dryrun', 'false', r'''run only the estimation phase of compact''', type='boolean'),
+    Config('exclude', '', r'''
+        list of table objects to be excluded from background compaction. The list is immutable and
+        only applied when the background compaction gets enabled. The list is not saved between the
+        calls and needs to be reapplied each time the service is enabled. The individual objects in
+        the list can only be of the \c table: URI type''',
+        type='list'),
+    Config('free_space_target', '20MB', r'''
+        minimum amount of space recoverable for compaction to proceed''',
+        min='1MB'),
+    Config('run_once', 'false', r'''
+        configure background compaction server to run once. In this mode, compaction is always
+        attempted on each table unless explicitly excluded''',
+        type='boolean'),
     Config('timeout', '1200', r'''
         maximum amount of time to allow for compact in seconds. The actual amount of time spent
         in compact may exceed the configured value. A value of zero disables the timeout''',
         type='int'),
 ]),
 
-'WT_SESSION.create' : Method(file_config + lsm_config + tiered_config +
+'WT_SESSION.create' : Method(file_config + tiered_config +
         source_meta + index_only_config + table_only_config + [
     Config('exclusive', 'false', r'''
         fail if the object exists. When false (the default), if the object exists, check that its
@@ -1306,14 +1402,18 @@ methods = {
         Config('enabled', 'false', r'''
             whether to import the input URI from disk''',
             type='boolean'),
-        Config('repair', 'false', r'''
-            whether to reconstruct the metadata from the raw file content''',
-            type='boolean'),
         Config('file_metadata', '', r'''
             the file configuration extracted from the metadata of the export database'''),
         Config('metadata_file', '', r'''
             a text file that contains all the relevant metadata information for the URI to import.
             The file is generated by backup:export cursor'''),
+        Config('panic_corrupt', 'true', r'''
+            whether to panic if the metadata given is no longer valid for the table.
+            Not valid with \c repair=true''',
+            type='boolean'),
+        Config('repair', 'false', r'''
+            whether to reconstruct the metadata from the raw file content''',
+            type='boolean'),
         ]),
 ]),
 
@@ -1338,39 +1438,6 @@ methods = {
         only be set if the drop operation is configured to remove the underlying files. Ignore
         this configuration if it is set for non-tiered tables''',
         type='boolean', undoc=True),
-]),
-
-'WT_SESSION.join' : Method([
-    Config('compare', '"eq"', r'''
-        modifies the set of items to be returned so that the index key satisfies the given
-        comparison relative to the key set in this cursor''',
-        choices=['eq', 'ge', 'gt', 'le', 'lt']),
-    Config('count', '0', r'''
-        set an approximate count of the elements that would be included in the join. This is
-        used in sizing the Bloom filter, and also influences evaluation order for cursors in
-        the join. When the count is equal for multiple Bloom filters in a composition of joins,
-        the Bloom filter may be shared''',
-        type='int'),
-    Config('bloom_bit_count', '16', r'''
-        the number of bits used per item for the Bloom filter''',
-        min='2', max='1000'),
-    Config('bloom_false_positives', 'false', r'''
-        return all values that pass the Bloom filter, without eliminating any false positives''',
-        type='boolean'),
-    Config('bloom_hash_count', '8', r'''
-        the number of hash values per item for the Bloom filter''',
-        min='2', max='100'),
-    Config('operation', '"and"', r'''
-        the operation applied between this and other joined cursors. When "operation=and"
-        is specified, all the conditions implied by joins must be satisfied for an entry to be
-        returned by the join cursor; when "operation=or" is specified, only one must be satisfied.
-        All cursors joined to a join cursor must have matching operations''',
-        choices=['and', 'or']),
-    Config('strategy', '', r'''
-        when set to \c bloom, a Bloom filter is created and populated for this index. This has an
-        up front cost but may reduce the number of accesses to the main table when iterating
-        the joined cursor. The \c bloom setting requires that \c count be set''',
-        choices=['bloom', 'default']),
 ]),
 
 'WT_SESSION.log_flush' : Method([
@@ -1486,6 +1553,9 @@ methods = {
         next_random_sample_size attempts to divide the object into \c next_random_sample_size
         equal-sized pieces, and each retrieval returns a record from one of those pieces. See
         @ref cursor_random for details'''),
+    Config('next_random_seed', '0', r'''
+        configure the cursor to set an initial random seed when using \c next_random configuration.
+        This is used for testing purposes only. See @ref cursor_random for details'''),
     Config('raw', 'false', r'''
         ignore the encodings for the key and value, manage data as if the formats were \c "u".
         See @ref cursor_raw for details''',
@@ -1532,7 +1602,6 @@ methods = {
 ]),
 
 'WT_SESSION.reset_snapshot' : Method([]),
-'WT_SESSION.rename' : Method([]),
 'WT_SESSION.reset' : Method([]),
 'WT_SESSION.salvage' : Method([
     Config('force', 'false', r'''
@@ -1540,40 +1609,28 @@ methods = {
         type='boolean'),
 ]),
 
-'WT_SESSION.flush_tier' : Method([
-    Config('force', 'false', r'''
-        force sharing of all data''',
-        type='boolean'),
-    Config('lock_wait', 'true', r'''
-        wait for locks, if \c lock_wait=false, fail if any required locks are not available
-        immediately''',
-        type='boolean'),
-    Config('sync', 'on', r'''
-        wait for all objects to be flushed to the shared storage to the level specified. The \c
-        off setting does not wait for any objects to be written to the tiered storage system but
-        returns immediately after generating the objects and work units for an internal thread.
-        The \c on setting causes the caller to wait until all work queued for this call to be
-        completely processed before returning''',
-        choices=['off', 'on']),
-    Config('timeout', '0', r'''
-        maximum amount of time to allow for waiting for previous flushing of objects, in
-        seconds. The actual amount of time spent waiting may exceed the configured value. A
-        value of zero disables the timeout''',
-        type='int'),
-]),
-
 'WT_SESSION.strerror' : Method([]),
 
 'WT_SESSION.truncate' : Method([]),
-'WT_SESSION.upgrade' : Method([]),
 'WT_SESSION.verify' : Method([
     Config('do_not_clear_txn_id', 'false', r'''
         Turn off transaction id clearing, intended for debugging and better diagnosis of crashes
-        or failures.''',
+        or failures. Note: History store validation is disabled when the configuration is set as
+        visibility rules may not work correctly because the transaction ids are not cleared.''',
         type='boolean'),
     Config('dump_address', 'false', r'''
         Display page addresses, time windows, and page types as pages are verified, using the
         application's message handler, intended for debugging''',
+        type='boolean'),
+    Config('dump_all_data', 'false', r'''
+        Display application data as pages or blocks are verified, using the application's message
+        handler, intended for debugging. Disabling this does not guarantee that no user data will
+        be output''',
+        type='boolean'),
+    Config('dump_key_data', 'false', r'''
+        Display application data keys as pages or blocks are verified, using the application's
+        message handler, intended for debugging. Disabling this does not guarantee that no user
+        data will be output''',
         type='boolean'),
     Config('dump_blocks', 'false', r'''
         Display the contents of on-disk blocks as they are verified, using the application's
@@ -1583,6 +1640,10 @@ methods = {
         Display the layout of the files as they are verified, using the application's message
         handler, intended for debugging; requires optional support from the block manager''',
         type='boolean'),
+    Config('dump_tree_shape', 'false', r'''
+        Display the btree shapes as they are verified, using the application's message
+        handler, intended for debugging; requires optional support from the block manager''',
+        type='boolean'),
     Config('dump_offsets', '', r'''
         Display the contents of specific on-disk blocks, using the application's message handler,
         intended for debugging''',
@@ -1590,6 +1651,10 @@ methods = {
     Config('dump_pages', 'false', r'''
         Display the contents of in-memory pages as they are verified, using the application's
         message handler, intended for debugging''',
+        type='boolean'),
+    Config('read_corrupt', 'false', r'''
+        A mode that allows verify to continue reading after encountering a checksum error. It
+        will skip past the corrupt block and continue with the verification process''',
         type='boolean'),
     Config('stable_timestamp', 'false', r'''
         Ensure that no data has a start timestamp after the stable timestamp, to be run after
@@ -1623,7 +1688,7 @@ methods = {
         API call. There is no guarantee any operation will not take longer than this amount of time.
         If WiredTiger notices the limit has been exceeded, an operation may return a WT_ROLLBACK
         error. Default is to have no limit''',
-        min=1),
+        min=0),
     Config('priority', 0, r'''
         priority of the transaction for resolving conflicts. Transactions with higher values
         are less likely to abort''',
@@ -1655,7 +1720,7 @@ methods = {
         whether to sync log records when the transaction commits, inherited from ::wiredtiger_open
         \c transaction_sync''',
         type='boolean')
-]),
+], compilable=True),
 
 'WT_SESSION.commit_transaction' : Method([
     Config('commit_timestamp', '', r'''
@@ -1676,7 +1741,7 @@ methods = {
         API call. There is no guarantee any operation will not take longer than this amount of time.
         If WiredTiger notices the limit has been exceeded, an operation may return a WT_ROLLBACK
         error. Default is to have no limit''',
-        min=1),
+        min=0),
     Config('sync', '', r'''
         override whether to sync log records when the transaction commits. The default is inherited
         from ::wiredtiger_open \c transaction_sync. The \c off setting does not wait for records
@@ -1726,10 +1791,24 @@ methods = {
         API call. There is no guarantee any operation will not take longer than this amount of time.
         If WiredTiger notices the limit has been exceeded, an operation may return a WT_ROLLBACK
         error. Default is to have no limit''',
-        min=1),
+        min=0),
 ]),
 
 'WT_SESSION.checkpoint' : Method([
+    Config('debug', '', r'''
+        configure debug specific behavior on a checkpoint. Generally only used for internal testing
+        purposes''',
+        type='category', subconfig=[
+        Config('checkpoint_cleanup', 'false', r'''
+            if true, checkpoint cleanup thread is triggered to perform the checkpoint cleanup''',
+            type='boolean'),
+        Config('checkpoint_crash_point', '-1', r'''
+            non-negative number between 0 and 1000 will trigger a controlled crash during the
+            checkpoint process. Lower values will trigger crashes in the initial phase of
+            checkpoint, while higher values will result in crashes in the final phase of the
+            checkpoint process''',
+            type='int'),
+        ]),
     Config('drop', '', r'''
         specify a list of checkpoints to drop. The list may additionally contain one of the
         following keys: \c "from=all" to drop all checkpoints, \c "from=<checkpoint>" to drop
@@ -1738,18 +1817,37 @@ methods = {
         dropped if open in a cursor. While a hot backup is in progress, checkpoints created
         prior to the start of the backup cannot be dropped''',
         type='list'),
+    Config('flush_tier', '', r'''
+        configure flushing objects to tiered storage after checkpoint. See @ref tiered_storage''',
+        type='category', subconfig= [
+            Config('enabled', 'false', r'''
+                if true and tiered storage is in use, perform one iteration of object switching
+                and flushing objects to tiered storage''',
+                type='boolean'),
+            Config('force', 'false', r'''
+                if false (the default), flush_tier of any individual object may be skipped if the
+                underlying object has not been modified since the previous flush_tier. If true,
+                this option forces the flush_tier''',
+                type='boolean'),
+            Config('sync', 'true', r'''
+                wait for all objects to be flushed to the shared storage to the level specified.
+                When false, do not wait for any objects to be written to the tiered storage system
+                but return immediately after generating the objects and work units for an internal
+                thread.  When true, the caller waits until all work queued for this call to be
+                completely processed before returning''',
+                type='boolean'),
+            Config('timeout', '0', r'''
+                amount of time, in seconds, to wait for flushing of objects to complete.
+                WiredTiger returns EBUSY if the timeout is reached. A value of zero disables
+                the timeout''',
+                type='int'),
+    ]),
     Config('force', 'false', r'''
         if false (the default), checkpoints may be skipped if the underlying object has not been
         modified. If true, this option forces the checkpoint''',
         type='boolean'),
     Config('name', '', r'''
-        if set, specify a name for the checkpoint (note that checkpoints including LSM trees
-        may not be named)'''),
-    Config('target', '', r'''
-        if non-empty, checkpoint the list of objects. Checkpointing a list of objects separately
-        from a database-wide checkpoint can lead to data inconsistencies; see @ref checkpoint_target
-        for more information''',
-        type='list'),
+        if set, specify a name for the checkpoint'''),
     Config('use_timestamp', 'true', r'''
         if true (the default), create the checkpoint as of the last stable timestamp if timestamps
         are in use, or with all committed  updates if there is no stable timestamp set. If false,
@@ -1761,7 +1859,6 @@ methods = {
 'WT_CONNECTION.add_compressor' : Method([]),
 'WT_CONNECTION.add_data_source' : Method([]),
 'WT_CONNECTION.add_encryptor' : Method([]),
-'WT_CONNECTION.add_extractor' : Method([]),
 'WT_CONNECTION.add_storage_source' : Method([]),
 'WT_CONNECTION.close' : Method([
     Config('final_flush', 'false', r'''
@@ -1778,6 +1875,8 @@ methods = {
 ]),
 
 'WT_CONNECTION.debug_info' : Method([
+    Config('backup', 'false', r'''
+        print incremental backup information''', type='boolean'),
     Config('cache', 'false', r'''
         print cache information''', type='boolean'),
     Config('cursors', 'false', r'''
@@ -1792,6 +1891,7 @@ methods = {
         print global txn information''', type='boolean'),
 ]),
 'WT_CONNECTION.reconfigure' : Method(
+    connection_reconfigure_chunk_cache_configuration +\
     connection_reconfigure_compatibility_configuration +\
     connection_reconfigure_log_configuration +\
     connection_reconfigure_statistics_log_configuration +\
@@ -1823,9 +1923,10 @@ methods = {
     Config('get', 'all_durable', r'''
         specify which timestamp to query: \c all_durable returns the largest timestamp such
         that all timestamps up to and including that value have been committed (possibly
-        bounded by the application-set \c durable timestamp); \c last_checkpoint returns the
-        timestamp of the most recent stable checkpoint; \c oldest_timestamp returns the most
-        recent \c oldest_timestamp set with WT_CONNECTION::set_timestamp; \c oldest_reader
+        bounded by the application-set \c durable timestamp); \c backup_checkpoint returns
+        the stable timestamp of the checkpoint pinned for an open backup cursor; \c last_checkpoint
+        returns the timestamp of the most recent stable checkpoint; \c oldest_timestamp returns the
+        most recent \c oldest_timestamp set with WT_CONNECTION::set_timestamp; \c oldest_reader
         returns the minimum of the read timestamps of all active readers; \c pinned returns
         the minimum of the \c oldest_timestamp and the read timestamps of all active readers;
         \c recovery returns the timestamp of the most recent stable checkpoint taken prior to
@@ -1833,7 +1934,7 @@ methods = {
         WT_CONNECTION::set_timestamp. (The \c oldest and \c stable arguments are deprecated
         short-hand for \c oldest_timestamp and \c stable_timestamp, respectively.) See @ref
         timestamp_global_api''',
-        choices=['all_durable','last_checkpoint','oldest',
+        choices=['all_durable','backup_checkpoint','last_checkpoint','oldest',
             'oldest_reader','oldest_timestamp','pinned','recovery','stable','stable_timestamp']),
 ]),
 
@@ -1849,17 +1950,24 @@ methods = {
         type='boolean', undoc=True),
     Config('oldest_timestamp', '', r'''
         future commits and queries will be no earlier than the specified timestamp. Values must
-        be monotonically increasing; any attempt to set the value to older than the current
-        is silently ignored. The value must not be newer than the current stable timestamp.
+        be monotonically increasing. The value must not be newer than the current stable timestamp.
         See @ref timestamp_global_api'''),
     Config('stable_timestamp', '', r'''
         checkpoints will not include commits that are newer than the specified timestamp in tables
-        configured with \c "log=(enabled=false)". Values must be monotonically increasing;
-        any attempt to set the value to older than the current is silently ignored. The value
+        configured with \c "log=(enabled=false)". Values must be monotonically increasing. The value
         must not be older than the current oldest timestamp. See @ref timestamp_global_api'''),
 ]),
 
-'WT_CONNECTION.rollback_to_stable' : Method([]),
+'WT_CONNECTION.rollback_to_stable' : Method([
+    Config('dryrun', 'false', r'''
+        perform the checks associated with RTS, but don't modify any data.''',
+        type='boolean'),
+    Config('threads', '4', r'''
+        maximum number of threads WiredTiger will start to help RTS. Each
+        RTS worker thread uses a session from the configured WT_RTS_MAX_WORKERS''',
+        min=0, 
+        max=10),     # !!! Must match WT_RTS_MAX_WORKERS
+]),
 
 'WT_SESSION.reconfigure' : Method(session_config),
 

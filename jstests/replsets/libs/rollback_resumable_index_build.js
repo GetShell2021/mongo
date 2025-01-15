@@ -1,7 +1,8 @@
-load("jstests/noPassthrough/libs/index_build.js");
-load('jstests/replsets/libs/rollback_test.js');
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {funWithArgs} from "jstests/libs/parallel_shell_helpers.js";
+import {ResumableIndexBuildTest} from "jstests/noPassthrough/libs/index_build.js";
 
-const RollbackResumableIndexBuildTest = class {
+export class RollbackResumableIndexBuildTest {
     static checkCompletedAndDrop(
         rollbackTest, originalPrimary, dbName, colls, buildUUIDs, indexNames) {
         for (let i = 0; i < colls.length; i++) {
@@ -79,8 +80,10 @@ const RollbackResumableIndexBuildTest = class {
 
         rollbackTest.awaitLastOpCommitted();
 
-        assert.commandWorked(originalPrimary.adminCommand(
-            {setParameter: 1, logComponentVerbosity: {index: 1, replication: {heartbeats: 0}}}));
+        assert.commandWorked(originalPrimary.adminCommand({
+            setParameter: 1,
+            logComponentVerbosity: {index: 1, replication: {election: 0, heartbeats: 0}},
+        }));
 
         // Set internalQueryExecYieldIterations to 0, internalIndexBuildBulkLoadYieldIterations to
         // 1, and maxIndexBuildDrainBatchSize to 1 so that the index builds are guaranteed to yield
@@ -104,8 +107,9 @@ const RollbackResumableIndexBuildTest = class {
             assert.commandWorked(colls[i].insert(docs));
 
             awaitCreateIndexes[i] = ResumableIndexBuildTest.createIndexWithSideWrites(
-                rollbackTest, function(collName, indexSpecs, indexNames) {
-                    load("jstests/noPassthrough/libs/index_build.js");
+                rollbackTest, async function(collName, indexSpecs, indexNames) {
+                    const {ResumableIndexBuildTest} =
+                        await import("jstests/noPassthrough/libs/index_build.js");
                     ResumableIndexBuildTest.createIndexesFails(
                         db, collName, indexSpecs, indexNames);
                 }, colls[i], indexSpecs[i], indexNames[i], sideWrites);
@@ -200,7 +204,7 @@ const RollbackResumableIndexBuildTest = class {
                     // Wait for the index build to be aborted for rollback.
                     checkLog.containsJson(db.getMongo(), 465611, {
                         buildUUID: function(uuid) {
-                            return uuid["uuid"]["$uuid"] === buildUUID;
+                            return uuid && uuid["uuid"]["$uuid"] === buildUUID;
                         }
                     });
 
@@ -212,7 +216,7 @@ const RollbackResumableIndexBuildTest = class {
 
         // Wait until the parallel shells have all started.
         assert.soon(() => {
-            return (rawMongoProgramOutput().match(/"id":5113600/g) || []).length ===
+            return (rawMongoProgramOutput("\"id\":5113600").match(/"id":5113600/g) || []).length ===
                 buildUUIDs.length;
         });
         getLogFp.off();
@@ -226,7 +230,7 @@ const RollbackResumableIndexBuildTest = class {
         for (const buildUUID of buildUUIDs) {
             checkLog.containsJson(originalPrimary, 20347, {
                 buildUUID: function(uuid) {
-                    return uuid["uuid"]["$uuid"] === buildUUID;
+                    return uuid && uuid["uuid"]["$uuid"] === buildUUID;
                 }
             });
         }
@@ -299,7 +303,7 @@ const RollbackResumableIndexBuildTest = class {
         // Ensure that the index build restarted, rather than resumed.
         checkLog.containsJson(originalPrimary, 20660, {
             buildUUID: function(uuid) {
-                return uuid["uuid"]["$uuid"] === testInfo.buildUUIDs[0];
+                return uuid && uuid["uuid"]["$uuid"] === testInfo.buildUUIDs[0];
             }
         });
         assert(!checkLog.checkContainsOnceJson(originalPrimary, 4841700));
@@ -311,4 +315,4 @@ const RollbackResumableIndexBuildTest = class {
                                                               testInfo.buildUUIDs,
                                                               testInfo.indexNames);
     }
-};
+}

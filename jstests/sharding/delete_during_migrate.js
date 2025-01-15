@@ -7,26 +7,27 @@
  * of 5MB across all sharding tests in wiredTiger.
  * @tags: [resource_intensive]
  */
-(function() {
-'use strict';
 
-const isCodeCoverageEnabled = buildInfo().buildEnvironment.ccflags.includes('-ftest-coverage');
-const isSanitizerEnabled = buildInfo().buildEnvironment.ccflags.includes('-fsanitize');
-const slowTestVariant = isCodeCoverageEnabled || isSanitizerEnabled;
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-var st = new ShardingTest({shards: 2, mongos: 1});
+var st = new ShardingTest({
+    shards: 2,
+    mongos: 1,
+    rs: {nodes: 2, setParameter: {defaultConfigCommandTimeoutMS: 5 * 60 * 1000}}
+});
 
 var dbname = "test";
 var coll = "foo";
 var ns = dbname + "." + coll;
 
-assert.commandWorked(st.s0.adminCommand({enablesharding: dbname}));
-st.ensurePrimaryShard(dbname, st.shard1.shardName);
+assert.commandWorked(
+    st.s0.adminCommand({enablesharding: dbname, primaryShard: st.shard1.shardName}));
 
 var t = st.s0.getDB(dbname).getCollection(coll);
 
 var bulk = t.initializeUnorderedBulkOp();
-for (var i = 0; i < 200000; i++) {
+const numDocs = 200000;
+for (var i = 0; i < numDocs; i++) {
     bulk.insert({a: i});
 }
 assert.commandWorked(bulk.execute());
@@ -40,17 +41,16 @@ assert.commandWorked(st.s0.adminCommand({shardcollection: ns, key: {a: 1}}));
 var join = startParallelShell("db." + coll + ".remove({});", st.s0.port);
 
 // migrate while deletions are happening
-try {
-    assert.commandWorked(st.s0.adminCommand(
-        {moveChunk: ns, find: {a: 1}, to: st.getOther(st.getPrimaryShard(dbname)).name}));
-} catch (e) {
-    const expectedFailureMessage = "startCommit timed out waiting for the catch up completion.";
-    if (!slowTestVariant || !e.message.match(expectedFailureMessage)) {
-        throw e;
-    }
+const res = st.s0.adminCommand(
+    {moveChunk: ns, find: {a: 1}, to: st.getOther(st.getPrimaryShard(dbname)).name});
+if (res.code == ErrorCodes.CommandFailed &&
+    res.errmsg.includes("timed out waiting for the catch up completion")) {
+    jsTest.log("Ignoring the critical section timeout error since this test deletes " + numDocs +
+               " documents in the chunk being migrated " + tojson(res));
+} else {
+    assert.commandWorked(res);
 }
 
 join();
 
 st.stop();
-})();

@@ -28,19 +28,58 @@
  */
 
 
+#include <boost/smart_ptr.hpp>
+#include <memory>
+#include <string>
+#include <tuple>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/client/remote_command_targeter.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/migration_source_manager.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_statistics.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/logv2/redaction.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -61,8 +100,7 @@ class ShardsvrMoveRangeCommand final : public TypedCommand<ShardsvrMoveRangeComm
 public:
     using Request = ShardsvrMoveRange;
 
-    ShardsvrMoveRangeCommand()
-        : TypedCommand<ShardsvrMoveRangeCommand>(Request::kCommandName, Request::kCommandAlias) {}
+    ShardsvrMoveRangeCommand() : TypedCommand<ShardsvrMoveRangeCommand>(Request::kCommandName) {}
 
     bool skipApiVersionCheck() const override {
         // Internal command (server to server).
@@ -86,12 +124,14 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
 
             // Make sure we're as up-to-date as possible with shard information. This catches the
             // case where we might have changed a shard's host by removing/adding a shard with the
             // same name.
             Grid::get(opCtx)->shardRegistry()->reload(opCtx);
+
+            sharding_ddl_util::assertDataMovementAllowed();
 
             auto scopedMigration = uassertStatusOK(
                 ActiveMigrationsRegistry::get(opCtx).registerDonateChunk(opCtx, request()));
@@ -99,7 +139,7 @@ public:
             // Check if there is an existing migration running and if so, join it
             if (scopedMigration.mustExecute()) {
                 auto moveChunkComplete =
-                    ExecutorFuture<void>(_getExecutor())
+                    ExecutorFuture<void>(Grid::get(opCtx)->getExecutorPool()->getFixedExecutor())
                         .then([req = request(),
                                writeConcern = opCtx->getWriteConcern(),
                                scopedMigration = std::move(scopedMigration),
@@ -109,11 +149,8 @@ public:
                             // Note that captured objects of the lambda are destroyed by the
                             // executor thread after setting the shared state as ready.
                             auto scopedMigrationLocal(std::move(scopedMigration));
-                            ThreadClient tc("MoveChunk", serviceContext);
-                            {
-                                stdx::lock_guard<Client> lk(*tc.get());
-                                tc->setSystemOperationKillableByStepdown(lk);
-                            }
+                            ThreadClient tc("MoveChunk",
+                                            serviceContext->getService(ClusterRole::ShardServer));
                             auto uniqueOpCtx = Client::getCurrent()->makeOperationContext();
                             auto executorOpCtx = uniqueOpCtx.get();
                             Status status = {ErrorCodes::InternalError, "Uninitialized value"};
@@ -137,13 +174,12 @@ public:
                                 // Note: This internal authorization is tied to the lifetime of the
                                 // client.
                                 AuthorizationSession::get(executorOpCtx->getClient())
-                                    ->grantInternalAuthorization(executorOpCtx->getClient());
+                                    ->grantInternalAuthorization();
                                 _runImpl(executorOpCtx, std::move(req), std::move(writeConcern));
                                 status = Status::OK();
                             } catch (const DBException& e) {
                                 status = e.toStatus();
                                 LOGV2_WARNING(23777,
-                                              "Chunk move failed with {error}",
                                               "Error while doing moveChunk",
                                               "error"_attr = redact(status));
 
@@ -191,15 +227,15 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
 
         static void _runImpl(OperationContext* opCtx,
                              ShardsvrMoveRange&& request,
                              WriteConcernOptions&& writeConcern) {
             if (request.getFromShard() == request.getToShard()) {
-                // TODO: SERVER-46669 handle wait for delete.
                 return;
             }
 
@@ -217,6 +253,13 @@ public:
                     opCtx, ReadPreferenceSetting{ReadPreference::PrimaryOnly});
             }());
 
+            long long totalDocsCloned =
+                ShardingStatistics::get(opCtx).countDocsClonedOnDonor.load();
+            long long totalBytesCloned =
+                ShardingStatistics::get(opCtx).countBytesClonedOnDonor.load();
+            long long totalCloneTime =
+                ShardingStatistics::get(opCtx).totalDonorChunkCloneTimeMillis.load();
+
             MigrationSourceManager migrationSourceManager(
                 opCtx, std::move(request), std::move(writeConcern), donorConnStr, recipientHost);
 
@@ -225,32 +268,27 @@ public:
             migrationSourceManager.enterCriticalSection();
             migrationSourceManager.commitChunkOnRecipient();
             migrationSourceManager.commitChunkMetadataOnConfig();
-        }
 
-        // Returns a single-threaded executor to be used to run moveChunk commands. The executor is
-        // initialized on the first call to this function. Uses a shared_ptr because a shared_ptr is
-        // required to work with ExecutorFutures.
-        static std::shared_ptr<ThreadPool> _getExecutor() {
-            static Mutex mutex = MONGO_MAKE_LATCH("MoveChunkExecutor::_mutex");
-            static std::shared_ptr<ThreadPool> executor;
+            long long docsCloned =
+                ShardingStatistics::get(opCtx).countDocsClonedOnDonor.load() - totalDocsCloned;
+            long long bytesCloned =
+                ShardingStatistics::get(opCtx).countBytesClonedOnDonor.load() - totalBytesCloned;
+            long long cloneTime =
+                ShardingStatistics::get(opCtx).totalDonorChunkCloneTimeMillis.load() -
+                totalCloneTime;
+            auto migrationId = migrationSourceManager.getMigrationId();
 
-            stdx::lock_guard<Latch> lg(mutex);
-            if (!executor) {
-                ThreadPool::Options options;
-                options.poolName = "MoveChunk";
-                options.minThreads = 0;
-                // We limit the size of the thread pool to a single thread because currently there
-                // can only be one moveRange operation on a shard at a time.
-                options.maxThreads = 1;
-                executor = std::make_shared<ThreadPool>(std::move(options));
-                executor->startup();
-            }
-
-            return executor;
+            LOGV2(7627801,
+                  "Migration finished",
+                  "migrationId"_attr = migrationId ? migrationId->toString() : "",
+                  "totalTimeMillis"_attr = migrationSourceManager.getOpTimeMillis(),
+                  "docsCloned"_attr = docsCloned,
+                  "bytesCloned"_attr = bytesCloned,
+                  "cloneTime"_attr = cloneTime);
         }
     };
-
-} _shardsvrMoveRangeCmd;
+};
+MONGO_REGISTER_COMMAND(ShardsvrMoveRangeCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

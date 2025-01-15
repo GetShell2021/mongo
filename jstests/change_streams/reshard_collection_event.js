@@ -2,27 +2,27 @@
  * Test that change streams returns reshardCollection events.
  *
  *  @tags: [
- *    requires_fcv_61,
  *    requires_sharding,
  *    uses_change_streams,
  *    change_stream_does_not_expect_txns,
  *    assumes_unsharded_collection,
  *    assumes_read_preference_unchanged,
- *    featureFlagChangeStreamsVisibility,
- *    featureFlagChangeStreamsFurtherEnrichedEvents
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/collection_drop_recreate.js");  // For assertDropCollection.
-load('jstests/libs/change_stream_util.js');        // For 'ChangeStreamTest' and
-                                                   // 'assertChangeStreamEventEq'.
+import {assertDropCollection} from "jstests/libs/collection_drop_recreate.js";
+import {
+    assertChangeStreamEventEq,
+    ChangeStreamTest
+} from "jstests/libs/query/change_stream_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({
     shards: 2,
-    rs: {nodes: 1, setParameter: {writePeriodicNoops: true, periodicNoopIntervalSecs: 1}}
+    rs: {nodes: 1, setParameter: {writePeriodicNoops: true, periodicNoopIntervalSecs: 1}},
+    other: {
+        configOptions: {setParameter: {reshardingCriticalSectionTimeoutMillis: 24 * 60 * 60 * 1000}}
+    }
 });
 
 const mongos = st.s0;
@@ -108,8 +108,7 @@ function validateExpectedEventAndConfirmResumability(collParam, expectedOutput) 
     });
 }
 
-assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, primaryShard);
+assert.commandWorked(mongos.adminCommand({enableSharding: kDbName, primaryShard: primaryShard}));
 
 // Test the behaviour of reshardCollection for a collection.
 // The values of 'collectionUUID' and 'reshardUUID' will be filled in by the validate function.
@@ -150,4 +149,3 @@ validateExpectedEventAndConfirmResumability(1, {
 });
 
 st.stop();
-}());

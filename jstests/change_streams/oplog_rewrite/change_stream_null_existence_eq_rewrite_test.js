@@ -2,32 +2,27 @@
  * Tests that change streams correctly handle rewrites of null, existence and equality checks, for
  * both existent and non-existent fields and subfields.
  * @tags: [
- *   featureFlagChangeStreamsRewrite,
  *   requires_fcv_51,
  *   requires_pipeline_optimization,
  *   uses_change_streams
  * ]
  */
-(function() {
-"use strict";
+import {
+    generateChangeStreamWriteWorkload,
+    getAllChangeStreamEvents,
+    isPlainObject
+} from "jstests/libs/query/change_stream_rewrite_util.js";
 
-load("jstests/libs/change_stream_rewrite_util.js");  // For rewrite helpers.
-load('jstests/libs/change_stream_util.js');          // For isChangeStreamsVisibilityEnabled.
-
-const dbName = "change_stream_rewrite_null_existence_test";
+const dbName = jsTestName();
 const collName = "coll1";
-
 const testDB = db.getSiblingDB(dbName);
-if (!isChangeStreamsVisibilityEnabled(testDB)) {
-    return;
-}
 
 // Establish a resume token at a point before anything actually happens in the test.
 const startPoint = db.getMongo().watch().getResumeToken();
 const numDocs = 8;
 
 // Generate a write workload for the change stream to consume.
-generateChangeStreamWriteWorkload(testDB, collName, numDocs);
+generateChangeStreamWriteWorkload(testDB, collName, numDocs, false /* includeInvalidatingEvents */);
 
 // Function to generate a list of all paths to be tested from those observed in the event stream.
 function traverseEvent(event, outputMap, prefixPath = "") {
@@ -216,4 +211,3 @@ for (let csConfig of [{fullDocument: "updateLookup", showExpandedEvents: true}])
 
 // Assert that there were no failed test cases.
 assert(failedTestCases.length == 0, failedTestCases);
-})();

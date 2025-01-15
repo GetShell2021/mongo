@@ -4,14 +4,12 @@
  * Verify that if pre-image for the collection has been deleted by the 'root' user.
  * @tags: [
  *  requires_fcv_60,
- *  featureFlagChangeStreamPreAndPostImages,
  *  uses_change_streams,
  *  assumes_read_preference_unchanged,
  *  requires_replication,
  * ]
  */
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const password = "password";
 const keyFile = "jstests/libs/key1";
@@ -200,4 +198,3 @@ assertActionAuthorized(removePreImage.bind(null, rootPrimary), true);
 rootPrimary.logout();
 
 replSetTest.stopSet();
-})();

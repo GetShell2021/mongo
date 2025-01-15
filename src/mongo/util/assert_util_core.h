@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include <boost/preprocessor/facilities/overload.hpp>
 #include <string>
 
 #include "mongo/platform/compiler.h"
@@ -87,12 +86,9 @@ MONGO_COMPILER_NORETURN void invariantFailedWithMsg(const char* expr,
 //
 //       Invariant failure !condition "hello!" some/file.cpp 528
 //
-#define MONGO_invariant_2(Expression, contextExpr)                                           \
-    ::mongo::invariantWithContextAndLocation((Expression),                                   \
-                                             #Expression,                                    \
-                                             [&]() -> std::string { return (contextExpr); }, \
-                                             __FILE__,                                       \
-                                             __LINE__)
+#define MONGO_invariant_2(Expression, contextExpr) \
+    ::mongo::invariantWithContextAndLocation(      \
+        (Expression), #Expression, [&] { return std::string{contextExpr}; }, __FILE__, __LINE__)
 
 template <typename T, typename ContextExpr>
 inline void invariantWithContextAndLocation(
@@ -102,11 +98,11 @@ inline void invariantWithContextAndLocation(
     }
 }
 
-// This helper macro is necessary to make the __VAR_ARGS__ expansion work properly on MSVC.
-#define MONGO_expand(x) x
-
-#define invariant(...) \
-    MONGO_expand(MONGO_expand(BOOST_PP_OVERLOAD(MONGO_invariant_, __VA_ARGS__))(__VA_ARGS__))
+#define MONGO_invariant_EXPAND(x) x /**< MSVC workaround */
+#define MONGO_invariant_PICK(_1, _2, x, ...) x
+#define invariant(...)      \
+    MONGO_invariant_EXPAND( \
+        MONGO_invariant_PICK(__VA_ARGS__, MONGO_invariant_2, MONGO_invariant_1)(__VA_ARGS__))
 
 // Behaves like invariant in debug builds and is compiled out in release. Use for checks, which can
 // potentially be slow or on a critical path.

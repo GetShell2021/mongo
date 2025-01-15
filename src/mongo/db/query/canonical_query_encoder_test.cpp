@@ -29,526 +29,653 @@
 
 #include "mongo/db/query/canonical_query_encoder.h"
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
-#include "mongo/db/pipeline/document_source.h"
+#include <list>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/pipeline/inner_pipeline_stage_impl.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/plan_cache_key_factory.h"
-#include "mongo/db/query/query_test_service_context.h"
+#include "mongo/db/query/canonical_query_test_util.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/query/projection_policies.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/idl/server_parameter_test_util.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/golden_test.h"
+#include "mongo/unittest/golden_test_base.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
 
 using std::unique_ptr;
 
-static const NamespaceString nss("testdb.testcoll");
-static const NamespaceString foreignNss("testdb.foreigncoll");
+static const NamespaceString foreignNss =
+    NamespaceString::createNamespaceString_forTest("testdb.foreigncoll");
 
-std::vector<std::unique_ptr<InnerPipelineStageInterface>> parsePipeline(
-    const boost::intrusive_ptr<ExpressionContext> expCtx, const std::vector<BSONObj>& rawPipeline) {
+unittest::GoldenTestConfig goldenTestConfig{"src/mongo/db/test_output/query"};
+
+std::vector<boost::intrusive_ptr<DocumentSource>> parsePipeline(
+    const boost::intrusive_ptr<ExpressionContext> expCtx,
+    const std::vector<BSONObj>& rawPipeline,
+    bool shouldParameterize = false) {
     auto pipeline = Pipeline::parse(rawPipeline, expCtx);
 
-    std::vector<std::unique_ptr<InnerPipelineStageInterface>> stages;
+    if (shouldParameterize) {
+        pipeline->parameterize();
+    }
+
+    std::vector<boost::intrusive_ptr<DocumentSource>> stages;
     for (auto&& source : pipeline->getSources()) {
-        stages.emplace_back(std::make_unique<InnerPipelineStageImpl>(source));
+        stages.emplace_back(source);
     }
     return stages;
 }
 
-/**
- * Utility functions to create a CanonicalQuery
- */
-unique_ptr<CanonicalQuery> canonicalize(BSONObj query,
-                                        BSONObj sort,
-                                        BSONObj proj,
-                                        BSONObj collation,
-                                        std::unique_ptr<FindCommandRequest> findCommand = nullptr,
-                                        std::vector<BSONObj> pipelineObj = {}) {
-    QueryTestServiceContext serviceContext;
-    auto opCtx = serviceContext.makeOperationContext();
+class CanonicalQueryEncoderTest : public CanonicalQueryTest {
+protected:
+    unique_ptr<CanonicalQuery> canonicalize(
+        OperationContext* opCtx,
+        BSONObj query,
+        BSONObj sort,
+        BSONObj proj,
+        BSONObj collation,
+        std::unique_ptr<FindCommandRequest> findCommand = nullptr,
+        std::vector<BSONObj> pipelineObj = {},
+        bool isCountLike = false,
+        bool needsMerge = false) {
+        if (!findCommand) {
+            findCommand = std::make_unique<FindCommandRequest>(nss);
+        }
+        findCommand->setFilter(query.getOwned());
+        findCommand->setSort(sort.getOwned());
+        findCommand->setProjection(proj.getOwned());
+        findCommand->setCollation(collation.getOwned());
 
-    if (!findCommand) {
-        findCommand = std::make_unique<FindCommandRequest>(nss);
+        const auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx, nss);
+        expCtx->addResolvedNamespaces({foreignNss});
+        expCtx->setNeedsMerge(needsMerge);
+        if (!findCommand->getCollation().isEmpty()) {
+            auto statusWithCollator = CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                          ->makeFromBSON(findCommand->getCollation());
+            ASSERT_OK(statusWithCollator.getStatus());
+            expCtx->setCollator(std::move(statusWithCollator.getValue()));
+        }
+        auto pipeline = parsePipeline(expCtx, pipelineObj);
+
+        return std::make_unique<CanonicalQuery>(CanonicalQueryParams{
+            .expCtx = expCtx,
+            .parsedFind =
+                ParsedFindCommandParams{.findCommand = std::move(findCommand),
+                                        .allowedFeatures =
+                                            MatchExpressionParser::kAllowAllSpecialFeatures},
+
+            .pipeline = std::move(pipeline),
+            .isCountLike = isCountLike});
     }
-    findCommand->setFilter(query.getOwned());
-    findCommand->setSort(sort.getOwned());
-    findCommand->setProjection(proj.getOwned());
-    findCommand->setCollation(collation.getOwned());
 
-    const auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx.get(), nss);
-    expCtx->addResolvedNamespaces({foreignNss});
-    if (!findCommand->getCollation().isEmpty()) {
-        auto statusWithCollator = CollatorFactoryInterface::get(opCtx->getServiceContext())
-                                      ->makeFromBSON(findCommand->getCollation());
-        ASSERT_OK(statusWithCollator.getStatus());
-        expCtx->setCollator(std::move(statusWithCollator.getValue()));
+    unique_ptr<CanonicalQuery> canonicalize(OperationContext* opCtx, const char* queryStr) {
+        BSONObj queryObj = fromjson(queryStr);
+        return canonicalize(opCtx, queryObj, {}, {}, {});
     }
-    auto pipeline = parsePipeline(expCtx, pipelineObj);
 
-    auto statusWithCQ =
-        CanonicalQuery::canonicalize(opCtx.get(),
-                                     std::move(findCommand),
-                                     false,
-                                     expCtx,
-                                     ExtensionsCallbackNoop(),
-                                     MatchExpressionParser::kAllowAllSpecialFeatures,
-                                     ProjectionPolicies::findProjectionPolicies(),
-                                     std::move(pipeline));
-    ASSERT_OK(statusWithCQ.getStatus());
-    return std::move(statusWithCQ.getValue());
-}
-
-unique_ptr<CanonicalQuery> canonicalize(const char* queryStr) {
-    BSONObj queryObj = fromjson(queryStr);
-    return canonicalize(queryObj, {}, {}, {});
-}
-
-
-/**
- * Test functions for computeKey, when no indexes are present. Cache keys are intentionally
- * obfuscated and are meaningful only within the current lifetime of the server process. Users
- * should treat plan cache keys as opaque.
- */
-
-void testComputeKey(const CanonicalQuery& cq, const char* expectedStr) {
-    const auto key = cq.encodeKey();
-    StringData expectedKey(expectedStr);
-    if (key != expectedKey) {
-        str::stream ss;
-        ss << "Unexpected plan cache key. Expected: " << expectedKey << ". Actual: " << key
-           << ". Query: " << cq.toString();
-        FAIL(ss);
+    void testEncodeClassic(unittest::GoldenTestContext& gctx, const CanonicalQuery& cq) {
+        gctx.outStream() << "==== VARIATION: cq=" << cq.toString();
+        const auto key = canonical_query_encoder::encodeClassic(cq);
+        gctx.outStream() << key << std::endl << std::endl;
     }
-}
 
-void testComputeKey(BSONObj query, BSONObj sort, BSONObj proj, const char* expectedStr) {
-    BSONObj collation;
-    unique_ptr<CanonicalQuery> cq(canonicalize(query, sort, proj, collation));
-    testComputeKey(*cq, expectedStr);
-}
+    /**
+     * Test functions for computeKey, when no indexes are present. Cache keys are intentionally
+     * obfuscated and are meaningful only within the current lifetime of the server process. Users
+     * should treat plan cache keys as opaque.
+     *
+     * This function is intended for classic encoding. The function `testComputeSBEKey` can be used
+     * for the SBE encoding.
+     */
+    void testComputeClassicKey(unittest::GoldenTestContext& gctx, const CanonicalQuery& cq) {
+        gctx.outStream() << "==== VARIATION: cq=" << cq.toString() << std::endl;
+        const auto key = canonical_query_encoder::encodeClassic(cq);
+        gctx.outStream() << key << std::endl;
+    }
 
-void testComputeSBEKey(BSONObj query,
-                       BSONObj sort,
-                       BSONObj proj,
-                       std::string expectedStr,
-                       std::unique_ptr<FindCommandRequest> findCommand = nullptr,
-                       std::vector<BSONObj> pipelineObj = {}) {
-    BSONObj collation;
-    unique_ptr<CanonicalQuery> cq(
-        canonicalize(query, sort, proj, collation, std::move(findCommand), std::move(pipelineObj)));
-    cq->setSbeCompatible(true);
-    const auto key = canonical_query_encoder::encodeSBE(*cq);
-    ASSERT_EQUALS(key, expectedStr);
-}
+    void testComputeKey(unittest::GoldenTestContext& gctx,
+                        BSONObj query,
+                        BSONObj sort,
+                        BSONObj proj) {
+        BSONObj collation;
+        gctx.outStream() << "==== VARIATION: query=" << query << ", sort=" << sort
+                         << ", proj=" << proj << std::endl;
+        unique_ptr<CanonicalQuery> cq(canonicalize(opCtx(), query, sort, proj, collation));
+        const auto key = encodeKey(*cq);
+        gctx.outStream() << key << std::endl;
+    }
 
-void testComputeKey(const char* queryStr,
-                    const char* sortStr,
-                    const char* projStr,
-                    const char* expectedStr) {
-    testComputeKey(fromjson(queryStr), fromjson(sortStr), fromjson(projStr), expectedStr);
-}
+    void testComputeKey(unittest::GoldenTestContext& gctx,
+                        const char* queryStr,
+                        const char* sortStr,
+                        const char* projStr) {
+        testComputeKey(gctx, fromjson(queryStr), fromjson(sortStr), fromjson(projStr));
+    }
 
-void testComputeSBEKey(const char* queryStr,
-                       const char* sortStr,
-                       const char* projStr,
-                       std::string expectedStr,
-                       std::unique_ptr<FindCommandRequest> findCommand = nullptr,
-                       std::vector<BSONObj> pipelineObj = {}) {
-    testComputeSBEKey(fromjson(queryStr),
-                      fromjson(sortStr),
-                      fromjson(projStr),
-                      expectedStr,
-                      std::move(findCommand),
-                      std::move(pipelineObj));
-}
+    void testComputeSBEKey(unittest::GoldenTestContext& gctx,
+                           const char* queryStr,
+                           const char* sortStr,
+                           const char* projStr,
+                           std::unique_ptr<FindCommandRequest> findCommand = nullptr,
+                           std::vector<BSONObj> pipelineObj = {},
+                           bool isCountLike = false,
+                           bool needsMerge = false) {
+        auto& stream = gctx.outStream();
+        stream << "==== VARIATION: sbe, query=" << queryStr << ", sort=" << sortStr
+               << ", proj=" << projStr;
+        if (findCommand) {
+            stream << ", hint=" << findCommand->getHint().toString()
+                   << ", allowDiskUse=" << findCommand->getAllowDiskUse()
+                   << ", returnKey=" << findCommand->getReturnKey()
+                   << ", requestResumeToken=" << findCommand->getRequestResumeToken();
+            if (!findCommand->getResumeAfter().isEmpty()) {
+                stream << ", resumeAfter=1";
+            }
+            if (!findCommand->getStartAt().isEmpty()) {
+                stream << ", startAt=1";
+            }
+        }
+        if (isCountLike) {
+            stream << ", isCountLike=true";
+        }
+        if (needsMerge) {
+            stream << ", needsMerge=true";
+        }
+        stream << std::endl;
+        BSONObj collation;
+        unique_ptr<CanonicalQuery> cq(canonicalize(opCtx(),
+                                                   fromjson(queryStr),
+                                                   fromjson(sortStr),
+                                                   fromjson(projStr),
+                                                   collation,
+                                                   std::move(findCommand),
+                                                   std::move(pipelineObj),
+                                                   isCountLike,
+                                                   needsMerge));
+        cq->setSbeCompatible(true);
+        const auto key = canonical_query_encoder::encodeSBE(*cq);
+        gctx.outStream() << key << std::endl;
+    }
 
-TEST(CanonicalQueryEncoderTest, ComputeKey) {
+    void testComputeKeyForPipeline(unittest::GoldenTestContext& gctx,
+                                   StringData matchStr,
+                                   StringData projStr) {
+        auto& stream = gctx.outStream();
+        stream << "==== VARIATION: sbe pipeline: " << matchStr << ", " << projStr;
+        stream << std::endl;
+
+        auto pipelineObj = [](StringData matchStr, StringData projStr) -> std::vector<BSONObj> {
+            auto matchObj = fromjson(matchStr);
+            if (projStr == "{}") {
+                return {matchObj};
+            }
+
+            auto projObj = fromjson(projStr);
+            return {matchObj, projObj};
+        };
+
+        const auto expCtx = make_intrusive<ExpressionContextForTest>(opCtx(), nss);
+        auto pipeline = parsePipeline(expCtx, pipelineObj(matchStr, projStr), true);
+
+        const auto key = canonical_query_encoder::encodePipeline(expCtx.get(), pipeline);
+        gctx.outStream() << key << std::endl;
+    }
+};
+
+TEST_F(CanonicalQueryEncoderTest, ComputeKey) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
     // Generated cache keys should be treated as opaque to the user.
 
     // The computed key depends on which execution engine is enabled. As such, we disable SBE for
     // this test so that the test doesn't break should the default value of
-    // 'internalQueryForceClassicEngine' change in the future.
-    RAIIServerParameterControllerForTest controllerSBE("internalQueryForceClassicEngine", true);
+    // 'internalQueryFrameworkControl' change in the future.
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "forceClassicEngine");
 
     // No sorts
-    testComputeKey("{}", "{}", "{}", "an@f");
-    testComputeKey("{$or: [{a: 1}, {b: 2}]}", "{}", "{}", "or[eqa,eqb]@f");
-    testComputeKey(
-        "{$or: [{a: 1}, {b: 1}, {c: 1}], d: 1}", "{}", "{}", "an[or[eqa,eqb,eqc],eqd]@f");
-    testComputeKey("{$or: [{a: 1}, {b: 1}], c: 1, d: 1}", "{}", "{}", "an[or[eqa,eqb],eqc,eqd]@f");
-    testComputeKey("{a: 1, b: 1, c: 1}", "{}", "{}", "an[eqa,eqb,eqc]@f");
-    testComputeKey("{a: 1, beqc: 1}", "{}", "{}", "an[eqa,eqbeqc]@f");
-    testComputeKey("{ap1a: 1}", "{}", "{}", "eqap1a@f");
-    testComputeKey("{aab: 1}", "{}", "{}", "eqaab@f");
+    testComputeKey(gctx, "{}", "{}", "{}");
+    testComputeKey(gctx, "{$or: [{a: 1}, {b: 2}]}", "{}", "{}");
+    testComputeKey(gctx, "{$or: [{a: 1}, {b: 1}, {c: 1}], d: 1}", "{}", "{}");
+    testComputeKey(gctx, "{$or: [{a: 1}, {b: 1}], c: 1, d: 1}", "{}", "{}");
+    testComputeKey(gctx, "{a: 1, b: 1, c: 1}", "{}", "{}");
+    testComputeKey(gctx, "{a: 1, beqc: 1}", "{}", "{}");
+    testComputeKey(gctx, "{ap1a: 1}", "{}", "{}");
+    testComputeKey(gctx, "{aab: 1}", "{}", "{}");
 
     // With sort
-    testComputeKey("{}", "{a: 1}", "{}", "an~aa@f");
-    testComputeKey("{}", "{a: -1}", "{}", "an~da@f");
-    testComputeKey("{$text: {$search: 'search keywords'}}",
+    testComputeKey(gctx, "{}", "{a: 1}", "{}");
+    testComputeKey(gctx, "{}", "{a: -1}", "{}");
+    testComputeKey(gctx,
+                   "{$text: {$search: 'search keywords'}}",
                    "{a: {$meta: 'textScore'}}",
-                   "{a: {$meta: 'textScore'}}",
-                   "te_fts~ta@f");
-    testComputeKey("{a: 1}", "{b: 1}", "{}", "eqa~ab@f");
+                   "{a: {$meta: 'textScore'}}");
+    testComputeKey(gctx, "{a: 1}", "{b: 1}", "{}");
 
     // With projection
-    testComputeKey("{}", "{}", "{a: 1}", "an|_id-a@f");
-    testComputeKey("{}", "{}", "{a: -1}", "an|_id-a@f");
-    testComputeKey("{}", "{}", "{a: -1.0}", "an|_id-a@f");
-    testComputeKey("{}", "{}", "{a: true}", "an|_id-a@f");
-    testComputeKey("{}", "{}", "{a: 0}", "an@f");
-    testComputeKey("{}", "{}", "{a: false}", "an@f");
-    testComputeKey("{}", "{}", "{a: 99}", "an|_id-a@f");
-    testComputeKey("{}", "{}", "{a: 'foo'}", "an|_id@f");
+    testComputeKey(gctx, "{}", "{}", "{a: 1}");
+    testComputeKey(gctx, "{}", "{}", "{a: -1}");
+    testComputeKey(gctx, "{}", "{}", "{a: -1.0}");
+    testComputeKey(gctx, "{}", "{}", "{a: true}");
+    testComputeKey(gctx, "{}", "{}", "{a: 0}");
+    testComputeKey(gctx, "{}", "{}", "{a: false}");
+    testComputeKey(gctx, "{}", "{}", "{a: 99}");
+    testComputeKey(gctx, "{}", "{}", "{a: 'foo'}");
 
     // $slice defaults to exclusion.
-    testComputeKey("{}", "{}", "{a: {$slice: [3, 5]}}", "an@f");
-    testComputeKey("{}", "{}", "{a: {$slice: [3, 5]}, b: 0}", "an@f");
+    testComputeKey(gctx, "{}", "{}", "{a: {$slice: [3, 5]}}");
+    testComputeKey(gctx, "{}", "{}", "{a: {$slice: [3, 5]}, b: 0}");
 
     // But even when using $slice in an inclusion, the entire document is needed.
-    testComputeKey("{}", "{}", "{a: {$slice: [3, 5]}, b: 1}", "an@f");
+    testComputeKey(gctx, "{}", "{}", "{a: {$slice: [3, 5]}, b: 1}");
 
-    testComputeKey("{}", "{}", "{a: {$elemMatch: {x: 2}}}", "an@f");
-    testComputeKey("{}", "{}", "{a: {$elemMatch: {x: 2}}, b: 0}", "an@f");
-    testComputeKey("{}", "{}", "{a: {$elemMatch: {x: 2}}, b: 1}", "an@f");
+    testComputeKey(gctx, "{}", "{}", "{a: {$elemMatch: {x: 2}}}");
+    testComputeKey(gctx, "{}", "{}", "{a: {$elemMatch: {x: 2}}, b: 0}");
+    testComputeKey(gctx, "{}", "{}", "{a: {$elemMatch: {x: 2}}, b: 1}");
 
-    testComputeKey("{}", "{}", "{a: {$slice: [3, 5]}, b: {$elemMatch: {x: 2}}}", "an@f");
+    testComputeKey(gctx, "{}", "{}", "{a: {$slice: [3, 5]}, b: {$elemMatch: {x: 2}}}");
 
-    testComputeKey("{}", "{}", "{a: ObjectId('507f191e810c19729de860ea')}", "an|_id@f");
+    testComputeKey(gctx, "{}", "{}", "{a: ObjectId('507f191e810c19729de860ea')}");
     // Since this projection overwrites the entire document, no fields are required.
-    testComputeKey(
-        "{}", "{}", "{_id: 0, a: ObjectId('507f191e810c19729de860ea'), b: 'foo'}", "an|@f");
-    testComputeKey("{a: 1}", "{}", "{'a.$': 1}", "eqa@f");
-    testComputeKey("{a: 1}", "{}", "{a: 1}", "eqa|_id-a@f");
+    testComputeKey(gctx, "{}", "{}", "{_id: 0, a: ObjectId('507f191e810c19729de860ea'), b: 'foo'}");
+    testComputeKey(gctx, "{a: 1}", "{}", "{'a.$': 1}");
+    testComputeKey(gctx, "{a: 1}", "{}", "{a: 1}");
 
     // Projection should be order-insensitive
-    testComputeKey("{}", "{}", "{a: 1, b: 1}", "an|_id-a-b@f");
-    testComputeKey("{}", "{}", "{b: 1, a: 1}", "an|_id-a-b@f");
+    testComputeKey(gctx, "{}", "{}", "{a: 1, b: 1}");
+    testComputeKey(gctx, "{}", "{}", "{b: 1, a: 1}");
 
     // And should escape the separation character.
-    testComputeKey("{}", "{}", "{'b-1': 1, 'a-2': 1}", "an|_id-a\\-2-b\\-1@f");
+    testComputeKey(gctx, "{}", "{}", "{'b-1': 1, 'a-2': 1}");
 
     // And should exclude $-prefixed fields which can be added internally.
-    testComputeKey("{}", "{x: 1}", "{$sortKey: {$meta: 'sortKey'}}", "an~ax@f");
-    testComputeKey("{}", "{}", "{}", "an@f");
+    testComputeKey(gctx, "{}", "{x: 1}", "{$sortKey: {$meta: 'sortKey'}}");
+    testComputeKey(gctx, "{}", "{}", "{}");
 
-    testComputeKey("{}", "{x: 1}", "{a: 1, $sortKey: {$meta: 'sortKey'}}", "an~ax|_id-a@f");
-    testComputeKey("{}", "{}", "{a: 1}", "an|_id-a@f");
+    testComputeKey(gctx, "{}", "{x: 1}", "{a: 1, $sortKey: {$meta: 'sortKey'}}");
+    testComputeKey(gctx, "{}", "{}", "{a: 1}");
 
     // With or-elimination and projection
-    testComputeKey("{$or: [{a: 1}]}", "{}", "{_id: 0, a: 1}", "eqa|a@f");
-    testComputeKey("{$or: [{a: 1}]}", "{}", "{'a.$': 1}", "eqa@f");
+    testComputeKey(gctx, "{$or: [{a: 1}]}", "{}", "{_id: 0, a: 1}");
+    testComputeKey(gctx, "{$or: [{a: 1}]}", "{}", "{'a.$': 1}");
 }
 
-TEST(CanonicalQueryEncoderTest, EncodeNotEqualNullPredicates) {
+TEST_F(CanonicalQueryEncoderTest, EncodeNotEqualNullPredicates) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
     // The computed key depends on which execution engine is enabled. As such, we disable SBE for
     // this test so that the test doesn't break should the default value of
-    // 'internalQueryForceClassicEngine' change in the future.
-    RAIIServerParameterControllerForTest controllerSBE("internalQueryForceClassicEngine", true);
+    // 'internalQueryFrameworkControl' change in the future.
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "forceClassicEngine");
 
     // With '$eq', '$gte', and '$lte' negation comparison to 'null'.
-    testComputeKey("{a: {$not: {$eq: null}}}", "{}", "{_id: 0, a: 1}", "ntnot_eq_null[eqa]|a@f");
-    testComputeKey(
-        "{a: {$not: {$eq: null}}}", "{a: 1}", "{_id: 0, a: 1}", "ntnot_eq_null[eqa]~aa|a@f");
-    testComputeKey(
-        "{a: {$not: {$gte: null}}}", "{a: 1}", "{_id: 0, a: 1}", "ntnot_eq_null[gea]~aa|a@f");
-    testComputeKey(
-        "{a: {$not: {$lte: null}}}", "{a: 1}", "{_id: 0, a: 1}", "ntnot_eq_null[lea]~aa|a@f");
+    testComputeKey(gctx, "{a: {$not: {$eq: null}}}", "{}", "{_id: 0, a: 1}");
+    testComputeKey(gctx, "{a: {$not: {$eq: null}}}", "{a: 1}", "{_id: 0, a: 1}");
+    testComputeKey(gctx, "{a: {$not: {$gte: null}}}", "{a: 1}", "{_id: 0, a: 1}");
+    testComputeKey(gctx, "{a: {$not: {$lte: null}}}", "{a: 1}", "{_id: 0, a: 1}");
 
     // Same '$eq' negation query with non-'null' argument should have different key.
-    testComputeKey("{a: {$not: {$eq: true}}}", "{a: 1}", "{_id: 0, a: 1}", "nt[eqa]~aa|a@f");
+    testComputeKey(gctx, "{a: {$not: {$eq: true}}}", "{a: 1}", "{_id: 0, a: 1}");
 }
 
 // Delimiters found in user field names or non-standard projection field values
 // must be escaped.
-TEST(CanonicalQueryEncoderTest, ComputeKeyEscaped) {
+TEST_F(CanonicalQueryEncoderTest, ComputeKeyEscaped) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
     // The computed key depends on which execution engine is enabled. As such, we disable SBE for
     // this test so that the test doesn't break should the default value of
-    // 'internalQueryForceClassicEngine' change in the future.
-    RAIIServerParameterControllerForTest controllerSBE("internalQueryForceClassicEngine", true);
+    // 'internalQueryFrameworkControl' change in the future.
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "forceClassicEngine");
     // Field name in query.
-    testComputeKey("{'a,[]~|-<>': 1}", "{}", "{}", "eqa\\,\\[\\]\\~\\|\\-<>@f");
+    testComputeKey(gctx, "{'a,[]~|-<>': 1}", "{}", "{}");
 
     // Field name in sort.
-    testComputeKey("{}", "{'a,[]~|-<>': 1}", "{}", "an~aa\\,\\[\\]\\~\\|\\-<>@f");
+    testComputeKey(gctx, "{}", "{'a,[]~|-<>': 1}", "{}");
 
     // Field name in projection.
-    testComputeKey("{}", "{}", "{'a,[]~|-<>': 1}", "an|_id-a\\,\\[\\]\\~\\|\\-<>@f");
+    testComputeKey(gctx, "{}", "{}", "{'a,[]~|-<>': 1}");
 
     // String literal provided as value.
-    testComputeKey("{}", "{}", "{a: 'foo,[]~|-<>'}", "an|_id@f");
+    testComputeKey(gctx, "{}", "{}", "{a: 'foo,[]~|-<>'}");
 }
 
 // Cache keys for $geoWithin queries with legacy and GeoJSON coordinates should
 // not be the same.
-TEST(CanonicalQueryEncoderTest, ComputeKeyGeoWithin) {
+TEST_F(CanonicalQueryEncoderTest, ComputeKeyGeoWithin) {
     // Legacy coordinates.
-    unique_ptr<CanonicalQuery> cqLegacy(
-        canonicalize("{a: {$geoWithin: "
-                     "{$box: [[-180, -90], [180, 90]]}}}"));
+    unique_ptr<CanonicalQuery> cqLegacy(canonicalize(opCtx(),
+                                                     "{a: {$geoWithin: "
+                                                     "{$box: [[-180, -90], [180, 90]]}}}"));
     // GeoJSON coordinates.
-    unique_ptr<CanonicalQuery> cqNew(
-        canonicalize("{a: {$geoWithin: "
-                     "{$geometry: {type: 'Polygon', coordinates: "
-                     "[[[0, 0], [0, 90], [90, 0], [0, 0]]]}}}}"));
-    ASSERT_NOT_EQUALS(canonical_query_encoder::encode(*cqLegacy),
-                      canonical_query_encoder::encode(*cqNew));
+    unique_ptr<CanonicalQuery> cqNew(canonicalize(opCtx(),
+                                                  "{a: {$geoWithin: "
+                                                  "{$geometry: {type: 'Polygon', coordinates: "
+                                                  "[[[0, 0], [0, 90], [90, 0], [0, 0]]]}}}}"));
+    ASSERT_NOT_EQUALS(canonical_query_encoder::encodeClassic(*cqLegacy),
+                      canonical_query_encoder::encodeClassic(*cqNew));
 }
 
 // GEO_NEAR cache keys should include information on geometry and CRS in addition
 // to the match type and field name.
-TEST(CanonicalQueryEncoderTest, ComputeKeyGeoNear) {
+TEST_F(CanonicalQueryEncoderTest, ComputeKeyGeoNear) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
     // The computed key depends on which execution engine is enabled. As such, we disable SBE for
     // this test so that the test doesn't break should the default value of
-    // 'internalQueryForceClassicEngine' change in the future.
-    RAIIServerParameterControllerForTest controllerSBE("internalQueryForceClassicEngine", true);
+    // 'internalQueryFrameworkControl' change in the future.
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "forceClassicEngine");
 
-    testComputeKey("{a: {$near: [0,0], $maxDistance:0.3 }}", "{}", "{}", "gnanrfl@f");
-    testComputeKey("{a: {$nearSphere: [0,0], $maxDistance: 0.31 }}", "{}", "{}", "gnanssp@f");
-    testComputeKey(
-        "{a: {$geoNear: {$geometry: {type: 'Point', coordinates: [0,0]},"
-        "$maxDistance:100}}}",
-        "{}",
-        "{}",
-        "gnanrsp@f");
+    testComputeKey(gctx, "{a: {$near: [0,0], $maxDistance:0.3 }}", "{}", "{}");
+    testComputeKey(gctx, "{a: {$nearSphere: [0,0], $maxDistance: 0.31 }}", "{}", "{}");
+    testComputeKey(gctx,
+                   "{a: {$geoNear: {$geometry: {type: 'Point', coordinates: [0,0]},"
+                   "$maxDistance:100}}}",
+                   "{}",
+                   "{}");
 }
 
-TEST(CanonicalQueryEncoderTest, ComputeKeyRegexDependsOnFlags) {
+// Cache keys for $_internalBucketGeoWithin with flat and spherical geometry should
+// not be the same.
+TEST_F(CanonicalQueryEncoderTest, ComputeKeyTimeseriesGeoWithin) {
+    // Flat geometry.
+    unique_ptr<CanonicalQuery> cqFlat(
+        canonicalize(opCtx(),
+                     "{ $_internalBucketGeoWithin: { withinRegion: { $center: [ [ 180.0, 0.0 ], "
+                     "1.79 ] }, field: \"loc\" } }"));
+    // Spherical geometry.
+    unique_ptr<CanonicalQuery> cqSpherical(
+        canonicalize(opCtx(),
+                     "{ $_internalBucketGeoWithin: { withinRegion: { $centerSphere: [ [ 180.0, 0.0 "
+                     "], 1.79 ] }, field: \"loc\" } }"));
+    ASSERT_NOT_EQUALS(canonical_query_encoder::encodeClassic(*cqFlat),
+                      canonical_query_encoder::encodeClassic(*cqSpherical));
+}
+
+TEST_F(CanonicalQueryEncoderTest, ComputeKeyRegexDependsOnFlags) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
     // The computed key depends on which execution engine is enabled. As such, we enable SBE for
     // this test in order to ensure that we have coverage for both SBE and the classic engine.
-    RAIIServerParameterControllerForTest controllerSBE("internalQueryForceClassicEngine", false);
-    testComputeKey("{a: {$regex: \"sometext\"}}", "{}", "{}", "rea@t");
-    testComputeKey("{a: {$regex: \"sometext\", $options: \"\"}}", "{}", "{}", "rea@t");
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "trySbeEngine");
+    testComputeKey(gctx, "{a: {$regex: \"sometext\"}}", "{}", "{}");
+    testComputeKey(gctx, "{a: {$regex: \"sometext\", $options: \"\"}}", "{}", "{}");
 
-    testComputeKey("{a: {$regex: \"sometext\", $options: \"s\"}}", "{}", "{}", "rea/s/@t");
-    testComputeKey("{a: {$regex: \"sometext\", $options: \"ms\"}}", "{}", "{}", "rea/ms/@t");
+    testComputeKey(gctx, "{a: {$regex: \"sometext\", $options: \"s\"}}", "{}", "{}");
+    testComputeKey(gctx, "{a: {$regex: \"sometext\", $options: \"ms\"}}", "{}", "{}");
 
     // Test that the ordering of $options doesn't matter.
-    testComputeKey("{a: {$regex: \"sometext\", $options: \"im\"}}", "{}", "{}", "rea/im/@t");
-    testComputeKey("{a: {$regex: \"sometext\", $options: \"mi\"}}", "{}", "{}", "rea/im/@t");
+    testComputeKey(gctx, "{a: {$regex: \"sometext\", $options: \"im\"}}", "{}", "{}");
+    testComputeKey(gctx, "{a: {$regex: \"sometext\", $options: \"mi\"}}", "{}", "{}");
 
     // Test that only the options affect the key. Two regex match expressions with the same options
     // but different $regex values should have the same shape.
-    testComputeKey("{a: {$regex: \"abc\", $options: \"mi\"}}", "{}", "{}", "rea/im/@t");
-    testComputeKey("{a: {$regex: \"efg\", $options: \"mi\"}}", "{}", "{}", "rea/im/@t");
+    testComputeKey(gctx, "{a: {$regex: \"abc\", $options: \"mi\"}}", "{}", "{}");
+    testComputeKey(gctx, "{a: {$regex: \"efg\", $options: \"mi\"}}", "{}", "{}");
 
-    testComputeKey("{a: {$regex: \"\", $options: \"ms\"}}", "{}", "{}", "rea/ms/@t");
-    testComputeKey("{a: {$regex: \"___\", $options: \"ms\"}}", "{}", "{}", "rea/ms/@t");
+    testComputeKey(gctx, "{a: {$regex: \"\", $options: \"ms\"}}", "{}", "{}");
+    testComputeKey(gctx, "{a: {$regex: \"___\", $options: \"ms\"}}", "{}", "{}");
 
     // Test that only valid regex flags contribute to the plan cache key encoding.
-    testComputeKey(BSON("a" << BSON("$regex"
+    testComputeKey(gctx,
+                   BSON("a" << BSON("$regex"
                                     << "abc"
                                     << "$options"
                                     << "imxsu")),
                    {},
-                   {},
-                   "rea/imsx/@t");
-    testComputeKey("{a: /abc/im}", "{}", "{}", "rea/im/@t");
+                   {});
+    testComputeKey(gctx, "{a: /abc/im}", "{}", "{}");
 }
 
-TEST(CanonicalQueryEncoderTest, ComputeKeyMatchInDependsOnPresenceOfRegexAndFlags) {
+TEST_F(CanonicalQueryEncoderTest, ComputeKeyMatchInDependsOnPresenceOfRegexAndFlags) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
     // The computed key depends on which execution engine is enabled. As such, we disable SBE for
     // this test so that the test doesn't break should the default value of
-    // 'internalQueryForceClassicEngine' change in the future.
-    RAIIServerParameterControllerForTest controllerSBE("internalQueryForceClassicEngine", true);
+    // 'internalQueryFrameworkControl' change in the future.
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "forceClassicEngine");
 
     // Test that an $in containing a single regex is unwrapped to $regex.
-    testComputeKey("{a: {$in: [/foo/]}}", "{}", "{}", "rea@f");
-    testComputeKey("{a: {$in: [/foo/i]}}", "{}", "{}", "rea/i/@f");
+    testComputeKey(gctx, "{a: {$in: [/foo/]}}", "{}", "{}");
+    testComputeKey(gctx, "{a: {$in: [/foo/i]}}", "{}", "{}");
 
     // Test that an $in with no regexes does not include any regex information.
-    testComputeKey("{a: {$in: [1, 'foo']}}", "{}", "{}", "ina@f");
+    testComputeKey(gctx, "{a: {$in: [1, 'foo']}}", "{}", "{}");
 
     // Test that an $in with a regex encodes the presence of the regex.
-    testComputeKey("{a: {$in: [1, /foo/]}}", "{}", "{}", "ina_re@f");
+    testComputeKey(gctx, "{a: {$in: [1, /foo/]}}", "{}", "{}");
 
     // Test that an $in with a regex encodes the presence of the regex and its flags.
-    testComputeKey("{a: {$in: [1, /foo/is]}}", "{}", "{}", "ina_re/is/@f");
+    testComputeKey(gctx, "{a: {$in: [1, /foo/is]}}", "{}", "{}");
 
     // Test that the computed key is invariant to the order of the flags within each regex.
-    testComputeKey("{a: {$in: [1, /foo/si]}}", "{}", "{}", "ina_re/is/@f");
+    testComputeKey(gctx, "{a: {$in: [1, /foo/si]}}", "{}", "{}");
 
     // Test that an $in with multiple regexes encodes all unique flags.
-    testComputeKey("{a: {$in: [1, /foo/i, /bar/m, /baz/s]}}", "{}", "{}", "ina_re/ims/@f");
+    testComputeKey(gctx, "{a: {$in: [1, /foo/i, /bar/m, /baz/s]}}", "{}", "{}");
 
     // Test that an $in with multiple regexes deduplicates identical flags.
-    testComputeKey(
-        "{a: {$in: [1, /foo/i, /bar/m, /baz/s, /qux/i, /quux/s]}}", "{}", "{}", "ina_re/ims/@f");
+    testComputeKey(gctx, "{a: {$in: [1, /foo/i, /bar/m, /baz/s, /qux/i, /quux/s]}}", "{}", "{}");
 
     // Test that the computed key is invariant to the ordering of the flags across regexes.
-    testComputeKey("{a: {$in: [1, /foo/ism, /bar/msi, /baz/im, /qux/si, /quux/im]}}",
-                   "{}",
-                   "{}",
-                   "ina_re/ims/@f");
-    testComputeKey("{a: {$in: [1, /foo/msi, /bar/ism, /baz/is, /qux/mi, /quux/im]}}",
-                   "{}",
-                   "{}",
-                   "ina_re/ims/@f");
+    testComputeKey(
+        gctx, "{a: {$in: [1, /foo/ism, /bar/msi, /baz/im, /qux/si, /quux/im]}}", "{}", "{}");
+    testComputeKey(
+        gctx, "{a: {$in: [1, /foo/msi, /bar/ism, /baz/is, /qux/mi, /quux/im]}}", "{}", "{}");
 
     // Test that $not-$in-$regex similarly records the presence and flags of any regexes.
-    testComputeKey("{a: {$not: {$in: [1, 'foo']}}}", "{}", "{}", "nt[ina]@f");
-    testComputeKey("{a: {$not: {$in: [1, /foo/]}}}", "{}", "{}", "nt[ina_re]@f");
-    testComputeKey(
-        "{a: {$not: {$in: [1, /foo/i, /bar/i, /baz/msi]}}}", "{}", "{}", "nt[ina_re/ims/]@f");
+    testComputeKey(gctx, "{a: {$not: {$in: [1, 'foo']}}}", "{}", "{}");
+    testComputeKey(gctx, "{a: {$not: {$in: [1, /foo/]}}}", "{}", "{}");
+    testComputeKey(gctx, "{a: {$not: {$in: [1, /foo/i, /bar/i, /baz/msi]}}}", "{}", "{}");
 
     // Test that a $not-$in containing a single regex is unwrapped to $not-$regex.
-    testComputeKey("{a: {$not: {$in: [/foo/]}}}", "{}", "{}", "nt[rea]@f");
-    testComputeKey("{a: {$not: {$in: [/foo/i]}}}", "{}", "{}", "nt[rea/i/]@f");
+    testComputeKey(gctx, "{a: {$not: {$in: [/foo/]}}}", "{}", "{}");
+    testComputeKey(gctx, "{a: {$not: {$in: [/foo/i]}}}", "{}", "{}");
 }
 
-TEST(CanonicalQueryEncoderTest, CheckCollationIsEncoded) {
+TEST_F(CanonicalQueryEncoderTest, CheckCollationIsEncoded) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
     // The computed key depends on which execution engine is enabled. As such, we disable SBE for
     // this test so that the test doesn't break should the default value of
-    // 'internalQueryForceClassicEngine' change in the future.
-    RAIIServerParameterControllerForTest controllerSBE("internalQueryForceClassicEngine", true);
+    // 'internalQueryFrameworkControl' change in the future.
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "forceClassicEngine");
 
     unique_ptr<CanonicalQuery> cq(canonicalize(
-        fromjson("{a: 1, b: 1}"), {}, {}, fromjson("{locale: 'mock_reverse_string'}")));
+        opCtx(), fromjson("{a: 1, b: 1}"), {}, {}, fromjson("{locale: 'mock_reverse_string'}")));
 
-    testComputeKey(*cq, "an[eqa,eqb]#mock_reverse_string02300000@f");
+    testComputeClassicKey(gctx, *cq);
 }
 
-TEST(CanonicalQueryEncoderTest, ComputeKeySBE) {
+TEST_F(CanonicalQueryEncoderTest, CheckSubplanningQueriesAreEncodedDifferentlyWhenSbeCompatible) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
+    unique_ptr<CanonicalQuery> cqWithOr(canonicalize(opCtx(), "{$or: [{a: 1, x:1}, {b: 1, y:2}]}"));
+    cqWithOr->setSbeCompatible(true);
+
+    // Test how we compute the top level key.
+    testEncodeClassic(gctx, *cqWithOr);
+
+    // Test how we compute the keys when using the CanonicalQuery() constructor specifically used by
+    // subplanning.
+    CanonicalQuery subQuery1(opCtx(), *cqWithOr, 0 /* index of OR branch */);
+    subQuery1.setSbeCompatible(true);
+    CanonicalQuery subQuery2(opCtx(), *cqWithOr, 1 /* index of OR branch */);
+    subQuery2.setSbeCompatible(true);
+
+    testEncodeClassic(gctx, subQuery1);
+    testEncodeClassic(gctx, subQuery2);
+
+    // Test how we compute the key for an equivalent query, though not created with the subplanning
+    // constructor.
+    unique_ptr<CanonicalQuery> equivalentToSubQuery1(canonicalize(opCtx(), "{a: 1, x:1}"));
+    equivalentToSubQuery1->setSbeCompatible(true);
+    unique_ptr<CanonicalQuery> equivalentToSubQuery2(canonicalize(opCtx(), "{b: 1, y:2}"));
+    equivalentToSubQuery2->setSbeCompatible(true);
+
+    testEncodeClassic(gctx, *equivalentToSubQuery1);
+    testEncodeClassic(gctx, *equivalentToSubQuery2);
+
+    // Now check that the keys for subQueryX and equivalentSubQueryX are NOT equal.
+    ASSERT_NE(canonical_query_encoder::encodeClassic(subQuery1),
+              canonical_query_encoder::encodeClassic(*equivalentToSubQuery1));
+    ASSERT_NE(canonical_query_encoder::encodeClassic(subQuery2),
+              canonical_query_encoder::encodeClassic(*equivalentToSubQuery2));
+}
+
+TEST_F(CanonicalQueryEncoderTest, ComputeClassicKeyForSbeCompatibleQuery) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
+
+    auto test = [&](const char* match, const char* sort, const char* proj) {
+        auto cq = canonicalize(opCtx(), fromjson(match), fromjson(sort), fromjson(proj), BSONObj());
+        cq->setSbeCompatible(true);
+
+        testEncodeClassic(gctx, *cq);
+    };
+
+    test("{}", "{}", "{}");
+    test("{$or: [{a: 1}, {b: 2}]}", "{}", "{}");
+    test("{a: 1}", "{}", "{}");
+    test("{b: 1}", "{}", "{}");
+    test("{a: 1, b: 1, c: 1}", "{}", "{}");
+
+    // With sort
+    test("{}", "{a: 1}", "{}");
+    test("{}", "{a: -1}", "{}");
+    test("{a: 1}", "{a: 1}", "{}");
+
+    // With projection
+    test("{a: 1}", "{a: 1}", "{a: 1}");
+    test("{}", "{a: 1}", "{a: 1}");
+    test("{}", "{a: 1}", "{a: 1}");
+    test("{}", "{}", "{a: 1}");
+    test("{}", "{}", "{a: true}");
+    test("{}", "{}", "{a: false}");
+}
+
+TEST_F(CanonicalQueryEncoderTest, ComputeKeySBE) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
     // Generated cache keys should be treated as opaque to the user.
 
     // SBE must be enabled in order to generate SBE plan cache keys.
-    RAIIServerParameterControllerForTest controllerSBE("internalQueryForceClassicEngine", false);
-
-    RAIIServerParameterControllerForTest controllerSBEPlanCache("featureFlagSbePlanCache", true);
-
-    testComputeSBEKey("{}", "{}", "{}", "YW4ABQAAAAAAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABe");
-    testComputeSBEKey(
-        "{$or: [{a: 1}, {b: 2}]}",
-        "{}",
-        "{}",
-        "b3IAW2VxAGE/AAAAACxlcQBiPwEAAABdBQAAAAAAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABe");
-    testComputeSBEKey(
-        "{a: 1}", "{}", "{}", "ZXEAYT8AAAAABQAAAAAAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABe");
-    testComputeSBEKey(
-        "{b: 1}", "{}", "{}", "ZXEAYj8AAAAABQAAAAAAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABe");
-    testComputeSBEKey(
-        "{a: 1, b: 1, c: 1}",
-        "{}",
-        "{}",
-        "YW4AW2VxAGE/"
-        "AAAAACxlcQBiPwEAAAAsZXEAYz8CAAAAXQUAAAAAAAAAAAAAAABubm5uBQAAAAAFAAAAAAUAAAAAXg==");
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "trySbeEngine");
+    testComputeSBEKey(gctx, "{}", "{}", "{}");
+    testComputeSBEKey(gctx, "{$or: [{a: 1}, {b: 2}]}", "{}", "{}");
+    testComputeSBEKey(gctx, "{a: 1}", "{}", "{}");
+    testComputeSBEKey(gctx, "{b: 1}", "{}", "{}");
+    testComputeSBEKey(gctx, "{a: 1, b: 1, c: 1}", "{}", "{}");
 
     // With sort
-    testComputeSBEKey("{}", "{a: 1}", "{}", "YW4ABQAAAAB+YWEAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABe");
-    testComputeSBEKey(
-        "{}", "{a: -1}", "{}", "YW4ABQAAAAB+ZGEAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABe");
-    testComputeSBEKey(
-        "{a: 1}", "{a: 1}", "{}", "ZXEAYT8AAAAABQAAAAB+YWEAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABe");
+    testComputeSBEKey(gctx, "{}", "{a: 1}", "{}");
+    testComputeSBEKey(gctx, "{}", "{a: -1}", "{}");
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}");
 
     // With projection
-    testComputeSBEKey("{a: 1}",
-                      "{a: 1}",
-                      "{a: 1}",
-                      "ZXEAYT8AAAAADAAAABBhAAEAAAAAfmFhAAAAAAAAAABubm5uBQAAAAAFAAAAAAUAAAAAXg==");
-    testComputeSBEKey("{}",
-                      "{a: 1}",
-                      "{a: 1}",
-                      "YW4ADAAAABBhAAEAAAAAfmFhAAAAAAAAAABubm5uBQAAAAAFAAAAAAUAAAAAXg==");
-    testComputeSBEKey("{}",
-                      "{a: 1}",
-                      "{a: 1, b: [{$const: 1}]}",
-                      "YW4AKAAAABBhAAEAAAAEYgAZAAAAAzAAEQAAABAkY29uc3QAAQAAAAAAAH5hYQAAAAAAAAAAbm5u"
-                      "bgUAAAAABQAAAAAFAAAAAF4=");
-    testComputeSBEKey(
-        "{}", "{}", "{a: 1}", "YW4ADAAAABBhAAEAAAAAAAAAAAAAAABubm5uBQAAAAAFAAAAAAUAAAAAXg==");
-    testComputeSBEKey(
-        "{}", "{}", "{a: true}", "YW4ACQAAAAhhAAEAAAAAAAAAAABubm5uBQAAAAAFAAAAAAUAAAAAXg==");
-    testComputeSBEKey(
-        "{}", "{}", "{a: false}", "YW4ACQAAAAhhAAAAAAAAAAAAAABubm5uBQAAAAAFAAAAAAUAAAAAXg==");
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{a: 1}");
+    testComputeSBEKey(gctx, "{}", "{a: 1}", "{a: 1}");
+    testComputeSBEKey(gctx, "{}", "{a: 1}", "{a: 1}");
+    testComputeSBEKey(gctx, "{}", "{}", "{a: 1}");
+    testComputeSBEKey(gctx, "{}", "{}", "{a: true}");
+    testComputeSBEKey(gctx, "{}", "{}", "{a: false}");
+
+    // With count
+    testComputeSBEKey(gctx,
+                      "{}",
+                      "{}",
+                      "{}",
+                      nullptr /* findCommand */,
+                      {} /* pipeline */,
+                      true /* isCountLike */);
 
     // With FindCommandRequest
     auto findCommand = std::make_unique<FindCommandRequest>(nss);
-    testComputeSBEKey("{a: 1}",
-                      "{a: 1}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAB+YWEAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABe",
-                      std::move(findCommand));
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
     findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setAllowDiskUse(true);
-    testComputeSBEKey("{a: 1}",
-                      "{a: 1}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAB+YWEAAAAAAAAAAHRubm4FAAAAAAUAAAAABQAAAABe",
-                      std::move(findCommand));
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
     findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setAllowDiskUse(false);
-    testComputeSBEKey("{a: 1}",
-                      "{a: 1}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAB+YWEAAAAAAAAAAGZubm4FAAAAAAUAAAAABQAAAABe",
-                      std::move(findCommand));
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
     findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setReturnKey(true);
-    testComputeSBEKey("{a: 1}",
-                      "{a: 1}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAB+YWEAAAAAAAAAAG50bm4FAAAAAAUAAAAABQAAAABe",
-                      std::move(findCommand));
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
     findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setRequestResumeToken(false);
-    testComputeSBEKey("{a: 1}",
-                      "{a: 1}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAB+YWEAAAAAAAAAAG5uZm4FAAAAAAUAAAAABQAAAABe",
-                      std::move(findCommand));
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
 
     findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setSkip(10);
-    testComputeSBEKey("{a: 1}",
-                      "{a: 1}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAB+YWEKAAAAAAAAAAAAAABubm5uBQAAAAAFAAAAAAUAAAAAXg==",
-                      std::move(findCommand));
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
 
     findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setLimit(10);
-    testComputeSBEKey("{a: 1}",
-                      "{a: 1}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAB+YWEAAAAACgAAAAAAAABubm5uBQAAAAAFAAAAAAUAAAAAXg==",
-                      std::move(findCommand));
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
 
     findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setMin(mongo::fromjson("{ a : 1 }"));
-    testComputeSBEKey("{a: 1}",
-                      "{a: 1}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAB+YWEAAAAAAAAAAG5ubm4FAAAAAAwAAAAQYQABAAAAAAUAAAAAXg==",
-                      std::move(findCommand));
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
     findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setMax(mongo::fromjson("{ a : 1 }"));
-    testComputeSBEKey("{a: 1}",
-                      "{a: 1}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAB+YWEAAAAAAAAAAG5ubm4FAAAAAAUAAAAADAAAABBhAAEAAAAAXg==",
-                      std::move(findCommand));
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
+
     findCommand = std::make_unique<FindCommandRequest>(nss);
     findCommand->setRequestResumeToken(true);
     // "hint" must be {$natural:1} if 'requestResumeToken' is enabled.
     findCommand->setHint(fromjson("{$natural: 1}"));
     findCommand->setResumeAfter(mongo::fromjson("{ $recordId: NumberLong(1) }"));
-    testComputeSBEKey(
-        "{a: 1}",
-        "{}",
-        "{}",
-        "ZXEAYT8AAAAABQAAAAAAAAAAAAAAAG5udG4YAAAAEiRyZWNvcmRJZAABAAAAAAAAAAAFAAAAAAUAAAAAXg==",
-        std::move(findCommand));
+    testComputeSBEKey(gctx, "{a: 1}", "{}", "{}", std::move(findCommand));
+
+
+    findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setRequestResumeToken(true);
+    findCommand->setHint(fromjson("{$natural: 1}"));
+    findCommand->setStartAt(mongo::fromjson("{ $recordId: NumberLong(1) }"));
+    testComputeSBEKey(gctx, "{a: 1}", "{}", "{}", std::move(findCommand));
+
+    findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setHint(fromjson("{a: 1}"));
+    testComputeSBEKey(gctx, "{a: 1}", "{}", "{}", std::move(findCommand));
+    findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setHint(fromjson("{a: -1}"));
+    testComputeSBEKey(gctx, "{a: 1}", "{}", "{}", std::move(findCommand));
 }
 
-TEST(CanonicalQueryEncoderTest, ComputeKeySBEWithPipeline) {
+TEST_F(CanonicalQueryEncoderTest, ComputeKeySBEWithPipeline) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
     // SBE must be enabled in order to generate SBE plan cache keys.
-    RAIIServerParameterControllerForTest controllerSBE("internalQueryForceClassicEngine", false);
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "trySbeEngine");
 
-    RAIIServerParameterControllerForTest controllerSBEPlanCache("featureFlagSbePlanCache", true);
 
     auto getLookupBson = [](StringData localField, StringData foreignField, StringData asField) {
         return BSON("$lookup" << BSON("from" << foreignNss.coll() << "localField" << localField
@@ -556,58 +683,111 @@ TEST(CanonicalQueryEncoderTest, ComputeKeySBEWithPipeline) {
     };
 
     // No pipeline stage.
-    testComputeSBEKey("{a: 1}",
-                      "{}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAAAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABe",
-                      nullptr,
-                      {});
+    testComputeSBEKey(gctx, "{a: 1}", "{}", "{}");
 
     // Different $lookup stage options.
-    testComputeSBEKey(
-        "{a: 1}",
-        "{}",
-        "{}",
-        "ZXEAYT8AAAAABQAAAAAAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABeWgAAAAMkbG9va3VwAEwAAAACZnJvbQAMAA"
-        "AAZm9yZWlnbmNvbGwAAmFzAAMAAABhcwACbG9jYWxGaWVsZAACAAAAYQACZm9yZWlnbkZpZWxkAAIAAABiAAAA",
-        nullptr,
-        {getLookupBson("a", "b", "as")});
-    testComputeSBEKey("{a: 1}",
-                      "{}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAAAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABeWwAAAAMkbG9va3VwAE0A"
-                      "AAACZnJvbQAMAAAAZm9yZWlnbmNvbGwAAmFzAAMAAABhcwACbG9jYWxGaWVsZAADAAAAYTEAAmZv"
-                      "cmVpZ25GaWVsZAACAAAAYgAAAA==",
-                      nullptr,
-                      {getLookupBson("a1", "b", "as")});
-    testComputeSBEKey("{a: 1}",
-                      "{}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAAAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABeWwAAAAMkbG9va3VwAE0A"
-                      "AAACZnJvbQAMAAAAZm9yZWlnbmNvbGwAAmFzAAMAAABhcwACbG9jYWxGaWVsZAACAAAAYQACZm9y"
-                      "ZWlnbkZpZWxkAAMAAABiMQAAAA==",
-                      nullptr,
-                      {getLookupBson("a", "b1", "as")});
-    testComputeSBEKey("{a: 1}",
-                      "{}",
-                      "{}",
-                      "ZXEAYT8AAAAABQAAAAAAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABeWwAAAAMkbG9va3VwAE0A"
-                      "AAACZnJvbQAMAAAAZm9yZWlnbmNvbGwAAmFzAAQAAABhczEAAmxvY2FsRmllbGQAAgAAAGEAAmZv"
-                      "cmVpZ25GaWVsZAACAAAAYgAAAA==",
-                      nullptr,
-                      {getLookupBson("a", "b", "as1")});
+    testComputeSBEKey(gctx, "{a: 1}", "{}", "{}", nullptr, {getLookupBson("a", "b", "as")});
+    testComputeSBEKey(gctx, "{a: 1}", "{}", "{}", nullptr, {getLookupBson("a1", "b", "as")});
+    testComputeSBEKey(gctx, "{a: 1}", "{}", "{}", nullptr, {getLookupBson("a", "b1", "as")});
+    testComputeSBEKey(gctx, "{a: 1}", "{}", "{}", nullptr, {getLookupBson("a", "b", "as1")});
 
     // Multiple $lookup stages.
-    testComputeSBEKey("{a: 1}",
+    testComputeSBEKey(gctx,
+                      "{a: 1}",
                       "{}",
                       "{}",
-                      "ZXEAYT8AAAAABQAAAAAAAAAAAAAAAG5ubm4FAAAAAAUAAAAABQAAAABeWgAAAAMkbG9va3VwAEwA"
-                      "AAACZnJvbQAMAAAAZm9yZWlnbmNvbGwAAmFzAAMAAABhcwACbG9jYWxGaWVsZAACAAAAYQACZm9y"
-                      "ZWlnbkZpZWxkAAIAAABiAAAAXQAAAAMkbG9va3VwAE8AAAACZnJvbQAMAAAAZm9yZWlnbmNvbGwA"
-                      "AmFzAAQAAABhczEAAmxvY2FsRmllbGQAAwAAAGExAAJmb3JlaWduRmllbGQAAwAAAGIxAAAA",
                       nullptr,
                       {getLookupBson("a", "b", "as"), getLookupBson("a1", "b1", "as1")});
 }
 
+TEST_F(CanonicalQueryEncoderTest, ComputeKeySBEWithReadConcern) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
+    // SBE must be enabled in order to generate SBE plan cache keys.
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "trySbeEngine");
+
+    // Find command without read concern.
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
+
+    // Find command with read concern "majority".
+    findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setReadConcern(repl::ReadConcernArgs::kMajority);
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
+
+    // Find command with read concern "available".
+    findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setReadConcern(repl::ReadConcernArgs::kAvailable);
+    testComputeSBEKey(gctx, "{a: 1}", "{a: 1}", "{}", std::move(findCommand));
+}
+
+TEST_F(CanonicalQueryEncoderTest, ComputeKeyWithApiStrict) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
+    {
+        RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                           "forceClassicEngine");
+        APIParameters::get(opCtx()).setAPIStrict(false);
+        testComputeKey(gctx, "{}", "{}", "{}");
+
+        APIParameters::get(opCtx()).setAPIStrict(true);
+        testComputeKey(gctx, "{}", "{}", "{}");
+    }
+
+    {
+        RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                           "trySbeEngine");
+
+        APIParameters::get(opCtx()).setAPIStrict(false);
+        testComputeSBEKey(gctx, "{}", "{}", "{}");
+
+        APIParameters::get(opCtx()).setAPIStrict(true);
+        testComputeSBEKey(gctx, "{}", "{}", "{}");
+    }
+}
+
+TEST_F(CanonicalQueryEncoderTest, ComputeKeyWithNeedsMerge) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "trySbeEngine");
+    const auto groupStage = fromjson("{$group: {_id: '$a', out: {$sum: 1}}}");
+    testComputeSBEKey(gctx,
+                      "{}",
+                      "{}",
+                      "{}",
+                      nullptr /* findCommand */,
+                      {groupStage},
+                      false /* isCountLike */,
+                      false /* needsMerge */);
+
+    testComputeSBEKey(gctx,
+                      "{}",
+                      "{}",
+                      "{}",
+                      nullptr /* findCommand */,
+                      {groupStage},
+                      false /* isCountLike */,
+                      true /* needsMerge */);
+}
+
+TEST_F(CanonicalQueryEncoderTest, ComputeKeyForPipeline) {
+    unittest::GoldenTestContext gctx(&goldenTestConfig);
+    // SBE must be enabled in order to generate SBE plan cache keys.
+    RAIIServerParameterControllerForTest controllerSBE("internalQueryFrameworkControl",
+                                                       "trySbeEngine");
+
+    testComputeKeyForPipeline(gctx, "{$match: {a: 1}}", "{}");
+    testComputeKeyForPipeline(gctx, "{$match: {a: 2}}", "{}");
+    testComputeKeyForPipeline(gctx, "{$match: {b: 1}}", "{}");
+    testComputeKeyForPipeline(gctx, "{$match: {$and: [{a: 1}, {b: 1}]}}", "{}");
+    testComputeKeyForPipeline(gctx, "{$match: {$or: [{a: 1}, {b: 1}]}}", "{}");
+
+    // with projection
+    testComputeKeyForPipeline(gctx, "{$match: {a: 1}}", "{$project: {a: 1}}");
+    testComputeKeyForPipeline(gctx, "{$match: {b: 1}}", "{$project: {b: 1}}");
+    testComputeKeyForPipeline(
+        gctx, "{$match: {$and: [{a: 1}, {b: 1}]}}", "{$project: {a: 1, b: 1}}");
+    testComputeKeyForPipeline(
+        gctx, "{$match: {$or: [{a: 1}, {b: 1}]}}", "{$project: {a: 1, b: 1}}");
+}
 }  // namespace
 }  // namespace mongo

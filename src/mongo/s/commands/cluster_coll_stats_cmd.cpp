@@ -28,21 +28,58 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <algorithm>
+#include <initializer_list>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/db/timeseries/timeseries_commands_conversion_helper.h"
+#include "mongo/executor/remote_command_response.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/chunk_manager_targeter.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/grid.h"
+#include "mongo/s/collection_routing_info_targeter.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 
 namespace mongo {
 namespace {
+
+Rarely _sampler;
 
 auto fieldIsAnyOf = [](StringData v, std::initializer_list<StringData> il) {
     auto ei = il.end();
@@ -82,6 +119,8 @@ BSONObj scaleIndividualShardStatistics(const BSONObj& shardStats, int scale) {
  * "clusterTimeseriesStats". All of the mongod "timeseries" collStats are numbers except for the
  * "bucketsNs" field, which we specially track in "timeseriesBucketsNs". We also track
  * "timeseriesTotalBucketSize" specially for calculating "avgBucketSize".
+ * "avgNumMeasurementsPerCommit" is specially calculated using "numMeasurementsCommitted" and
+ * "numCommits"
  *
  * Invariants that "shardTimeseriesStats" is non-empty.
  */
@@ -134,6 +173,11 @@ void aggregateTimeseriesStats(const BSONObj& shardTimeseriesStats,
     (*clusterTimeseriesStats)["avgBucketSize"] = (*clusterTimeseriesStats)["bucketCount"]
         ? *timeseriesTotalBucketSize / (*clusterTimeseriesStats)["bucketCount"]
         : 0;
+    (*clusterTimeseriesStats)["avgNumMeasurementsPerCommit"] =
+        (*clusterTimeseriesStats)["numCommits"]
+        ? (*clusterTimeseriesStats)["numMeasurementsCommitted"] /
+            (*clusterTimeseriesStats)["numCommits"]
+        : 0;
 }
 
 /**
@@ -174,30 +218,40 @@ public:
         return false;
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsCollectionRequired(dbname, cmdObj).ns();
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsCollectionRequired(dbName, cmdObj);
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::collStats);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::collStats)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        if (_sampler.tick())
+            LOGV2_WARNING(7024601,
+                          "The collStats command is deprecated. For more information, see "
+                          "https://dochub.mongodb.org/core/collStats-deprecated");
+
         const NamespaceString nss(parseNs(dbName, cmdObj));
 
-        const auto targeter = ChunkManagerTargeter(opCtx, nss);
-        const auto cm = targeter.getRoutingInfo();
+        const auto targeter = CollectionRoutingInfoTargeter(opCtx, nss);
+        const auto cri = targeter.getRoutingInfo();
+        const auto& cm = cri.cm;
         if (cm.isSharded()) {
             result.appendBool("sharded", true);
         } else {
@@ -227,15 +281,17 @@ public:
         // statistics.
         auto unscaledShardResults = scatterGatherVersionedTargetByRoutingTable(
             opCtx,
-            nss.db(),
+            nss.dbName(),
             targeter.getNS(),
-            cm,
+            cri,
             applyReadWriteConcern(
                 opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObjToSend)),
             ReadPreferenceSetting::get(opCtx),
             Shard::RetryPolicy::kIdempotent,
-            {},
-            {});
+            {} /*query*/,
+            {} /*collation*/,
+            boost::none /*letParameters*/,
+            boost::none /*runtimeConstants*/);
 
         BSONObjBuilder shardStats;
         std::map<std::string, long long> counts;
@@ -324,7 +380,6 @@ public:
                     }
                 } else {
                     LOGV2(22749,
-                          "Unexpected field for mongos collStats: {fieldName}",
                           "Unexpected field for mongos collStats",
                           "fieldName"_attr = e.fieldName());
                 }
@@ -333,7 +388,8 @@ public:
             shardStats.append(shardId.toString(), scaleIndividualShardStatistics(res, scale));
         }
 
-        result.append("ns", nss.ns());
+        result.append("ns",
+                      NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
 
         for (const auto& countEntry : counts) {
             if (fieldIsAnyOf(countEntry.first,
@@ -373,8 +429,8 @@ public:
 
         return true;
     }
-
-} collectionStatsCmd;
+};
+MONGO_REGISTER_COMMAND(CollectionStats).forRouter();
 
 }  // namespace
 }  // namespace mongo

@@ -4,14 +4,16 @@
  *   expects_explicit_underscore_id_index,
  * ]
  */
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const dbName = "test";
 const collName = "scaled_collection_stats";
 const ns = dbName + "." + collName;
 
 const st = new ShardingTest({shards: 2});
+
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 jsTest.log("Insert some data.");
 const coll = st.s0.getDB(dbName)[collName];
@@ -22,8 +24,6 @@ for (let i = -50; i < 50; i++) {
 assert.commandWorked(bulk.execute());
 
 jsTest.log("Create a sharded collection with one chunk on each of the two shards.");
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
 assert.commandWorked(st.s.adminCommand(
@@ -53,4 +53,3 @@ res = assert.commandWorked(coll.stats(totalIndexSize));
 assert.eq(1, res.totalIndexSize);
 
 st.stop();
-}());

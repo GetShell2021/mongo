@@ -28,17 +28,36 @@
  */
 
 #include <boost/algorithm/string/join.hpp>
+#include <memory>
+#include <string>
 #include <vector>
 
-#include "mongo/bson/bsonobj.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes_util.h"
 #include "mongo/bson/json.h"
-#include "mongo/db/bson/bson_helper.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/change_stream_rewrite_helpers.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/bson/bson_helper.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
+using namespace std::string_literals;
 
 class ChangeStreamRewriteTest : public AggregationContextFixture {
 public:
@@ -54,7 +73,8 @@ public:
 
     std::string getNsCollRegexMatchExpr(const std::string& field, const std::string& regex) {
         if (field == "$o.drop" || field == "$o.create" || field == "$o.createIndexes" ||
-            field == "$o.commitIndexBuild" || field == "$o.dropIndexes" || field == "$o.collMod") {
+            field == "$o.commitIndexBuild" || field == "$o.startIndexBuild" ||
+            field == "$o.abortIndexBuild" || field == "$o.dropIndexes" || field == "$o.collMod") {
             return str::stream()
                 << "{$expr: {$let: {vars: {oplogField: {$cond: [{ $eq: [{ $type: ['" << field
                 << "']}, {$const: 'string'}]}, '" << field
@@ -81,8 +101,12 @@ TEST_F(ChangeStreamRewriteTest, RewriteOrPredicateOnRenameableFields) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
-    auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"clusterTime", "lsid"});
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"clusterTime", "lsid"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -96,9 +120,11 @@ TEST_F(ChangeStreamRewriteTest, InexactRewriteOfAndWithUnrewritableChild) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression =
         change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
                                                       statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
                                                       {"clusterTime", "lsid", "operationType"});
     ASSERT(rewrittenMatchExpression);
 
@@ -114,9 +140,11 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteOrWithUnrewritableChild) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression =
         change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
                                                       statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
                                                       {"clusterTime", "lsid", "operationType"});
     ASSERT(rewrittenMatchExpression);
 
@@ -132,9 +160,11 @@ TEST_F(ChangeStreamRewriteTest, InexactRewriteOfNorWithUnrewritableChild) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression =
         change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
                                                       statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
                                                       {"clusterTime", "lsid", "operationType"});
     ASSERT(rewrittenMatchExpression);
 
@@ -153,9 +183,11 @@ TEST_F(ChangeStreamRewriteTest, CannotInexactlyRewriteNegatedPredicate) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression =
         change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
                                                       statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
                                                       {"operationType", "clusterTime", "lsid"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -170,8 +202,12 @@ TEST_F(ChangeStreamRewriteTest, DoesNotRewriteUnrequestedField) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
-    auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"clusterTime", "lsid"});
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"clusterTime", "lsid"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(rewrittenPredicate, fromjson("{$and: [{ts: {$type: [17]}}]}"));
@@ -183,8 +219,12 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteExprWhenAllFieldsAreRenameable) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
-    auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"clusterTime", "lsid"});
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"clusterTime", "lsid"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -199,8 +239,9 @@ TEST_F(ChangeStreamRewriteTest, CanInexactlyRewriteExprAndWithUnrewritableChild)
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"lsid"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"lsid"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(rewrittenPredicate, fromjson("{$expr: {$and: [{$isNumber: ['$lsid']}]}}"));
@@ -215,8 +256,9 @@ TEST_F(ChangeStreamRewriteTest, CanInexactlyRewriteExprAndWithUnknownField) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"lsid"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"lsid"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(rewrittenPredicate, fromjson("{$expr: {$and: [{$isNumber: ['$lsid']}]}}"));
@@ -230,8 +272,12 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteExprOrWithUnrewritableChild) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
-    auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"clusterTime", "lsid"});
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"clusterTime", "lsid"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(rewrittenPredicate, fromjson("{$expr: {$and: [{$isNumber: ['$ts']}]}}"));
@@ -244,8 +290,12 @@ TEST_F(ChangeStreamRewriteTest, CanInexactlyRewriteExprNorWithUnrewritableChild)
         "{$not: {$or: [{$isNumber: '$lsid'}, {$isArray: '$$ROOT'}]}}]}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
 
-    auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"clusterTime", "lsid"});
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"clusterTime", "lsid"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(
@@ -261,8 +311,12 @@ TEST_F(ChangeStreamRewriteTest, CanInexactlyRewriteExprNorWithUnknownField) {
         "{$not: {$or: [{$isNumber: '$lsid'}, {$isArray: '$unknown'}]}}]}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
 
-    auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"clusterTime", "lsid"});
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"clusterTime", "lsid"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(
@@ -277,8 +331,9 @@ TEST_F(ChangeStreamRewriteTest, CannotInexactlyRewriteNegatedExprPredicate) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"lsid"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"lsid"});
 
     ASSERT(!rewrittenMatchExpression);
 }
@@ -288,8 +343,12 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteExprLet) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
-    auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"clusterTime", "lsid"});
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"clusterTime", "lsid"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(rewrittenPredicate,
@@ -301,8 +360,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteExprFieldRefWithCurrentPrefix) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"clusterTime"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"clusterTime"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(rewrittenPredicate, fromjson("{$expr: {$isNumber: ['$ts']}}"));
@@ -313,8 +373,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteExprFieldRefWithRootPrefix) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"clusterTime"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"clusterTime"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(rewrittenPredicate, fromjson("{$expr: {$isNumber: ['$ts']}}"));
@@ -326,8 +387,12 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteExprFieldRefWithReassignedCurrentPr
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
-    auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType", "lsid"});
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"operationType", "lsid"});
 
     ASSERT(!rewrittenMatchExpression);
 }
@@ -341,8 +406,12 @@ TEST_F(ChangeStreamRewriteTest, DoesNotRewriteUnrequestedFieldInExpr) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
-    auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"clusterTime", "lsid"});
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"clusterTime", "lsid"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(rewrittenPredicate, fromjson("{$expr: {$and: [{$isNumber: ['$ts']}]}}"));
@@ -352,12 +421,13 @@ TEST_F(ChangeStreamRewriteTest, DoesNotRewriteUnrequestedFieldInExpr) {
 // 'operationType' rewrites
 //
 TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeWithInvalidOperandType) {
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("operationType" << 1), getExpCtx());
+    auto query = BSON("operationType" << 1);
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -365,13 +435,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeWithInvalidO
 }
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeWithUnknownOpType) {
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("operationType"
-                                                                       << "nonExisting"),
-                                                                  getExpCtx());
+    auto query = BSON("operationType"
+                      << "nonExisting");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -379,12 +450,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeWithUnknownO
 }
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnOperationType) {
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("operationType" << BSONNULL), getExpCtx());
+    auto query = BSON("operationType" << BSONNULL);
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -396,8 +468,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeInsert) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -409,8 +482,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeReplace) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -423,8 +497,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeDrop) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -437,8 +512,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeCreate) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -451,8 +527,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeRename) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -466,8 +543,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeDropDatabase
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -480,8 +558,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteInequalityPredicateOnOperationType)
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -490,8 +569,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnOperationTypeSubField) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -503,8 +583,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnOperationTypeSubField
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -518,8 +599,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteInPredicateOnOperationType) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -535,8 +617,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteInPredicateWithRegexOnOperationType
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -545,8 +628,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteRegexPredicateOnOperationType) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -555,8 +639,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteInPredicateOnOperationTypeWithInvalidO
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -569,8 +654,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -584,8 +670,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteInPredicateOnOperationTypeWithUnknownO
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -598,8 +685,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEmptyInPredicateOnOperationType) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -612,8 +700,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNinPredicateOnOperationType) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -628,8 +717,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteExprWithOperationType) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"operationType"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"operationType"});
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
 
@@ -673,6 +763,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteExprWithOperationType) {
                             then: {$const: 'createIndexes'}
                         },
                         {
+                            case: {$ne: ['$o.startIndexBuild', '$$REMOVE']},
+                            then: {$const: 'startIndexBuild'}
+                        },
+                        {
+                            case: {$ne: ['$o.abortIndexBuild', '$$REMOVE']},
+                            then: {$const: 'abortIndexBuild'}
+                        },
+                        {
                             case: {$ne: ['$o.dropIndexes', '$$REMOVE']},
                             then: {$const: 'dropIndexes'}
                         },
@@ -699,8 +797,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnFieldDocumentKey) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -716,10 +815,7 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqPredicateOnFieldDocumentKey) {
                                "  ]},"
                                "  {$and: ["
                                "    {op: {$eq: 'i'}},"
-                               "    {$and: ["
-                               "      {'o._id': {$eq: 'bar'}},"
-                               "      {'o.foo': {$eq: 'baz'}}"
-                               "    ]}"
+                               "    {o2: {$eq: {_id: 'bar', foo: 'baz'}}}"
                                "  ]}"
                                "]}"));
 }
@@ -729,8 +825,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnFieldDocumentKey) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -751,7 +848,7 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnFieldDocumentKey) {
                                "  ]},"
                                "  {$and: ["
                                "    {op: {$eq: 'i'}},"
-                               "    {$alwaysFalse: 1}"
+                               "    {o2: {$eq: null}}"
                                "  ]}"
                                "]}"));
 }
@@ -761,8 +858,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteInPredicateOnFieldDocumentKey) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -778,32 +876,64 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteInPredicateOnFieldDocumentKey) {
                                "  ]},"
                                "  {$and: ["
                                "    {op: {$eq: 'i'}},"
-                               "    {$or: ["
-                               "      {$alwaysFalse: 1},"
-                               "      {$and: ["
-                               "        {'o._id': {$eq: 'bar'}}"
-                               "      ]},"
-                               "      {$and: ["
-                               "        {'o._id': {$eq: 'bar'}},"
-                               "        {'o.foo': {$eq: 'baz'}}"
-                               "      ]}"
-                               "    ]}"
+                               "    {o2: {$in: [{}, {_id: 'bar'}, {_id: 'bar', foo: 'baz'}]}}"
                                "  ]}"
                                "]}"));
 }
 
-TEST_F(ChangeStreamRewriteTest, CannotInexactlyRewriteExprPredicateOnFieldDocumentKey) {
-    auto spec = fromjson("{$expr: {$or: ['$documentKey']}}");
+TEST_F(ChangeStreamRewriteTest, CanRewriteArbitraryPredicateOnFieldDocumentKey) {
+    auto spec = fromjson("{documentKey: {$gt: 'bar'}}");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
+    ASSERT_OK(statusWithMatchExpression.getStatus());
+
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
+    ASSERT(rewrittenMatchExpression);
+
+    auto rewrittenPredicate = rewrittenMatchExpression->serialize();
+    ASSERT_BSONOBJ_EQ(rewrittenPredicate,
+                      fromjson("{$or: ["
+                               "  {$and: ["
+                               "    {op: {$eq: 'u'}},"
+                               "    {o2: {$gt: 'bar'}}"
+                               "  ]},"
+                               "  {$and: ["
+                               "    {op: {$eq: 'd'}},"
+                               "    {o: {$gt: 'bar'}}"
+                               "  ]},"
+                               "  {$and: ["
+                               "    {op: {$eq: 'i'}},"
+                               "    {o2: {$gt: 'bar'}}"
+                               "  ]}"
+                               "]}"));
+}
+
+TEST_F(ChangeStreamRewriteTest, CanExactlyRewriteExprPredicateOnFieldDocumentKey) {
+    auto spec = fromjson("{$expr: {$lt: ['$documentKey', 'bar']}}");
 
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
 
-    // $expr predicates that refer to the full 'documentKey' field (and not a subfield thereof)
-    // cannot be rewritten (exactly or inexactly).
-    ASSERT(rewrittenMatchExpression == nullptr);
+    auto rewrittenPredicate = rewrittenMatchExpression->serialize();
+    ASSERT_BSONOBJ_EQ(
+        rewrittenPredicate,
+        fromjson("{$expr:"
+                 "  {$lt: ["
+                 "    {$switch: {"
+                 "      branches: ["
+                 "        {case: {$eq: ['$op', {$const: 'd'}]}, then: '$o'},"
+                 "        {case: {$in: ['$op', [{$const: 'i'}, {$const: 'u'}]]}, then: '$o2'}"
+                 "      ],"
+                 "      default: '$$REMOVE'"
+                 "    }},"
+                 "    {$const: 'bar'}"
+                 "  ]}"
+                 "}"));
 }
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteArbitraryPredicateOnFieldDocumentKeyId) {
@@ -811,8 +941,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteArbitraryPredicateOnFieldDocumentKeyId
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -828,7 +959,7 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteArbitraryPredicateOnFieldDocumentKeyId
                                "  ]},"
                                "  {$and: ["
                                "    {op: {$eq: 'i'}},"
-                               "    {'o._id': {$lt: 'bar'}}"
+                               "    {'o2._id': {$lt: 'bar'}}"
                                "  ]}"
                                "]}"));
 }
@@ -838,8 +969,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnFieldDocumentKeyId) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -860,7 +992,7 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnFieldDocumentKeyId) {
                                "  ]},"
                                "  {$and: ["
                                "    {op: {$eq: 'i'}},"
-                               "    {'o._id': {$eq: null}}"
+                               "    {'o2._id': {$eq: null}}"
                                "  ]}"
                                "]}"));
 }
@@ -871,8 +1003,9 @@ TEST_F(ChangeStreamRewriteTest, CanExactlyRewriteExprPredicateOnFieldDocumentKey
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -882,8 +1015,8 @@ TEST_F(ChangeStreamRewriteTest, CanExactlyRewriteExprPredicateOnFieldDocumentKey
                  "  {$lt: ["
                  "    {$switch: {"
                  "      branches: ["
-                 "        {case: {$in: ['$op', [{$const: 'i'}, {$const: 'd'}]]}, then: '$o._id'},"
-                 "        {case: {$eq: ['$op', {$const: 'u'}]}, then: '$o2._id'}"
+                 "        {case: {$eq: ['$op', {$const: 'd'}]}, then: '$o._id'},"
+                 "        {case: {$in: ['$op', [{$const: 'i'}, {$const: 'u'}]]}, then: '$o2._id'}"
                  "      ],"
                  "      default: '$$REMOVE'"
                  "    }},"
@@ -897,8 +1030,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteArbitraryPredicateOnFieldDocumentKeyFo
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -914,7 +1048,7 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteArbitraryPredicateOnFieldDocumentKeyFo
                                "  ]},"
                                "  {$and: ["
                                "    {op: {$eq: 'i'}},"
-                               "    {'o.foo': {$gt: 'bar'}}"
+                               "    {'o2.foo': {$gt: 'bar'}}"
                                "  ]}"
                                "]}"));
 }
@@ -924,8 +1058,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnFieldDocumentKeyFoo) 
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -944,21 +1079,40 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnFieldDocumentKeyFoo) 
                                "    {op: {$eq: 'd'}},"
                                "    {'o.foo': {$eq: null}}"
                                "  ]},"
-                               "  {op: {$eq: 'i'}}"
+                               "  {$and: ["
+                               "    {op: {$eq: 'i'}},"
+                               "    {'o2.foo': {$eq: null}}"
+                               "  ]}"
                                "]}"));
 }
 
-TEST_F(ChangeStreamRewriteTest, CannotExactlyRewritePredicateOnFieldDocumentKey) {
+TEST_F(ChangeStreamRewriteTest, CanExactlyRewritePredicateOnFieldDocumentKey) {
     auto spec = fromjson("{documentKey: {$not: {$eq: {_id: 'bar'}}}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
 
-    // Insert events do not have a specific documentKey field in the oplog, so filters on the full
-    // documentKey field cannot be exactly rewritten.
-    ASSERT(rewrittenMatchExpression == nullptr);
+    auto rewrittenPredicate = rewrittenMatchExpression->serialize();
+    ASSERT_BSONOBJ_EQ(rewrittenPredicate,
+                      fromjson("{$nor: ["
+                               "  {$or: ["
+                               "    {$and: ["
+                               "      {op: {$eq: 'u'}},"
+                               "      {o2: {$eq: {_id: 'bar'}}}"
+                               "    ]},"
+                               "    {$and: ["
+                               "      {op: {$eq: 'd'}},"
+                               "      {o: {$eq: {_id: 'bar'}}}"
+                               "    ]},"
+                               "    {$and: ["
+                               "      {op: {$eq: 'i'}},"
+                               "      {o2: {$eq: {_id: 'bar'}}}"
+                               "    ]}"
+                               "  ]}"
+                               "]}"));
 }
 
 TEST_F(ChangeStreamRewriteTest, CanExactlyRewritePredicateOnFieldDocumentKeyId) {
@@ -966,8 +1120,9 @@ TEST_F(ChangeStreamRewriteTest, CanExactlyRewritePredicateOnFieldDocumentKeyId) 
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
     ASSERT(rewrittenMatchExpression);
 
     // Every documentKey must have an _id field, so a predicate on this field can always be exactly
@@ -986,33 +1141,50 @@ TEST_F(ChangeStreamRewriteTest, CanExactlyRewritePredicateOnFieldDocumentKeyId) 
                                "    ]},"
                                "    {$and: ["
                                "      {op: {$eq: 'i'}},"
-                               "      {'o._id': {$eq: 'bar'}}"
+                               "      {'o2._id': {$eq: 'bar'}}"
                                "    ]}"
                                "  ]}"
                                "]}"));
 }
 
-TEST_F(ChangeStreamRewriteTest, CannotExactlyRewritePredicateOnFieldDocumentKeyFoo) {
+TEST_F(ChangeStreamRewriteTest, CanExactlyRewritePredicateOnFieldDocumentKeyFoo) {
     auto spec = fromjson("{'documentKey.foo': {$not: {$eq: 'bar'}}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
 
-    // We cannot be sure that the path for this predicate is actually a valid field in the
-    // documentKey. Therefore, we cannot exactly rewrite a predicate on this field.
-    ASSERT(rewrittenMatchExpression == nullptr);
+    auto rewrittenPredicate = rewrittenMatchExpression->serialize();
+    ASSERT_BSONOBJ_EQ(rewrittenPredicate,
+                      fromjson("{$nor: ["
+                               "  {$or: ["
+                               "    {$and: ["
+                               "      {op: {$eq: 'u'}},"
+                               "      {'o2.foo': {$eq: 'bar'}}"
+                               "    ]},"
+                               "    {$and: ["
+                               "      {op: {$eq: 'd'}},"
+                               "      {'o.foo': {$eq: 'bar'}}"
+                               "    ]},"
+                               "    {$and: ["
+                               "      {op: {$eq: 'i'}},"
+                               "      {'o2.foo': {$eq: 'bar'}}"
+                               "    ]}"
+                               "  ]}"
+                               "]}"));
 }
 
-TEST_F(ChangeStreamRewriteTest, CanInexactlyRewriteExprPredicateOnFieldDocumentKeyFoo) {
+TEST_F(ChangeStreamRewriteTest, CanRewriteExprPredicateOnFieldDocumentKeyFoo) {
     auto spec = fromjson("{$expr: {$or: ['$documentKey.foo']}}");
 
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1022,8 +1194,8 @@ TEST_F(ChangeStreamRewriteTest, CanInexactlyRewriteExprPredicateOnFieldDocumentK
                  "  {$or: ["
                  "    {$switch: {"
                  "      branches: ["
-                 "        {case: {$in: ['$op', [{$const: 'i'}, {$const: 'd'}]]}, then: '$o.foo'},"
-                 "        {case: {$eq: ['$op', {$const: 'u'}]}, then: '$o2.foo'}"
+                 "        {case: {$eq: ['$op', {$const: 'd'}]}, then: '$o.foo'},"
+                 "        {case: {$in: ['$op', [{$const: 'i'}, {$const: 'u'}]]}, then: '$o2.foo'}"
                  "      ],"
                  "      default: '$$REMOVE'"
                  "    }}"
@@ -1031,18 +1203,31 @@ TEST_F(ChangeStreamRewriteTest, CanInexactlyRewriteExprPredicateOnFieldDocumentK
                  "}"));
 }
 
-TEST_F(ChangeStreamRewriteTest, CannotExactlyRewriteExprPredicateOnFieldDocumentKeyFoo) {
+TEST_F(ChangeStreamRewriteTest, CanExactlyRewriteExprPredicateOnFieldDocumentKeyFoo) {
     auto spec = fromjson("{$expr: {$lt: ['$documentKey.foo', 'bar']}}");
 
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"documentKey"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"documentKey"});
 
-    // We cannot be sure that the field path is actually a valid field in the documentKey.
-    // Therefore, we cannot exactly rewrite this expression.
-    ASSERT(rewrittenMatchExpression == nullptr);
+    auto rewrittenPredicate = rewrittenMatchExpression->serialize();
+    ASSERT_BSONOBJ_EQ(
+        rewrittenPredicate,
+        fromjson("{$expr:"
+                 "  {$lt: ["
+                 "    {$switch: {"
+                 "      branches: ["
+                 "        {case: {$eq: ['$op', {$const: 'd'}]}, then: '$o.foo'},"
+                 "        {case: {$in: ['$op', [{$const: 'i'}, {$const: 'u'}]]}, then: '$o2.foo'}"
+                 "      ],"
+                 "      default: '$$REMOVE'"
+                 "    }},"
+                 "    {$const: 'bar'}"
+                 "  ]}"
+                 "}"));
 }
 
 //
@@ -1053,8 +1238,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteArbitraryPredicateOnFieldFullDocumentF
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"fullDocument"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"fullDocument"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1082,8 +1268,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNullComparisonPredicateOnFieldFullDocu
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"fullDocument"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"fullDocument"});
     ASSERT(rewrittenMatchExpression);
 
     // Note that the filter below includes a predicate on delete and non-CRUD events. These are only
@@ -1117,8 +1304,9 @@ TEST_F(ChangeStreamRewriteTest, CannotExactlyRewritePredicateOnFieldFullDocument
     auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"fullDocument"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"fullDocument"});
 
     // Because the 'fullDocument' field can be populated later in the pipeline for update events
     // (via the '{fullDocument: "updateLookup"}' option), it's impractical to try to generate a
@@ -1127,53 +1315,181 @@ TEST_F(ChangeStreamRewriteTest, CannotExactlyRewritePredicateOnFieldFullDocument
 }
 
 //
+// 'fullDocumentBeforeChange' rewrites
+//
+TEST_F(ChangeStreamRewriteTest, CannotRewriteNullPredicateOnFieldFullDocumentBeforeChange) {
+    auto spec = fromjson("{'fullDocumentBeforeChange': null}");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
+    ASSERT_OK(statusWithMatchExpression.getStatus());
+
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"fullDocumentBeforeChange"});
+
+    // '{fullDocumentBeforeChange: null}' cannot be rewritten
+    ASSERT(rewrittenMatchExpression == nullptr);
+}
+
+TEST_F(ChangeStreamRewriteTest, CanRewriteNonNullPredicateOnFieldFullDocumentBeforeChange) {
+    auto spec = fromjson("{'fullDocumentBeforeChange': 1}");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
+    ASSERT_OK(statusWithMatchExpression.getStatus());
+
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"fullDocumentBeforeChange"});
+    ASSERT(rewrittenMatchExpression);
+
+    auto rewrittenPredicate = rewrittenMatchExpression->serialize();
+    ASSERT_BSONOBJ_EQ(rewrittenPredicate,
+                      fromjson("{$or:[{$and:[{op:{$eq:'u'}}]}, {$and:[{op:{$eq:'d'}}]}]}"));
+}
+
+TEST_F(ChangeStreamRewriteTest, CanRewriteNonNullPredicateOnFieldFullDocumentBeforeChangeFoo) {
+    auto spec = fromjson("{'fullDocumentBeforeChange.foo': {$eq: 'bar'}}");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
+    ASSERT_OK(statusWithMatchExpression.getStatus());
+
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"fullDocumentBeforeChange"});
+    ASSERT(rewrittenMatchExpression);
+
+    auto rewrittenPredicate = rewrittenMatchExpression->serialize();
+    ASSERT_BSONOBJ_EQ(rewrittenPredicate,
+                      fromjson("{$or:[{$and:[{op:{$eq:'u'}}]}, {$and:[{op:{$eq:'d'}}]}]}"));
+}
+
+TEST_F(ChangeStreamRewriteTest, CannotExactlyRewritePredicateOnFieldFullDocumentBeforeChangeFoo) {
+    auto spec = fromjson("{'fullDocumentBeforeChange.foo': {$not: {$eq: 'bar'}}}");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
+    ASSERT_OK(statusWithMatchExpression.getStatus());
+
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"fullDocumentBeforeChange"});
+
+    ASSERT(rewrittenMatchExpression == nullptr);
+}
+
+TEST_F(ChangeStreamRewriteTest, CannotExactlyRewritePredicateOnFieldFullDocumentBeforeChangeId) {
+    auto spec = fromjson("{'fullDocumentBeforeChange._id': {$not: {$lt: 3}}}");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
+    ASSERT_OK(statusWithMatchExpression.getStatus());
+
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"fullDocumentBeforeChange"});
+
+    ASSERT(rewrittenMatchExpression == nullptr);
+}
+
+TEST_F(ChangeStreamRewriteTest, CanRewriteNonNullPredicateOnFieldFullDocumentBeforeChangeId) {
+    auto spec = fromjson("{'fullDocumentBeforeChange._id': {$lt: 3}}");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(spec, getExpCtx());
+    ASSERT_OK(statusWithMatchExpression.getStatus());
+
+    auto bsonObjsArray = std::vector<BSONObj>{};
+    auto rewrittenMatchExpression =
+        change_stream_rewrite::rewriteFilterForFields(getExpCtx(),
+                                                      statusWithMatchExpression.getValue().get(),
+                                                      bsonObjsArray,
+                                                      {"fullDocumentBeforeChange"});
+    ASSERT(rewrittenMatchExpression);
+
+    auto rewrittenPredicate = rewrittenMatchExpression->serialize();
+    ASSERT_BSONOBJ_EQ(rewrittenPredicate,
+                      fromjson("{$or:["
+                               "   {$and: ["
+                               "       {op: {$eq: 'u'}},"
+                               "       {'o2._id': {$lt: 3}}"
+                               "   ]}, "
+                               "   {$and: ["
+                               "       {op: {$eq: 'd'}},"
+                               "       {'o._id': {$lt: 3}}"
+                               "   ]}"
+                               "]}"));
+}
+
+//
 // 'ns' rewrites
 //
 TEST_F(ChangeStreamRewriteTest, CanRewriteFullNamespaceObject) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(
-        BSON("ns" << BSON("db" << expCtx->ns.db() << "coll" << expCtx->ns.coll())), expCtx);
+    auto query = BSON("ns" << BSON("db" << expCtx->getNamespaceString().db_forTest() << "coll"
+                                        << expCtx->getNamespaceString().coll()));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
-    const std::string ns = expCtx->ns.db().toString() + "." + expCtx->ns.coll().toString();
-    const std::string cmdNs = expCtx->ns.db().toString() + ".$cmd";
+    const std::string ns = expCtx->getNamespaceString().db_forTest().toString() + "." +
+        expCtx->getNamespaceString().coll().toString();
+    const std::string cmdNs = expCtx->getNamespaceString().db_forTest().toString() + ".$cmd";
 
     ASSERT_BSONOBJ_EQ(
         rewrittenPredicate,
         BSON(OR(
             BSON(AND(fromjson("{op: {$not: {$eq: 'c'}}}"), BSON("ns" << BSON("$eq" << ns)))),
-            BSON(AND(
-                fromjson("{op: {$eq: 'c'}}"),
-                BSON(OR(BSON("o.renameCollection" << BSON("$eq" << ns)),
-                        BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
-                                 BSON("o.drop" << BSON("$eq" << expCtx->ns.coll())))),
-                        BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
-                                 BSON("o.create" << BSON("$eq" << expCtx->ns.coll())))),
-                        BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
-                                 BSON("o.createIndexes" << BSON("$eq" << expCtx->ns.coll())))),
-                        BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
-                                 BSON("o.commitIndexBuild" << BSON("$eq" << expCtx->ns.coll())))),
-                        BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
-                                 BSON("o.dropIndexes" << BSON("$eq" << expCtx->ns.coll())))),
-                        BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
-                                 BSON("o.collMod" << BSON("$eq" << expCtx->ns.coll())))),
-                        BSON(AND(fromjson("{$alwaysFalse: 1}"),
-                                 fromjson("{'o.dropDatabase': {$eq: 1}}"))))))))));
+            BSON(AND(fromjson("{op: {$eq: 'c'}}"),
+                     BSON(OR(BSON("o.renameCollection" << BSON("$eq" << ns)),
+                             BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
+                                      BSON("o.drop"
+                                           << BSON("$eq" << expCtx->getNamespaceString().coll())))),
+                             BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
+                                      BSON("o.create"
+                                           << BSON("$eq" << expCtx->getNamespaceString().coll())))),
+                             BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
+                                      BSON("o.createIndexes"
+                                           << BSON("$eq" << expCtx->getNamespaceString().coll())))),
+                             BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
+                                      BSON("o.commitIndexBuild"
+                                           << BSON("$eq" << expCtx->getNamespaceString().coll())))),
+                             BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
+                                      BSON("o.startIndexBuild"
+                                           << BSON("$eq" << expCtx->getNamespaceString().coll())))),
+                             BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
+                                      BSON("o.abortIndexBuild"
+                                           << BSON("$eq" << expCtx->getNamespaceString().coll())))),
+                             BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
+                                      BSON("o.dropIndexes"
+                                           << BSON("$eq" << expCtx->getNamespaceString().coll())))),
+                             BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
+                                      BSON("o.collMod"
+                                           << BSON("$eq" << expCtx->getNamespaceString().coll())))),
+                             BSON(AND(fromjson("{$alwaysFalse: 1}"),
+                                      fromjson("{'o.dropDatabase': {$eq: 1}}"))))))))));
 }
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithSwappedField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(
-        BSON("ns" << BSON("coll" << expCtx->ns.coll() << "db" << expCtx->ns.db())), expCtx);
+    auto query = BSON("ns" << BSON("coll" << expCtx->getNamespaceString().coll() << "db"
+                                          << expCtx->getNamespaceString().db_forTest()));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1186,6 +1502,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithSwappedField) {
                                  fromjson("{$alwaysFalse: 1 }"),  // create.
                                  fromjson("{$alwaysFalse: 1 }"),  // createIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild.
                                  fromjson("{$alwaysFalse: 1 }"),  // dropIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // collMod.
                                  BSON(AND(fromjson("{$alwaysFalse: 1}"),
@@ -1194,15 +1512,16 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithSwappedField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithOnlyDbField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("ns" << BSON("db" << expCtx->ns.db())), expCtx);
+    auto query = BSON("ns" << BSON("db" << expCtx->getNamespaceString().db_forTest()));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
-    const std::string cmdNs = expCtx->ns.db().toString() + ".$cmd";
+    const std::string cmdNs = expCtx->getNamespaceString().db_forTest().toString() + ".$cmd";
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     ASSERT_BSONOBJ_EQ(
@@ -1214,6 +1533,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithOnlyDbField) {
                                  fromjson("{$alwaysFalse: 1 }"),  // create.
                                  fromjson("{$alwaysFalse: 1 }"),  // createIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild.
                                  fromjson("{$alwaysFalse: 1 }"),  // dropIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // collMod.
                                  BSON(AND(BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)))),
@@ -1222,12 +1543,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithOnlyDbField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithOnlyCollectionField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("ns" << BSON("coll" << expCtx->ns.coll())), expCtx);
+    auto query = BSON("ns" << BSON("coll" << expCtx->getNamespaceString().coll()));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1240,6 +1562,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithOnlyCollectionField
                                  fromjson("{$alwaysFalse: 1 }"),  // create.
                                  fromjson("{$alwaysFalse: 1 }"),  // createIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild.
                                  fromjson("{$alwaysFalse: 1 }"),  // dropIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // collMod.
                                  BSON(AND(fromjson("{$alwaysFalse: 1}"),
@@ -1248,12 +1572,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithOnlyCollectionField
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithInvalidDbField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(
-        BSON("ns" << BSON("db" << 1 << "coll" << expCtx->ns.coll())), expCtx);
+    auto query = BSON("ns" << BSON("db" << 1 << "coll" << expCtx->getNamespaceString().coll()));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1266,6 +1591,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithInvalidDbField) {
                                  fromjson("{$alwaysFalse: 1 }"),  // create.
                                  fromjson("{$alwaysFalse: 1 }"),  // createIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild.
                                  fromjson("{$alwaysFalse: 1 }"),  // dropIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // collMod.
                                  BSON(AND(fromjson("{$alwaysFalse: 1}"),
@@ -1274,12 +1601,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithInvalidDbField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithInvalidCollField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(
-        BSON("ns" << BSON("db" << expCtx->ns.db() << "coll" << 1)), expCtx);
+    auto query =
+        BSON("ns" << BSON("db" << expCtx->getNamespaceString().db_forTest() << "coll" << 1));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1292,6 +1621,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithInvalidCollField) {
                                  fromjson("{$alwaysFalse: 1 }"),  // create.
                                  fromjson("{$alwaysFalse: 1 }"),  // createIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild.
                                  fromjson("{$alwaysFalse: 1 }"),  // dropIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // collMod.
                                  BSON(AND(fromjson("{$alwaysFalse: 1}"),
@@ -1300,12 +1631,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithInvalidCollField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithExtraField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(
-        fromjson("{ns: {db: 'db', coll: 'coll', extra: 'extra'}}"), expCtx);
+    auto query = fromjson("{ns: {db: 'db', coll: 'coll', extra: 'extra'}}");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1318,6 +1650,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithExtraField) {
                                  fromjson("{$alwaysFalse: 1 }"),  // create.
                                  fromjson("{$alwaysFalse: 1 }"),  // createIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild.
                                  fromjson("{$alwaysFalse: 1 }"),  // dropIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // collMod.
                                  BSON(AND(fromjson("{$alwaysFalse: 1}"),
@@ -1326,18 +1660,19 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceObjectWithExtraField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithStringDbFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("ns.db" << expCtx->ns.db()), expCtx);
+    auto query = BSON("ns.db" << expCtx->getNamespaceString().db_forTest());
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
-    const std::string regexNs = "^" + expCtx->ns.db().toString() + "\\." +
+    const std::string regexNs = "^" + expCtx->getNamespaceString().db_forTest().toString() + "\\." +
         DocumentSourceChangeStream::kRegexAllCollections.toString();
-    const std::string cmdNs = expCtx->ns.db().toString() + ".$cmd";
+    const std::string cmdNs = expCtx->getNamespaceString().db_forTest().toString() + ".$cmd";
 
     ASSERT_BSONOBJ_EQ(
         rewrittenPredicate,
@@ -1349,6 +1684,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithStringDbFieldPath) {
                                  BSON("ns" << BSON("$eq" << cmdNs)),  // create.
                                  BSON("ns" << BSON("$eq" << cmdNs)),  // createIndex.
                                  BSON("ns" << BSON("$eq" << cmdNs)),  // commitIndexBuild.
+                                 BSON("ns" << BSON("$eq" << cmdNs)),  // startIndexBuild.
+                                 BSON("ns" << BSON("$eq" << cmdNs)),  // abortIndexBuild.
                                  BSON("ns" << BSON("$eq" << cmdNs)),  // dropIndex.
                                  BSON("ns" << BSON("$eq" << cmdNs)),  // collMod.
                                  BSON(AND(BSON("ns" << BSON("$eq" << cmdNs)),
@@ -1357,42 +1694,50 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithStringDbFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithCollectionFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("ns.coll" << expCtx->ns.coll()), expCtx);
+    auto query = BSON("ns.coll" << expCtx->getNamespaceString().coll());
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     const std::string regexNs = DocumentSourceChangeStream::kRegexAllDBs.toString() + "\\." +
-        expCtx->ns.coll().toString() + "$";
+        expCtx->getNamespaceString().coll().toString() + "$";
 
     ASSERT_BSONOBJ_EQ(
         rewrittenPredicate,
-        BSON(OR(BSON(AND(fromjson("{op: {$not: {$eq: 'c'}}}"),
-                         BSON("ns" << BSON("$regex" << regexNs)))),
-                BSON(AND(fromjson("{op: {$eq: 'c'}}"),
-                         BSON(OR(BSON("o.renameCollection" << BSON("$regex" << regexNs)),
-                                 BSON("o.drop" << BSON("$eq" << expCtx->ns.coll())),
-                                 BSON("o.create" << BSON("$eq" << expCtx->ns.coll())),
-                                 BSON("o.createIndexes" << BSON("$eq" << expCtx->ns.coll())),
-                                 BSON("o.commitIndexBuild" << BSON("$eq" << expCtx->ns.coll())),
-                                 BSON("o.dropIndexes" << BSON("$eq" << expCtx->ns.coll())),
-                                 BSON("o.collMod" << BSON("$eq" << expCtx->ns.coll())),
-                                 BSON(AND(fromjson("{$alwaysFalse: 1}"),
-                                          fromjson("{'o.dropDatabase': {$eq: 1}}"))))))))));
+        BSON(OR(
+            BSON(
+                AND(fromjson("{op: {$not: {$eq: 'c'}}}"), BSON("ns" << BSON("$regex" << regexNs)))),
+            BSON(AND(
+                fromjson("{op: {$eq: 'c'}}"),
+                BSON(OR(
+                    BSON("o.renameCollection" << BSON("$regex" << regexNs)),
+                    BSON("o.drop" << BSON("$eq" << expCtx->getNamespaceString().coll())),
+                    BSON("o.create" << BSON("$eq" << expCtx->getNamespaceString().coll())),
+                    BSON("o.createIndexes" << BSON("$eq" << expCtx->getNamespaceString().coll())),
+                    BSON("o.commitIndexBuild"
+                         << BSON("$eq" << expCtx->getNamespaceString().coll())),
+                    BSON("o.startIndexBuild" << BSON("$eq" << expCtx->getNamespaceString().coll())),
+                    BSON("o.abortIndexBuild" << BSON("$eq" << expCtx->getNamespaceString().coll())),
+                    BSON("o.dropIndexes" << BSON("$eq" << expCtx->getNamespaceString().coll())),
+                    BSON("o.collMod" << BSON("$eq" << expCtx->getNamespaceString().coll())),
+                    BSON(AND(fromjson("{$alwaysFalse: 1}"),
+                             fromjson("{'o.dropDatabase': {$eq: 1}}"))))))))));
 }
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithRegexDbFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("ns.db" << BSONRegEx(R"(^unit.*$)")), expCtx);
+    auto query = BSON("ns.db" << BSONRegEx(R"(^unit.*$)"));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1408,6 +1753,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithRegexDbFieldPath) {
                         fromjson(getNsDbRegexMatchExpr("$ns", R"(^unit.*$)")),  // create.
                         fromjson(getNsDbRegexMatchExpr("$ns", R"(^unit.*$)")),  // createIndexes.
                         fromjson(getNsDbRegexMatchExpr("$ns", R"(^unit.*$)")),  // commitIndexBuild.
+                        fromjson(getNsDbRegexMatchExpr("$ns", R"(^unit.*$)")),  // startIndexBuild.
+                        fromjson(getNsDbRegexMatchExpr("$ns", R"(^unit.*$)")),  // abortIndexBuild.
                         fromjson(getNsDbRegexMatchExpr("$ns", R"(^unit.*$)")),  // dropIndexes.
                         fromjson(getNsDbRegexMatchExpr("$ns", R"(^unit.*$)")),  // collMod.
                         BSON(AND(fromjson(getNsDbRegexMatchExpr("$ns", R"(^unit.*$)")),
@@ -1416,12 +1763,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithRegexDbFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithRegexCollectionFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("ns.coll" << BSONRegEx(R"(^pipeline.*$)")), expCtx);
+    auto query = BSON("ns.coll" << BSONRegEx(R"(^pipeline.*$)"));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1437,6 +1785,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithRegexCollectionFieldPath)
                         fromjson(getNsCollRegexMatchExpr("$o.create", R"(^pipeline.*$)")),
                         fromjson(getNsCollRegexMatchExpr("$o.createIndexes", R"(^pipeline.*$)")),
                         fromjson(getNsCollRegexMatchExpr("$o.commitIndexBuild", R"(^pipeline.*$)")),
+                        fromjson(getNsCollRegexMatchExpr("$o.startIndexBuild", R"(^pipeline.*$)")),
+                        fromjson(getNsCollRegexMatchExpr("$o.abortIndexBuild", R"(^pipeline.*$)")),
                         fromjson(getNsCollRegexMatchExpr("$o.dropIndexes", R"(^pipeline.*$)")),
                         fromjson(getNsCollRegexMatchExpr("$o.collMod", R"(^pipeline.*$)")),
                         BSON(AND(fromjson("{ $alwaysFalse: 1 }"),
@@ -1445,33 +1795,38 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithRegexCollectionFieldPath)
 
 TEST_F(ChangeStreamRewriteTest, CannotRewriteNamespaceWithInvalidDbFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("ns.db" << 1), expCtx);
+    auto query = BSON("ns.db" << 1);
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
 TEST_F(ChangeStreamRewriteTest, CannotRewriteNamespaceWithInvalidCollectionFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("ns.coll" << 1), expCtx);
+    auto query = BSON("ns.coll" << 1);
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"ns"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithExtraDbFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("ns.db.subField"
-                                                                       << "subDb"),
-                                                                  expCtx);
+    auto query = BSON("ns.db.subField"
+                      << "subDb");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1484,6 +1839,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithExtraDbFieldPath) {
                                  fromjson("{$alwaysFalse: 1 }"),  // create
                                  fromjson("{$alwaysFalse: 1 }"),  // createIndexes
                                  fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild
+                                 fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild
+                                 fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild
                                  fromjson("{$alwaysFalse: 1 }"),  // dropIndexes
                                  fromjson("{$alwaysFalse: 1 }"),  // collMod
                                  BSON(AND(fromjson("{$alwaysFalse: 1 }"),
@@ -1492,13 +1849,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithExtraDbFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithExtraCollectionFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("ns.coll.subField"
-                                                                       << "subColl"),
-                                                                  expCtx);
+    auto query = BSON("ns.coll.subField"
+                      << "subColl");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"ns"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1511,6 +1869,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithExtraCollectionFieldPath)
                                  fromjson("{$alwaysFalse: 1 }"),  // create
                                  fromjson("{$alwaysFalse: 1 }"),  // createIndexes
                                  fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild
+                                 fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild
+                                 fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild
                                  fromjson("{$alwaysFalse: 1 }"),  // dropIndexes
                                  fromjson("{$alwaysFalse: 1 }"),  // collMod
                                  BSON(AND(fromjson("{$alwaysFalse: 1 }"),
@@ -1519,13 +1879,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithExtraCollectionFieldPath)
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInvalidFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("ns.unknown"
-                                                                       << "test"),
-                                                                  expCtx);
+    auto query = BSON("ns.unknown"
+                      << "test");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"ns"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1538,6 +1899,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInvalidFieldPath) {
                                  fromjson("{$alwaysFalse: 1 }"),  // create
                                  fromjson("{$alwaysFalse: 1 }"),  // createIndexes
                                  fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild
+                                 fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild
+                                 fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild
                                  fromjson("{$alwaysFalse: 1 }"),  // dropIndexes
                                  fromjson("{$alwaysFalse: 1 }"),  // collMod
                                  BSON(AND(fromjson("{$alwaysFalse: 1 }"),
@@ -1550,8 +1913,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInExpressionOnDb) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string firstRegexNs = std::string("^") + "news" + "\\." +
@@ -1579,6 +1943,10 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInExpressionOnDb) {
                                     BSON("ns" << BSON("$eq" << secondCmdNs)))),
                             BSON(OR(BSON("ns" << BSON("$eq" << firstCmdNs)),  // commitIndexBuild.
                                     BSON("ns" << BSON("$eq" << secondCmdNs)))),
+                            BSON(OR(BSON("ns" << BSON("$eq" << firstCmdNs)),  // startIndexBuild.
+                                    BSON("ns" << BSON("$eq" << secondCmdNs)))),
+                            BSON(OR(BSON("ns" << BSON("$eq" << firstCmdNs)),  // abortIndexBuild.
+                                    BSON("ns" << BSON("$eq" << secondCmdNs)))),
                             BSON(OR(BSON("ns" << BSON("$eq" << firstCmdNs)),  // dropIndexes.
                                     BSON("ns" << BSON("$eq" << secondCmdNs)))),
                             BSON(OR(BSON("ns" << BSON("$eq" << firstCmdNs)),  // collMod.
@@ -1595,8 +1963,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithNinExpressionOnDb) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string firstRegexNs = std::string("^") + "test" + "\\." +
@@ -1624,6 +1993,10 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithNinExpressionOnDb) {
                                      BSON("ns" << BSON("$eq" << firstCmdNs)))),
                              BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),  // commitIndexBuild.
                                      BSON("ns" << BSON("$eq" << firstCmdNs)))),
+                             BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),  // startIndexBuild.
+                                     BSON("ns" << BSON("$eq" << firstCmdNs)))),
+                             BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),  // abortIndexBuild.
+                                     BSON("ns" << BSON("$eq" << firstCmdNs)))),
                              BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),  // dropIndexes.
                                      BSON("ns" << BSON("$eq" << firstCmdNs)))),
                              BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),  // collMod.
@@ -1639,8 +2012,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInExpressionOnCollection)
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string firstRegexNs =
@@ -1674,6 +2048,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInExpressionOnCollection)
                                                                       << "news")),
                                     BSON("o.commitIndexBuild" << BSON("$eq"
                                                                       << "test")))),
+                            BSON(OR(BSON("o.startIndexBuild" << BSON("$eq"
+                                                                     << "news")),
+                                    BSON("o.startIndexBuild" << BSON("$eq"
+                                                                     << "test")))),
+                            BSON(OR(BSON("o.abortIndexBuild" << BSON("$eq"
+                                                                     << "news")),
+                                    BSON("o.abortIndexBuild" << BSON("$eq"
+                                                                     << "test")))),
                             BSON(OR(BSON("o.dropIndexes" << BSON("$eq"
                                                                  << "news")),
                                     BSON("o.dropIndexes" << BSON("$eq"
@@ -1694,8 +2076,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithNinExpressionOnCollection
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string firstRegexNs =
@@ -1729,6 +2112,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithNinExpressionOnCollection
                                                                        << "news")),
                                      BSON("o.commitIndexBuild" << BSON("$eq"
                                                                        << "test")))),
+                             BSON(OR(BSON("o.startIndexBuild" << BSON("$eq"
+                                                                      << "news")),
+                                     BSON("o.startIndexBuild" << BSON("$eq"
+                                                                      << "test")))),
+                             BSON(OR(BSON("o.abortIndexBuild" << BSON("$eq"
+                                                                      << "news")),
+                                     BSON("o.abortIndexBuild" << BSON("$eq"
+                                                                      << "test")))),
                              BSON(OR(BSON("o.dropIndexes" << BSON("$eq"
                                                                   << "news")),
                                      BSON("o.dropIndexes" << BSON("$eq"
@@ -1748,8 +2139,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInRegexExpressionOnDb) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1773,6 +2165,12 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInRegexExpressionOnDb) {
                            fromjson(getNsDbRegexMatchExpr("$ns", R"(^news$)")))),
                     BSON(OR(
                         fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")),  // commitIndexBuild.
+                        fromjson(getNsDbRegexMatchExpr("$ns", R"(^news$)")))),
+                    BSON(OR(
+                        fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")),  // startIndexBuild.
+                        fromjson(getNsDbRegexMatchExpr("$ns", R"(^news$)")))),
+                    BSON(OR(
+                        fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")),  // abortIndexBuild.
                         fromjson(getNsDbRegexMatchExpr("$ns", R"(^news$)")))),
                     BSON(OR(fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")),  // dropIndexes.
                             fromjson(getNsDbRegexMatchExpr("$ns", R"(^news$)")))),
@@ -1789,8 +2187,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithNinRegexExpressionOnDb) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1815,6 +2214,12 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithNinRegexExpressionOnDb) {
                     BSON(OR(
                         fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")),  // commitIndexBuild.
                         fromjson(getNsDbRegexMatchExpr("$ns", R"(^news$)")))),
+                    BSON(OR(
+                        fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")),  // startIndexBuild.
+                        fromjson(getNsDbRegexMatchExpr("$ns", R"(^news$)")))),
+                    BSON(OR(
+                        fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")),  // abortIndexBuild.
+                        fromjson(getNsDbRegexMatchExpr("$ns", R"(^news$)")))),
                     BSON(OR(fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")),  // dropIndexes.
                             fromjson(getNsDbRegexMatchExpr("$ns", R"(^news$)")))),
                     BSON(OR(fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")),  // collMod.
@@ -1830,8 +2235,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInRegexExpressionOnCollec
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1854,6 +2260,10 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInRegexExpressionOnCollec
                             fromjson(getNsCollRegexMatchExpr("$o.createIndexes", R"(^news$)")))),
                     BSON(OR(fromjson(getNsCollRegexMatchExpr("$o.commitIndexBuild", R"(^test.*$)")),
                             fromjson(getNsCollRegexMatchExpr("$o.commitIndexBuild", R"(^news$)")))),
+                    BSON(OR(fromjson(getNsCollRegexMatchExpr("$o.startIndexBuild", R"(^test.*$)")),
+                            fromjson(getNsCollRegexMatchExpr("$o.startIndexBuild", R"(^news$)")))),
+                    BSON(OR(fromjson(getNsCollRegexMatchExpr("$o.abortIndexBuild", R"(^test.*$)")),
+                            fromjson(getNsCollRegexMatchExpr("$o.abortIndexBuild", R"(^news$)")))),
                     BSON(OR(fromjson(getNsCollRegexMatchExpr("$o.dropIndexes", R"(^test.*$)")),
                             fromjson(getNsCollRegexMatchExpr("$o.dropIndexes", R"(^news$)")))),
                     BSON(OR(fromjson(getNsCollRegexMatchExpr("$o.collMod", R"(^test.*$)")),
@@ -1868,8 +2278,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithNinRegexExpressionOnColle
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -1892,6 +2303,10 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithNinRegexExpressionOnColle
                             fromjson(getNsCollRegexMatchExpr("$o.createIndexes", R"(^news$)")))),
                     BSON(OR(fromjson(getNsCollRegexMatchExpr("$o.commitIndexBuild", R"(^test.*$)")),
                             fromjson(getNsCollRegexMatchExpr("$o.commitIndexBuild", R"(^news$)")))),
+                    BSON(OR(fromjson(getNsCollRegexMatchExpr("$o.startIndexBuild", R"(^test.*$)")),
+                            fromjson(getNsCollRegexMatchExpr("$o.startIndexBuild", R"(^news$)")))),
+                    BSON(OR(fromjson(getNsCollRegexMatchExpr("$o.abortIndexBuild", R"(^test.*$)")),
+                            fromjson(getNsCollRegexMatchExpr("$o.abortIndexBuild", R"(^news$)")))),
                     BSON(OR(fromjson(getNsCollRegexMatchExpr("$o.dropIndexes", R"(^test.*$)")),
                             fromjson(getNsCollRegexMatchExpr("$o.dropIndexes", R"(^news$)")))),
                     BSON(OR(fromjson(getNsCollRegexMatchExpr("$o.collMod", R"(^test.*$)")),
@@ -1906,8 +2321,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInExpressionOnDbWithRegex
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string secondRegexNs = std::string("^") + "news" + "\\." +
@@ -1936,6 +2352,12 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInExpressionOnDbWithRegex
                     BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),
                             fromjson(getNsDbRegexMatchExpr("$ns",
                                                            R"(^test.*$)")))),  // commitIndexBuild.
+                    BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),
+                            fromjson(getNsDbRegexMatchExpr("$ns",
+                                                           R"(^test.*$)")))),  // startIndexBuild.
+                    BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),
+                            fromjson(getNsDbRegexMatchExpr("$ns",
+                                                           R"(^test.*$)")))),  // abortIndexBuild.
                     BSON(
                         OR(BSON("ns" << BSON("$eq" << secondCmdNs)),
                            fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")))),  // dropIndexes.
@@ -1952,8 +2374,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithNinExpressionOnDbWithRege
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
 
@@ -1983,6 +2406,12 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithNinExpressionOnDbWithRege
                     BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),
                             fromjson(getNsDbRegexMatchExpr("$ns",
                                                            R"(^test.*$)")))),  // commitIndexBuild.
+                    BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),
+                            fromjson(getNsDbRegexMatchExpr("$ns",
+                                                           R"(^test.*$)")))),  // startIndexBuild.
+                    BSON(OR(BSON("ns" << BSON("$eq" << secondCmdNs)),
+                            fromjson(getNsDbRegexMatchExpr("$ns",
+                                                           R"(^test.*$)")))),  // abortIndexBuild.
                     BSON(
                         OR(BSON("ns" << BSON("$eq" << secondCmdNs)),
                            fromjson(getNsDbRegexMatchExpr("$ns", R"(^test.*$)")))),  // dropIndexes.
@@ -1999,8 +2428,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInExpressionOnCollectionW
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string secondRegexNs =
@@ -2034,6 +2464,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithInExpressionOnCollectionW
                                                                  << "news")),
                                fromjson(
                                    getNsCollRegexMatchExpr("$o.commitIndexBuild", R"(^test.*$)")))),
+                       BSON(OR(
+                           BSON("o.startIndexBuild" << BSON("$eq"
+                                                            << "news")),
+                           fromjson(getNsCollRegexMatchExpr("$o.startIndexBuild", R"(^test.*$)")))),
+                       BSON(OR(
+                           BSON("o.abortIndexBuild" << BSON("$eq"
+                                                            << "news")),
+                           fromjson(getNsCollRegexMatchExpr("$o.abortIndexBuild", R"(^test.*$)")))),
                        BSON(OR(BSON("o.dropIndexes" << BSON("$eq"
                                                             << "news")),
                                fromjson(getNsCollRegexMatchExpr("$o.dropIndexes", R"(^test.*$)")))),
@@ -2052,8 +2490,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string secondRegexNs =
@@ -2087,6 +2526,14 @@ TEST_F(ChangeStreamRewriteTest,
                                                                  << "news")),
                                fromjson(
                                    getNsCollRegexMatchExpr("$o.commitIndexBuild", R"(^test.*$)")))),
+                       BSON(OR(
+                           BSON("o.startIndexBuild" << BSON("$eq"
+                                                            << "news")),
+                           fromjson(getNsCollRegexMatchExpr("$o.startIndexBuild", R"(^test.*$)")))),
+                       BSON(OR(
+                           BSON("o.abortIndexBuild" << BSON("$eq"
+                                                            << "news")),
+                           fromjson(getNsCollRegexMatchExpr("$o.abortIndexBuild", R"(^test.*$)")))),
                        BSON(OR(BSON("o.dropIndexes" << BSON("$eq"
                                                             << "news")),
                                fromjson(getNsCollRegexMatchExpr("$o.dropIndexes", R"(^test.*$)")))),
@@ -2104,8 +2551,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteNamespaceWithInExpressionOnInvalidD
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -2115,8 +2563,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteNamespaceWithNinExpressionOnInvalid
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -2126,8 +2575,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteNamespaceWithInExpressionOnInvalidC
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -2137,8 +2587,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteNamespaceWithNinExpressionOnInvalid
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -2148,8 +2599,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithEmptyInExpression) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2162,6 +2614,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithEmptyInExpression) {
                                  fromjson("{$alwaysFalse: 1 }"),  // create.
                                  fromjson("{$alwaysFalse: 1 }"),  // createIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild.
+                                 fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild.
                                  fromjson("{$alwaysFalse: 1 }"),  // dropIndexes.
                                  fromjson("{$alwaysFalse: 1 }"),  // collMod.
                                  BSON(AND(fromjson("{$alwaysFalse: 1 }"),
@@ -2174,8 +2628,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithEmptyNinExpression) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2189,6 +2644,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithEmptyNinExpression) {
                                      fromjson("{$alwaysFalse: 1 }"),  // create.
                                      fromjson("{$alwaysFalse: 1 }"),  // createIndexes.
                                      fromjson("{$alwaysFalse: 1 }"),  // commitIndexBuild.
+                                     fromjson("{$alwaysFalse: 1 }"),  // startIndexBuild.
+                                     fromjson("{$alwaysFalse: 1 }"),  // abortIndexBuild.
                                      fromjson("{$alwaysFalse: 1 }"),  // dropIndexes.
                                      fromjson("{$alwaysFalse: 1 }"),  // collMod.
                                      BSON(AND(fromjson("{$alwaysFalse: 1 }"),
@@ -2197,13 +2654,15 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNamespaceWithEmptyNinExpression) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnFullObject) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$ns', {db: '" + expCtx->ns.db() + "', coll: '" +
-                         expCtx->ns.coll() + "'}]}}");
+    auto expr =
+        fromjson("{$expr: {$eq: ['$ns', {db: '" + expCtx->getNamespaceString().db_forTest() +
+                 "', coll: '" + expCtx->getNamespaceString().coll() + "'}]}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto caseCRUD =
@@ -2222,6 +2681,10 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnFullObject) {
         "{case: {$ne: ['$o.createIndexes', '$$REMOVE']}, then: '$o.createIndexes'}";
     auto caseCommitIndexBuild =
         "{case: {$ne: ['$o.commitIndexBuild', '$$REMOVE']}, then: '$o.commitIndexBuild'}";
+    auto caseStartIndexBuild =
+        "{case: {$ne: ['$o.startIndexBuild', '$$REMOVE']}, then: '$o.startIndexBuild'}";
+    auto caseAbortIndexBuild =
+        "{case: {$ne: ['$o.abortIndexBuild', '$$REMOVE']}, then: '$o.abortIndexBuild'}";
     auto caseDropIndexes = "{case: {$ne: ['$o.dropIndexes', '$$REMOVE']}, then: '$o.dropIndexes'}";
     auto caseCollMod = "{case: {$ne: ['$o.collMod', '$$REMOVE']}, then: '$o.collMod'}";
 
@@ -2233,6 +2696,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnFullObject) {
                                                                        caseCreate,
                                                                        caseCreateIndexes,
                                                                        caseCommitIndexBuild,
+                                                                       caseStartIndexBuild,
+                                                                       caseAbortIndexBuild,
                                                                        caseDropIndexes,
                                                                        caseCollMod},
                                               ",");
@@ -2263,12 +2728,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnFullObject) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnFullObjectWithOnlyDb) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$ns', {db: '" + expCtx->ns.db() + "'}]}}");
+    auto expr = fromjson("{$expr: {$eq: ['$ns', {db: '" +
+                         expCtx->getNamespaceString().db_forTest() + "'}]}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto caseCRUD =
@@ -2287,6 +2754,10 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnFullObjectWithOnlyDb) {
         "{case: {$ne: ['$o.createIndexes', '$$REMOVE']}, then: '$o.createIndexes'}";
     auto caseCommitIndexBuild =
         "{case: {$ne: ['$o.commitIndexBuild', '$$REMOVE']}, then: '$o.commitIndexBuild'}";
+    auto caseStartIndexBuild =
+        "{case: {$ne: ['$o.startIndexBuild', '$$REMOVE']}, then: '$o.startIndexBuild'}";
+    auto caseAbortIndexBuild =
+        "{case: {$ne: ['$o.abortIndexBuild', '$$REMOVE']}, then: '$o.abortIndexBuild'}";
     auto caseDropIndexes = "{case: {$ne: ['$o.dropIndexes', '$$REMOVE']}, then: '$o.dropIndexes'}";
     auto caseCollMod = "{case: {$ne: ['$o.collMod', '$$REMOVE']}, then: '$o.collMod'}";
 
@@ -2298,6 +2769,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnFullObjectWithOnlyDb) {
                                                                        caseCreate,
                                                                        caseCreateIndexes,
                                                                        caseCommitIndexBuild,
+                                                                       caseStartIndexBuild,
+                                                                       caseAbortIndexBuild,
                                                                        caseDropIndexes,
                                                                        caseCollMod},
                                               ",");
@@ -2328,12 +2801,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnFullObjectWithOnlyDb) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnDbFieldPath) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$ns.db', '" + expCtx->ns.coll() + "']}}");
+    auto expr =
+        fromjson("{$expr: {$eq: ['$ns.db', '" + expCtx->getNamespaceString().coll() + "']}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto expectedExpr = fromjson(
@@ -2356,12 +2831,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnDbFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnCollFieldPath) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$ns.coll', '" + expCtx->ns.coll() + "']}}");
+    auto expr =
+        fromjson("{$expr: {$eq: ['$ns.coll', '" + expCtx->getNamespaceString().coll() + "']}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto caseCRUD =
@@ -2380,6 +2857,10 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnCollFieldPath) {
         "{case: {$ne: ['$o.createIndexes', '$$REMOVE']}, then: '$o.createIndexes'}";
     auto caseCommitIndexBuild =
         "{case: {$ne: ['$o.commitIndexBuild', '$$REMOVE']}, then: '$o.commitIndexBuild'}";
+    auto caseStartIndexBuild =
+        "{case: {$ne: ['$o.startIndexBuild', '$$REMOVE']}, then: '$o.startIndexBuild'}";
+    auto caseAbortIndexBuild =
+        "{case: {$ne: ['$o.abortIndexBuild', '$$REMOVE']}, then: '$o.abortIndexBuild'}";
     auto caseDropIndexes = "{case: {$ne: ['$o.dropIndexes', '$$REMOVE']}, then: '$o.dropIndexes'}";
     auto caseCollMod = "{case: {$ne: ['$o.collMod', '$$REMOVE']}, then: '$o.collMod'}";
 
@@ -2391,6 +2872,8 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnCollFieldPath) {
                                                                        caseCreate,
                                                                        caseCreateIndexes,
                                                                        caseCommitIndexBuild,
+                                                                       caseStartIndexBuild,
+                                                                       caseAbortIndexBuild,
                                                                        caseDropIndexes,
                                                                        caseCollMod},
                                               ",");
@@ -2419,12 +2902,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnCollFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnInvalidFieldPath) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$ns.test', '" + expCtx->ns.coll() + "']}}");
+    auto expr =
+        fromjson("{$expr: {$eq: ['$ns.test', '" + expCtx->getNamespaceString().coll() + "']}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"ns"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"ns"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2437,16 +2922,19 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteNsWithExprOnInvalidFieldPath) {
 //
 TEST_F(ChangeStreamRewriteTest, CanRewriteFullToObject) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(
-        BSON("to" << BSON("db" << expCtx->ns.db() << "coll" << expCtx->ns.coll())), expCtx);
+    auto query = BSON("to" << BSON("db" << expCtx->getNamespaceString().db_forTest() << "coll"
+                                        << expCtx->getNamespaceString().coll()));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
-    const std::string ns = expCtx->ns.db().toString() + "." + expCtx->ns.coll().toString();
+    const std::string ns = expCtx->getNamespaceString().db_forTest().toString() + "." +
+        expCtx->getNamespaceString().coll().toString();
 
     ASSERT_BSONOBJ_EQ(rewrittenPredicate,
                       BSON(AND(fromjson("{op: {$eq: 'c'}}"), BSON("o.to" << BSON("$eq" << ns)))));
@@ -2454,12 +2942,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteFullToObject) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithSwappedField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(
-        BSON("to" << BSON("coll" << expCtx->ns.coll() << "db" << expCtx->ns.db())), expCtx);
+    auto query = BSON("to" << BSON("coll" << expCtx->getNamespaceString().coll() << "db"
+                                          << expCtx->getNamespaceString().db_forTest()));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2469,12 +2959,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithSwappedField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithOnlyDbField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("to" << BSON("db" << expCtx->ns.db())), expCtx);
+    auto query = BSON("to" << BSON("db" << expCtx->getNamespaceString().db_forTest()));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2484,12 +2975,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithOnlyDbField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithOnlyCollectionField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("to" << BSON("coll" << expCtx->ns.coll())), expCtx);
+    auto query = BSON("to" << BSON("coll" << expCtx->getNamespaceString().coll()));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2499,12 +2991,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithOnlyCollectionField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithInvalidDbField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(
-        BSON("to" << BSON("db" << 1 << "coll" << expCtx->ns.coll())), expCtx);
+    auto query = BSON("to" << BSON("db" << 1 << "coll" << expCtx->getNamespaceString().coll()));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2514,12 +3007,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithInvalidDbField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithInvalidCollField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(
-        BSON("to" << BSON("db" << expCtx->ns.db() << "coll" << 1)), expCtx);
+    auto query =
+        BSON("to" << BSON("db" << expCtx->getNamespaceString().db_forTest() << "coll" << 1));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2529,12 +3024,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithInvalidCollField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithExtraField) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(
-        fromjson("{to: {db: 'db', coll: 'coll', extra: 'extra'}}"), expCtx);
+    auto query = fromjson("{to: {db: 'db', coll: 'coll', extra: 'extra'}}");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2544,16 +3040,17 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToObjectWithExtraField) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithStringDbFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("to.db" << expCtx->ns.db()), expCtx);
+    auto query = BSON("to.db" << expCtx->getNamespaceString().db_forTest());
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
-    const std::string regexNs = "^" + expCtx->ns.db().toString() + "\\." +
+    const std::string regexNs = "^" + expCtx->getNamespaceString().db_forTest().toString() + "\\." +
         DocumentSourceChangeStream::kRegexAllCollections.toString();
 
     ASSERT_BSONOBJ_EQ(
@@ -2563,17 +3060,18 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithStringDbFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithCollectionFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("to.coll" << expCtx->ns.coll()), expCtx);
+    auto query = BSON("to.coll" << expCtx->getNamespaceString().coll());
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
     const std::string regexNs = DocumentSourceChangeStream::kRegexAllDBs.toString() + "\\." +
-        expCtx->ns.coll().toString() + "$";
+        expCtx->getNamespaceString().coll().toString() + "$";
 
     ASSERT_BSONOBJ_EQ(
         rewrittenPredicate,
@@ -2582,12 +3080,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithCollectionFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithRegexDbFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("to.db" << BSONRegEx(R"(^unit.*$)")), expCtx);
+    auto query = BSON("to.db" << BSONRegEx(R"(^unit.*$)"));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2598,12 +3097,13 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithRegexDbFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithRegexCollectionFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression =
-        MatchExpressionParser::parse(BSON("to.coll" << BSONRegEx(R"(^pipeline.*$)")), expCtx);
+    auto query = BSON("to.coll" << BSONRegEx(R"(^pipeline.*$)"));
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2614,33 +3114,38 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithRegexCollectionFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CannotRewriteToWithInvalidDbFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("to.db" << 1), expCtx);
+    auto query = BSON("to.db" << 1);
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
 TEST_F(ChangeStreamRewriteTest, CannotRewriteToWithInvalidCollectionFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("to.coll" << 1), expCtx);
+    auto query = BSON("to.coll" << 1);
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"to"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExtraDbFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("to.to.subField"
-                                                                       << "subDb"),
-                                                                  expCtx);
+    auto query = BSON("to.to.subField"
+                      << "subDb");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2650,13 +3155,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExtraDbFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExtraCollectionFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("to.coll.subField"
-                                                                       << "subColl"),
-                                                                  expCtx);
+    auto query = BSON("to.coll.subField"
+                      << "subColl");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"to"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2666,13 +3172,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExtraCollectionFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithInvalidFieldPath) {
     auto expCtx = getExpCtx();
-    auto statusWithMatchExpression = MatchExpressionParser::parse(BSON("to.unknown"
-                                                                       << "test"),
-                                                                  expCtx);
+    auto query = BSON("to.unknown"
+                      << "test");
+    auto statusWithMatchExpression = MatchExpressionParser::parse(query, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        getExpCtx(), statusWithMatchExpression.getValue().get(), {"to"});
+        getExpCtx(), statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2686,8 +3193,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithInExpressionOnDb) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string firstRegexNs = std::string("^") + "news" + "\\." +
@@ -2709,8 +3217,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithNinExpressionOnDb) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string firstRegexNs = std::string("^") + "test" + "\\." +
@@ -2732,8 +3241,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithInExpressionOnCollection) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string firstRegexNs =
@@ -2755,8 +3265,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithNinExpressionOnCollection) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string firstRegexNs =
@@ -2778,8 +3289,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithInRegexExpressionOnDb) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2795,8 +3307,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithNinRegexExpressionOnDb) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2813,8 +3326,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithInRegexExpressionOnCollection) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2830,8 +3344,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithNinRegexExpressionOnCollection) 
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2848,8 +3363,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithInExpressionOnDbWithRegexAndStri
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string secondRegexNs = std::string("^") + "news" + "\\." +
@@ -2868,8 +3384,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithNinExpressionOnDbWithRegexAndStr
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string secondRegexNs = std::string("^") + "news" + "\\." +
@@ -2889,8 +3406,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithInExpressionOnCollectionWithRege
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string secondRegexNs =
@@ -2910,8 +3428,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithNinExpressionOnCollectionWithReg
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     const std::string secondRegexNs =
@@ -2931,8 +3450,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteToWithInExpressionOnInvalidDb) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -2942,8 +3462,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteToWithNinExpressionOnInvalidDb) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -2953,8 +3474,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteToWithInExpressionOnInvalidCollecti
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -2964,8 +3486,9 @@ TEST_F(ChangeStreamRewriteTest, CannotRewriteToWithNinExpressionOnInvalidCollect
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT_FALSE(rewrittenMatchExpression);
 }
 
@@ -2975,8 +3498,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithEmptyInExpression) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -2990,8 +3514,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithEmptyNinExpression) {
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -3002,13 +3527,15 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithEmptyNinExpression) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnFullObject) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$to', {db: '" + expCtx->ns.db() + "', coll: '" +
-                         expCtx->ns.coll() + "'}]}}");
+    auto expr =
+        fromjson("{$expr: {$eq: ['$to', {db: '" + expCtx->getNamespaceString().db_forTest() +
+                 "', coll: '" + expCtx->getNamespaceString().coll() + "'}]}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto expectedExpr = fromjson(
@@ -3040,12 +3567,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnFullObject) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnDbFieldPath) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$to.db', '" + expCtx->ns.db() + "']}}");
+    auto expr =
+        fromjson("{$expr: {$eq: ['$to.db', '" + expCtx->getNamespaceString().db_forTest() + "']}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto expectedExpr = fromjson(
@@ -3073,12 +3602,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnDbFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnCollFieldPath) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$to.coll', '" + expCtx->ns.coll() + "']}}");
+    auto expr =
+        fromjson("{$expr: {$eq: ['$to.coll', '" + expCtx->getNamespaceString().coll() + "']}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto expectedExpr = fromjson(
@@ -3106,12 +3637,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnCollFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnInvalidFieldPath) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$to.test', '" + expCtx->ns.coll() + "']}}");
+    auto expr =
+        fromjson("{$expr: {$eq: ['$to.test', '" + expCtx->getNamespaceString().coll() + "']}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -3121,12 +3654,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnInvalidFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnInvalidDbSubFieldPath) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$to.db.test', '" + expCtx->ns.db() + "']}}");
+    auto expr = fromjson("{$expr: {$eq: ['$to.db.test', '" +
+                         expCtx->getNamespaceString().db_forTest() + "']}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -3136,12 +3671,14 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnInvalidDbSubFieldPath) {
 
 TEST_F(ChangeStreamRewriteTest, CanRewriteToWithExprOnInvalidCollSubFieldPath) {
     auto expCtx = getExpCtx();
-    auto expr = fromjson("{$expr: {$eq: ['$to.coll.test', '" + expCtx->ns.coll() + "']}}");
+    auto expr = fromjson("{$expr: {$eq: ['$to.coll.test', '" + expCtx->getNamespaceString().coll() +
+                         "']}}");
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"to"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"to"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -3159,8 +3696,9 @@ TEST_F(ChangeStreamRewriteTest, CanInexactlyRewritePredicateOnFieldUpdateDescrip
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // This produces a minimally selective filter which returns all non-replacement update events.
@@ -3179,8 +3717,9 @@ TEST_F(ChangeStreamRewriteTest, CannotExactlyRewritePredicateOnFieldUpdateDescri
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }
@@ -3191,8 +3730,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnFieldUpdateDescriptio
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // Note that this produces an {$alwaysFalse:1} predicate for update events. This will optimize
@@ -3221,8 +3761,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteExistsPredicateOnFieldUpdateDescriptio
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // Note that the {$alwaysTrue:1} predicate is an artefact of the rewrite process. It will be
@@ -3242,8 +3783,9 @@ TEST_F(ChangeStreamRewriteTest, CanInexactlyRewritePredicateOnFieldUpdateDescrip
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // This produces a minimally selective filter which returns all non-replacement update events.
@@ -3262,8 +3804,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }
@@ -3274,8 +3817,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnFieldUpdateDescriptio
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // Note that this produces an {$alwaysFalse:1} predicate for update events. This will optimize
@@ -3304,8 +3848,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteExistsPredicateOnFieldUpdateDescriptio
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // Note that the {$alwaysTrue:1} predicate is an artefact of the rewrite process. It will be
@@ -3326,8 +3871,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -3349,8 +3895,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnFieldUpdateDescriptio
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // Note that we perform an $and of all three oplog locations for this rewrite.
@@ -3383,8 +3930,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // This produces a minimally selective filter which returns all non-replacement update events.
@@ -3403,8 +3951,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }
@@ -3416,8 +3965,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }
@@ -3428,8 +3978,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteStringEqPredicateOnFieldUpdateDescript
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -3450,8 +4001,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEqNullPredicateOnFieldUpdateDescriptio
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // Note that this produces an {$alwaysFalse:1} predicate for update events. This will optimize
@@ -3480,8 +4032,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteExistsPredicateOnFieldUpdateDescriptio
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // Note that the {$alwaysTrue:1} predicate is an artefact of the rewrite process. It will be
@@ -3502,8 +4055,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // This produces a minimally selective filter which returns all non-replacement update events.
@@ -3522,8 +4076,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }
@@ -3535,8 +4090,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // This produces a minimally selective filter which returns all non-replacement update events.
@@ -3555,8 +4111,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }
@@ -3567,8 +4124,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteStringInPredicateOnFieldUpdateDescript
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -3595,8 +4153,9 @@ TEST_F(ChangeStreamRewriteTest, CanRewriteEmptyInPredicateOnFieldUpdateDescripti
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     auto rewrittenPredicate = rewrittenMatchExpression->serialize();
@@ -3615,8 +4174,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // This produces a minimally selective filter which returns all non-replacement update events.
@@ -3635,8 +4195,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }
@@ -3648,8 +4209,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // This produces a minimally selective filter which returns all non-replacement update events.
@@ -3668,8 +4230,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }
@@ -3681,8 +4244,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // This produces a minimally selective filter which returns all non-replacement update events.
@@ -3701,8 +4265,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }
@@ -3714,8 +4279,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // This produces a minimally selective filter which returns all non-replacement update events.
@@ -3734,8 +4300,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }
@@ -3747,8 +4314,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
     ASSERT(rewrittenMatchExpression);
 
     // This produces a minimally selective filter which returns all non-replacement update events.
@@ -3767,8 +4335,9 @@ TEST_F(ChangeStreamRewriteTest,
     auto statusWithMatchExpression = MatchExpressionParser::parse(expr, expCtx);
     ASSERT_OK(statusWithMatchExpression.getStatus());
 
+    auto bsonObjsArray = std::vector<BSONObj>{};
     auto rewrittenMatchExpression = change_stream_rewrite::rewriteFilterForFields(
-        expCtx, statusWithMatchExpression.getValue().get(), {"updateDescription"});
+        expCtx, statusWithMatchExpression.getValue().get(), bsonObjsArray, {"updateDescription"});
 
     ASSERT(rewrittenMatchExpression == nullptr);
 }

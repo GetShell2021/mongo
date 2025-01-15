@@ -27,20 +27,42 @@
  *    it in the license file.
  */
 
+#include <boost/cstdint.hpp>
+#include <cstdint>
+#include <string>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_cache_noop.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/find_command.h"
+#include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -51,21 +73,27 @@ class ShardingDDLUtilTest : public ConfigServerTestFixture {
 protected:
     ShardType shard0;
 
+private:
+    ReadWriteConcernDefaultsLookupMock _lookupMock;
+
     void setUp() override {
         setUpAndInitializeConfigDb();
+
+        // Manually instantiate the ReadWriteConcernDefaults decoration on the service
+        ReadWriteConcernDefaults::create(getService(), _lookupMock.getFetchDefaultsFn());
 
         // Create config.transactions collection
         auto opCtx = operationContext();
         DBDirectClient client(opCtx);
-        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns());
-        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace.ns(),
+        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace);
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
                              {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
-        client.createCollection(NamespaceString::kConfigReshardingOperationsNamespace.ns());
-        client.createCollection(CollectionType::ConfigNS.ns());
+        client.createCollection(NamespaceString::kConfigReshardingOperationsNamespace);
+        client.createCollection(CollectionType::ConfigNS);
 
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
         TransactionCoordinatorService::get(operationContext())
-            ->onShardingInitialization(operationContext(), true);
+            ->initializeIfNeeded(operationContext(), /* term */ 1);
 
         // Initialize a shard
         shard0.setName("shard0");
@@ -74,12 +102,31 @@ protected:
     }
 
     void tearDown() override {
-        TransactionCoordinatorService::get(operationContext())->onStepDown();
+        TransactionCoordinatorService::get(operationContext())->interrupt();
         ConfigServerTestFixture::tearDown();
+    }
+
+public:
+    CollectionType setupShardedCollection(const NamespaceString& nss) {
+
+        // Initialize a chunk
+        ChunkVersion chunkVersion({OID::gen(), Timestamp(2, 1)}, {1, 1});
+        ChunkType chunk;
+        chunk.setName(OID::gen());
+        chunk.setCollectionUUID(UUID::gen());
+        chunk.setVersion(chunkVersion);
+        chunk.setShard(shard0.getName());
+        chunk.setOnCurrentShardSince(Timestamp(1, 1));
+        chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), shard0.getName())});
+        chunk.setRange({kMinBSONKey, kMaxBSONKey});
+
+        // Initialize the sharded collection
+        return setupCollection(nss, KeyPattern(BSON("x" << 1)), {chunk});
     }
 };
 
-const NamespaceString kToNss("test.to");
+const NamespaceString kFromNss = NamespaceString::createNamespaceString_forTest("test.from");
+const NamespaceString kToNss = NamespaceString::createNamespaceString_forTest("test.to");
 
 // Query 'limit' objects from the database into an array.
 void findN(DBClientBase& client,
@@ -96,107 +143,96 @@ void findN(DBClientBase& client,
     }
 }
 
-// Test that config.collection document and config.chunks documents are properly updated from source
-// to destination collection metadata
-TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
-    auto opCtx = operationContext();
-    DBDirectClient client(opCtx);
+TEST_F(ShardingDDLUtilTest, SerializeDeserializeErrorStatusWithoutExtraInfo) {
+    const Status sample{ErrorCodes::ForTestingOptionalErrorExtraInfo, "Dummy reason"};
 
-    const NamespaceString fromNss("test.from");
-    const auto fromCollQuery = BSON(CollectionType::kNssFieldName << fromNss.ns());
+    BSONObjBuilder bsonBuilder;
+    sharding_ddl_util_serializeErrorStatusToBSON(sample, "status", &bsonBuilder);
+    const auto serialized = bsonBuilder.done();
 
-    const auto toCollQuery = BSON(CollectionType::kNssFieldName << kToNss.ns());
+    const auto deserialized =
+        sharding_ddl_util_deserializeErrorStatusFromBSON(serialized.firstElement());
 
-    const Timestamp collTimestamp(1);
-    const auto collUUID = UUID::gen();
+    ASSERT_EQ(sample.code(), deserialized.code());
+    ASSERT_EQ(sample.reason(), deserialized.reason());
+    ASSERT(!deserialized.extraInfo());
+}
 
-    // Initialize FROM collection chunks
-    const auto fromEpoch = OID::gen();
-    const int nChunks = 10;
-    std::vector<ChunkType> chunks;
-    for (int i = 0; i < nChunks; i++) {
-        ChunkVersion chunkVersion({fromEpoch, collTimestamp}, {1, uint32_t(i)});
-        ChunkType chunk;
-        chunk.setName(OID::gen());
-        chunk.setCollectionUUID(collUUID);
-        chunk.setVersion(chunkVersion);
-        chunk.setShard(shard0.getName());
-        chunk.setHistory({ChunkHistory(Timestamp(1, i), shard0.getName())});
-        chunk.setMin(BSON("a" << i));
-        chunk.setMax(BSON("a" << i + 1));
-        chunks.push_back(chunk);
-    }
+TEST_F(ShardingDDLUtilTest, SerializeDeserializeErrorStatusWithExtraInfo) {
+    OptionalErrorExtraInfoExample::EnableParserForTest whenInScope;
 
-    setupCollection(fromNss, KeyPattern(BSON("x" << 1)), chunks);
+    const Status sample{
+        ErrorCodes::ForTestingOptionalErrorExtraInfo, "Dummy reason", fromjson("{data: 123}")};
 
-    // Initialize TO collection chunks
-    std::vector<ChunkType> originalToChunks;
-    const auto toEpoch = OID::gen();
-    const auto toUUID = UUID::gen();
-    for (int i = 0; i < nChunks; i++) {
-        ChunkVersion chunkVersion({toEpoch, Timestamp(2)}, {1, uint32_t(i)});
-        ChunkType chunk;
-        chunk.setName(OID::gen());
-        chunk.setCollectionUUID(toUUID);
-        chunk.setVersion(chunkVersion);
-        chunk.setShard(shard0.getName());
-        chunk.setHistory({ChunkHistory(Timestamp(1, i), shard0.getName())});
-        chunk.setMin(BSON("a" << i));
-        chunk.setMax(BSON("a" << i + 1));
-        originalToChunks.push_back(chunk);
-    }
-    setupCollection(kToNss, KeyPattern(BSON("x" << 1)), originalToChunks);
+    BSONObjBuilder bsonBuilder;
+    sharding_ddl_util_serializeErrorStatusToBSON(sample, "status", &bsonBuilder);
+    const auto serialized = bsonBuilder.done();
 
-    // Get FROM collection document and chunks
-    auto fromDoc = client.findOne(CollectionType::ConfigNS, fromCollQuery);
-    CollectionType fromCollection(fromDoc);
+    const auto deserialized =
+        sharding_ddl_util_deserializeErrorStatusFromBSON(serialized.firstElement());
 
-    FindCommandRequest fromChunksRequest{ChunkType::ConfigNS};
-    fromChunksRequest.setFilter(BSON(ChunkType::collectionUUID << collUUID));
-    fromChunksRequest.setSort(BSON("_id" << 1));
+    ASSERT_EQ(sample.code(), deserialized.code());
+    ASSERT_EQ(sample.reason(), deserialized.reason());
+    ASSERT(deserialized.extraInfo());
+    ASSERT(deserialized.extraInfo<OptionalErrorExtraInfoExample>());
+    ASSERT_EQ(deserialized.extraInfo<OptionalErrorExtraInfoExample>()->data, 123);
+}
 
-    std::vector<BSONObj> fromChunks;
-    findN(client, std::move(fromChunksRequest), nChunks, fromChunks);
+TEST_F(ShardingDDLUtilTest, SerializeDeserializeErrorStatusInvalid) {
+    BSONObjBuilder bsonBuilder;
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util_serializeErrorStatusToBSON(Status::OK(), "status", &bsonBuilder),
+        DBException,
+        7418500);
 
-    auto fromCollType = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, fromNss);
-    // Perform the metadata rename
-    sharding_ddl_util::shardedRenameMetadata(
-        opCtx, fromCollType, kToNss, ShardingCatalogClient::kMajorityWriteConcern);
+    const auto okStatusBSON =
+        BSON("status" << BSON("code" << ErrorCodes::OK << "codeName"
+                                     << ErrorCodes::errorString(ErrorCodes::OK)));
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util_deserializeErrorStatusFromBSON(okStatusBSON.firstElement()),
+        DBException,
+        7418501);
+}
 
-    // Check that the FROM config.collections entry has been deleted
-    ASSERT(client.findOne(CollectionType::ConfigNS, fromCollQuery).isEmpty());
+TEST_F(ShardingDDLUtilTest, SerializeErrorStatusTooBig) {
+    const std::string longReason(1024 * 3, 'x');
+    const Status sample{ErrorCodes::ForTestingOptionalErrorExtraInfo, longReason};
 
-    // Get TO collection document and chunks
-    auto toDoc = client.findOne(CollectionType::ConfigNS, toCollQuery);
-    CollectionType toCollection(toDoc);
+    BSONObjBuilder bsonBuilder;
+    sharding_ddl_util_serializeErrorStatusToBSON(sample, "status", &bsonBuilder);
+    const auto serialized = bsonBuilder.done();
 
-    FindCommandRequest toChunksRequest{ChunkType::ConfigNS};
-    toChunksRequest.setFilter(BSON(ChunkType::collectionUUID << collUUID));
-    toChunksRequest.setSort(BSON("_id" << 1));
+    const auto deserialized =
+        sharding_ddl_util_deserializeErrorStatusFromBSON(serialized.firstElement());
 
-    std::vector<BSONObj> toChunks;
-    findN(client, std::move(toChunksRequest), nChunks, toChunks);
-
-    // Check that original epoch/timestamp are changed in config.collections entry
-    ASSERT(fromCollection.getEpoch() != toCollection.getEpoch());
-    ASSERT(fromCollection.getTimestamp() != toCollection.getTimestamp());
-
-    // Check that no other CollectionType field has been changed
-    auto fromUnchangedFields = fromDoc.removeField(CollectionType::kNssFieldName)
-                                   .removeField(CollectionType::kEpochFieldName)
-                                   .removeField(CollectionType::kTimestampFieldName);
-    auto toUnchangedFields = toDoc.removeField(CollectionType::kNssFieldName)
-                                 .removeField(CollectionType::kEpochFieldName)
-                                 .removeField(CollectionType::kTimestampFieldName);
-    ASSERT_EQ(fromUnchangedFields.woCompare(toUnchangedFields), 0);
-
-    // Check that chunk documents remain unchanged
-    for (int i = 0; i < nChunks; i++) {
-        auto fromChunkDoc = fromChunks[i];
-        auto toChunkDoc = toChunks[i];
-
-        ASSERT_EQ(fromChunkDoc.woCompare(toChunkDoc), 0);
-    }
+    ASSERT_EQ(ErrorCodes::TruncatedSerialization, deserialized.code());
+    ASSERT_EQ(
+        "ForTestingOptionalErrorExtraInfo: "
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        deserialized.reason());
+    ASSERT(!deserialized.extraInfo());
 }
 
 // Test all combinations of rename acceptable preconditions:
@@ -206,26 +242,19 @@ TEST_F(ShardingDDLUtilTest, ShardedRenameMetadata) {
 TEST_F(ShardingDDLUtilTest, RenamePreconditionsAreMet) {
     auto opCtx = operationContext();
 
+    // Initialize the sharded FROM collection
+    const auto fromColl = setupShardedCollection(kFromNss);
+
     // No exception is thrown if the TO collection does not exist and has no associated tags
     sharding_ddl_util::checkRenamePreconditions(
-        opCtx, false /* sourceIsSharded */, kToNss, false /* dropTarget */);
-
-    // Initialize a chunk
-    ChunkVersion chunkVersion({OID::gen(), Timestamp(2, 1)}, {1, 1});
-    ChunkType chunk;
-    chunk.setName(OID::gen());
-    chunk.setCollectionUUID(UUID::gen());
-    chunk.setVersion(chunkVersion);
-    chunk.setShard(shard0.getName());
-    chunk.setHistory({ChunkHistory(Timestamp(1, 1), shard0.getName())});
-    chunk.setMin(kMinBSONKey);
-    chunk.setMax(kMaxBSONKey);
+        opCtx, kToNss, boost::none /*toColl*/, false /*isSourceUnsharded*/, false /* dropTarget */);
 
     // Initialize the sharded TO collection
-    setupCollection(kToNss, KeyPattern(BSON("x" << 1)), {chunk});
+    const auto toColl = setupShardedCollection(kToNss);
 
+    // No exception is thrown if the TO collection exists and dropTarget is `true`
     sharding_ddl_util::checkRenamePreconditions(
-        opCtx, false /* sourceIsSharded */, kToNss, true /* dropTarget */);
+        opCtx, kToNss, toColl, false /*isSourceUnsharded*/, true /* dropTarget */);
 }
 
 TEST_F(ShardingDDLUtilTest, RenamePreconditionsTargetNamespaceIsTooLong) {
@@ -233,61 +262,127 @@ TEST_F(ShardingDDLUtilTest, RenamePreconditionsTargetNamespaceIsTooLong) {
 
     const std::string dbName{"test"};
 
+    // Initialize the sharded FROM collection
+    const auto fromColl = setupShardedCollection(kFromNss);
+
     // Check that no exception is thrown if the namespace of the target collection is long enough
-    const NamespaceString longEnoughNss{
+    const NamespaceString longEnoughNss = NamespaceString::createNamespaceString_forTest(
         dbName + "." +
-        std::string(NamespaceString::MaxNsShardedCollectionLen - dbName.length() - 1, 'x')};
+        std::string(NamespaceString::MaxUserNsShardedCollectionLen - dbName.length() - 1, 'x'));
     sharding_ddl_util::checkRenamePreconditions(
-        opCtx, true /* sourceIsSharded */, longEnoughNss, false /* dropTarget */);
+        opCtx, longEnoughNss, boost::none, false /*isSourceUnsharded*/, false /* dropTarget */);
 
     // Check that an exception is thrown if the namespace of the target collection is too long
-    const NamespaceString tooLongNss{longEnoughNss.ns() + 'x'};
-    ASSERT_THROWS_CODE(sharding_ddl_util::checkRenamePreconditions(
-                           opCtx, true /* sourceIsSharded */, tooLongNss, false /* dropTarget */),
-                       AssertionException,
-                       ErrorCodes::InvalidNamespace);
+    const NamespaceString tooLongNss =
+        NamespaceString::createNamespaceString_forTest(longEnoughNss.toString_forTest() + 'x');
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util::checkRenamePreconditions(
+            opCtx, tooLongNss, boost::none, false /*isSourceUnsharded*/, false /* dropTarget */),
+        AssertionException,
+        ErrorCodes::InvalidNamespace);
+}
+
+TEST_F(ShardingDDLUtilTest, RenamePreconditionsTargetNamespaceIsTooLongUnsplittable) {
+    auto opCtx{operationContext()};
+
+    const std::string dbName{"test"};
+
+    // Initialize the sharded FROM collection
+    const auto fromColl = setupShardedCollection(kFromNss);
+
+    // Check that no exception is thrown if the namespace of the target collection is long enough
+    const NamespaceString longEnoughNss = NamespaceString::createNamespaceString_forTest(
+        dbName + "." +
+        std::string(NamespaceString::MaxUserNsCollectionLen - dbName.length() - 1, 'x'));
+    sharding_ddl_util::checkRenamePreconditions(
+        opCtx, longEnoughNss, boost::none, true /*isSourceUnsharded*/, false /* dropTarget */);
+
+    // Check that an exception is thrown if the namespace of the target collection is too long
+    const NamespaceString tooLongNss =
+        NamespaceString::createNamespaceString_forTest(longEnoughNss.toString_forTest() + 'x');
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util::checkRenamePreconditions(
+            opCtx, tooLongNss, boost::none, true /*isSourceUnsharded*/, false /* dropTarget */),
+        AssertionException,
+        ErrorCodes::InvalidNamespace);
 }
 
 TEST_F(ShardingDDLUtilTest, RenamePreconditionsTargetCollectionExists) {
     auto opCtx = operationContext();
 
-    // Initialize a chunk
-    ChunkVersion chunkVersion({OID::gen(), Timestamp(2, 1)}, {1, 1});
-    ChunkType chunk;
-    chunk.setName(OID::gen());
-    chunk.setCollectionUUID(UUID::gen());
-    chunk.setVersion(chunkVersion);
-    chunk.setShard(shard0.getName());
-    chunk.setHistory({ChunkHistory(Timestamp(1, 1), shard0.getName())});
-    chunk.setMin(kMinBSONKey);
-    chunk.setMax(kMaxBSONKey);
+    // Initialize the sharded FROM collection
+    const auto fromColl = setupShardedCollection(kFromNss);
 
-    // Initialize the sharded collection
-    setupCollection(kToNss, KeyPattern(BSON("x" << 1)), {chunk});
+    // Initialize the sharded TO collection
+    const auto toColl = setupShardedCollection(kToNss);
 
     // Check that an exception is thrown if the target collection exists and dropTarget is not set
-    ASSERT_THROWS_CODE(sharding_ddl_util::checkRenamePreconditions(
-                           opCtx, false /* sourceIsSharded */, kToNss, false /* dropTarget */),
-                       AssertionException,
-                       ErrorCodes::NamespaceExists);
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util::checkRenamePreconditions(
+            opCtx, kToNss, toColl, false /*isSourceUnsharded*/, false /* dropTarget */),
+        AssertionException,
+        ErrorCodes::NamespaceExists);
 }
 
 TEST_F(ShardingDDLUtilTest, RenamePreconditionTargetCollectionHasTags) {
     auto opCtx = operationContext();
 
+    // Initialize the sharded FROM collection
+    const auto fromColl = setupShardedCollection(kFromNss);
+
+    // Initialize the sharded TO collection
+    const auto toColl = setupShardedCollection(kToNss);
+
     // Associate a tag to the target collection
     TagsType tagDoc;
     tagDoc.setNS(kToNss);
-    tagDoc.setMinKey(BSON("x" << 0));
-    tagDoc.setMaxKey(BSON("x" << 1));
+    tagDoc.setRange({BSON("x" << 0), BSON("x" << 1)});
     tagDoc.setTag("z");
     ASSERT_OK(insertToConfigCollection(operationContext(), TagsType::ConfigNS, tagDoc.toBSON()));
 
     // Check that an exception is thrown if some tag is associated to the target collection
-    ASSERT_THROWS_CODE(sharding_ddl_util::checkRenamePreconditions(
-                           opCtx, false /* sourceIsSharded */, kToNss, false /* dropTarget */),
-                       AssertionException,
-                       ErrorCodes::CommandFailed);
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util::checkRenamePreconditions(
+            opCtx, kToNss, toColl, false /*isSourceUnsharded*/, true /* dropTarget */),
+        AssertionException,
+        ErrorCodes::CommandFailed);
+}
+
+TEST_F(ShardingDDLUtilTest, NamespaceTooLong) {
+    auto generateNss = [](int len) {
+        std::string dbName = "test";
+        auto collName = std::string(len - dbName.size() - 1, 'x');
+        return NamespaceString::createNamespaceString_forTest(dbName, collName);
+    };
+
+    NamespaceString validNss = generateNss(NamespaceString::MaxUserNsShardedCollectionLen);
+    NamespaceString invalidShardedNss =
+        generateNss(NamespaceString::MaxUserNsShardedCollectionLen + 1);
+    NamespaceString invalidNss = generateNss(NamespaceString::MaxUserNsCollectionLen + 1);
+
+    // Always valid.
+    ASSERT_DOES_NOT_THROW(
+        sharding_ddl_util::assertNamespaceLengthLimit(validNss, true /*isUnsharded*/));
+    ASSERT_DOES_NOT_THROW(
+        sharding_ddl_util::assertNamespaceLengthLimit(validNss, false /*isUnsharded*/));
+
+    // Only valid if the collection is unsharded.
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util::assertNamespaceLengthLimit(invalidShardedNss, false /*isUnsharded*/),
+        DBException,
+        ErrorCodes::InvalidNamespace);
+    ASSERT_DOES_NOT_THROW(
+        sharding_ddl_util::assertNamespaceLengthLimit(invalidShardedNss, true /*isUnsharded*/));
+
+    // Never valid.
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util::assertNamespaceLengthLimit(invalidNss, true /*isUnsharded*/),
+        DBException,
+        ErrorCodes::InvalidNamespace);
+    ASSERT_THROWS_CODE(
+        sharding_ddl_util::assertNamespaceLengthLimit(invalidNss, false /*isUnsharded*/),
+        DBException,
+        ErrorCodes::InvalidNamespace);
 }
 
 }  // namespace

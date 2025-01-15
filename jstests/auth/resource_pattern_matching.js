@@ -3,13 +3,14 @@
  * @tags: [requires_replication, requires_sharding]
  */
 
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 // This test logs in users on the admin database, but doesn't log them out, which can fail with
 // implicit sessions and ReplSetTest when the fixture attempts to verify data hashes at shutdown by
 // authenticating as the __system user.
-TestData.disableImplicitSessions = true;
 
-(function() {
-'use strict';
+TestData.disableImplicitSessions = true;
 
 function setup_users(granter) {
     const admin = granter.getSiblingDB("admin");
@@ -79,12 +80,14 @@ function invalidateUserCache(verifier) {
     admin.logout();
 }
 
-function run_test(name, granter, verifier, privileges, collections) {
+function run_test(name, granter, verifier, privileges, collections, rst) {
     print("\n=== testing " + name + "() ===\n");
 
     grant_privileges(granter, privileges);
     invalidateUserCache(verifier);
-
+    if (rst) {
+        rst.awaitReplication();
+    }
     const verifierDB = verifier.getSiblingDB('admin');
     assert(verifierDB.auth("test_user", "password"));
 
@@ -113,12 +116,6 @@ function should_insert(testdb, testcol) {
     });
 }
 
-function should_fail_insert(testdb, testcol) {
-    assert.throws(function() {
-        testcol.insert({a: "b"});
-    });
-}
-
 function should_find(testdb, testcol) {
     assert.doesNotThrow(function() {
         testcol.findOne();
@@ -131,7 +128,7 @@ function should_fail_find(testdb, testcol) {
     });
 }
 
-function run_tests(granter, verifier) {
+function run_tests(granter, verifier, rst) {
     setup_users(granter);
     setup_dbs_and_cols(granter);
 
@@ -144,36 +141,44 @@ function run_tests(granter, verifier) {
                  "a.b": should_fail_find,
                  "b.a": should_fail_find,
                  "b.b": should_fail_find
-             });
+             },
+             rst);
 
     run_test(
         "glob_collection",
         granter,
         verifier,
         [{resource: {db: "a", collection: ""}, actions: ["find"]}],
-        {"a.a": should_find, "a.b": should_find, "b.a": should_fail_find, "b.b": should_fail_find});
+        {"a.a": should_find, "a.b": should_find, "b.a": should_fail_find, "b.b": should_fail_find},
+        rst);
 
     run_test(
         "glob_database",
         granter,
         verifier,
         [{resource: {db: "", collection: "a"}, actions: ["find"]}],
-        {"a.a": should_find, "a.b": should_fail_find, "b.a": should_find, "b.b": should_fail_find});
+        {"a.a": should_find, "a.b": should_fail_find, "b.a": should_find, "b.b": should_fail_find},
+        rst);
 
     run_test("glob_all",
              granter,
              verifier,
              [{resource: {db: "", collection: ""}, actions: ["find"]}],
-             {"a.a": should_find, "a.b": should_find, "b.a": should_find, "b.b": should_find});
+             {"a.a": should_find, "a.b": should_find, "b.a": should_find, "b.b": should_find},
+             rst);
 
-    run_test(
-        "any_resource", granter, verifier, [{resource: {anyResource: true}, actions: ["find"]}], {
-            "a.a": should_find,
-            "a.b": should_find,
-            "b.a": should_find,
-            "b.b": should_find,
-            "c.a": should_find
-        });
+    run_test("any_resource",
+             granter,
+             verifier,
+             [{resource: {anyResource: true}, actions: ["find"]}],
+             {
+                 "a.a": should_find,
+                 "a.b": should_find,
+                 "b.a": should_find,
+                 "b.b": should_find,
+                 "c.a": should_find
+             },
+             rst);
 
     run_test("no_global_access",
              granter,
@@ -186,7 +191,8 @@ function run_tests(granter, verifier) {
                      if (r["ok"])
                          throw ("db.$.cmd shouldn't give a.stats()");
                  }
-             });
+             },
+             rst);
 
     run_test_bad_resource("empty_resource", granter, {});
     run_test_bad_resource("users_collection_any_db", granter, {collection: "users"});
@@ -219,7 +225,8 @@ function run_tests(granter, verifier) {
                      should_insert(testdb, testcol);
                      should_fail_find(testdb, testcol);
                  },
-             });
+             },
+             rst);
 }
 
 const keyfile = "jstests/libs/key1";
@@ -242,7 +249,7 @@ const keyfile = "jstests/libs/key1";
     const primary = rst.getPrimary().getDB('admin');
     rst.awaitSecondaryNodes();
     const secondary = rst.getSecondaries()[0].getDB('admin');
-    run_tests(primary, secondary);
+    run_tests(primary, secondary, rst);
     rst.stopSet();
     print('--- done with the rs tests ---');
 }
@@ -256,11 +263,10 @@ const keyfile = "jstests/libs/key1";
         other: {
             mongosOptions: {'auth': null},
             configOptions: {'auth': null},
-            shardOptions: {'auth': null}
+            rsOptions: {'auth': null}
         }
     });
     run_tests(st.s0.getDB('admin'), st.s1.getDB('admin'));
     st.stop();
     print('--- sharding test done ---');
 }
-})();

@@ -27,36 +27,89 @@
  *    it in the license file.
  */
 
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/smart_ptr.hpp>
+#include <deque>
 #include <fmt/format.h>
+#include <functional>
+#include <iterator>
+#include <limits>
+#include <string>
+#include <tuple>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/client/connection_string.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/catalog/create_collection.h"
-#include "mongo/db/catalog_raii.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_cache_noop.h"
-#include "mongo/db/repl/oplog_applier.h"
-#include "mongo/db/repl/session_update_tracker.h"
-#include "mongo/db/repl/storage_interface_impl.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/optime_with.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/s/metrics/sharding_data_transform_instance_metrics.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
+#include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_oplog_applier.h"
-#include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
-#include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/update/document_diff_serialization.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
+#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
-#include "mongo/executor/thread_pool_task_executor_test_fixture.h"
-#include "mongo/idl/server_parameter_test_util.h"
-#include "mongo/logv2/log.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
+#include "mongo/rpc/metadata/metadata_hook.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/sharding_catalog_client_mock.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/catalog/type_index_catalog_gen.h"
+#include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/catalog_cache_loader_mock.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/str.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/s/type_collection_common_types_gen.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -110,46 +163,48 @@ private:
     bool _doThrow{false};
 };
 
-class ReshardingOplogApplierTest : public ShardingMongodTestFixture {
+class ReshardingOplogApplierTest : service_context_test::WithSetupTransportLayer,
+                                   public ShardingMongoDTestFixture {
 public:
     const HostAndPort kConfigHostAndPort{"DummyConfig", 12345};
     const std::string kOriginalShardKey = "sk";
     const BSONObj kOriginalShardKeyPattern{BSON(kOriginalShardKey << 1)};
 
     void setUp() override {
-        ShardingMongodTestFixture::setUp();
+        ShardingMongoDTestFixture::setUp();
 
-        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-
-        auto clusterId = OID::gen();
         ShardingState::get(getServiceContext())
-            ->setInitialized(_sourceId.getShardId().toString(), clusterId);
+            ->setRecoveryCompleted({OID::gen(),
+                                    ClusterRole::ShardServer,
+                                    ConnectionString(kConfigHostAndPort),
+                                    _sourceId.getShardId()});
 
-        auto mockLoader = std::make_unique<CatalogCacheLoaderMock>();
-        CatalogCacheLoader::set(getServiceContext(), std::move(mockLoader));
-
+        _mockCatalogCacheLoader = std::make_shared<ShardServerCatalogCacheLoaderMock>();
+        auto catalogCache =
+            std::make_unique<CatalogCache>(getServiceContext(), _mockCatalogCacheLoader);
         uassertStatusOK(
-            initializeGlobalShardingStateForMongodForTest(ConnectionString(kConfigHostAndPort)));
+            initializeGlobalShardingStateForMongodForTest(ConnectionString(kConfigHostAndPort),
+                                                          std::move(catalogCache),
+                                                          _mockCatalogCacheLoader));
 
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
 
         uassertStatusOK(createCollection(
             operationContext(),
-            NamespaceString::kSessionTransactionsTableNamespace.db().toString(),
+            NamespaceString::kSessionTransactionsTableNamespace.dbName(),
             BSON("create" << NamespaceString::kSessionTransactionsTableNamespace.coll())));
         DBDirectClient client(operationContext());
-        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace.ns(),
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
                              {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
 
         OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
             operationContext());
-        uassertStatusOK(createCollection(operationContext(),
-                                         kAppliedToNs.db().toString(),
-                                         BSON("create" << kAppliedToNs.coll())));
         uassertStatusOK(createCollection(
-            operationContext(), kStashNs.db().toString(), BSON("create" << kStashNs.coll())));
+            operationContext(), kAppliedToNs.dbName(), BSON("create" << kAppliedToNs.coll())));
+        uassertStatusOK(createCollection(
+            operationContext(), kStashNs.dbName(), BSON("create" << kStashNs.coll())));
         uassertStatusOK(createCollection(operationContext(),
-                                         kOtherDonorStashNs.db().toString(),
+                                         kOtherDonorStashNs.dbName(),
                                          BSON("create" << kOtherDonorStashNs.coll())));
 
         _cm = createChunkManagerForOriginalColl();
@@ -170,14 +225,59 @@ public:
         _cancelableOpCtxExecutor->startup();
     }
 
-    void tearDown() {
+    void tearDown() override {
         _executor->shutdown();
         _executor->join();
 
         _cancelableOpCtxExecutor->shutdown();
         _cancelableOpCtxExecutor->join();
 
-        ShardingMongodTestFixture::tearDown();
+        ShardingMongoDTestFixture::tearDown();
+    }
+
+    class StaticCatalogClient final : public ShardingCatalogClientMock {
+    public:
+        StaticCatalogClient(std::vector<ShardType> shards) : _shards(std::move(shards)) {}
+
+        StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
+            OperationContext* opCtx,
+            repl::ReadConcernLevel readConcern,
+            bool excludeDraining) override {
+            return repl::OpTimeWith<std::vector<ShardType>>(_shards);
+        }
+
+        std::vector<CollectionType> getShardedCollections(OperationContext* opCtx,
+                                                          const DatabaseName& dbName,
+                                                          repl::ReadConcernLevel readConcernLevel,
+                                                          const BSONObj& sort) override {
+            return {};
+        }
+
+        std::vector<CollectionType> getCollections(OperationContext* opCtx,
+                                                   const DatabaseName& dbName,
+                                                   repl::ReadConcernLevel readConcernLevel,
+                                                   const BSONObj& sort) override {
+            return _colls;
+        }
+
+        std::pair<CollectionType, std::vector<IndexCatalogType>> getCollectionAndGlobalIndexes(
+            OperationContext* opCtx,
+            const NamespaceString& nss,
+            const repl::ReadConcernArgs& readConcern) {
+            return std::make_pair(CollectionType(), std::vector<IndexCatalogType>());
+        }
+
+        void setCollections(std::vector<CollectionType> colls) {
+            _colls = std::move(colls);
+        }
+
+    private:
+        const std::vector<ShardType> _shards;
+        std::vector<CollectionType> _colls;
+    };
+
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
+        return std::make_unique<StaticCatalogClient>(kShardList);
     }
 
     ChunkManager createChunkManagerForOriginalColl() {
@@ -206,13 +306,14 @@ public:
         auto rt = RoutingTableHistory::makeNew(kCrudNs,
                                                kCrudUUID,
                                                kOriginalShardKeyPattern,
+                                               false, /* unsplittable */
                                                nullptr,
                                                false,
                                                epoch,
                                                Timestamp(1, 1),
                                                boost::none /* timeseriesFields */,
-                                               boost::none,
-                                               boost::none /* chunkSizeBytes */,
+                                               boost::none /* reshardingFields */,
+
                                                false,
                                                chunks);
 
@@ -220,6 +321,27 @@ public:
                             DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
                             makeStandaloneRoutingTableHistory(std::move(rt)),
                             boost::none);
+    }
+
+    void loadCatalogCacheValues() {
+        _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(
+            DatabaseType(kAppliedToNs.dbName(), _cm->dbPrimary(), _cm->dbVersion()));
+        std::vector<ChunkType> chunks;
+        _cm->forEachChunk([&](const auto& chunk) {
+            chunks.emplace_back(
+                _cm->getUUID(), chunk.getRange(), chunk.getLastmod(), chunk.getShardId());
+            return true;
+        });
+        _mockCatalogCacheLoader->setCollectionRefreshValues(
+            kAppliedToNs,
+            CollectionType(kAppliedToNs,
+                           _cm->getVersion().epoch(),
+                           _cm->getVersion().getTimestamp(),
+                           Date_t::now(),
+                           kCrudUUID,
+                           kOriginalShardKeyPattern),
+            chunks,
+            boost::none);
     }
 
     repl::OplogEntry makeOplog(const repl::OpTime& opTime,
@@ -237,11 +359,11 @@ public:
                                const std::vector<StmtId>& statementIds) {
         ReshardingDonorOplogId id(opTime.getTimestamp(), opTime.getTimestamp());
         return {repl::DurableOplogEntry(opTime,
-                                        boost::none /* hash */,
                                         opType,
                                         kCrudNs,
                                         kCrudUUID,
                                         false /* fromMigrate */,
+                                        boost::none,  // checkExistenceForDiffInsert
                                         0 /* version */,
                                         obj1,
                                         obj2,
@@ -274,7 +396,7 @@ public:
     }
 
     const ChunkManager& chunkManager() {
-        return _cm.get();
+        return _cm.value();
     }
 
     const std::vector<NamespaceString>& stashCollections() {
@@ -314,20 +436,15 @@ protected:
         threadPoolOptions.threadNamePrefix = "TestReshardOplogApplication-";
         threadPoolOptions.poolName = "TestReshardOplogApplicationThreadPool";
         threadPoolOptions.onCreateThread = [](const std::string& threadName) {
-            Client::initThread(threadName.c_str());
+            Client::initThread(threadName, getGlobalServiceContext()->getService());
             auto* client = Client::getCurrent();
-            AuthorizationSession::get(*client)->grantInternalAuthorization(client);
-
-            {
-                stdx::lock_guard<Client> lk(*client);
-                client->setSystemOperationKillableByStepdown(lk);
-            }
+            AuthorizationSession::get(*client)->grantInternalAuthorization();
         };
 
         auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
         hookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(getServiceContext()));
 
-        auto executor = std::make_shared<executor::ThreadPoolTaskExecutor>(
+        auto executor = executor::ThreadPoolTaskExecutor::create(
             std::make_unique<ThreadPool>(std::move(threadPoolOptions)),
             executor::makeNetworkInterface(
                 "TestReshardOplogApplicationNetwork", nullptr, std::move(hookList)));
@@ -345,19 +462,31 @@ protected:
         }());
     }
 
-    static constexpr int kWriterPoolSize = 4;
-    const NamespaceString kOplogNs{"config.localReshardingOplogBuffer.xxx.yyy"};
-    const NamespaceString kCrudNs{"foo.bar"};
+    static constexpr size_t kWriterPoolSize = 4;
+    static constexpr size_t kApplierBatchTaskCount = kWriterPoolSize;
+
+    const NamespaceString kOplogNs =
+        NamespaceString::createNamespaceString_forTest("config.localReshardingOplogBuffer.xxx.yyy");
+    const NamespaceString kCrudNs = NamespaceString::createNamespaceString_forTest("foo.bar");
     const UUID kCrudUUID = UUID::gen();
-    const NamespaceString kAppliedToNs{"foo", "system.resharding.{}"_format(kCrudUUID.toString())};
-    const NamespaceString kStashNs{"foo", "{}.{}"_format(kCrudNs.coll(), kOplogNs.coll())};
-    const NamespaceString kOtherDonorStashNs{"foo", "{}.{}"_format("otherstash", "otheroplog")};
+    const NamespaceString kAppliedToNs = NamespaceString::createNamespaceString_forTest(
+        "foo", "system.resharding.{}"_format(kCrudUUID.toString()));
+    const NamespaceString kStashNs = NamespaceString::createNamespaceString_forTest(
+        "foo", "{}.{}"_format(kCrudNs.coll(), kOplogNs.coll()));
+    const NamespaceString kOtherDonorStashNs = NamespaceString::createNamespaceString_forTest(
+        "foo", "{}.{}"_format("otherstash", "otheroplog"));
     const std::vector<NamespaceString> kStashCollections{kStashNs, kOtherDonorStashNs};
     const ShardId kMyShardId{"shard1"};
     const ShardId kOtherShardId{"shard2"};
-    boost::optional<ChunkManager> _cm;
-
+    const std::vector<ShardType> kShardList = {ShardType(kMyShardId.toString(), "Host0:12345"),
+                                               ShardType(kOtherShardId.toString(), "Host1:12345")};
     const ReshardingSourceId _sourceId{UUID::gen(), kMyShardId};
+
+    service_context_test::ShardRoleOverride _shardRole;
+
+    boost::optional<ChunkManager> _cm;
+    std::shared_ptr<ShardServerCatalogCacheLoaderMock> _mockCatalogCacheLoader;
+
     std::unique_ptr<ReshardingMetrics> _metrics;
     std::unique_ptr<ReshardingOplogApplierMetrics> _applierMetrics;
 
@@ -372,6 +501,7 @@ TEST_F(ReshardingOplogApplierTest, NothingToIterate) {
     boost::optional<ReshardingOplogApplier> applier;
 
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -387,6 +517,7 @@ TEST_F(ReshardingOplogApplierTest, NothingToIterate) {
 }
 
 TEST_F(ReshardingOplogApplierTest, ApplyBasicCrud) {
+    loadCatalogCacheValues();
     std::deque<repl::OplogEntry> crudOps;
     crudOps.push_back(makeOplog(repl::OpTime(Timestamp(5, 3), 1),
                                 repl::OpTypeEnum::kInsert,
@@ -398,7 +529,8 @@ TEST_F(ReshardingOplogApplierTest, ApplyBasicCrud) {
                                 boost::none));
     crudOps.push_back(makeOplog(repl::OpTime(Timestamp(7, 3), 1),
                                 repl::OpTypeEnum::kUpdate,
-                                BSON("$set" << BSON("x" << 1)),
+                                update_oplog_entry::makeDeltaOplogEntry(
+                                    BSON(doc_diff::kUpdateSectionFieldName << BSON("x" << 1))),
                                 BSON("_id" << 2)));
     crudOps.push_back(makeOplog(repl::OpTime(Timestamp(8, 3), 1),
                                 repl::OpTypeEnum::kDelete,
@@ -408,6 +540,7 @@ TEST_F(ReshardingOplogApplierTest, ApplyBasicCrud) {
     auto iterator = std::make_unique<OplogIteratorMock>(std::move(crudOps), 2 /* batchSize */);
     boost::optional<ReshardingOplogApplier> applier;
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -454,6 +587,7 @@ TEST_F(ReshardingOplogApplierTest, CanceledApplyingBatch) {
     boost::optional<ReshardingOplogApplier> applier;
 
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -472,6 +606,8 @@ TEST_F(ReshardingOplogApplierTest, CanceledApplyingBatch) {
 }
 
 TEST_F(ReshardingOplogApplierTest, InsertTypeOplogAppliedInMultipleBatches) {
+    loadCatalogCacheValues();
+
     std::deque<repl::OplogEntry> crudOps;
 
     for (int x = 0; x < 20; x++) {
@@ -484,6 +620,7 @@ TEST_F(ReshardingOplogApplierTest, InsertTypeOplogAppliedInMultipleBatches) {
     auto iterator = std::make_unique<OplogIteratorMock>(std::move(crudOps), 3 /* batchSize */);
     boost::optional<ReshardingOplogApplier> applier;
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -512,6 +649,7 @@ TEST_F(ReshardingOplogApplierTest, InsertTypeOplogAppliedInMultipleBatches) {
 }
 
 TEST_F(ReshardingOplogApplierTest, ErrorDuringFirstBatchApply) {
+    loadCatalogCacheValues();
     std::deque<repl::OplogEntry> crudOps;
     crudOps.push_back(makeOplog(repl::OpTime(Timestamp(5, 3), 1),
                                 repl::OpTypeEnum::kInsert,
@@ -525,6 +663,7 @@ TEST_F(ReshardingOplogApplierTest, ErrorDuringFirstBatchApply) {
     auto iterator = std::make_unique<OplogIteratorMock>(std::move(crudOps), 4 /* batchSize */);
     boost::optional<ReshardingOplogApplier> applier;
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -536,7 +675,7 @@ TEST_F(ReshardingOplogApplierTest, ErrorDuringFirstBatchApply) {
     auto cancelToken = operationContext()->getCancellationToken();
     CancelableOperationContextFactory factory(cancelToken, getCancelableOpCtxExecutor());
     auto future = applier->run(getExecutor(), getExecutor(), cancelToken, factory);
-    ASSERT_EQ(future.getNoThrow(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(future.getNoThrow(), ErrorCodes::duplicateCodeForTest(4772600));
 
     DBDirectClient client(operationContext());
     auto doc = client.findOne(appliedToNs(), BSON("_id" << 1));
@@ -547,6 +686,7 @@ TEST_F(ReshardingOplogApplierTest, ErrorDuringFirstBatchApply) {
 }
 
 TEST_F(ReshardingOplogApplierTest, ErrorDuringSecondBatchApply) {
+    loadCatalogCacheValues();
     std::deque<repl::OplogEntry> crudOps;
     crudOps.push_back(makeOplog(repl::OpTime(Timestamp(5, 3), 1),
                                 repl::OpTypeEnum::kInsert,
@@ -568,6 +708,7 @@ TEST_F(ReshardingOplogApplierTest, ErrorDuringSecondBatchApply) {
     auto iterator = std::make_unique<OplogIteratorMock>(std::move(crudOps), 2 /* batchSize */);
     boost::optional<ReshardingOplogApplier> applier;
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -579,7 +720,7 @@ TEST_F(ReshardingOplogApplierTest, ErrorDuringSecondBatchApply) {
     auto cancelToken = operationContext()->getCancellationToken();
     CancelableOperationContextFactory factory(cancelToken, getCancelableOpCtxExecutor());
     auto future = applier->run(getExecutor(), getExecutor(), cancelToken, factory);
-    ASSERT_EQ(future.getNoThrow(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(future.getNoThrow(), ErrorCodes::duplicateCodeForTest(4772600));
 
     DBDirectClient client(operationContext());
     auto doc = client.findOne(appliedToNs(), BSON("_id" << 1));
@@ -610,6 +751,7 @@ TEST_F(ReshardingOplogApplierTest, ErrorWhileIteratingFirstOplog) {
 
     boost::optional<ReshardingOplogApplier> applier;
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -647,6 +789,7 @@ TEST_F(ReshardingOplogApplierTest, ErrorWhileIteratingFirstBatch) {
 
     boost::optional<ReshardingOplogApplier> applier;
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -669,6 +812,8 @@ TEST_F(ReshardingOplogApplierTest, ErrorWhileIteratingFirstBatch) {
 }
 
 TEST_F(ReshardingOplogApplierTest, ErrorWhileIteratingSecondBatch) {
+    loadCatalogCacheValues();
+
     std::deque<repl::OplogEntry> crudOps;
     crudOps.push_back(makeOplog(repl::OpTime(Timestamp(5, 3), 1),
                                 repl::OpTypeEnum::kInsert,
@@ -688,6 +833,7 @@ TEST_F(ReshardingOplogApplierTest, ErrorWhileIteratingSecondBatch) {
 
     boost::optional<ReshardingOplogApplier> applier;
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -728,6 +874,7 @@ TEST_F(ReshardingOplogApplierTest, ExecutorIsShutDown) {
     auto iterator = std::make_unique<OplogIteratorMock>(std::move(crudOps), 4 /* batchSize */);
     boost::optional<ReshardingOplogApplier> applier;
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -752,16 +899,17 @@ TEST_F(ReshardingOplogApplierTest, ExecutorIsShutDown) {
 }
 
 TEST_F(ReshardingOplogApplierTest, UnsupportedCommandOpsShouldError) {
+    loadCatalogCacheValues();
     std::deque<repl::OplogEntry> ops;
     ops.push_back(makeOplog(repl::OpTime(Timestamp(5, 3), 1),
                             repl::OpTypeEnum::kInsert,
                             BSON("_id" << 1),
                             boost::none));
-    ops.push_back(
-        makeOplog(repl::OpTime(Timestamp(6, 3), 1),
-                  repl::OpTypeEnum::kCommand,
-                  BSON("renameCollection" << appliedToNs().ns() << "to" << stashNs().ns()),
-                  boost::none));
+    ops.push_back(makeOplog(
+        repl::OpTime(Timestamp(6, 3), 1),
+        repl::OpTypeEnum::kCommand,
+        BSON("renameCollection" << appliedToNs().ns_forTest() << "to" << stashNs().ns_forTest()),
+        boost::none));
     ops.push_back(makeOplog(repl::OpTime(Timestamp(7, 3), 1),
                             repl::OpTypeEnum::kInsert,
                             BSON("_id" << 2),
@@ -770,6 +918,7 @@ TEST_F(ReshardingOplogApplierTest, UnsupportedCommandOpsShouldError) {
     auto iterator = std::make_unique<OplogIteratorMock>(std::move(ops), 1 /* batchSize */);
     boost::optional<ReshardingOplogApplier> applier;
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -801,12 +950,13 @@ TEST_F(ReshardingOplogApplierTest, DropSourceCollectionCmdShouldError) {
     std::deque<repl::OplogEntry> ops;
     ops.push_back(makeOplog(repl::OpTime(Timestamp(5, 3), 1),
                             repl::OpTypeEnum::kCommand,
-                            BSON("drop" << appliedToNs().ns()),
+                            BSON("drop" << appliedToNs().ns_forTest()),
                             boost::none));
 
     auto iterator = std::make_unique<OplogIteratorMock>(std::move(ops), 1 /* batchSize */);
     boost::optional<ReshardingOplogApplier> applier;
     applier.emplace(makeApplierEnv(),
+                    kApplierBatchTaskCount,
                     sourceId(),
                     oplogBufferNs(),
                     appliedToNs(),
@@ -825,6 +975,8 @@ TEST_F(ReshardingOplogApplierTest, DropSourceCollectionCmdShouldError) {
 }
 
 TEST_F(ReshardingOplogApplierTest, MetricsAreReported) {
+    loadCatalogCacheValues();
+
     // Compress the makeOplog syntax a little further for this special case.
     using OpT = repl::OpTypeEnum;
     auto easyOp = [this](auto ts, OpT opType, BSONObj obj1, boost::optional<BSONObj> obj2 = {}) {
@@ -834,11 +986,16 @@ TEST_F(ReshardingOplogApplierTest, MetricsAreReported) {
         std::deque<repl::OplogEntry>{
             easyOp(5, OpT::kDelete, BSON("_id" << 1)),
             easyOp(6, OpT::kInsert, BSON("_id" << 2)),
-            easyOp(7, OpT::kUpdate, BSON("$set" << BSON("x" << 1)), BSON("_id" << 2)),
+            easyOp(7,
+                   OpT::kUpdate,
+                   update_oplog_entry::makeDeltaOplogEntry(
+                       BSON(doc_diff::kUpdateSectionFieldName << BSON("x" << 1))),
+                   BSON("_id" << 2)),
             easyOp(8, OpT::kDelete, BSON("_id" << 1)),
             easyOp(9, OpT::kInsert, BSON("_id" << 3))},
         2);
     ReshardingOplogApplier applier(makeApplierEnv(),
+                                   4,
                                    sourceId(),
                                    oplogBufferNs(),
                                    appliedToNs(),

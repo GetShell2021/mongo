@@ -29,6 +29,22 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
+#include <memory>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/cancelable_operation_context.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/recipient_document_gen.h"
 #include "mongo/db/s/resharding/resharding_data_replication.h"
@@ -36,8 +52,20 @@
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_oplog_applier_metrics.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/s/shard_key_util.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/executor/scoped_task_executor.h"
+#include "mongo/s/resharding/common_types_gen.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/stdx/mutex.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -46,8 +74,8 @@ public:
     static constexpr StringData kServiceName = "ReshardingRecipientService"_sd;
 
     explicit ReshardingRecipientService(ServiceContext* serviceContext)
-        : PrimaryOnlyService(serviceContext) {}
-    ~ReshardingRecipientService() = default;
+        : PrimaryOnlyService(serviceContext), _serviceContext(serviceContext) {}
+    ~ReshardingRecipientService() override = default;
 
     class RecipientStateMachine;
 
@@ -76,6 +104,9 @@ public:
         OperationContext* opCtx) {
         return getAllInstances(opCtx);
     }
+
+private:
+    ServiceContext* _serviceContext;
 };
 
 /**
@@ -108,9 +139,10 @@ public:
         const ReshardingRecipientService* recipientService,
         const ReshardingRecipientDocument& recipientDoc,
         std::unique_ptr<RecipientStateMachineExternalState> externalState,
-        ReshardingDataReplicationFactory dataReplicationFactory);
+        ReshardingDataReplicationFactory dataReplicationFactory,
+        ServiceContext* serviceContext);
 
-    ~RecipientStateMachine() = default;
+    ~RecipientStateMachine() override = default;
 
     /**
      *  Runs up until the recipient is in state kStrictConsistency or encountered an error.
@@ -168,12 +200,18 @@ public:
         return *_metrics;
     }
 
+    ReshardingMetrics& getMetricsForTest() const {
+        invariant(_metrics);
+        return *_metrics;
+    }
+
     boost::optional<BSONObj> reportForCurrentOp(
         MongoProcessInterface::CurrentOpConnectionsMode,
         MongoProcessInterface::CurrentOpSessionsMode) noexcept override;
 
     void onReshardingFieldsChanges(OperationContext* opCtx,
-                                   const TypeCollectionReshardingFields& reshardingFields);
+                                   const TypeCollectionReshardingFields& reshardingFields,
+                                   bool noChunksToCopy);
 
     static void insertStateDocument(OperationContext* opCtx,
                                     const ReshardingRecipientDocument& recipientDoc);
@@ -189,7 +227,26 @@ public:
      */
     void abort(bool isUserCancelled);
 
+    void checkIfOptionsConflict(const BSONObj& stateDoc) const final {}
+
 private:
+    class CloningMetrics {
+    public:
+        void add(int64_t documentsCopied, int64_t bytesCopied);
+
+        int64_t getDocumentsCopied() const {
+            return _documentsCopied;
+        }
+
+        int64_t getBytesCopied() const {
+            return _bytesCopied;
+        }
+
+    private:
+        int64_t _documentsCopied = 0;
+        int64_t _bytesCopied = 0;
+    };
+
     /**
      * The work inside this function must be run regardless of any work on _scopedExecutor ever
      * running.
@@ -206,7 +263,12 @@ private:
     void _createTemporaryReshardingCollectionThenTransitionToCloning(
         const CancelableOperationContextFactory& factory);
 
-    ExecutorFuture<void> _cloneThenTransitionToApplying(
+    ExecutorFuture<void> _cloneThenTransitionToBuildingIndex(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancellationToken& abortToken,
+        const CancelableOperationContextFactory& factory);
+
+    ExecutorFuture<void> _buildIndexThenTransitionToApplying(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
         const CancellationToken& abortToken,
         const CancelableOperationContextFactory& factory);
@@ -227,6 +289,7 @@ private:
     void _transitionState(RecipientStateEnum newState,
                           const CancelableOperationContextFactory& factory);
 
+    // Transitions the on-disk and in-memory state to the state defined in 'newRecipientCtx'.
     void _transitionState(RecipientShardContext&& newRecipientCtx,
                           boost::optional<CloneDetails>&& cloneDetails,
                           boost::optional<mongo::Date_t> configStartTime,
@@ -237,13 +300,11 @@ private:
                                          boost::optional<mongo::Date_t> startConfigTxnCloneTime,
                                          const CancelableOperationContextFactory& factory);
 
-    void _transitionToCloning(const CancelableOperationContextFactory& factory);
-
     void _transitionToApplying(const CancelableOperationContextFactory& factory);
 
-    void _transitionToStrictConsistency(const CancelableOperationContextFactory& factory);
-
     void _transitionToError(Status abortReason, const CancelableOperationContextFactory& factory);
+
+    void _transitionToDone(bool aborted, const CancelableOperationContextFactory& factory);
 
     BSONObj _makeQueryForCoordinatorUpdate(const ShardId& shardId, RecipientStateEnum newState);
 
@@ -286,8 +347,17 @@ private:
     // Should only be called once per lifetime.
     CancellationToken _initAbortSource(const CancellationToken& stepdownToken);
 
+    // Get indexesToBuild and indexesBuilt from the index catalog, then save them in _metrics
+    void _tryFetchBuildIndexMetrics(OperationContext* opCtx);
+
+    // Return the total and per-donor number documents and bytes cloned if the numbers are available
+    // in the cloner resume data documents. Otherwise, return none.
+    boost::optional<CloningMetrics> _tryFetchCloningMetrics(OperationContext* opCtx);
+
     // The primary-only service instance corresponding to the recipient instance. Not owned.
     const ReshardingRecipientService* const _recipientService;
+
+    ServiceContext* _serviceContext;
 
     std::unique_ptr<ReshardingMetrics> _metrics;
     ReshardingApplierMetricsMap _applierMetricsMap;
@@ -296,6 +366,16 @@ private:
     // config.localReshardingOperations.recipient.
     const CommonReshardingMetadata _metadata;
     const Milliseconds _minimumOperationDuration;
+    const boost::optional<std::size_t> _oplogBatchTaskCount;
+    // Set to true if this recipient should skip cloning documents and fetching/applying oplog
+    // entries because it is not going to own any chunks for the collection after resharding.
+    const bool _skipCloningAndApplying;
+    // Set to true if this recipient should store the count of oplog entries fetched in a progress
+    // document and use this count instead of the fast count to recover metrics upon recovery
+    const bool _storeOplogFetcherProgress;
+    // Set to true if this recipient should run cloner aggregation without specifying a collection
+    // UUID to avoid errors in a scenario where the collection UUIDs are inconsistent among shards.
+    const OptionalBool _relaxed;
 
     // The in-memory representation of the mutable portion of the document in
     // config.localReshardingOperations.recipient.
@@ -320,7 +400,7 @@ private:
     SharedSemiFuture<void> _dataReplicationQuiesced;
 
     // Protects the state below
-    Mutex _mutex = MONGO_MAKE_LATCH("RecipientStateMachine::_mutex");
+    stdx::mutex _mutex;
 
     std::unique_ptr<ReshardingDataReplicationInterface> _dataReplication;
 

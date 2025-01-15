@@ -1,8 +1,11 @@
 // SERVER-38015 Test having many interactive transactions to ensure we don't hold on to too
 // many resources (like "write tickets") and don't prevent other operations from succeeding.
-// @tags: [uses_transactions]
-(function() {
-"use strict";
+//
+// @tags: [
+//   # The test runs commands that are not allowed with security token: endSession.
+//   not_allowed_with_signed_security_token,
+//   uses_transactions
+// ]
 
 const dbName = "test";
 const collName = "many_txns";
@@ -102,4 +105,3 @@ const getParamRes = db.adminCommand({getParameter: 1, transactionLifetimeLimitSe
 if (getParamRes.ok && elapsedTime < getParamRes.transactionLifetimeLimitSeconds)
     assert.eq(
         numAborted, 0, "should not get aborts when transactionLifetimeLimitSeconds not exceeded");
-}());

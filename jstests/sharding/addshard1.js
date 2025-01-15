@@ -1,7 +1,9 @@
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {
+    moveDatabaseAndUnshardedColls
+} from "jstests/sharding/libs/move_database_and_unsharded_coll_helper.js";
 
 var s = new ShardingTest({name: "add_shard1", shards: 1, useHostname: false});
 
@@ -22,13 +24,18 @@ var configDB = s.s.getDB('config');
 assert.eq(null, configDB.databases.findOne({_id: 'testDB'}));
 
 var newShard = "myShard";
-assert.commandWorked(s.admin.runCommand({addShard: rs1.getURL(), name: newShard, maxSize: 1024}));
+assert.commandWorked(s.admin.runCommand({addShard: rs1.getURL(), name: newShard}));
 
 assert.neq(null, configDB.databases.findOne({_id: 'testDB'}));
 
 var newShardDoc = configDB.shards.findOne({_id: newShard});
-assert.eq(1024, newShardDoc.maxSize);
 assert(newShardDoc.topologyTime instanceof Timestamp);
+
+// maxSize field is no longer supported
+var newShardMaxSize = "myShardMaxSize";
+assert.commandFailedWithCode(
+    s.admin.runCommand({addShard: rs1.getURL(), name: newShardMaxSize, maxSize: 1024}),
+    ErrorCodes.InvalidOptions);
 
 // a mongod with an existing database name should not be allowed to become a shard
 var rs2 = new ReplSetTest({name: "addshard1-2", nodes: 1});
@@ -60,7 +67,8 @@ assert.eq(s.normalize(s.config.databases.findOne({_id: "testDB"}).primary),
           "DB primary is wrong");
 
 var origShard = s.getNonPrimaries("testDB")[0];
-s.ensurePrimaryShard("testDB", origShard);
+moveDatabaseAndUnshardedColls(s.s.getDB("testDB"), origShard);
+
 assert.eq(s.normalize(s.config.databases.findOne({_id: "testDB"}).primary),
           origShard,
           "DB primary didn't move");
@@ -77,8 +85,6 @@ assert.eq(2,
           "wrong chunk number after splitting collection that existed before");
 assert.eq(numObjs, sdb1.foo.count(), "wrong count after splitting collection that existed before");
 
+s.stop();
 rs1.stopSet();
 rs2.stopSet();
-
-s.stop();
-})();

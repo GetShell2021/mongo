@@ -28,21 +28,33 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/s/resharding/resharding_txn_cloner.h"
-
+#include <absl/container/node_hash_map.h>
+#include <boost/cstdint.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
@@ -53,13 +65,30 @@
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_future_util.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
+#include "mongo/db/s/resharding/resharding_txn_cloner.h"
 #include "mongo/db/s/resharding/resharding_txn_cloner_progress_gen.h"
-#include "mongo/db/s/session_catalog_migration_destination.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/future_util.h"
+#include "mongo/util/intrusive_counter.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
@@ -74,22 +103,14 @@ std::unique_ptr<Pipeline, PipelineDeleter> ReshardingTxnCloner::makePipeline(
     std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
     const boost::optional<LogicalSessionId>& startAfter) {
     const auto& sourceNss = NamespaceString::kSessionTransactionsTableNamespace;
-    StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
+    StringMap<ResolvedNamespace> resolvedNamespaces;
     resolvedNamespaces[sourceNss.coll()] = {sourceNss, std::vector<BSONObj>{}};
-
-    auto expCtx = make_intrusive<ExpressionContext>(opCtx,
-                                                    boost::none, /* explain */
-                                                    false,       /* fromMongos */
-                                                    false,       /* needsMerge */
-                                                    false,       /* allowDiskUse */
-                                                    false,       /* bypassDocumentValidation */
-                                                    false,       /* isMapReduceCommand */
-                                                    sourceNss,
-                                                    boost::none, /* runtimeConstants */
-                                                    nullptr,     /* collator */
-                                                    std::move(mongoProcessInterface),
-                                                    std::move(resolvedNamespaces),
-                                                    boost::none /* collUUID */);
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx)
+                      .mongoProcessInterface(std::move(mongoProcessInterface))
+                      .ns(sourceNss)
+                      .resolvedNamespace(std::move(resolvedNamespaces))
+                      .build();
 
     Pipeline::SourceContainer stages;
 
@@ -125,16 +146,16 @@ std::unique_ptr<Pipeline, PipelineDeleter> ReshardingTxnCloner::_targetAggregati
     AggregateCommandRequest request(NamespaceString::kSessionTransactionsTableNamespace,
                                     pipeline.serializeToBson());
 
-    request.setReadConcern(BSON(repl::ReadConcernArgs::kLevelFieldName
-                                << repl::readConcernLevels::kSnapshotName
-                                << repl::ReadConcernArgs::kAtClusterTimeFieldName << _fetchTimestamp
-                                << repl::ReadConcernArgs::kAllowTransactionTableSnapshot << true));
+    request.setReadConcern(repl::ReadConcernArgs::snapshot(LogicalTime(_fetchTimestamp), true));
     request.setWriteConcern(WriteConcernOptions());
     request.setHint(BSON(SessionTxnRecord::kSessionIdFieldName << 1));
     request.setUnwrappedReadPref(ReadPreferenceSetting{ReadPreference::Nearest}.toContainingBSON());
 
     return sharded_agg_helpers::runPipelineDirectlyOnSingleShard(
-        pipeline.getContext(), std::move(request), _sourceId.getShardId());
+        pipeline.getContext(),
+        std::move(request),
+        _sourceId.getShardId(),
+        false /* requestQueryStatsFromRemotes */);
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter> ReshardingTxnCloner::_restartPipeline(
@@ -161,7 +182,8 @@ boost::optional<SessionTxnRecord> ReshardingTxnCloner::_getNextRecord(OperationC
     ON_BLOCK_EXIT([curOp] { curOp->done(); });
 
     auto doc = pipeline.getNext();
-    return doc ? SessionTxnRecord::parse({"resharding config.transactions cloning"}, doc->toBson())
+    return doc ? SessionTxnRecord::parse(IDLParserContext{"resharding config.transactions cloning"},
+                                         doc->toBson())
                : boost::optional<SessionTxnRecord>{};
 }
 
@@ -187,11 +209,18 @@ boost::optional<SharedSemiFuture<void>> ReshardingTxnCloner::doOneRecord(
 
     return resharding::data_copy::withSessionCheckedOut(
         opCtx, sessionId, txnNumber, boost::none /* stmtId */, [&] {
+            // If the TransactionParticipant is flagged as having an incomplete history, then the
+            // dead end sentinel is already present in the oplog.
+            if (TransactionParticipant::get(opCtx).hasIncompleteHistory()) {
+                return;
+            }
+
             resharding::data_copy::updateSessionRecord(opCtx,
                                                        TransactionParticipant::kDeadEndSentinel,
                                                        {kIncompleteHistoryStmtId},
                                                        boost::none /* preImageOpTime */,
-                                                       boost::none /* postImageOpTime */);
+                                                       boost::none /* postImageOpTime */,
+                                                       {});
         });
 }
 
@@ -303,8 +332,13 @@ SemiFuture<void> ReshardingTxnCloner::run(
         .onCompletion([chainCtx](Status status) {
             if (chainCtx->pipeline) {
                 // Guarantee the pipeline is always cleaned up - even upon cancellation.
-                auto client =
-                    cc().getServiceContext()->makeClient("ReshardingTxnClonerCleanupClient");
+                //
+                // TODO(SERVER-74658): Please revisit if this thread could be made killable.
+                auto client = cc().getServiceContext()
+                                  ->getService(ClusterRole::ShardServer)
+                                  ->makeClient("ReshardingTxnClonerCleanupClient",
+                                               Client::noSession(),
+                                               ClientOperationKillableByStepdown{false});
 
                 AlternativeClientRegion acr(client);
                 auto opCtx = cc().makeOperationContext();
@@ -328,7 +362,8 @@ std::unique_ptr<Pipeline, PipelineDeleter> createConfigTxnCloningPipelineForResh
     ReshardingSourceId sourceId(UUID::gen(), ShardId("dummyShardId"));
     ReshardingTxnCloner cloner(std::move(sourceId), fetchTimestamp);
 
-    return cloner.makePipeline(expCtx->opCtx, expCtx->mongoProcessInterface, startAfter);
+    return cloner.makePipeline(
+        expCtx->getOperationContext(), expCtx->getMongoProcessInterface(), startAfter);
 }
 
 }  // namespace mongo

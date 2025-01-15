@@ -7,15 +7,11 @@
  *   requires_fcv_52,
  * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
+import {ShardVersioningUtil} from "jstests/sharding/libs/shard_versioning_util.js";
 
-load('jstests/libs/fail_point_util.js');
-load('jstests/libs/parallel_shell_helpers.js');
-load("jstests/sharding/libs/find_chunks_util.js");
-load("jstests/sharding/libs/shard_versioning_util.js");
-
-const st = new ShardingTest({shards: 2, other: {chunkSize: 1, enableAutoSplit: false}});
+const st = new ShardingTest({shards: 2, other: {chunkSize: 1}});
 const configDB = st.s.getDB("config");
 const dbName = 'AllowMigrations';
 
@@ -98,20 +94,9 @@ const testBalancer = function(setAllowMigrations, collBSetNoBalanceParam) {
     setAllowMigrationsCmd(collB.getFullName(), setAllowMigrations);
 
     st.startBalancer();
-    assert.soon(() => {
-        st.awaitBalancerRound();
-        const shard0Chunks =
-            findChunksUtil
-                .findChunksByNs(configDB, collA.getFullName(), {shard: st.shard0.shardName})
-                .itcount();
-        const shard1Chunks =
-            findChunksUtil
-                .findChunksByNs(configDB, collA.getFullName(), {shard: st.shard1.shardName})
-                .itcount();
-        jsTestLog(`shard0 chunks ${shard0Chunks}, shard1 chunks ${shard1Chunks}`);
-        return shard0Chunks == 2 && shard1Chunks == 2;
-    }, `Balancer failed to balance ${collA.getFullName()}`, 1000 * 60 * 10);
+    st.awaitBalance(collAName, dbName);
     st.stopBalancer();
+    st.verifyCollectionIsBalanced(collA);
 
     const collABalanceStatus =
         assert.commandWorked(st.s.adminCommand({balancerCollectionStatus: collA.getFullName()}));
@@ -136,8 +121,6 @@ const testSetAllowMigrationsCommand = function() {
 
     assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
 
-    ShardVersioningUtil.assertCollectionVersionEquals(st.shard0, ns, Timestamp(1, 0));
-
     // Use setAllowMigrations to forbid migrations from happening
     setAllowMigrationsCmd(ns, false);
 
@@ -161,4 +144,3 @@ testBalancer(false /* setAllowMigrations */, {noBalance: true});
 testSetAllowMigrationsCommand();
 
 st.stop();
-})();

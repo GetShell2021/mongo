@@ -10,8 +10,8 @@
  * ]
  */
 
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {removeShard} from "jstests/sharding/libs/remove_shard_util.js";
 
 // TODO SERVER-50144 Remove this and allow orphan checking.
 // This test calls removeShard which can leave docs in config.rangeDeletions in state "pending",
@@ -24,7 +24,7 @@ const ns = dbName + "." + collName;
 const shardKeys = [-1, 1];
 
 // This number is chosen so that the chunks are considered 'large' as defined by
-// the MigrationChunkClonerSourceLegacy class. Currently, that class considers chunks containing
+// the MigrationChunkClonerSource class. Currently, that class considers chunks containing
 // more than the following number of documents as 'large':
 //    (13/10) * MaxChunkSize / avgRecSize (MaxChunkSize is 64MB by default)
 const numDocs = 10;
@@ -35,35 +35,13 @@ const bigDocSize = 16 * 1024 * 1024 - 4096;
 const bigDocPayload = "x".repeat(bigDocSize);
 
 let st = new ShardingTest({shards: 2});
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 jsTest.log("Sharding collection with one chunk on each shard.");
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {x: 0}}));
 assert.commandWorked(st.s.adminCommand({moveChunk: ns, find: {x: 1}, to: st.shard1.shardName}));
-
-function removeShardAndWait(shardName) {
-    const removeShardCmd = {removeShard: shardName};
-    const res = st.s.adminCommand(removeShardCmd);
-
-    assert.commandWorked(res);
-    assert(res.state === "started");
-
-    assert.soon(function() {
-        let res = st.s.adminCommand(removeShardCmd);
-        if (res.state === "completed") {
-            return true;
-        } else {
-            jsTest.log("Still waiting for shard removal to complete:");
-            printjson(res);
-            assert.commandWorked(st.s.adminCommand({clearJumboFlag: ns, find: {"x": 1}}));
-            return false;
-        }
-    });
-
-    jsTest.log("Shard removal complete.");
-}
 
 function assertDocsExist(shardKeys, numDocs, payloadSize) {
     shardKeys.forEach(key => {
@@ -94,8 +72,7 @@ assert.commandWorked(st.s.getDB("config").settings.update(
     {_id: "balancer"}, {$set: {attemptToBalanceJumboChunks: true}}, true));
 st.startBalancer();
 
-removeShardAndWait(st.shard1.shardName);
+removeShard(st, st.shard1.shardName);
 assertDocsExist(shardKeys, numDocs, bigDocSize);
 
 st.stop();
-})();

@@ -1,14 +1,12 @@
-'use strict';
+import {Cluster} from "jstests/concurrency/fsm_libs/cluster.js";
+import {parseConfig} from "jstests/concurrency/fsm_libs/parse_config.js";
+import {ThreadManager} from "jstests/concurrency/fsm_libs/thread_mgr.js";
+import {uniqueCollName, uniqueDBName} from "jstests/concurrency/fsm_utils/name_utils.js";
+import {ShardTransitionUtil} from "jstests/libs/shard_transition_util.js";
 
-load('jstests/concurrency/fsm_libs/assert.js');
-load('jstests/concurrency/fsm_libs/cluster.js');
-load('jstests/concurrency/fsm_libs/parse_config.js');
-load('jstests/concurrency/fsm_libs/thread_mgr.js');
-load('jstests/concurrency/fsm_utils/name_utils.js');  // for uniqueCollName and uniqueDBName
-
-var runner = (function() {
+export const runner = (function() {
     function validateExecutionMode(mode) {
-        var allowedKeys = ['composed', 'parallel', 'serial'];
+        var allowedKeys = ['parallel', 'serial'];
 
         Object.keys(mode).forEach(function(option) {
             assert.contains(option,
@@ -16,9 +14,6 @@ var runner = (function() {
                             'invalid option: ' + tojson(option) +
                                 '; valid options are: ' + tojson(allowedKeys));
         });
-
-        mode.composed = mode.composed || false;
-        assert.eq('boolean', typeof mode.composed);
 
         mode.parallel = mode.parallel || false;
         assert.eq('boolean', typeof mode.parallel);
@@ -43,17 +38,14 @@ var runner = (function() {
             'dbNamePrefix',
             'iterationMultiplier',
             'sessionOptions',
-            'stepdownFiles',
-            'threadMultiplier'
+            'actionFiles',
+            'threadMultiplier',
+            'tenantId',
         ];
 
-        if (mode.parallel || mode.composed) {
+        if (mode.parallel) {
             allowedKeys.push('numSubsets');
             allowedKeys.push('subsetSize');
-        }
-        if (mode.composed) {
-            allowedKeys.push('composeProb');
-            allowedKeys.push('iterations');
         }
 
         Object.keys(options).forEach(function(option) {
@@ -80,12 +72,6 @@ var runner = (function() {
             assert.gt(options.iterations, 0);
         }
 
-        if (typeof options.composeProb !== 'undefined') {
-            assert.eq('number', typeof options.composeProb);
-            assert.gt(options.composeProb, 0);
-            assert.lte(options.composeProb, 1);
-        }
-
         if (typeof options.dbNamePrefix !== 'undefined') {
             assert.eq(
                 'string', typeof options.dbNamePrefix, 'expected dbNamePrefix to be a string');
@@ -98,18 +84,18 @@ var runner = (function() {
                    1,
                    'expected iterationMultiplier to be greater than or equal to 1');
 
-        if (typeof options.stepdownFiles !== 'undefined') {
+        if (typeof options.actionFiles !== 'undefined') {
             assert.eq('string',
-                      typeof options.stepdownFiles.permitted,
-                      'expected stepdownFiles.permitted to be a string');
+                      typeof options.actionFiles.permitted,
+                      'expected actionFiles.permitted to be a string');
 
             assert.eq('string',
-                      typeof options.stepdownFiles.idleRequest,
-                      'expected stepdownFiles.idleRequest to be a string');
+                      typeof options.actionFiles.idleRequest,
+                      'expected actionFiles.idleRequest to be a string');
 
             assert.eq('string',
-                      typeof options.stepdownFiles.idleAck,
-                      'expected stepdownFiles.idleAck to be a string');
+                      typeof options.actionFiles.idleAck,
+                      'expected actionFiles.idleAck to be a string');
         }
 
         options.threadMultiplier = options.threadMultiplier || 1;
@@ -231,9 +217,25 @@ var runner = (function() {
                 myDB[collName].drop();
 
                 if (cluster.isSharded()) {
-                    var shardKey = context[workload].config.data.shardKey || {_id: 'hashed'};
-                    // TODO: allow workload config data to specify split
-                    cluster.shardCollection(myDB[collName], shardKey, false);
+                    // If the suite specifies shardCollection probability, only shard this
+                    // collection with that probability unless the workload expects it to be sharded
+                    // (i.e. specified a custom shard key).
+                    const shouldShard =
+                        (typeof context[workload].config.data.shardKey !== "undefined") ||
+                        (typeof TestData.shardCollectionProbability == "undefined") ||
+                        (Math.random() < TestData.shardCollectionProbability);
+                    print("Preparing test collection " + tojsononeline({
+                              dbName,
+                              collName,
+                              customShardKey: context[workload].config.data.shardKey,
+                              shardCollectionProbability: TestData.shardCollectionProbability,
+                              shouldShard,
+                          }));
+                    if (shouldShard) {
+                        var shardKey = context[workload].config.data.shardKey || {_id: "hashed"};
+                        // TODO: allow workload config data to specify split
+                        cluster.shardCollection(myDB[collName], shardKey, false);
+                    }
                 }
             }
 
@@ -372,8 +374,16 @@ var runner = (function() {
         var myDB = context[workload].db;
         var collName = context[workload].collName;
 
-        var config = context[workload].config;
-        config.setup.call(config.data, myDB, collName, cluster);
+        const fn = () => {
+            var config = context[workload].config;
+            config.setup.call(config.data, myDB, collName, cluster);
+        };
+
+        if (TestData.shardsAddedRemoved) {
+            ShardTransitionUtil.retryOnShardTransitionErrors(fn);
+        } else {
+            fn();
+        }
     }
 
     function teardownWorkload(workload, context, cluster) {
@@ -400,16 +410,17 @@ var runner = (function() {
             config.data, 'threadCount', {enumerable: true, value: config.threadCount});
     }
 
-    function loadWorkloadContext(workloads, context, executionOptions, applyMultipliers) {
-        workloads.forEach(function(workload) {
-            load(workload);  // for $config
+    async function loadWorkloadContext(workloads, context, executionOptions, applyMultipliers) {
+        for (const workload of workloads) {
+            print(`Loading FSM workload: ${workload}`);
+            const {$config} = await import(workload);
             assert.neq('undefined', typeof $config, '$config was not defined by ' + workload);
             context[workload] = {config: parseConfig($config)};
             if (applyMultipliers) {
                 context[workload].config.iterations *= executionOptions.iterationMultiplier;
                 context[workload].config.threadCount *= executionOptions.threadMultiplier;
             }
-        });
+        }
     }
 
     function printWorkloadSchedule(schedule) {
@@ -460,31 +471,6 @@ var runner = (function() {
         return true;
     }
 
-    function recordConfigServerData(cluster, workloads, configServerData, errors) {
-        const CONFIG_DATA_LENGTH = 3;
-
-        if (cluster.isSharded()) {
-            var newData;
-            try {
-                newData = cluster.recordAllConfigServerData();
-            } catch (e) {
-                var failureType = 'Config Server Data Collection';
-                errors.push(new WorkloadFailure(e.toString(), e.stack, 'main', failureType));
-                return;
-            }
-
-            newData.previousWorkloads = workloads;
-            newData.time = (new Date()).toISOString();
-            configServerData.push(newData);
-
-            // Limit the amount of data recorded to avoid logging too much info when a test
-            // fails.
-            while (configServerData.length > CONFIG_DATA_LENGTH) {
-                configServerData.shift();
-            }
-        }
-    }
-
     function runWorkloadGroup(threadMgr,
                               workloads,
                               context,
@@ -495,7 +481,6 @@ var runner = (function() {
                               errors,
                               maxAllowedThreads,
                               dbHashDenylist,
-                              configServerData,
                               cleanupOptions) {
         var cleanup = [];
         var teardownFailed = false;
@@ -574,8 +559,6 @@ var runner = (function() {
 
             totalTime = Date.now() - startTime;
             jsTest.log('Workload(s) completed in ' + totalTime + ' ms: ' + workloads.join(' '));
-
-            recordConfigServerData(cluster, workloads, configServerData, errors);
         }
 
         // Only drop the collections/databases if all the workloads ran successfully.
@@ -591,7 +574,7 @@ var runner = (function() {
                                             'after workload-group teardown and data clean-up');
     }
 
-    function runWorkloads(
+    async function runWorkloads(
         workloads, clusterOptions, executionMode, executionOptions, cleanupOptions) {
         assert.gt(workloads.length, 0, 'need at least one workload to run');
 
@@ -604,31 +587,12 @@ var runner = (function() {
         validateCleanupOptions(cleanupOptions);
         Object.freeze(cleanupOptions);  // immutable after validation (and normalization)
 
-        if (executionMode.composed) {
-            clusterOptions.sameDB = true;
-            clusterOptions.sameCollection = true;
-        }
-
-        // Determine how strong to make assertions while simultaneously executing
-        // different workloads.
-        var assertLevel = AssertLevel.OWN_DB;
-        if (clusterOptions.sameDB) {
-            // The database is shared by multiple workloads, so only make the asserts
-            // that apply when the collection is owned by an individual workload.
-            assertLevel = AssertLevel.OWN_COLL;
-        }
-        if (clusterOptions.sameCollection) {
-            // The collection is shared by multiple workloads, so only make the asserts
-            // that always apply.
-            assertLevel = AssertLevel.ALWAYS;
-        }
-        globalAssertLevel = assertLevel;
-
         var context = {};
-        loadWorkloadContext(workloads, context, executionOptions, true /* applyMultipliers */);
-        var threadMgr = new ThreadManager(clusterOptions, executionMode);
+        await loadWorkloadContext(
+            workloads, context, executionOptions, true /* applyMultipliers */);
+        var threadMgr = new ThreadManager(clusterOptions);
 
-        var cluster = new Cluster(clusterOptions);
+        var cluster = new Cluster(clusterOptions, executionOptions.sessionOptions);
         cluster.setup();
 
         // Clean up the state left behind by other tests in the concurrency suite
@@ -651,7 +615,6 @@ var runner = (function() {
         var maxAllowedThreads = 100 * executionOptions.threadMultiplier;
         Random.setRandomSeed(clusterOptions.seed);
         var errors = [];
-        var configServerData = [];
 
         try {
             var schedule = scheduleWorkloads(workloads, executionMode, executionOptions);
@@ -679,13 +642,8 @@ var runner = (function() {
                                  errors,
                                  maxAllowedThreads,
                                  dbHashDenylist,
-                                 configServerData,
                                  cleanupOptions);
             });
-
-            if (cluster.isSharded() && errors.length) {
-                jsTest.log('Config Server Data:\n' + tojsononeline(configServerData));
-            }
 
             throwError(errors);
         } finally {
@@ -694,32 +652,24 @@ var runner = (function() {
     }
 
     return {
-        serial: function serial(workloads, clusterOptions, executionOptions, cleanupOptions) {
+        serial: async function serial(workloads, clusterOptions, executionOptions, cleanupOptions) {
             clusterOptions = clusterOptions || {};
             executionOptions = executionOptions || {};
             cleanupOptions = cleanupOptions || {};
 
-            runWorkloads(
+            await runWorkloads(
                 workloads, clusterOptions, {serial: true}, executionOptions, cleanupOptions);
         },
 
-        parallel: function parallel(workloads, clusterOptions, executionOptions, cleanupOptions) {
-            clusterOptions = clusterOptions || {};
-            executionOptions = executionOptions || {};
-            cleanupOptions = cleanupOptions || {};
+        parallel:
+            async function parallel(workloads, clusterOptions, executionOptions, cleanupOptions) {
+                clusterOptions = clusterOptions || {};
+                executionOptions = executionOptions || {};
+                cleanupOptions = cleanupOptions || {};
 
-            runWorkloads(
-                workloads, clusterOptions, {parallel: true}, executionOptions, cleanupOptions);
-        },
-
-        composed: function composed(workloads, clusterOptions, executionOptions, cleanupOptions) {
-            clusterOptions = clusterOptions || {};
-            executionOptions = executionOptions || {};
-            cleanupOptions = cleanupOptions || {};
-
-            runWorkloads(
-                workloads, clusterOptions, {composed: true}, executionOptions, cleanupOptions);
-        },
+                await runWorkloads(
+                    workloads, clusterOptions, {parallel: true}, executionOptions, cleanupOptions);
+            },
 
         internals: {
             validateExecutionOptions,
@@ -735,6 +685,5 @@ var runner = (function() {
     };
 })();
 
-var runWorkloadsSerially = runner.serial;
-var runWorkloadsInParallel = runner.parallel;
-var runCompositionOfWorkloads = runner.composed;
+export const runWorkloadsSerially = runner.serial;
+export const runWorkloadsInParallel = runner.parallel;

@@ -11,14 +11,13 @@
  *   requires_persistence,
  * ]
  */
-(function() {
-'use strict';
-load("jstests/replsets/rslib.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
 
 // Replica set nodes started with --shardsvr do not enable key generation until they are added
 // to a sharded cluster and reject commands with gossiped clusterTime from users without the
 // advanceClusterTime privilege. This causes ShardingTest setup to fail because the shell
-// briefly authenticates as __system and recieves clusterTime metadata then will fail trying to
+// briefly authenticates as __system and receives clusterTime metadata then will fail trying to
 // gossip that time later in setup.
 //
 
@@ -39,7 +38,16 @@ function doesRouteToSec(coll, query) {
 }
 
 var rsOpts = {oplogSize: 50};
-var st = new ShardingTest({shards: 1, rs: rsOpts, other: {keyFile: 'jstests/libs/key1'}});
+var st = new ShardingTest({
+    shards: 1,
+    rs: rsOpts,
+    other: {keyFile: 'jstests/libs/key1'},
+    // By default, our test infrastructure sets the election timeout to a very high value
+    // (24 hours). For this test, we need a shorter election timeout because it relies on
+    // nodes running an election when they do not detect an active primary. Therefore, we
+    // are setting the electionTimeoutMillis to its default value.
+    initiateWithDefaultElectionTimeout: true
+});
 
 var mongos = st.s;
 var replTest = st.rs0;
@@ -55,10 +63,13 @@ var nodeCount = replTest.nodes.length;
 var adminDB = mongos.getDB('admin');
 adminDB.createUser({user: 'user', pwd: 'password', roles: jsTest.adminUserRoles});
 adminDB.auth('user', 'password');
-var priAdminDB = replTest.getPrimary().getDB('admin');
-replTest.getPrimary().waitForClusterTime(60);
-priAdminDB.createUser({user: 'user', pwd: 'password', roles: jsTest.adminUserRoles},
-                      {w: 3, wtimeout: 30000});
+if (!TestData.configShard) {
+    // In config shard mode, creating this user above also created it on the first shard.
+    var priAdminDB = replTest.getPrimary().getDB('admin');
+    replTest.getPrimary().waitForClusterTime(60);
+    priAdminDB.createUser({user: 'user', pwd: 'password', roles: jsTest.adminUserRoles},
+                          {w: 3, wtimeout: 30000});
+}
 
 coll.drop();
 coll.setSecondaryOk();
@@ -115,4 +126,3 @@ priAdminDB.auth('user', 'password');
 priAdminDB.dropUser('user');
 
 st.stop();
-})();

@@ -1,5 +1,3 @@
-'use strict';
-
 /**
  * Provides wrapper functions that perform exponential backoff and allow for
  * acceptable errors to be returned from mergeChunks, moveChunk, and splitChunk
@@ -10,10 +8,14 @@
  * Intended for use by workloads testing sharding (i.e., workloads starting with 'sharded_').
  */
 
-load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongos & isMongod
-load("jstests/sharding/libs/find_chunks_util.js");
+import {
+    isMongod,
+    isMongodConfigsvr,
+    isMongos
+} from "jstests/concurrency/fsm_workload_helpers/server_types.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
-var ChunkHelper = (function() {
+export var ChunkHelper = (function() {
     // exponential backoff
     function getNextBackoffSleep(curSleep) {
         const MAX_BACKOFF_SLEEP = 5000;  // milliseconds
@@ -45,7 +47,7 @@ var ChunkHelper = (function() {
             }
 
             // Throw an exception if the command errored for any other reason.
-            assertWhenOwnColl.commandWorked(res, cmd);
+            assert.commandWorked(res, cmd);
         }
 
         return res;
@@ -85,6 +87,11 @@ var ChunkHelper = (function() {
 
         const runningWithStepdowns =
             TestData.runningWithConfigStepdowns || TestData.runningWithShardStepdowns;
+        const isSlowBuild = () => {
+            // Consider this a slow build on TSAN or if we're fuzzing mongod configs, which
+            // can intentionally slow the server.
+            return TestData.fuzzMongodConfigs || db.getServerBuildInfo().isThreadSanitizerActive();
+        };
 
         return runCommandWithRetries(
             db,
@@ -94,8 +101,8 @@ var ChunkHelper = (function() {
                     res.code === ErrorCodes.LockTimeout ||
                     // The chunk migration has surely been aborted if the startCommit of the
                     // procedure was interrupted by a stepdown.
-                    (runningWithStepdowns && res.code === ErrorCodes.CommandFailed &&
-                     res.errmsg.includes("startCommit")) ||
+                    ((runningWithStepdowns || isSlowBuild()) &&
+                     res.code === ErrorCodes.CommandFailed && res.errmsg.includes("startCommit")) ||
                     // The chunk migration has surely been aborted if the recipient shard didn't
                     // believe there was an active chunk migration.
                     (runningWithStepdowns && res.code === ErrorCodes.OperationFailed &&
@@ -107,7 +114,11 @@ var ChunkHelper = (function() {
                     // A stepdown may cause the collection's lock to become temporarily unreleasable
                     // and cause the chunk migration to timeout.  The migration may still succeed
                     // after the lock's lease expires.
-                    (runningWithStepdowns && res.code === ErrorCodes.LockBusy)));
+                    (runningWithStepdowns && res.code === ErrorCodes.LockBusy) ||
+                    // Slow builds can result in a failure when waiting for write concern in certain
+                    // migration phases.
+                    (isSlowBuild() && res.code === ErrorCodes.OperationFailed &&
+                     res.errmsg.includes("WriteConcernTimeout"))));
     }
 
     function mergeChunks(db, collName, bounds) {
@@ -120,14 +131,14 @@ var ChunkHelper = (function() {
     // to any node in the set for which isWritablePrimary is true.
     function getPrimary(connArr) {
         const kDefaultTimeoutMS = 10 * 60 * 1000;  // 10 minutes.
-        assertAlways(Array.isArray(connArr), 'Expected an array but got ' + tojson(connArr));
+        assert(Array.isArray(connArr), 'Expected an array but got ' + tojson(connArr));
 
         let primary = null;
         assert.soon(() => {
             for (let conn of connArr) {
                 assert(isMongod(conn.getDB('admin')), tojson(conn) + ' is not to a mongod');
                 let res = conn.adminCommand({hello: 1});
-                assertAlways.commandWorked(res);
+                assert.commandWorked(res);
 
                 if (res.isWritablePrimary) {
                     primary = conn;
@@ -142,7 +153,7 @@ var ChunkHelper = (function() {
     // Take a set of mongos connections to a sharded cluster and return a
     // random connection.
     function getRandomMongos(connArr) {
-        assertAlways(Array.isArray(connArr), 'Expected an array but got ' + tojson(connArr));
+        assert(Array.isArray(connArr), 'Expected an array but got ' + tojson(connArr));
         var conn = connArr[Random.randInt(connArr.length)];
         assert(isMongos(conn.getDB('admin')), tojson(conn) + ' is not to a mongos');
         return conn;
@@ -154,7 +165,7 @@ var ChunkHelper = (function() {
         assert(isMongos(conn.getDB('admin')), tojson(conn) + ' is not to a mongos');
         var adminDB = conn.getDB('admin');
         var shardVersion = adminDB.runCommand({getShardVersion: collName, fullMetadata: true});
-        assertAlways.commandWorked(shardVersion);
+        assert.commandWorked(shardVersion);
         // As noted in SERVER-20768, doing a range query with { $lt : X },  where
         // X is the _upper bound_ of a chunk,  incorrectly targets the shard whose
         // _lower bound_ is X. Therefore, if upper !== MaxKey, we use a workaround
@@ -166,8 +177,8 @@ var ChunkHelper = (function() {
             query = {$and: [{_id: {$gte: lower}}, {_id: {$lte: upper - 1}}]};
         }
         var res = conn.getCollection(collName).find(query).explain();
-        assertAlways.commandWorked(res);
-        assertAlways.gt(
+        assert.commandWorked(res);
+        assert.gt(
             res.queryPlanner.winningPlan.shards.length, 0, 'Explain did not have shards key.');
 
         var shards = res.queryPlanner.winningPlan.shards.map(shard => shard.shardName);

@@ -8,13 +8,20 @@ if ((typeof DBCollection) == "undefined") {
         this._db = db;
         this._shortName = shortName;
         this._fullName = fullName;
-
         this.verify();
     };
 }
 
-DBCollection.prototype.compact = function() {
-    return this._db.getMongo().compact(this._fullName);
+DBCollection.prototype.compact = function(extra = {}) {
+    return this._db.getMongo().compact(this._fullName, extra);
+};
+
+DBCollection.prototype.cleanup = function(extra = {}) {
+    return this._db.getMongo().cleanup(this._fullName, extra);
+};
+
+DBCollection.prototype._getCompactionTokens = function() {
+    return this._db.getMongo()._getCompactionTokens(this._fullName);
 };
 
 DBCollection.prototype.verify = function() {
@@ -39,6 +46,9 @@ DBCollection.prototype.help = function() {
     print(
         "\tdb." + shortName +
         ".bulkWrite( operations, <optional params> ) - bulk execute write operations, optional parameters are: w, wtimeout, j");
+    print(
+        "\tdb." + shortName +
+        ".checkMetadataConsistency() - return metadata inconsistency information found in the collection.");
     print(
         "\tdb." + shortName +
         ".count( query = {}, <optional params> ) - count the number of documents that matches the query, optional parameters are: limit, skip, hint, maxTimeMS");
@@ -138,9 +148,12 @@ DBCollection.prototype.help = function() {
     print("\tdb." + shortName + ".getShardVersion() - only for use with sharding");
     print("\tdb." + shortName +
           ".getShardDistribution() - prints statistics about data distribution in the cluster");
+    print("\tdb." + shortName + ".getShardKey() - prints the shard key for this collection");
     print(
         "\tdb." + shortName +
         ".getSplitKeysForChunks( <maxChunkSize> ) - calculates split points over all chunks and returns splitter function");
+    print("\tdb." + shortName + ".disableBalancing() - disables the balancer for this collection");
+    print("\tdb." + shortName + ".enableBalancing() - enables the balancer for this collection");
     print(
         "\tdb." + shortName +
         ".getWriteConcern() - returns the write concern used for any operations on this collection, inherited from server/db if set");
@@ -152,6 +165,8 @@ DBCollection.prototype.help = function() {
         ".unsetWriteConcern( <write concern doc> ) - unsets the write concern for writes to the collection");
     print("\tdb." + shortName +
           ".latencyStats() - display operation latency histograms for this collection");
+    print("\tdb." + shortName + ".disableAutoMerger() - disable auto-merging on this collection");
+    print("\tdb." + shortName + ".enableAutoMerger() - enable auto-merge on this collection");
     return __magicNoPrint;
 };
 
@@ -219,7 +234,7 @@ DBCollection.prototype._massageObject = function(q) {
     throw Error("don't know how to massage : " + type);
 };
 
-DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, options) {
+DBCollection.prototype.find = function(filter, projection, limit, skip, batchSize, options) {
     // Verify that API version parameters are not supplied via the shell helper.
     assert.noAPIParams(options);
 
@@ -227,8 +242,8 @@ DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, op
                              this._db,
                              this,
                              this._fullName,
-                             this._massageObject(query),
-                             fields,
+                             this._massageObject(filter),
+                             projection,
                              limit,
                              skip,
                              batchSize,
@@ -244,8 +259,7 @@ DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, op
 
         const client = session._getSessionAwareClient();
         const readConcern = client.getReadConcern(session);
-        if (readConcern !== null &&
-            client.canUseReadConcern(session, cursor._convertToCommand(true))) {
+        if (readConcern !== null && client.canUseReadConcern(session, cursor._convertToCommand())) {
             cursor.readConcern(readConcern.level);
         }
     }
@@ -253,8 +267,9 @@ DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, op
     return cursor;
 };
 
-DBCollection.prototype.findOne = function(query, fields, options, readConcern, collation) {
-    var cursor = this.find(query, fields, -1 /* limit */, 0 /* skip*/, 0 /* batchSize */, options);
+DBCollection.prototype.findOne = function(filter, projection, options, readConcern, collation) {
+    var cursor =
+        this.find(filter, projection, -1 /* limit */, 0 /* skip*/, 0 /* batchSize */, options);
 
     if (readConcern) {
         cursor = cursor.readConcern(readConcern);
@@ -447,6 +462,10 @@ DBCollection.prototype._parseUpdate = function(query, updateSpec, upsert, multi)
         arrayFilters = opts.arrayFilters;
         hint = opts.hint;
         letParams = opts.let;
+        if (opts.sort) {
+            throw new Error(
+                "This sort will not do anything. Please call update without a sort or defer to calling updateOne with a sort.");
+        }
     }
 
     // Normalize 'upsert' and 'multi' to booleans.
@@ -533,8 +552,8 @@ DBCollection.prototype.save = function(obj, opts) {
     if (obj == null)
         throw Error("can't save a null");
 
-    if (typeof (obj) == "number" || typeof (obj) == "string")
-        throw Error("can't save a number or string");
+    if (typeof (obj) == "number" || typeof (obj) == "string" || Array.isArray(obj))
+        throw Error("can't save a number, a string or an array");
 
     if (typeof (obj._id) == "undefined") {
         obj._id = new ObjectId();
@@ -650,7 +669,7 @@ DBCollection.prototype.dropIndexes = function(indexNames) {
 
 DBCollection.prototype.drop = function(options = {}) {
     const cmdObj = Object.assign({drop: this.getName()}, options);
-    ret = this._db.runCommand(cmdObj);
+    const ret = this._db.runCommand(cmdObj);
     if (!ret.ok) {
         if (ret.errmsg == "ns not found")
             return false;
@@ -1005,7 +1024,7 @@ DBCollection.prototype.mapReduce = function(map, reduce, optionsOrOutString) {
     }
 
     if (!output.ok) {
-        __mrerror__ = output;
+        __mrerror__ = output;  // eslint-disable-line
         throw _getErrorWithCode(output, "map reduce failed:" + tojson(output));
     }
     return output;
@@ -1113,6 +1132,19 @@ DBCollection.prototype.getShardDistribution = function() {
     }
 
     print("\n");
+};
+
+/**
+ * Prints shard key for this collection
+ */
+DBCollection.prototype.getShardKey = function() {
+    if (!this._isSharded()) {
+        throw Error("Collection " + this + " is not sharded.");
+    }
+
+    var config = this.getDB().getSiblingDB("config");
+    const coll = config.collections.findOne({_id: this._fullName});
+    return coll.key;
 };
 
 /*
@@ -1231,6 +1263,61 @@ DBCollection.prototype.getSplitKeysForChunks = function(chunkSize) {
     return splitFunction;
 };
 
+/**
+ * Enable balancing for this collection. Uses the configureCollectionBalancing command
+ * with the noBalance paramater if FCV >= 8.1 and directly writes to config.collections if FCV
+ * < 8.1.
+ * TODO: SERVER-94845 remove FCV check when 9.0 becomes the last LTS
+ */
+DBCollection.prototype.enableBalancing = function() {
+    if (!this._isSharded()) {
+        throw Error("Collection " + this + " is not sharded.");
+    }
+
+    var adminDb = this.getDB().getSiblingDB("admin");
+    const fcvDoc = adminDb.runCommand({
+        getParameter: 1,
+        featureCompatibilityVersion: 1,
+    });
+    if (MongoRunner.compareBinVersions(
+            fcvDoc.featureCompatibilityVersion.version,
+            "8.1",
+            ) >= 0) {
+        return adminDb.runCommand({configureCollectionBalancing: this._fullName, noBalance: false});
+    } else {
+        var configDb = this.getDB().getSiblingDB("config");
+        return assert.commandWorked(
+            configDb.collections.update({_id: this._fullName}, {$set: {"noBalance": false}}));
+    }
+};
+
+/**
+ * Disable balancing for this collection. Uses the configureCollectionBalancing command
+ * with the noBalance paramater if FCV >= 8.1 and directly writes to config.collections if FCV
+ * < 8.1.
+ * TODO: SERVER-94845 remove FCV check when 9.0 becomes the last LTS
+ */
+DBCollection.prototype.disableBalancing = function() {
+    if (!this._isSharded()) {
+        throw Error("Collection " + this + " is not sharded.");
+    }
+    var adminDb = this.getDB().getSiblingDB("admin");
+    const fcvDoc = adminDb.runCommand({
+        getParameter: 1,
+        featureCompatibilityVersion: 1,
+    });
+    if (MongoRunner.compareBinVersions(
+            fcvDoc.featureCompatibilityVersion.version,
+            "8.1",
+            ) >= 0) {
+        return adminDb.runCommand({configureCollectionBalancing: this._fullName, noBalance: true});
+    } else {
+        var configDb = this.getDB().getSiblingDB("config");
+        return assert.commandWorked(
+            configDb.collections.update({_id: this._fullName}, {$set: {"noBalance": true}}));
+    }
+};
+
 DBCollection.prototype.setSlaveOk = function(value) {
     print(
         "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
@@ -1289,6 +1376,22 @@ DBCollection.prototype.getWriteConcern = function() {
 
 DBCollection.prototype.unsetWriteConcern = function() {
     delete this._writeConcern;
+};
+
+/**
+ * disable auto-merging on this collection
+ */
+DBCollection.prototype.disableAutoMerger = function() {
+    return this._db._adminCommand(
+        {configureCollectionBalancing: this._fullName, enableAutoMerger: false});
+};
+
+/**
+ * enable auto-merge on this collection
+ */
+DBCollection.prototype.enableAutoMerger = function() {
+    return this._db._adminCommand(
+        {configureCollectionBalancing: this._fullName, enableAutoMerger: true});
 };
 
 //
@@ -1443,6 +1546,10 @@ DBCollection.prototype.distinct = function(keyString, query, options) {
         cmd.collation = opts.collation;
     }
 
+    if (opts.hint) {
+        cmd.hint = opts.hint;
+    }
+
     // Execute distinct command
     var res = this.runReadCommand(cmd);
     if (!res.ok) {
@@ -1464,10 +1571,16 @@ DBCollection.prototype.latencyStats = function(options) {
 DBCollection.prototype.watch = function(pipeline, options) {
     pipeline = pipeline || [];
     assert(pipeline instanceof Array, "'pipeline' argument must be an array");
-    let changeStreamStage;
-    [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
-    pipeline.unshift(changeStreamStage);
-    return this.aggregate(pipeline, aggOptions);
+    const [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
+    return this.aggregate([changeStreamStage, ...pipeline], aggOptions);
+};
+
+DBCollection.prototype.checkMetadataConsistency = function(options = {}) {
+    assert(options instanceof Object,
+           `'options' parameter expected to be type object but found: ${typeof options}`);
+    const res = assert.commandWorked(
+        this._db.runCommand(Object.extend({checkMetadataConsistency: this.getName()}, options)));
+    return new DBCommandCursor(this._db, res);
 };
 
 /**
@@ -1476,7 +1589,7 @@ DBCollection.prototype.watch = function(pipeline, options) {
  * Proxy for planCache* commands.
  */
 if ((typeof PlanCache) == "undefined") {
-    PlanCache = function(collection) {
+    globalThis.PlanCache = function(collection) {
         this._collection = collection;
     };
 }

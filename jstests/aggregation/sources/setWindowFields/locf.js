@@ -5,17 +5,7 @@
  *   requires_fcv_52,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/window_function_helpers.js");
-load("jstests/aggregation/extras/utils.js");  // For arrayEq.
-load("jstests/libs/feature_flag_util.js");    // For isEnabled.
-
-if (!FeatureFlagUtil.isEnabled(db, "Locf")) {
-    jsTestLog("Skipping as featureFlagLocf is not enabled");
-    return;
-}
+import {assertArrayEq} from "jstests/aggregation/extras/utils.js";
 
 const coll = db[jsTestName()];
 coll.drop();
@@ -158,4 +148,3 @@ result = coll.aggregate([{
              .toArray();
 
 assertArrayEq({actual: result, expected: expected});
-})();

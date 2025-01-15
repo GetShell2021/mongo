@@ -27,29 +27,36 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
+#include <cstddef>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <vector>
 
-#include "mongo/db/client.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/dbtests/dbtests.h"  // IWYU pragma: keep
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/base64.h"
+#include "mongo/util/debug_util.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/queue.h"
 #include "mongo/util/str.h"
-#include "mongo/util/text.h"
+#include "mongo/util/text.h"  // IWYU pragma: keep
 #include "mongo/util/timer.h"
 
+namespace mongo {
 namespace BasicTests {
 
 using std::cout;
 using std::dec;
 using std::endl;
 using std::hex;
-using std::shared_ptr;
 using std::string;
 using std::stringstream;
-using std::unique_ptr;
 using std::vector;
 
 class RarelyTest {
@@ -159,7 +166,7 @@ public:
 };
 
 class simple1 : public Base {
-    void pop() {
+    void pop() override {
         SBTGB(1);
         SBTGB("yo");
         SBTGB(2);
@@ -167,7 +174,7 @@ class simple1 : public Base {
 };
 
 class simple2 : public Base {
-    void pop() {
+    void pop() override {
         SBTGB(1);
         SBTGB("yo");
         SBTGB(2);
@@ -331,11 +338,11 @@ public:
     }
 };
 
-class All : public OldStyleSuiteSpecification {
+class All : public unittest::OldStyleSuiteSpecification {
 public:
     All() : OldStyleSuiteSpecification("basic") {}
 
-    void setupTests() {
+    void setupTests() override {
         add<RarelyTest>();
         add<Base64Tests>();
 
@@ -357,6 +364,7 @@ public:
     }
 };
 
-OldStyleSuiteInitializer<All> myall;
+unittest::OldStyleSuiteInitializer<All> myall;
 
 }  // namespace BasicTests
+}  // namespace mongo

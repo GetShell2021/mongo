@@ -26,9 +26,9 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef COMPONENT_H
-#define COMPONENT_H
+#pragma once
 
+#include <chrono>
 #include <string>
 
 #include "src/main/configuration.h"
@@ -39,7 +39,7 @@ namespace test_harness {
  * the following order: load, run, end_run, finish.
  */
 class component {
-    public:
+public:
     component(const std::string &name, configuration *config);
     virtual ~component();
 
@@ -69,7 +69,7 @@ class component {
      * do_work is called every X seconds as defined by the sleep time. Generally most components
      * should do their "operation" in the do_work function.
      */
-    virtual void do_work();
+    virtual void do_work() = 0;
 
     /* Gets the value of the _enabled variable. */
     bool enabled() const;
@@ -81,14 +81,11 @@ class component {
      */
     virtual void finish();
 
-    protected:
+protected:
     bool _enabled = false;
     volatile bool _running = false;
-    uint64_t _sleep_time_ms = 1000;
+    std::chrono::milliseconds _sleep_time_ms;
     configuration *_config;
-
-    private:
     std::string _name;
 };
 } // namespace test_harness
-#endif

@@ -28,66 +28,147 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <string>
 
-#include "mongo/db/commands/set_cluster_parameter_invocation.h"
+#include <boost/optional/optional.hpp>
+#include <boost/optional/optional_io.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/commands.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/commands/set_cluster_parameter_invocation.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/query/write_ops/write_ops_parsers.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/update/storage_validation.h"
 #include "mongo/db/vector_clock.h"
-#include "mongo/idl/cluster_server_parameter_gen.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/rpc/unique_message.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 
 namespace mongo {
-
 bool SetClusterParameterInvocation::invoke(OperationContext* opCtx,
                                            const SetClusterParameter& cmd,
-                                           boost::optional<Timestamp> paramTime,
-                                           const WriteConcernOptions& writeConcern) {
+                                           boost::optional<Timestamp> clusterParameterTime,
+                                           boost::optional<LogicalTime> previousTime,
+                                           const WriteConcernOptions& writeConcern,
+                                           bool skipValidation) {
 
     BSONObj cmdParamObj = cmd.getCommandParameter();
     StringData parameterName = cmdParamObj.firstElement().fieldName();
     ServerParameter* serverParameter = _sps->get(parameterName);
+    auto tenantId = cmd.getDbName().tenantId();
 
     auto [query, update] =
-        normalizeParameter(opCtx, cmdParamObj, paramTime, serverParameter, parameterName);
+        normalizeParameter(opCtx,
+                           cmdParamObj,
+                           clusterParameterTime,
+                           previousTime,
+                           serverParameter,
+                           tenantId,
+                           skipValidation || serverGlobalParams.clusterRole.isShardOnly());
 
     BSONObjBuilder oldValueBob;
-    serverParameter->append(opCtx, oldValueBob, parameterName.toString());
-    audit::logSetClusterParameter(opCtx->getClient(), oldValueBob.obj(), update);
+    serverParameter->append(opCtx, &oldValueBob, parameterName.toString(), tenantId);
+    audit::logSetClusterParameter(opCtx->getClient(), oldValueBob.obj(), update, tenantId);
 
     LOGV2_DEBUG(
         6432603, 2, "Updating cluster parameter on-disk", "clusterParameter"_attr = parameterName);
 
-    return uassertStatusOK(_dbService.updateParameterOnDisk(opCtx, query, update, writeConcern));
+    auto result = _dbService.updateParameterOnDisk(
+        query, update, writeConcern, auth::ValidatedTenancyScope::get(opCtx));
+    auto resultStatus = result.toStatus();
+
+    // When 'previousTime' is provided, it is added to the 'query' part of the upsert command to
+    // match the persisted 'clusterParameterTime' field. If in this case the upsert returns the
+    // 'DuplicateKey' error, this means a concurrent operation has modified 'clusterParameterTime'.
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            "encountered concurrent cluster parameter update operations, please try again",
+            !previousTime || resultStatus.code() != ErrorCodes::DuplicateKey);
+
+    // Throw if the upsert command returned any errors (e.g., 'PrimarySteppedDown').
+    uassertStatusOK(resultStatus);
+
+    size_t nUpserted = result.isUpsertDetailsSet() ? result.sizeUpsertDetails() : 0;
+    tassert(8454100,
+            "when 'previousTime' is 'kUninitialized' a new document must be inserted",
+            !(previousTime && *previousTime == LogicalTime::kUninitialized) || nUpserted == 1);
+
+    // Return true if an oplog entry was created.
+    return result.getNModified() == 1 || nUpserted == 1;
 }
 
 std::pair<BSONObj, BSONObj> SetClusterParameterInvocation::normalizeParameter(
     OperationContext* opCtx,
     BSONObj cmdParamObj,
-    const boost::optional<Timestamp>& paramTime,
+    boost::optional<Timestamp> clusterParameterTime,
+    boost::optional<LogicalTime> previousTime,
     ServerParameter* sp,
-    StringData parameterName) {
+    const boost::optional<TenantId>& tenantId,
+    bool skipValidation) {
     BSONElement commandElement = cmdParamObj.firstElement();
-    uassert(ErrorCodes::IllegalOperation,
+    uassert(ErrorCodes::BadValue,
             "Cluster parameter value must be an object",
             BSONType::Object == commandElement.type());
 
-    Timestamp clusterTime = paramTime ? *paramTime : _dbService.getUpdateClusterTime(opCtx);
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "Server parameter: '" << sp->name() << "' is disabled",
+            skipValidation || sp->isEnabled());
 
+    Timestamp clusterTime =
+        clusterParameterTime ? *clusterParameterTime : _dbService.getUpdateClusterTime(opCtx);
     BSONObjBuilder updateBuilder;
-    updateBuilder << "_id" << parameterName << "clusterParameterTime" << clusterTime;
+    updateBuilder << "_id" << sp->name() << "clusterParameterTime" << clusterTime;
     updateBuilder.appendElements(commandElement.Obj());
 
-    BSONObj query = BSON("_id" << parameterName);
+    BSONObjBuilder queryBuilder;
+    queryBuilder << "_id" << sp->name();
+    if (previousTime) {
+        // When the 'previousTime' is set, we must check that the parameter being updated has
+        // 'clusterParameterTime' equal to 'previousTime'. This way we ensure there are no
+        // concurrent updates. When 'previousTime' is set to 'kUninitialized', there should be no
+        // cluster parameter with the given name persisted. Therefore, 'kUninitialized' should not
+        // collide with any valid timestamp.
+        tassert(8454101,
+                "'previousTime' was set to 'kUninitialized' with a different timestamp than "
+                "Timestamp(0, 0)",
+                *previousTime != LogicalTime::kUninitialized ||
+                    previousTime->asTimestamp() == Timestamp(0, 0));
+        queryBuilder << "clusterParameterTime" << previousTime->asTimestamp();
+    }
+
     BSONObj update = updateBuilder.obj();
 
-    uassertStatusOK(sp->validate(update));
+    // Validate that serialized update is validate replacement update document by calling the same
+    // document validation function as the update stage.
+    {
+        bool ignore;
+        mutablebson::Document mutableUpdate(update);
+        storage_validation::scanDocument(mutableUpdate, false, true, &ignore);
+    }
+
+    BSONObj query = queryBuilder.obj();
+
+    if (!skipValidation) {
+        uassertStatusOK(sp->validate(update, tenantId));
+    }
 
     return {query, update};
 }
@@ -97,50 +178,35 @@ Timestamp ClusterParameterDBClientService::getUpdateClusterTime(OperationContext
     return vt.clusterTime().asTimestamp();
 }
 
-StatusWith<bool> ClusterParameterDBClientService::updateParameterOnDisk(
-    OperationContext* opCtx,
+BatchedCommandResponse ClusterParameterDBClientService::updateParameterOnDisk(
     BSONObj query,
     BSONObj update,
-    const WriteConcernOptions& writeConcern) {
-    BSONObj res;
+    const WriteConcernOptions& writeConcern,
+    const boost::optional<auth::ValidatedTenancyScope>& validatedTenancyScope) {
+    const auto tenantId = (validatedTenancyScope && validatedTenancyScope->hasTenantId())
+        ? boost::make_optional(validatedTenancyScope->tenantId())
+        : boost::none;
+    const auto nss = NamespaceString::makeClusterParametersNSS(tenantId);
+    auto request = OpMsgRequestBuilder::create(validatedTenancyScope, nss.dbName(), [&] {
+        write_ops::UpdateCommandRequest updateOp(nss);
+        updateOp.setUpdates({[&] {
+            write_ops::UpdateOpEntry entry;
+            entry.setQ(query);
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
+            entry.setMulti(false);
+            entry.setUpsert(true);
+            return entry;
+        }()});
+        updateOp.setWriteConcern(writeConcern);
+        return updateOp.toBSON();
+    }());
 
-    BSONObjBuilder set;
-    set.append("$set", update);
-    set.doneFast();
-
-    const auto writeConcernObj =
-        BSON(WriteConcernOptions::kWriteConcernField << writeConcern.toBSON());
-
-    try {
-        _dbClient.runCommand(
-            NamespaceString::kConfigDb.toString(),
-            [&] {
-                write_ops::UpdateCommandRequest updateOp(
-                    NamespaceString::kClusterParametersNamespace);
-                updateOp.setUpdates({[&] {
-                    write_ops::UpdateOpEntry entry;
-                    entry.setQ(query);
-                    entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
-                    entry.setMulti(false);
-                    entry.setUpsert(true);
-                    return entry;
-                }()});
-
-                return updateOp.toBSON(writeConcernObj);
-            }(),
-            res);
-    } catch (const DBException& ex) {
-        return ex.toStatus();
-    }
-
+    BSONObj res = _dbClient.runCommand(request)->getCommandReply();
     BatchedCommandResponse response;
     std::string errmsg;
-
-    if (!response.parseBSON(res, &errmsg)) {
-        return Status(ErrorCodes::FailedToParse, errmsg);
-    }
-
-    return response.getNModified() > 0 || response.getN() > 0;
+    auto parseResult = response.parseBSON(res, &errmsg);
+    uassert(ErrorCodes::FailedToParse, errmsg, parseResult);
+    return response;
 }
 
 ServerParameter* ClusterParameterService::get(StringData name) {

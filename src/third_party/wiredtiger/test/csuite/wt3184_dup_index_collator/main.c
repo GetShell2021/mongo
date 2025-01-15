@@ -31,10 +31,9 @@
  * JIRA ticket reference: WT-3184 Test case description: Each set of data is ordered and contains
  * five elements (0-4). We insert elements 1 and 3, and then do search_near and search for each
  * element. For each set of data, we perform these tests first using a custom collator, and second
- * using a custom collator and extractor. In each case there are index keys having variable length.
- * Failure mode: In the reported test case, the custom compare routine is given a truncated key to
- * compare, and the unpack functions return errors because the truncation appeared in the middle of
- * a key.
+ * using a custom collator. In each case there are index keys having variable length. Failure mode:
+ * In the reported test case, the custom compare routine is given a truncated key to compare, and
+ * the unpack functions return errors because the truncation appeared in the middle of a key.
  */
 
 /*
@@ -144,9 +143,10 @@ main(int argc, char *argv[])
     opts = &_opts;
     memset(opts, 0, sizeof(*opts));
     testutil_check(testutil_parse_opts(argc, argv, opts));
-    testutil_make_work_dir(opts->home);
+    testutil_recreate_dir(opts->home);
 
-    testutil_check(wiredtiger_open(opts->home, NULL, "create", &opts->conn));
+    testutil_check(wiredtiger_open(opts->home, NULL,
+      "create,statistics=(all),statistics_log=(json,on_close,wait=1)", &opts->conn));
     testutil_check(opts->conn->open_session(opts->conn, NULL, NULL, &session));
 
     testutil_check(opts->conn->add_collator(opts->conn, "index_coll", &index_coll, NULL));

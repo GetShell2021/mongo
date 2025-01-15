@@ -34,8 +34,8 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/util/cancellation.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/future.h"
@@ -74,6 +74,7 @@ public:
                              std::vector<ShardId> recipientShards,
                              TaskExecutorPtr executor,
                              CancellationToken cancelToken,
+                             int delayBeforeInitialQueryMillis,
                              Milliseconds maxDelayBetweenQueries = kMaxDelayBetweenQueries);
 
     SemiFuture<void> waitUntilRecipientsAreWithinCommitThreshold() const;
@@ -90,7 +91,7 @@ public:
     RemainingOperationTimes queryRemainingOperationTimeForRecipients() const;
 
 private:
-    ExecutorFuture<void> _makeFuture() const;
+    ExecutorFuture<void> _makeFuture(Milliseconds delayBetweenQueries) const;
 
     static constexpr auto kDiagnosticLogLevel = 0;
     static constexpr auto kMaxDelayBetweenQueries = Seconds(30);
@@ -102,6 +103,8 @@ private:
     const CancellationToken _cancelToken;
 
     const Milliseconds _threshold;
+
+    const Milliseconds _delayBeforeInitialQueryMillis;
     const Milliseconds _maxDelayBetweenQueries;
 
     TaskExecutorPtr _networkExecutor;

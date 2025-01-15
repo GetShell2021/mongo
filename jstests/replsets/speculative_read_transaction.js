@@ -4,9 +4,8 @@
  *
  * @tags: [uses_transactions, requires_majority_read_concern]
  */
-(function() {
-"use strict";
-load("jstests/libs/write_concern_util.js");  // For stopServerReplication
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const dbName = "test";
 const collName = "speculative_read_transaction";
@@ -62,7 +61,7 @@ function runTest(sessionOptions) {
         {readConcern: {level: "snapshot"}, writeConcern: {w: "majority", wtimeout: 5000}});
     assert.eq(sessionColl.findOne({_id: 0}), {_id: 0, x: 1});
     assert.commandFailedWithCode(session.commitTransaction_forTesting(),
-                                 ErrorCodes.WriteConcernFailed);
+                                 ErrorCodes.WriteConcernTimeout);
 
     // Allow the majority commit point to advance to allow the failed write concern to clear.
     restartServerReplication(secondary);
@@ -81,7 +80,7 @@ function runTest(sessionOptions) {
         {readConcern: {level: "local"}, writeConcern: {w: "majority", wtimeout: 5000}});
     assert.eq(sessionColl.findOne({_id: 0}), {_id: 0, x: 2});
     assert.commandFailedWithCode(session.commitTransaction_forTesting(),
-                                 ErrorCodes.WriteConcernFailed);
+                                 ErrorCodes.WriteConcernTimeout);
 
     // Allow the majority commit point to advance to allow the failed write concern to clear.
     restartServerReplication(secondary);
@@ -98,7 +97,7 @@ function runTest(sessionOptions) {
         {readConcern: {level: "majority"}, writeConcern: {w: "majority", wtimeout: 5000}});
     assert.eq(sessionColl.findOne({_id: 0}), {_id: 0, x: 3});
     assert.commandFailedWithCode(session.commitTransaction_forTesting(),
-                                 ErrorCodes.WriteConcernFailed);
+                                 ErrorCodes.WriteConcernTimeout);
 
     // Restart server replication to allow majority commit point to advance.
     restartServerReplication(secondary);
@@ -109,4 +108,3 @@ runTest({causalConsistency: false});
 runTest({causalConsistency: true});
 
 rst.stopSet();
-}());

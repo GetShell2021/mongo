@@ -3,12 +3,16 @@
 //     1. coll2 shard0 to shard2 -- shard0 can't send two chunks simultaneously.
 //     2. coll2 shard2 to shard1 -- shard1 can't receive two chunks simultaneously.
 
-load('./jstests/libs/chunk_manipulation_util.js');
+import {
+    migrateStepNames,
+    moveChunkParallel,
+    pauseMigrateAtStep,
+    unpauseMigrateAtStep,
+    waitForMigrateStep,
+} from "jstests/libs/chunk_manipulation_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-(function() {
-"use strict";
-
-var staticMongod = MongoRunner.runMongod({});  // For startParallelOps.
+var staticMongod = MongoRunner.runMongod({});
 
 var st = new ShardingTest({shards: 3});
 
@@ -17,8 +21,7 @@ var mongos = st.s0, admin = mongos.getDB('admin'), dbName = "testDB", ns1 = dbNa
     shard0Coll1 = shard0.getCollection(ns1), shard1Coll1 = shard1.getCollection(ns1),
     shard2Coll1 = shard2.getCollection(ns1);
 
-assert.commandWorked(admin.runCommand({enableSharding: dbName}));
-st.ensurePrimaryShard(dbName, st.shard0.shardName);
+assert.commandWorked(admin.runCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 
 assert.commandWorked(admin.runCommand({shardCollection: ns1, key: {a: 1}}));
 assert.commandWorked(admin.runCommand({split: ns1, middle: {a: 0}}));
@@ -77,4 +80,3 @@ assert.eq(1, shard2Coll1.find().itcount());
 
 st.stop();
 MongoRunner.stopMongod(staticMongod);
-})();

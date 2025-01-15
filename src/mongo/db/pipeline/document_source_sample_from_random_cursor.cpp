@@ -28,18 +28,33 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
-
+#include <boost/exception/exception.hpp>
 #include <boost/math/distributions/beta.hpp>
+#include <boost/math/policies/policy.hpp>
+// IWYU pragma: no_include "boost/math/special_functions/detail/erf_inv.hpp"
+// IWYU pragma: no_include "boost/math/special_functions/detail/lanczos_sse2.hpp"
+#include <algorithm>
+#include <boost/math/tools/precision.hpp>
+#include <cstddef>
+#include <stdexcept>
+#include <utility>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/db/client.h"
 #include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/document_metadata_fields.h"
 #include "mongo/db/exec/document_value/value.h"
-#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/document_source_sample_from_random_cursor.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/random.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -55,7 +70,7 @@ DocumentSourceSampleFromRandomCursor::DocumentSourceSampleFromRandomCursor(
     : DocumentSource(kStageName, pExpCtx),
       _size(size),
       _idField(std::move(idField)),
-      _seenDocs(pExpCtx->getValueComparator().makeUnorderedValueSet()),
+      _seenDocs(pExpCtx->getValueComparator().makeFlatUnorderedValueSet()),
       _nDocsInColl(nDocsInCollection) {}
 
 const char* DocumentSourceSampleFromRandomCursor::getSourceName() const {
@@ -88,12 +103,12 @@ DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::doGetNext() 
 
     // Assign it a random value to enable merging by random value, attempting to avoid bias in that
     // process.
-    auto& prng = pExpCtx->opCtx->getClient()->getPrng();
+    auto& prng = pExpCtx->getOperationContext()->getClient()->getPrng();
     _randMetaFieldVal -= smallestFromSampleOfUniform(&prng, _nDocsInColl);
 
     MutableDocument md(nextResult.releaseDocument());
     md.metadata().setRandVal(_randMetaFieldVal);
-    if (pExpCtx->needsMerge) {
+    if (pExpCtx->getNeedsMerge()) {
         // This stage will be merged by sorting results according to this random metadata field, but
         // the merging logic expects to sort by the sort key metadata.
         const bool isSingleElementKey = true;
@@ -145,9 +160,8 @@ DocumentSource::GetNextResult DocumentSourceSampleFromRandomCursor::getNextNonDu
                                "sporadic failure, please try again.");
 }
 
-Value DocumentSourceSampleFromRandomCursor::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    return Value(DOC(getSourceName() << DOC("size" << _size)));
+Value DocumentSourceSampleFromRandomCursor::serialize(const SerializationOptions& opts) const {
+    return Value(DOC(getSourceName() << DOC("size" << opts.serializeLiteral(_size))));
 }
 
 DepsTracker::State DocumentSourceSampleFromRandomCursor::getDependencies(DepsTracker* deps) const {

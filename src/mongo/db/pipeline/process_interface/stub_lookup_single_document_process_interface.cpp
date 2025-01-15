@@ -27,39 +27,65 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
 
-#include "mongo/db/pipeline/process_interface/stub_lookup_single_document_process_interface.h"
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/stub_lookup_single_document_process_interface.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
 std::unique_ptr<Pipeline, PipelineDeleter>
 StubLookupSingleDocumentProcessInterface::attachCursorSourceToPipelineForLocalRead(
-    Pipeline* ownedPipeline) {
+    Pipeline* ownedPipeline,
+    boost::optional<const AggregateCommandRequest&> aggRequest,
+    bool shouldUseCollectionDefaultCollator,
+    ExecShardFilterPolicy shardFilterPolicy) {
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline(
-        ownedPipeline, PipelineDeleter(ownedPipeline->getContext()->opCtx));
+        ownedPipeline, PipelineDeleter(ownedPipeline->getContext()->getOperationContext()));
     pipeline->addInitialSource(
         DocumentSourceMock::createForTest(_mockResults, pipeline->getContext()));
     return pipeline;
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter>
-StubLookupSingleDocumentProcessInterface::attachCursorSourceToPipeline(
+StubLookupSingleDocumentProcessInterface::preparePipelineForExecution(
     Pipeline* ownedPipeline,
     ShardTargetingPolicy shardTargetingPolicy,
     boost::optional<BSONObj> readConcern) {
     return attachCursorSourceToPipelineForLocalRead(ownedPipeline);
 }
 
+std::unique_ptr<Pipeline, PipelineDeleter>
+StubLookupSingleDocumentProcessInterface::preparePipelineForExecution(
+    const boost::intrusive_ptr<mongo::ExpressionContext>& expCtx,
+    const AggregateCommandRequest& aggRequest,
+    Pipeline* pipeline,
+    boost::optional<BSONObj> shardCursorsSortSpec,
+    ShardTargetingPolicy shardTargetingPolicy,
+    boost::optional<BSONObj> readConcern,
+    bool shouldUseCollectionDefaultCollator) {
+    return attachCursorSourceToPipelineForLocalRead(
+        pipeline, aggRequest, shouldUseCollectionDefaultCollator);
+}
+
 boost::optional<Document> StubLookupSingleDocumentProcessInterface::lookupSingleDocument(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& nss,
-    UUID collectionUUID,
+    boost::optional<UUID> collectionUUID,
     const Document& documentKey,
     boost::optional<BSONObj> readConcern) {
     // The namespace 'nss' may be different than the namespace on the ExpressionContext in the

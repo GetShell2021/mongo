@@ -27,26 +27,41 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/throttle_cursor.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/catalog/catalog_test_fixture.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/catalog/validate_gen.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog/throttle_cursor.h"
+#include "mongo/db/catalog/validate/validate_gen.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/collection_crud/collection_write_path.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/clock_source_mock.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
 namespace {
 
-const NamespaceString kNss = NamespaceString("test.throttleCursor");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.throttleCursor");
 const uint8_t kTickDelay = 200;
 
 class ThrottleCursorTest : public CatalogTestFixture {
@@ -55,10 +70,10 @@ private:
     void tearDown() override;
 
 protected:
-    const KeyString::Value kMinKeyString = KeyString::Builder{KeyString::Version::kLatestVersion,
-                                                              kMinBSONKey,
-                                                              KeyString::ALL_ASCENDING}
-                                               .getValueCopy();
+    const key_string::Value kMinKeyString = key_string::Builder{key_string::Version::kLatestVersion,
+                                                                kMinBSONKey,
+                                                                key_string::ALL_ASCENDING}
+                                                .getValueCopy();
 
     explicit ThrottleCursorTest(Milliseconds clockIncrement = Milliseconds{kTickDelay})
         : CatalogTestFixture(Options{}.useMockClock(true, clockIncrement)) {}
@@ -93,12 +108,13 @@ void ThrottleCursorTest::setUp() {
     for (int i = 0; i < 10; i++) {
         WriteUnitOfWork wuow(operationContext());
 
-        ASSERT_OK(collection->insertDocument(
-            operationContext(), InsertStatement(BSON("_id" << i)), nullOpDebug));
+        ASSERT_OK(collection_internal::insertDocument(
+            operationContext(), *collection, InsertStatement(BSON("_id" << i)), nullOpDebug));
         wuow.commit();
     }
 
-    _dataThrottle = std::make_unique<DataThrottle>(operationContext());
+    _dataThrottle = std::make_unique<DataThrottle>(operationContext(),
+                                                   [&]() { return gMaxValidateMBperSec.load(); });
 }
 
 void ThrottleCursorTest::tearDown() {
@@ -282,8 +298,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOff) {
     setMaxMbPerSec(0);
     Date_t start = getTime();
 
-    ASSERT_TRUE(cursor.seek(opCtx, kMinKeyString));
-    int numRecords = 1;
+    int numRecords = 0;
 
     while (cursor.next(opCtx)) {
         numRecords++;
@@ -312,8 +327,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOn) {
         setMaxMbPerSec(1);
         Date_t start = getTime();
 
-        ASSERT_TRUE(cursor.seek(opCtx, kMinKeyString));
-        int numRecords = 1;
+        int numRecords = 0;
 
         while (cursor.next(opCtx)) {
             numRecords++;
@@ -332,7 +346,7 @@ TEST_F(ThrottleCursorTest, TestSortedDataInterfaceThrottleCursorOn) {
         setMaxMbPerSec(5);
         Date_t start = getTime();
 
-        ASSERT_TRUE(cursor.seek(opCtx, kMinKeyString));
+        ASSERT_TRUE(cursor.seek(opCtx, kMinKeyString.getView()));
         int numRecords = 1;
 
         while (cursor.next(opCtx)) {
@@ -365,8 +379,7 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOff) {
     setMaxMbPerSec(10);
     Date_t start = getTime();
 
-    ASSERT_TRUE(indexCursor.seek(opCtx, kMinKeyString));
-    int numRecords = 1;
+    int numRecords = 0;
 
     while (indexCursor.next(opCtx)) {
         numRecords++;
@@ -408,12 +421,14 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOn) {
         setMaxMbPerSec(2);
         Date_t start = getTime();
 
-        ASSERT_TRUE(indexCursor.seek(opCtx, kMinKeyString));
-        ASSERT_TRUE(recordCursor.seekExact(opCtx, RecordId(1)));
-        int numRecords = 2;
+        int numRecords = 0;
 
         while (indexCursor.next(opCtx)) {
-            ASSERT_TRUE(recordCursor.next(opCtx));
+            if (numRecords == 0) {
+                ASSERT_TRUE(recordCursor.seekExact(opCtx, RecordId(1)));
+            } else {
+                ASSERT_TRUE(recordCursor.next(opCtx));
+            }
             numRecords += 2;
         }
 
@@ -430,7 +445,7 @@ TEST_F(ThrottleCursorTest, TestMixedCursorsWithSharedThrottleOn) {
         setMaxMbPerSec(5);
         Date_t start = getTime();
 
-        ASSERT_TRUE(indexCursor.seek(opCtx, kMinKeyString));
+        ASSERT_TRUE(indexCursor.seek(opCtx, kMinKeyString.getView()));
         ASSERT_TRUE(recordCursor.seekExact(opCtx, RecordId(1)));
         int numRecords = 2;
 

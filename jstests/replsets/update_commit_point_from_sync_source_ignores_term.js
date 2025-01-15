@@ -3,10 +3,8 @@
  * lastApplied, the node can update its own lastOpCommitted to its lastApplied.
  * @tags: [requires_majority_read_concern]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");  // for [stop|restart]ServerReplication.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 const dbName = "test";
 const collName = "coll";
@@ -57,7 +55,7 @@ jsTest.log("Step up Node B in term 2. Commit a new write.");
 // Ensure Node B is caught up, so that it can become primary.
 rst.awaitReplication(undefined, undefined, [nodeB]);
 assert.commandWorked(nodeB.adminCommand({replSetStepUp: 1}));
-rst.waitForState(nodeA, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [nodeA]);
 assert.eq(nodeB, rst.getPrimary());
 assert.commandWorked(
     nodeB.getDB(dbName)[collName].insert({_id: "term 2"}, {writeConcern: {w: "majority"}}));
@@ -90,4 +88,3 @@ assert.eq(
 assert.commandWorked(
     nodeE.adminCommand({configureFailPoint: "stopReplProducerOnDocument", mode: "off"}));
 rst.stopSet();
-}());

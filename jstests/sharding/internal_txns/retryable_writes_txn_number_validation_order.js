@@ -10,10 +10,13 @@
  *
  * @tags: [requires_fcv_60, uses_transactions, requires_persistence]
  */
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
+import {makeCommitTransactionCmdObj} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+// This test requires running transactions directly against the shard.
+TestData.replicaSetEndpointIncompatible = true;
 
 const kDbName = "testDb";
 const kCollName = "testColl";
@@ -26,6 +29,8 @@ const mongosTestColl = mongosTestDB.getCollection(kCollName);
 let shard0TestDB = shard0Primary.getDB(kDbName);
 
 assert.commandWorked(mongosTestDB.createCollection(kCollName));
+assert.commandWorked(
+    st.shard0.adminCommand({_flushRoutingTableCacheUpdates: mongosTestColl.getFullName()}));
 
 const kTestMode = {
     kNonRecovery: 1,
@@ -45,6 +50,8 @@ function setUpTestMode(mode) {
         assert.commandWorked(oldPrimary.adminCommand({replSetFreeze: 0}));
         shard0TestDB = st.rs0.getPrimary().getDB(kDbName);
     }
+
+    awaitRSClientHosts(st.s, st.rs0.getPrimary(), {ok: true, ismaster: true});
 }
 
 function makeInsertCmdObj(docs, {lsid, txnNumber, isTransaction}) {
@@ -348,4 +355,3 @@ function runTestForInternalSessionForNonRetryableWrite(makeSessionOptsFunc) {
 }
 
 st.stop();
-})();

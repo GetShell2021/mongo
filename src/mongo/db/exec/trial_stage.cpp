@@ -27,17 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/exec/trial_stage.h"
-
-#include <algorithm>
 #include <memory>
+#include <utility>
+#include <vector>
+
 
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/exec/or.h"
 #include "mongo/db/exec/queued_data_stage.h"
-#include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/exec/trial_stage.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -73,11 +72,18 @@ Status TrialStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     while (!_specificStats.trialCompleted) {
         WorkingSetID id = WorkingSet::INVALID_ID;
         const bool mustYield = (work(&id) == PlanStage::NEED_YIELD);
-        if (mustYield || yieldPolicy->shouldYieldOrInterrupt(expCtx()->opCtx)) {
+        if (mustYield) {
+            // Run-time plan selection occurs before a WriteUnitOfWork is opened and it's not
+            // subject to TemporarilyUnavailableException's.
+            invariant(!expCtx()->getTemporarilyUnavailableException());
+        }
+        if (mustYield || yieldPolicy->shouldYieldOrInterrupt(expCtx()->getOperationContext())) {
             if (mustYield && !yieldPolicy->canAutoYield()) {
-                throwWriteConflictException();
+                throwWriteConflictException(
+                    "Write conflict during TrialStage plan selection and yielding is disabled.");
             }
-            auto yieldStatus = yieldPolicy->yieldOrInterrupt(expCtx()->opCtx);
+            auto yieldStatus = yieldPolicy->yieldOrInterrupt(
+                expCtx()->getOperationContext(), nullptr, RestoreContext::RestoreType::kYield);
             if (!yieldStatus.isOK()) {
                 return yieldStatus;
             }
@@ -131,6 +137,9 @@ PlanStage::StageState TrialStage::_workTrialPlan(WorkingSetID* out) {
             }
             return state;
         case PlanStage::NEED_YIELD:
+            // Run-time plan selection occurs before a WriteUnitOfWork is opened and it's not
+            // subject to TemporarilyUnavailableException's.
+            invariant(!expCtx()->getTemporarilyUnavailableException());
             // Nothing to update here.
             return state;
         case PlanStage::IS_EOF:

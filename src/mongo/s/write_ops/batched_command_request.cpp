@@ -27,46 +27,52 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/pipeline/variables.h"
 #include "mongo/s/write_ops/batched_command_request.h"
-#include "mongo/util/visit_helper.h"
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/write_ops/write_ops.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/overloaded_visitor.h"  // IWYU pragma: keep
 
 namespace mongo {
 namespace {
-
-const auto kWriteConcern = "writeConcern"_sd;
 
 template <class T>
 BatchedCommandRequest constructBatchedCommandRequest(const OpMsgRequest& request) {
     auto batchRequest = BatchedCommandRequest{T::parse(request)};
 
-    auto shardVersionField = request.body[ChunkVersion::kShardVersionField];
-    if (!shardVersionField.eoo()) {
-        auto shardVersion = ChunkVersion::parse(shardVersionField);
-        if (shardVersion == ChunkVersion::UNSHARDED()) {
-            batchRequest.setDbVersion(DatabaseVersion(request.body));
-        }
-        batchRequest.setShardVersion(shardVersion);
-    }
-
-    auto writeConcernField = request.body[kWriteConcern];
-    if (!writeConcernField.eoo()) {
-        batchRequest.setWriteConcern(writeConcernField.Obj());
-    }
-
     // The 'isTimeseriesNamespace' is an internal parameter used for communication between mongos
     // and mongod.
-    auto isTimeseriesNamespace =
-        request.body[write_ops::WriteCommandRequestBase::kIsTimeseriesNamespaceFieldName];
     uassert(5916401,
             "the 'isTimeseriesNamespace' parameter cannot be used on mongos",
-            !isTimeseriesNamespace.trueValue());
+            !batchRequest.getWriteCommandRequestBase().getIsTimeseriesNamespace().value_or(false));
 
     return batchRequest;
+}
+
+// Utility that parses and evaluates 'let'. It returns the result as a serialized object.
+BSONObj freezeLet(OperationContext* opCtx,
+                  const mongo::BSONObj& let,
+                  const boost::optional<mongo::LegacyRuntimeConstants>& legacyRuntimeConstants,
+                  const NamespaceString& nss) {
+    // Evaluate the let parameters.
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx)
+                      .ns(nss)
+                      .runtimeConstants(legacyRuntimeConstants)
+                      .letParameters(let)
+                      .build();
+    expCtx->variables.seedVariablesWithLetParameters(expCtx.get(), let);
+    return expCtx->variables.toBSON(expCtx->variablesParseState, let);
 }
 
 }  // namespace
@@ -116,30 +122,32 @@ std::size_t BatchedCommandRequest::sizeWriteOps() const {
 }
 
 bool BatchedCommandRequest::hasLegacyRuntimeConstants() const {
-    return _visit(visit_helper::Overloaded{[](write_ops::InsertCommandRequest&) { return false; },
-                                           [&](write_ops::UpdateCommandRequest& op) {
-                                               return op.getLegacyRuntimeConstants().has_value();
-                                           },
-                                           [&](write_ops::DeleteCommandRequest& op) {
-                                               return op.getLegacyRuntimeConstants().has_value();
-                                           }});
-}
-
-void BatchedCommandRequest::setLegacyRuntimeConstants(LegacyRuntimeConstants runtimeConstants) {
-    _visit(visit_helper::Overloaded{[](write_ops::InsertCommandRequest&) {},
+    return _visit(OverloadedVisitor{[](write_ops::InsertCommandRequest&) { return false; },
                                     [&](write_ops::UpdateCommandRequest& op) {
-                                        op.setLegacyRuntimeConstants(std::move(runtimeConstants));
+                                        return op.getLegacyRuntimeConstants().has_value();
                                     },
                                     [&](write_ops::DeleteCommandRequest& op) {
-                                        op.setLegacyRuntimeConstants(std::move(runtimeConstants));
+                                        return op.getLegacyRuntimeConstants().has_value();
                                     }});
 }
 
+void BatchedCommandRequest::setLegacyRuntimeConstants(LegacyRuntimeConstants runtimeConstants) {
+    _visit(OverloadedVisitor{[](write_ops::InsertCommandRequest&) {},
+                             [&](write_ops::UpdateCommandRequest& op) {
+                                 op.setLegacyRuntimeConstants(std::move(runtimeConstants));
+                             },
+                             [&](write_ops::DeleteCommandRequest& op) {
+                                 op.setLegacyRuntimeConstants(std::move(runtimeConstants));
+                             }});
+}
+
 void BatchedCommandRequest::unsetLegacyRuntimeConstants() {
-    _visit(visit_helper::Overloaded{
+    _visit(OverloadedVisitor{
         [](write_ops::InsertCommandRequest&) {},
         [&](write_ops::UpdateCommandRequest& op) { op.setLegacyRuntimeConstants(boost::none); },
-        [&](write_ops::DeleteCommandRequest& op) { op.setLegacyRuntimeConstants(boost::none); }});
+        [&](write_ops::DeleteCommandRequest& op) {
+            op.setLegacyRuntimeConstants(boost::none);
+        }});
 }
 
 const boost::optional<LegacyRuntimeConstants>& BatchedCommandRequest::getLegacyRuntimeConstants()
@@ -173,19 +181,28 @@ const boost::optional<BSONObj>& BatchedCommandRequest::getLet() const {
     return _visit(Visitor{});
 };
 
-bool BatchedCommandRequest::isVerboseWC() const {
-    if (!hasWriteConcern()) {
-        return true;
+void BatchedCommandRequest::evaluateAndReplaceLetParams(OperationContext* opCtx) {
+    switch (_batchType) {
+        case BatchedCommandRequest::BatchType_Insert:
+            break;
+        case BatchedCommandRequest::BatchType_Update:
+            if (auto let = _updateReq->getLet()) {
+                _updateReq->setLet(
+                    freezeLet(opCtx, *let, _updateReq->getLegacyRuntimeConstants(), getNS()));
+            }
+            break;
+        case BatchedCommandRequest::BatchType_Delete:
+            if (auto let = _deleteReq->getLet()) {
+                _deleteReq->setLet(
+                    freezeLet(opCtx, *let, _deleteReq->getLegacyRuntimeConstants(), getNS()));
+            }
+            break;
     }
-
-    BSONObj writeConcern = getWriteConcern();
-    BSONElement wElem = writeConcern["w"];
-    if (!wElem.isNumber() || wElem.Number() != 0) {
-        return true;
-    }
-
-    return false;
 }
+
+const OptionalBool& BatchedCommandRequest::getBypassEmptyTsReplacement() const {
+    return _visit([](auto&& op) -> decltype(auto) { return op.getBypassEmptyTsReplacement(); });
+};
 
 const write_ops::WriteCommandRequestBase& BatchedCommandRequest::getWriteCommandRequestBase()
     const {
@@ -194,22 +211,49 @@ const write_ops::WriteCommandRequestBase& BatchedCommandRequest::getWriteCommand
 
 void BatchedCommandRequest::setWriteCommandRequestBase(
     write_ops::WriteCommandRequestBase writeCommandBase) {
-    return _visit([&](auto&& op) { op.setWriteCommandRequestBase(std::move(writeCommandBase)); });
+    _visit([&](auto&& op) { op.setWriteCommandRequestBase(std::move(writeCommandBase)); });
 }
 
 void BatchedCommandRequest::serialize(BSONObjBuilder* builder) const {
-    _visit([&](auto&& op) { op.serialize({}, builder); });
-    if (_shardVersion) {
-        _shardVersion->serializeToBSON(ChunkVersion::kShardVersionField, builder);
-    }
+    _visit([&](auto&& op) { op.serialize(builder); });
+}
 
-    if (_dbVersion) {
-        builder->append("databaseVersion", _dbVersion->toBSON());
-    }
+void BatchedCommandRequest::setShardVersion(ShardVersion shardVersion) {
+    _visit([sv = std::move(shardVersion)](auto&& op) { op.setShardVersion(std::move(sv)); });
+}
 
-    if (_writeConcern) {
-        builder->append(kWriteConcern, *_writeConcern);
-    }
+bool BatchedCommandRequest::hasShardVersion() const {
+    return _visit([](auto&& op) { return op.getShardVersion().has_value(); });
+}
+
+const ShardVersion& BatchedCommandRequest::getShardVersion() const {
+    return _visit([](auto&& op) -> const ShardVersion& {
+        invariant(op.getShardVersion());
+        return *op.getShardVersion();
+    });
+}
+
+void BatchedCommandRequest::setDbVersion(DatabaseVersion dbVersion) {
+    _visit([dbv = std::move(dbVersion)](auto&& op) { op.setDatabaseVersion(std::move(dbv)); });
+}
+
+bool BatchedCommandRequest::hasDbVersion() const {
+    return false;
+}
+
+const DatabaseVersion& BatchedCommandRequest::getDbVersion() const {
+    return _visit([](auto&& op) -> const DatabaseVersion& {
+        invariant(op.getDatabaseVersion());
+        return *op.getDatabaseVersion();
+    });
+}
+
+GenericArguments& BatchedCommandRequest::getGenericArguments() {
+    return _visit([&](auto&& op) -> GenericArguments& { return op.getGenericArguments(); });
+}
+
+const GenericArguments& BatchedCommandRequest::getGenericArguments() const {
+    return _visit([&](auto&& op) -> const GenericArguments& { return op.getGenericArguments(); });
 }
 
 BSONObj BatchedCommandRequest::toBSON() const {
@@ -263,7 +307,7 @@ BatchedCommandRequest BatchedCommandRequest::buildDeleteOp(const NamespaceString
             entry.setMulti(multiDelete);
 
             if (hint) {
-                entry.setHint(hint.get());
+                entry.setHint(hint.value());
             }
             return entry;
         }()});
@@ -295,7 +339,7 @@ BatchedCommandRequest BatchedCommandRequest::buildUpdateOp(const NamespaceString
             entry.setUpsert(upsert);
             entry.setMulti(multi);
             if (hint) {
-                entry.setHint(hint.get());
+                entry.setHint(hint.value());
             }
             return entry;
         }()});
@@ -324,8 +368,116 @@ BatchedCommandRequest BatchedCommandRequest::buildPipelineUpdateOp(
 }
 
 BatchItemRef::BatchItemRef(const BatchedCommandRequest* request, int index)
-    : _request(*request), _index(index) {
+    : _batchedRequest(*request), _index(index), _batchType(_batchedRequest->getBatchType()) {
     invariant(index < int(request->sizeWriteOps()));
+}
+
+BatchItemRef::BatchItemRef(const BulkWriteCommandRequest* request, int index)
+    : _bulkWriteRequest(*request), _index(index) {
+    invariant(index < int(request->getOps().size()));
+    _batchType = convertOpType(BulkWriteCRUDOp(request->getOps()[index]).getType());
+}
+
+int BatchItemRef::getSizeForBatchWriteBytes() const {
+    tassert(7328113, "Invalid BatchedCommandRequest reference", _batchedRequest);
+
+    switch (_batchType) {
+        case BatchedCommandRequest::BatchType_Insert:
+            return getDocument().objsize();
+
+        case BatchedCommandRequest::BatchType_Update: {
+            auto& update = _batchedRequest->getUpdateRequest().getUpdates()[_index];
+            auto estSize = write_ops::getUpdateSizeEstimate(
+                update.getQ(),
+                update.getU(),
+                update.getC(),
+                update.getUpsertSupplied().has_value(),
+                update.getCollation(),
+                update.getArrayFilters(),
+                update.getSort(),
+                update.getHint(),
+                update.getSampleId(),
+                update.getAllowShardKeyUpdatesWithoutFullShardKeyInQuery().has_value());
+            // When running a debug build, verify that estSize is at least the BSON serialization
+            // size.
+            dassert(estSize >= update.toBSON().objsize());
+            return estSize;
+        }
+
+        case BatchedCommandRequest::BatchType_Delete: {
+            auto& deleteOp = _batchedRequest->getDeleteRequest().getDeletes()[_index];
+            auto estSize = write_ops::getDeleteSizeEstimate(deleteOp.getQ(),
+                                                            deleteOp.getCollation(),
+                                                            deleteOp.getHint(),
+                                                            deleteOp.getSampleId());
+            // When running a debug build, verify that estSize is at least the BSON serialization
+            // size.
+            dassert(estSize >= deleteOp.toBSON().objsize());
+            return estSize;
+        }
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+int BatchItemRef::getSizeForBulkWriteBytes() const {
+    tassert(7353600, "Invalid BulkWriteCommandRequest reference", _bulkWriteRequest);
+
+    switch (_batchType) {
+        case BatchedCommandRequest::BatchType_Insert: {
+            auto& insertOp = *BulkWriteCRUDOp(_bulkWriteRequest->getOps()[_index]).getInsert();
+            auto estSize = write_ops::getBulkWriteInsertSizeEstimate(insertOp.getDocument());
+            // When running a debug build, verify that estSize is at least the BSON serialization
+            // size.
+            dassert(estSize >= insertOp.toBSON().objsize());
+            return estSize;
+        }
+
+        case BatchedCommandRequest::BatchType_Update: {
+            auto& updateOp = *BulkWriteCRUDOp(_bulkWriteRequest->getOps()[_index]).getUpdate();
+            auto estSize =
+                write_ops::getBulkWriteUpdateSizeEstimate(updateOp.getFilter(),
+                                                          updateOp.getUpdateMods(),
+                                                          updateOp.getConstants(),
+                                                          updateOp.getUpsertSupplied().has_value(),
+                                                          updateOp.getCollation(),
+                                                          updateOp.getArrayFilters(),
+                                                          updateOp.getSort(),
+                                                          updateOp.getHint(),
+                                                          updateOp.getSampleId());
+            // When running a debug build, verify that estSize is at least the BSON serialization
+            // size.
+            dassert(estSize >= updateOp.toBSON().objsize());
+            return estSize;
+        }
+        case BatchedCommandRequest::BatchType_Delete: {
+            auto& deleteOp = *BulkWriteCRUDOp(_bulkWriteRequest->getOps()[_index]).getDelete();
+            auto estSize = write_ops::getBulkWriteDeleteSizeEstimate(deleteOp.getFilter(),
+                                                                     deleteOp.getCollation(),
+                                                                     deleteOp.getHint(),
+                                                                     deleteOp.getSampleId());
+            // When running a debug build, verify that estSize is at least the BSON serialization
+            // size.
+            dassert(estSize >= deleteOp.toBSON().objsize());
+            return estSize;
+        }
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+BatchedCommandRequest::BatchType convertOpType(BulkWriteCRUDOp::OpType opType) {
+    switch (opType) {
+        case BulkWriteCRUDOp::OpType::kInsert:
+            return BatchedCommandRequest::BatchType_Insert;
+        case BulkWriteCRUDOp::OpType::kUpdate:
+            return BatchedCommandRequest::BatchType_Update;
+        case BulkWriteCRUDOp::OpType::kDelete:
+            return BatchedCommandRequest::BatchType_Delete;
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
 }
 
 }  // namespace mongo

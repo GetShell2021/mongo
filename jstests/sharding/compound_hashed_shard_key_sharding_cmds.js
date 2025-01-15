@@ -5,17 +5,15 @@
  *   multiversion_incompatible,
  * ]
  */
-(function() {
-'use strict';
-
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 const st = new ShardingTest({shards: 2, other: {chunkSize: 1}});
 const configDB = st.s0.getDB('config');
-assert.commandWorked(configDB.adminCommand({enableSharding: 'test'}));
 const shard0 = st.shard0.shardName;
 const shard1 = st.shard1.shardName;
-st.ensurePrimaryShard('test', shard0);
+assert.commandWorked(configDB.adminCommand({enableSharding: 'test', primaryShard: shard0}));
+
 const testDBOnPrimary = st.rs0.getPrimary().getDB('test');
 
 function verifyChunkSplitIntoTwo(namespace, chunk) {
@@ -112,9 +110,15 @@ function testSplit(shardKey, collName) {
     assert.eq(++totalChunksBefore, findChunksUtil.countChunksForNs(configDB, namespace));
     verifyChunkSplitIntoTwo(namespace, chunkToBeSplit);
 
-    // Cannot split on existing chunk boundary with 'middle'.
-    assert.commandFailed(configDB.adminCommand({split: namespace, middle: chunkToBeSplit.min}));
-
+    // TODO(SERVER-97588): Remove version check from tests when 8.1 becomes last LTS.
+    const fcvDoc = configDB.adminCommand({getParameter: 1, featureCompatibilityVersion: 1});
+    if (MongoRunner.compareBinVersions(fcvDoc.featureCompatibilityVersion.version, "8.1") >= 0) {
+        // It should not fail on boundaries that have already been split.
+        assert.commandWorked(configDB.adminCommand({split: namespace, middle: chunkToBeSplit.min}));
+    } else {
+        // Cannot split on existing chunk boundary with 'middle'.
+        assert.commandFailed(configDB.adminCommand({split: namespace, middle: chunkToBeSplit.min}));
+    }
     st.s.getDB("test")[collName].drop();
 }
 
@@ -178,4 +182,3 @@ testMoveChunk({_id: "hashed", b: 1, c: 1});
 testMoveChunk({_id: 1, "b.c.d": "hashed", c: 1});
 
 st.stop();
-})();

@@ -29,7 +29,24 @@
 
 #pragma once
 
-#include "mongo/db/op_observer.h"
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer/op_observer.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -37,75 +54,40 @@ namespace mongo {
  * OpObserver for authentication. Observes all secondary replication traffic and filters down to
  * relevant entries for authentication.
  */
-class AuthOpObserver final : public OpObserver {
+class AuthOpObserver final : public OpObserverNoop {
     AuthOpObserver(const AuthOpObserver&) = delete;
     AuthOpObserver& operator=(const AuthOpObserver&) = delete;
 
 public:
     AuthOpObserver();
-    ~AuthOpObserver();
+    ~AuthOpObserver() override;
 
-    void onCreateIndex(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       const UUID& uuid,
-                       BSONObj indexDoc,
-                       bool fromMigrate) final {}
-
-    void onStartIndexBuild(OperationContext* opCtx,
-                           const NamespaceString& nss,
-                           const UUID& collUUID,
-                           const UUID& indexBuildUUID,
-                           const std::vector<BSONObj>& indexes,
-                           bool fromMigrate) final {}
-
-    void onStartIndexBuildSinglePhase(OperationContext* opCtx, const NamespaceString& nss) final {}
-
-    void onAbortIndexBuildSinglePhase(OperationContext* opCtx, const NamespaceString& nss) final {}
-
-    void onCommitIndexBuild(OperationContext* opCtx,
-                            const NamespaceString& nss,
-                            const UUID& collUUID,
-                            const UUID& indexBuildUUID,
-                            const std::vector<BSONObj>& indexes,
-                            bool fromMigrate) final {}
-
-    void onAbortIndexBuild(OperationContext* opCtx,
-                           const NamespaceString& nss,
-                           const UUID& collUUID,
-                           const UUID& indexBuildUUID,
-                           const std::vector<BSONObj>& indexes,
-                           const Status& cause,
-                           bool fromMigrate) final {}
+    // The filtering for this OpObserver is derived from the namespace filters in
+    // AuthorizationManagerImpl and the various AuditInterface implementations, see SERVER-83383.
+    NamespaceFilters getNamespaceFilters() const final {
+        return {NamespaceFilter::kSystem, NamespaceFilter::kSystem};
+    }
 
     void onInserts(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   const UUID& uuid,
+                   const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator first,
                    std::vector<InsertStatement>::const_iterator last,
-                   bool fromMigrate) final;
+                   const std::vector<RecordId>& recordIds,
+                   std::vector<bool> fromMigrate,
+                   bool defaultFromMigrate,
+                   OpStateAccumulator* opAccumulator = nullptr) final;
 
-    void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) final;
-
-    void aboutToDelete(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       const UUID& uuid,
-                       const BSONObj& doc) final;
+    void onUpdate(OperationContext* opCtx,
+                  const OplogUpdateEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) final;
 
     void onDelete(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  const UUID& uuid,
+                  const CollectionPtr& coll,
                   StmtId stmtId,
-                  const OplogDeleteEntryArgs& args) final;
-
-    void onInternalOpMessage(OperationContext* opCtx,
-                             const NamespaceString& nss,
-                             const boost::optional<UUID>& uuid,
-                             const BSONObj& msgObj,
-                             const boost::optional<BSONObj> o2MsgObj,
-                             const boost::optional<repl::OpTime> preImageOpTime,
-                             const boost::optional<repl::OpTime> postImageOpTime,
-                             const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
-                             const boost::optional<OplogSlot> slot) final{};
+                  const BSONObj& doc,
+                  const DocumentKey& documentKey,
+                  const OplogDeleteEntryArgs& args,
+                  OpStateAccumulator* opAccumulator = nullptr) final;
 
     void onCreateCollection(OperationContext* opCtx,
                             const CollectionPtr& coll,
@@ -122,14 +104,15 @@ public:
                    const CollectionOptions& oldCollOptions,
                    boost::optional<IndexCollModInfo> indexInfo) final;
 
-    void onDropDatabase(OperationContext* opCtx, const std::string& dbName) final;
+    void onDropDatabase(OperationContext* opCtx,
+                        const DatabaseName& dbName,
+                        bool markFromMigrate) final;
 
-    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   const UUID& uuid,
                                   std::uint64_t numRecords,
-                                  CollectionDropType dropType) final;
+                                  bool markFromMigrate) final;
 
     void onDropIndex(OperationContext* opCtx,
                      const NamespaceString& nss,
@@ -137,14 +120,14 @@ public:
                      const std::string& indexName,
                      const BSONObj& indexInfo) final;
 
-    using OpObserver::onRenameCollection;
     void onRenameCollection(OperationContext* opCtx,
                             const NamespaceString& fromCollection,
                             const NamespaceString& toCollection,
                             const UUID& uuid,
                             const boost::optional<UUID>& dropTargetUUID,
                             std::uint64_t numRecords,
-                            bool stayTemp) final;
+                            bool stayTemp,
+                            bool markFromMigrate) final;
 
     void onImportCollection(OperationContext* opCtx,
                             const UUID& importUUID,
@@ -155,72 +138,14 @@ public:
                             const BSONObj& storageMetadata,
                             bool isDryRun) final;
 
-    using OpObserver::preRenameCollection;
-    repl::OpTime preRenameCollection(OperationContext* opCtx,
-                                     const NamespaceString& fromCollection,
-                                     const NamespaceString& toCollection,
-                                     const UUID& uuid,
-                                     const boost::optional<UUID>& dropTargetUUID,
-                                     std::uint64_t numRecords,
-                                     bool stayTemp) final {
-        return repl::OpTime();
-    }
     void postRenameCollection(OperationContext* opCtx,
                               const NamespaceString& fromCollection,
                               const NamespaceString& toCollection,
                               const UUID& uuid,
                               const boost::optional<UUID>& dropTargetUUID,
                               bool stayTemp) final;
-    void onApplyOps(OperationContext* opCtx,
-                    const std::string& dbName,
-                    const BSONObj& applyOpCmd) final;
 
-    void onEmptyCapped(OperationContext* opCtx,
-                       const NamespaceString& collectionName,
-                       const UUID& uuid) final;
-
-    void onUnpreparedTransactionCommit(OperationContext* opCtx,
-                                       std::vector<repl::ReplOperation>* statements,
-                                       size_t numberOfPrePostImagesToWrite) final {}
-
-    void onPreparedTransactionCommit(
-        OperationContext* opCtx,
-        OplogSlot commitOplogEntryOpTime,
-        Timestamp commitTimestamp,
-        const std::vector<repl::ReplOperation>& statements) noexcept final {}
-
-    std::unique_ptr<ApplyOpsOplogSlotAndOperationAssignment> preTransactionPrepare(
-        OperationContext* opCtx,
-        const std::vector<OplogSlot>& reservedSlots,
-        size_t numberOfPrePostImagesToWrite,
-        Date_t wallClockTime,
-        std::vector<repl::ReplOperation>* statements) final {
-        return nullptr;
-    }
-
-    void onTransactionPrepare(
-        OperationContext* opCtx,
-        const std::vector<OplogSlot>& reservedSlots,
-        std::vector<repl::ReplOperation>* statements,
-        const ApplyOpsOplogSlotAndOperationAssignment* applyOpsOperationAssignment,
-        size_t numberOfPrePostImagesToWrite,
-        Date_t wallClockTime) final {}
-
-    void onTransactionAbort(OperationContext* opCtx,
-                            boost::optional<OplogSlot> abortOplogEntryOpTime) final {}
-
-    void onBatchedWriteCommit(OperationContext* opCtx) final {}
-
-    void onMajorityCommitPointUpdate(ServiceContext* service,
-                                     const repl::OpTime& newCommitPoint) final {}
-
-    // Contains the fields of the document that are in the collection's shard key, and "_id".
-    static BSONObj getDocumentKey(OperationContext* opCtx,
-                                  NamespaceString const& nss,
-                                  BSONObj const& doc);
-
-private:
-    void _onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo);
+    void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo) final;
 };
 
 }  // namespace mongo

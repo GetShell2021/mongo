@@ -25,9 +25,7 @@
 # OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 # ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 # OTHER DEALINGS IN THE SOFTWARE.
-from helper import simulate_crash_restart
-from test_rollback_to_stable01 import test_rollback_to_stable_base
-from wiredtiger import stat
+from rollback_to_stable_util import test_rollback_to_stable_base
 from wtdataset import SimpleDataSet
 from wtscenario import make_scenarios
 
@@ -47,10 +45,16 @@ class test_rollback_to_stable32(test_rollback_to_stable_base):
         ('prepare', dict(prepare=True))
     ]
 
-    scenarios = make_scenarios(format_values, prepare_values)
+    worker_thread_values = [
+        ('0', dict(threads=0)),
+        ('4', dict(threads=4)),
+        ('8', dict(threads=8))
+    ]
+
+    scenarios = make_scenarios(format_values, prepare_values, worker_thread_values)
 
     def conn_config(self):
-        config = 'cache_size=100MB,statistics=(all)'
+        config = 'cache_size=100MB,statistics=(all),verbose=(rts:5)'
         return config
 
     def test_rollback_to_stable_with_update_restore_evict(self):
@@ -96,7 +100,7 @@ class test_rollback_to_stable32(test_rollback_to_stable_base):
         self.check(value_c, uri, nrows, None, 61 if self.prepare else 60)
         self.evict_cursor(uri, nrows, value_c)
 
-        self.conn.rollback_to_stable()
+        self.conn.rollback_to_stable('threads=' + str(self.threads))
 
         self.conn.reconfigure("debug_mode=(eviction=false)")
 

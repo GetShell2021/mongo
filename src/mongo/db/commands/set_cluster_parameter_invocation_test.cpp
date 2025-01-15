@@ -27,18 +27,28 @@
  *    it in the license file.
  */
 
-#include "mongo/db/operation_context.h"
-#include "mongo/db/operation_id.h"
-#include "mongo/db/service_context.h"
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
 #include <functional>
+#include <string>
 
-#include "mongo/db/dbdirectclient.h"
-#include "mongo/logv2/log.h"
-#include "mongo/unittest/unittest.h"
+#include <boost/optional/optional.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/set_cluster_parameter_invocation.h"
-#include "mongo/idl/idl_parser.h"
+#include "mongo/db/logical_time.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -55,7 +65,7 @@ class MockParameterService : public ServerParameterService {
 public:
     MockParameterService(std::function<ServerParameter*(StringData)> get) : _getMock(get){};
 
-    ServerParameter* get(StringData parameterName) {
+    ServerParameter* get(StringData parameterName) override {
         return _getMock(parameterName);
     }
 
@@ -70,21 +80,27 @@ public:
         : ServerParameter(name, ServerParameterType::kRuntimeOnly) {
         this->validateImpl = validateImpl;
     }
-    void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) {}
+    void append(OperationContext* opCtx,
+                BSONObjBuilder* b,
+                StringData name,
+                const boost::optional<TenantId>&) override {}
 
     void appendSupportingRoundtrip(OperationContext* opCtx,
-                                   BSONObjBuilder& b,
-                                   const std::string& name) {}
+                                   BSONObjBuilder* b,
+                                   StringData name,
+                                   const boost::optional<TenantId>&) override {}
 
-    Status set(const BSONElement& newValueElement) {
+    Status set(const BSONElement& newValueElement,
+               const boost::optional<TenantId>& tenantId) override {
         return Status(ErrorCodes::BadValue, "Should not call set() in this test");
     }
 
-    Status setFromString(const std::string& str) {
-        return Status(ErrorCodes::BadValue, "Should not call setFromString in this test");
+    Status setFromString(StringData str, const boost::optional<TenantId>& tenantId) override {
+        return Status(ErrorCodes::BadValue, "Should not call setFromString() in this test");
     }
 
-    Status validate(const BSONElement& newValueElement) const {
+    Status validate(const BSONElement& newValueElement,
+                    const boost::optional<TenantId>& tenantId) const override {
         return validateImpl(newValueElement);
     }
 
@@ -94,15 +110,18 @@ private:
 
 class DBClientMock : public DBClientService {
 public:
-    DBClientMock(std::function<StatusWith<bool>(BSONObj, BSONObj)> updateParameterOnDiskMock) {
+    DBClientMock(std::function<BatchedCommandResponse(
+                     BSONObj, BSONObj, const boost::optional<auth::ValidatedTenancyScope>&)>
+                     updateParameterOnDiskMock) {
         this->updateParameterOnDiskMockImpl = updateParameterOnDiskMock;
     }
 
-    StatusWith<bool> updateParameterOnDisk(OperationContext* opCtx,
-                                           BSONObj cmd,
-                                           BSONObj info,
-                                           const WriteConcernOptions&) override {
-        return updateParameterOnDiskMockImpl(cmd, info);
+    BatchedCommandResponse updateParameterOnDisk(
+        BSONObj query,
+        BSONObj update,
+        const WriteConcernOptions&,
+        const boost::optional<auth::ValidatedTenancyScope>& vts) override {
+        return updateParameterOnDiskMockImpl(query, update, vts);
     }
 
     Timestamp getUpdateClusterTime(OperationContext*) override {
@@ -111,7 +130,9 @@ public:
     }
 
 private:
-    std::function<StatusWith<bool>(BSONObj, BSONObj)> updateParameterOnDiskMockImpl;
+    std::function<BatchedCommandResponse(
+        BSONObj, BSONObj, const boost::optional<auth::ValidatedTenancyScope>&)>
+        updateParameterOnDiskMockImpl;
 };
 
 MockServerParameter alwaysValidatingServerParameter(StringData name) {
@@ -131,15 +152,33 @@ MockServerParameter alwaysInvalidatingServerParameter(StringData name) {
 }
 
 DBClientMock alwaysSucceedingDbClient() {
-    DBClientMock dbServiceMock([&](BSONObj cmd, BSONObj info) { return true; });
+    DBClientMock dbServiceMock(
+        [&](BSONObj, BSONObj, const boost::optional<auth::ValidatedTenancyScope>&) {
+            BatchedCommandResponse result;
+            result.setStatus(Status::OK());
+            return result;
+        });
+
+    return dbServiceMock;
+}
+
+DBClientMock tenantIdReportingDbClient() {
+    DBClientMock dbServiceMock(
+        [&](BSONObj, BSONObj, const boost::optional<auth::ValidatedTenancyScope>& vts) {
+            uasserted(ErrorCodes::UnknownError,
+                      (vts && vts->hasTenantId()) ? vts->tenantId().toString() : "");
+            return BatchedCommandResponse();
+        });
 
     return dbServiceMock;
 }
 
 DBClientMock alwaysFailingDbClient() {
-    DBClientMock dbServiceMock([&](BSONObj cmd, BSONObj info) {
-        return Status(ErrorCodes::UnknownError, "DB Client Update Failed");
-    });
+    DBClientMock dbServiceMock(
+        [&](BSONObj, BSONObj, const boost::optional<auth::ValidatedTenancyScope>&) {
+            uasserted(ErrorCodes::UnknownError, "DB Client Update Failed");
+            return BatchedCommandResponse();
+        });
 
     return dbServiceMock;
 }
@@ -151,7 +190,7 @@ TEST(SetClusterParameterCommand, SucceedsWithObjectParameter) {
     DBClientMock dbServiceMock = alwaysSucceedingDbClient();
 
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("SomeTest");
+    auto client = serviceCtx->getService()->makeClient("SomeTest");
 
     auto mpsPtr = std::make_unique<MockParameterService>([&](StringData s) { return &sp; });
 
@@ -172,7 +211,7 @@ TEST(SetClusterParameterCommand, SucceedsWithObjectParameter) {
                                                                         << "majority")));
     SetClusterParameter testCmd(obj);
 
-    fixture.invoke(&spyCtx, testCmd, boost::none, kMajorityWriteConcern);
+    fixture.invoke(&spyCtx, testCmd, boost::none, boost::none, kMajorityWriteConcern);
 }
 
 TEST(SetClusterParameterCommand, ThrowsWithNonObjectParameter) {
@@ -181,7 +220,7 @@ TEST(SetClusterParameterCommand, ThrowsWithNonObjectParameter) {
     DBClientMock dbServiceMock = alwaysSucceedingDbClient();
 
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("SomeTest");
+    auto client = serviceCtx->getService()->makeClient("SomeTest");
 
     auto mpsPtr = std::make_unique<MockParameterService>([&](StringData s) { return &sp; });
 
@@ -197,9 +236,10 @@ TEST(SetClusterParameterCommand, ThrowsWithNonObjectParameter) {
     OperationContext spyCtx(clientPtr, 1234);
     SetClusterParameter testCmd(obj);
 
-    ASSERT_THROWS_CODE(fixture.invoke(&spyCtx, testCmd, boost::none, kMajorityWriteConcern),
-                       DBException,
-                       ErrorCodes::IllegalOperation);
+    ASSERT_THROWS_CODE(
+        fixture.invoke(&spyCtx, testCmd, boost::none, boost::none, kMajorityWriteConcern),
+        DBException,
+        ErrorCodes::BadValue);
 }
 
 TEST(SetClusterParameterCommand, ThrowsWhenServerParameterValidationFails) {
@@ -209,7 +249,7 @@ TEST(SetClusterParameterCommand, ThrowsWhenServerParameterValidationFails) {
     DBClientMock dbServiceMock = alwaysSucceedingDbClient();
 
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("SomeTest");
+    auto client = serviceCtx->getService()->makeClient("SomeTest");
 
     auto mpsPtr = std::make_unique<MockParameterService>([&](StringData s) { return &sp; });
 
@@ -228,7 +268,7 @@ TEST(SetClusterParameterCommand, ThrowsWhenServerParameterValidationFails) {
     SetClusterParameter testCmd(obj);
 
     ASSERT_THROWS_CODE_AND_WHAT(
-        fixture.invoke(&spyCtx, testCmd, boost::none, kMajorityWriteConcern),
+        fixture.invoke(&spyCtx, testCmd, boost::none, boost::none, kMajorityWriteConcern),
         DBException,
         ErrorCodes::BadValue,
         "Parameter Validation Failed"_sd);
@@ -240,7 +280,7 @@ TEST(SetClusterParameterCommand, ThrowsWhenDBUpdateFails) {
     DBClientMock dbServiceMock = alwaysFailingDbClient();
 
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("SomeTest");
+    auto client = serviceCtx->getService()->makeClient("SomeTest");
 
     auto mpsPtr = std::make_unique<MockParameterService>([&](StringData s) { return &sp; });
 
@@ -259,9 +299,10 @@ TEST(SetClusterParameterCommand, ThrowsWhenDBUpdateFails) {
 
     SetClusterParameter testCmd(obj);
 
-    ASSERT_THROWS_WHAT(fixture.invoke(&spyCtx, testCmd, boost::none, kMajorityWriteConcern),
-                       DBException,
-                       "DB Client Update Failed"_sd);
+    ASSERT_THROWS_WHAT(
+        fixture.invoke(&spyCtx, testCmd, boost::none, boost::none, kMajorityWriteConcern),
+        DBException,
+        "DB Client Update Failed"_sd);
 }
 
 TEST(SetClusterParameterCommand, ThrowsWhenParameterNotPresent) {
@@ -269,7 +310,7 @@ TEST(SetClusterParameterCommand, ThrowsWhenParameterNotPresent) {
     DBClientMock dbServiceMock = alwaysSucceedingDbClient();
 
     auto serviceCtx = ServiceContext::make();
-    auto client = serviceCtx->makeClient("SomeTest");
+    auto client = serviceCtx->getService()->makeClient("SomeTest");
 
     auto mpsPtr = std::make_unique<MockParameterService>([&](StringData s) {
         return ServerParameterSet::getClusterParameterSet()->get("doesNotExistParam"_sd);
@@ -290,9 +331,58 @@ TEST(SetClusterParameterCommand, ThrowsWhenParameterNotPresent) {
 
     SetClusterParameter testCmd(obj);
 
-    ASSERT_THROWS_CODE(fixture.invoke(&spyCtx, testCmd, boost::none, kMajorityWriteConcern),
-                       DBException,
-                       ErrorCodes::NoSuchKey);
+    ASSERT_THROWS_CODE(
+        fixture.invoke(&spyCtx, testCmd, boost::none, boost::none, kMajorityWriteConcern),
+        DBException,
+        ErrorCodes::NoSuchKey);
 }
+
+TEST(SetClusterParameterCommand, TenantIdPassesThrough) {
+
+    DBClientMock dbServiceMock = tenantIdReportingDbClient();
+    MockServerParameter sp = alwaysValidatingServerParameter("TenantIdPassesThroughParameter"_sd);
+
+    auto serviceCtx = ServiceContext::make();
+    auto client = serviceCtx->getService()->makeClient("SomeTest");
+
+    auto mpsPtr = std::make_unique<MockParameterService>([&](StringData s) { return &sp; });
+
+    Client* clientPtr = client.get();
+
+    BSONObjBuilder testCmdBson;
+    testCmdBson << "testCommand"
+                << BSON("ok"
+                        << "someval");
+
+    BSONObj obj = testCmdBson.obj();
+
+    SetClusterParameterInvocation fixture(std::move(mpsPtr), dbServiceMock);
+
+    OperationContext spyCtx(clientPtr, 1234);
+
+    TenantId tenantId(OID("123456789012345678901234"));
+
+    SetClusterParameter testCmdNoTenant(obj);
+
+    ASSERT_THROWS_CODE_AND_WHAT(
+        fixture.invoke(&spyCtx, testCmdNoTenant, boost::none, boost::none, kMajorityWriteConcern),
+        DBException,
+        ErrorCodes::UnknownError,
+        "");
+
+    SetClusterParameter testCmdWithTenant(obj);
+    testCmdWithTenant.setDbName(NamespaceString::makeClusterParametersNSS(tenantId).dbName());
+
+    // Prepare the tenant operation context with tenant scope.
+    auth::ValidatedTenancyScopeGuard::runAsTenant(&spyCtx, tenantId, [&]() {
+        ASSERT_THROWS_CODE_AND_WHAT(
+            fixture.invoke(
+                &spyCtx, testCmdWithTenant, boost::none, boost::none, kMajorityWriteConcern),
+            DBException,
+            ErrorCodes::UnknownError,
+            tenantId.toString());
+    });
+}
+
 }  // namespace
 }  // namespace mongo

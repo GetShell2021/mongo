@@ -1,10 +1,13 @@
 /**
  * Tests server status has correct fault/facet information.
  *
- *  @tags: [multiversion_incompatible]
+ * @tags: [
+ *   multiversion_incompatible,
+ *   # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *   embedded_router_incompatible,
+ * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 function changeObserverIntensity(observer, intensity) {
     let paramValue = {"values": [{"type": observer, "intensity": intensity}]};
@@ -21,7 +24,6 @@ const params = {
                 {type: "dns", intensity: "off"}
             ]
         }),
-        featureFlagHealthMonitoring: true
     }
 };
 
@@ -95,4 +97,3 @@ assert(testObserver.timeSinceLastCheckStartedMs >= 1);
 assert(testObserver.timeSinceLastCheckCompletedMs >= 1);
 
 st.stop();
-})();

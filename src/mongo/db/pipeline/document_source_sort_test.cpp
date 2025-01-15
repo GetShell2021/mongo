@@ -27,13 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/intrusive_ptr.hpp>
+#include <cstddef>
 #include <deque>
+#include <iterator>
+#include <list>
 #include <string>
 #include <vector>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
@@ -42,13 +47,20 @@
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/dependencies.h"
+#include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/query/explain_options.h"
 #include "mongo/idl/server_parameter_test_util.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/unittest/temp_dir.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -70,14 +82,20 @@ protected:
         _sort = DocumentSourceSort::createFromBson(specElement, getExpCtx());
         checkBsonRepresentation(spec);
     }
-    DocumentSourceSort* sort() {
-        return dynamic_cast<DocumentSourceSort*>(_sort.get());
+
+    void setSort(intrusive_ptr<DocumentSource> sort) {
+        _sort = std::move(sort);
     }
+
     /** Assert that iterator state accessors consistently report the source is exhausted. */
     void assertEOF() const {
         ASSERT(_sort->getNext().isEOF());
         ASSERT(_sort->getNext().isEOF());
         ASSERT(_sort->getNext().isEOF());
+    }
+
+    DocumentSourceSort* sort() {
+        return dynamic_cast<DocumentSourceSort*>(_sort.get());
     }
 
 private:
@@ -166,6 +184,39 @@ TEST_F(DocumentSourceSortTest, SortWithLimit) {
         sort()->distributedPlanLogic()->mergingStages.begin()->get()));
 }
 
+TEST_F(DocumentSourceSortTest, ParseableSerialization) {
+    // Test that SerializationOptions.serializeForCloning works as expected for $sort stage.
+    auto expCtx = getExpCtx();
+    createSort(BSON("a" << 1));
+
+    ASSERT(!sort()->getLimit());
+    Pipeline::SourceContainer container;
+    container.push_back(sort());
+
+    container.push_back(DocumentSourceLimit::create(expCtx, 2));
+    sort()->optimizeAt(container.begin(), &container);
+    ASSERT_EQUALS(container.size(), 1U);
+    ASSERT_EQUALS(*sort()->getLimit(), 2);
+
+    vector<Value> arr;
+    sort()->serializeToArray(arr, SerializationOptions{.serializeForCloning = true});
+    ASSERT_EQUALS(arr.size(), 1U);
+    ASSERT_VALUE_EQ(arr[0], Value(fromjson("{$sort: {a: 1, $_internalLimit: 2}}")));
+
+    // Test that the serialized spec can be parsed to construct a clone of the DocumentSourceSort
+    // instance.
+    BSONObj spec = arr[0].getDocument().toBson();
+    BSONElement specElement = spec.firstElement();
+    auto sort2Source = DocumentSourceSort::createFromBson(specElement, expCtx);
+    auto sort2 = dynamic_cast<DocumentSourceSort*>(sort2Source.get());
+    ASSERT_EQUALS(*sort2->getLimit(), 2);
+
+    arr.clear();
+    sort2->serializeToArray(arr, SerializationOptions{.serializeForCloning = true});
+    ASSERT_EQUALS(arr.size(), 1U);
+    ASSERT_VALUE_EQ(arr[0], Value(fromjson("{$sort: {a: 1, $_internalLimit: 2}}")));
+}
+
 TEST_F(DocumentSourceSortTest, DoesNotPushProjectBeforeSelf) {
     Pipeline::SourceContainer container;
     createSort(BSON("_id" << 1));
@@ -205,34 +256,19 @@ TEST_F(DocumentSourceSortTest, AllowsSortOnMetaGeoNearDistance) {
     BSONObj spec = BSON("$sort" << BSON("dist" << BSON("$meta"
                                                        << "geoNearDistance")));
     BSONElement specElement = spec.firstElement();
-    // The {$meta: 'geoNearDistance'} is allowed only when the featureFlagTimeseriesMetricIndexes
-    // flag is enabled.
-    {
-        RAIIServerParameterControllerForTest controller("featureFlagTimeseriesMetricIndexes", true);
-        auto sort = DocumentSourceSort::createFromBson(specElement, getExpCtx());
+    auto sort = DocumentSourceSort::createFromBson(specElement, getExpCtx());
 
-        vector<Value> arr;
-        sort->serializeToArray(arr);
-        ASSERT_BSONOBJ_EQ(arr[0].getDocument().toBson(),
-                          BSON("$sort" << BSON("$computed0" << BSON("$meta"
-                                                                    << "geoNearDistance"))));
-    }
-    {
-        RAIIServerParameterControllerForTest controller("featureFlagTimeseriesMetricIndexes",
-                                                        false);
-        ASSERT_THROWS_CODE(DocumentSourceSort::createFromBson(specElement, getExpCtx()),
-                           AssertionException,
-                           5917100);
-    }
+    vector<Value> arr;
+    sort->serializeToArray(arr);
+    ASSERT_BSONOBJ_EQ(arr[0].getDocument().toBson(),
+                      BSON("$sort" << BSON("$computed0" << BSON("$meta"
+                                                                << "geoNearDistance"))));
 }
 
 TEST_F(DocumentSourceSortTest, DetectsDependencyOnMeta) {
     BSONObj spec = BSON("$sort" << BSON("dist" << BSON("$meta"
                                                        << "geoNearDistance")));
     BSONElement specElement = spec.firstElement();
-    // The {$meta: 'geoNearDistance'} is allowed only when the featureFlagTimeseriesMetricIndexes
-    // flag is enabled.
-    RAIIServerParameterControllerForTest controller("featureFlagTimeseriesMetricIndexes", true);
     auto sort = DocumentSourceSort::createFromBson(specElement, getExpCtx());
 
     DepsTracker dependencies;
@@ -244,15 +280,14 @@ TEST_F(DocumentSourceSortTest, DetectsDependencyOnMeta) {
 class DocumentSourceSortExecutionTest : public DocumentSourceSortTest {
 public:
     void checkResults(deque<DocumentSource::GetNextResult> inputDocs,
-                      BSONObj sortSpec,
+                      DocumentSourceSort* sort,
                       string expectedResultSetString) {
-        createSort(sortSpec);
         auto source = DocumentSourceMock::createForTest(inputDocs, getExpCtx());
-        sort()->setSource(source.get());
+        sort->setSource(source.get());
 
         // Load the results from the DocumentSourceUnwind.
         vector<Document> resultSet;
-        for (auto output = sort()->getNext(); output.isAdvanced(); output = sort()->getNext()) {
+        for (auto output = sort->getNext(); output.isAdvanced(); output = sort->getNext()) {
             // Get the current result.
             resultSet.push_back(output.releaseDocument());
         }
@@ -279,86 +314,97 @@ protected:
 };
 
 TEST_F(DocumentSourceSortExecutionTest, ShouldGiveNoOutputIfGivenNoInputs) {
-    checkResults({}, BSON("a" << 1), "[]");
+    createSort(BSON("a" << 1));
+    checkResults({}, sort(), "[]");
 }
 
 TEST_F(DocumentSourceSortExecutionTest, ShouldGiveOneOutputIfGivenOneInput) {
-    checkResults({Document{{"_id", 0}, {"a", 1}}}, BSON("a" << 1), "[{_id:0,a:1}]");
+    createSort(BSON("a" << 1));
+    checkResults({Document{{"_id", 0}, {"a", 1}}}, sort(), "[{_id:0,a:1}]");
 }
 
 TEST_F(DocumentSourceSortExecutionTest, ShouldSortTwoInputsAccordingToOneFieldAscending) {
+    createSort(BSON("a" << 1));
     checkResults({Document{{"_id", 0}, {"a", 2}}, Document{{"_id", 1}, {"a", 1}}},
-                 BSON("a" << 1),
+                 sort(),
                  "[{_id:1,a:1},{_id:0,a:2}]");
 }
 
 /** Sort spec with a descending field. */
 TEST_F(DocumentSourceSortExecutionTest, DescendingOrder) {
+    createSort(BSON("a" << -1));
     checkResults({Document{{"_id", 0}, {"a", 2}}, Document{{"_id", 1}, {"a", 1}}},
-                 BSON("a" << -1),
+                 sort(),
                  "[{_id:0,a:2},{_id:1,a:1}]");
 }
 
 /** Sort spec with a dotted field. */
 TEST_F(DocumentSourceSortExecutionTest, DottedSortField) {
+    createSort(BSON("a.b" << 1));
     checkResults({Document{{"_id", 0}, {"a", Document{{"b", 2}}}},
                   Document{{"_id", 1}, {"a", Document{{"b", 1}}}}},
-                 BSON("a.b" << 1),
+                 sort(),
                  "[{_id:1,a:{b:1}},{_id:0,a:{b:2}}]");
 }
 
 /** Sort spec with a compound key. */
 TEST_F(DocumentSourceSortExecutionTest, CompoundSortSpec) {
+    createSort(BSON("a" << 1 << "b" << 1));
     checkResults({Document{{"_id", 0}, {"a", 1}, {"b", 3}},
                   Document{{"_id", 1}, {"a", 1}, {"b", 2}},
                   Document{{"_id", 2}, {"a", 0}, {"b", 4}}},
-                 BSON("a" << 1 << "b" << 1),
+                 sort(),
                  "[{_id:2,a:0,b:4},{_id:1,a:1,b:2},{_id:0,a:1,b:3}]");
 }
 
 /** Sort spec with a compound key and descending order. */
 TEST_F(DocumentSourceSortExecutionTest, CompoundSortSpecAlternateOrder) {
+    createSort(BSON("a" << -1 << "b" << 1));
     checkResults({Document{{"_id", 0}, {"a", 1}, {"b", 3}},
                   Document{{"_id", 1}, {"a", 1}, {"b", 2}},
                   Document{{"_id", 2}, {"a", 0}, {"b", 4}}},
-                 BSON("a" << -1 << "b" << 1),
+                 sort(),
                  "[{_id:1,a:1,b:2},{_id:0,a:1,b:3},{_id:2,a:0,b:4}]");
 }
 
 /** Sort spec with a compound key and descending order. */
 TEST_F(DocumentSourceSortExecutionTest, CompoundSortSpecAlternateOrderSecondField) {
+    createSort(BSON("a" << 1 << "b" << -1));
     checkResults({Document{{"_id", 0}, {"a", 1}, {"b", 3}},
                   Document{{"_id", 1}, {"a", 1}, {"b", 2}},
                   Document{{"_id", 2}, {"a", 0}, {"b", 4}}},
-                 BSON("a" << 1 << "b" << -1),
+                 sort(),
                  "[{_id:2,a:0,b:4},{_id:0,a:1,b:3},{_id:1,a:1,b:2}]");
 }
 
 /** Sorting different types is not supported. */
 TEST_F(DocumentSourceSortExecutionTest, InconsistentTypeSort) {
+    createSort(BSON("a" << 1));
     checkResults({Document{{"_id", 0}, {"a", 1}}, Document{{"_id", 1}, {"a", "foo"_sd}}},
-                 BSON("a" << 1),
+                 sort(),
                  "[{_id:0,a:1},{_id:1,a:\"foo\"}]");
 }
 
 /** Sorting different numeric types is supported. */
 TEST_F(DocumentSourceSortExecutionTest, MixedNumericSort) {
+    createSort(BSON("a" << 1));
     checkResults({Document{{"_id", 0}, {"a", 2.3}}, Document{{"_id", 1}, {"a", 1}}},
-                 BSON("a" << 1),
+                 sort(),
                  "[{_id:1,a:1},{_id:0,a:2.3}]");
 }
 
 /** Ordering of a missing value. */
 TEST_F(DocumentSourceSortExecutionTest, MissingValue) {
-    checkResults({Document{{"_id", 0}, {"a", 1}}, Document{{"_id", 1}}},
-                 BSON("a" << 1),
-                 "[{_id:1},{_id:0,a:1}]");
+    createSort(BSON("a" << 1));
+    checkResults(
+        {Document{{"_id", 0}, {"a", 1}}, Document{{"_id", 1}}}, sort(), "[{_id:1},{_id:0,a:1}]");
 }
 
 /** Ordering of a null value. */
 TEST_F(DocumentSourceSortExecutionTest, NullValue) {
+    createSort(BSON("a" << 1));
     checkResults({Document{{"_id", 0}, {"a", 1}}, Document{{"_id", 1}, {"a", BSONNULL}}},
-                 BSON("a" << 1),
+                 sort(),
                  "[{_id:1,a:null},{_id:0,a:1}]");
 }
 
@@ -371,9 +417,8 @@ TEST_F(DocumentSourceSortExecutionTest, TextScore) {
     MutableDocument second(Document{{"_id", 1}});
     second.metadata().setTextScore(20);
 
-    checkResults({first.freeze(), second.freeze()},
-                 BSON("$computed0" << metaTextScore),
-                 "[{_id:1},{_id:0}]");
+    createSort(BSON("$computed0" << metaTextScore));
+    checkResults({first.freeze(), second.freeze()}, sort(), "[{_id:1},{_id:0}]");
 }
 
 /**
@@ -385,27 +430,68 @@ TEST_F(DocumentSourceSortExecutionTest, RandMeta) {
     MutableDocument second(Document{{"_id", 1}});
     second.metadata().setRandVal(0.02);
 
-    checkResults({first.freeze(), second.freeze()},
-                 BSON("$computed0" << BSON("$meta"
-                                           << "randVal")),
-                 "[{_id:1},{_id:0}]");
+    createSort(BSON("$computed0" << BSON("$meta"
+                                         << "randVal")));
+    checkResults({first.freeze(), second.freeze()}, sort(), "[{_id:1},{_id:0}]");
 }
 
 /** A missing nested object within an array returns an empty array. */
 TEST_F(DocumentSourceSortExecutionTest, MissingObjectWithinArray) {
+    createSort(BSON("a.b" << 1));
     checkResults({Document{{"_id", 0}, {"a", DOC_ARRAY(1)}},
                   Document{{"_id", 1}, {"a", DOC_ARRAY(DOC("b" << 1))}}},
-                 BSON("a.b" << 1),
+                 sort(),
                  "[{_id:0,a:[1]},{_id:1,a:[{b:1}]}]");
 }
 
 /** Compare nested values from within an array. */
 TEST_F(DocumentSourceSortExecutionTest, ExtractArrayValues) {
+    createSort(BSON("a.b" << 1));
     checkResults({Document{{"_id", 0}, {"a", DOC_ARRAY(DOC("b" << 1) << DOC("b" << 2))}},
                   Document{{"_id", 1}, {"a", DOC_ARRAY(DOC("b" << 1) << DOC("b" << 0))}}},
-                 BSON("a.b" << 1),
+                 sort(),
                  "[{_id:1,a:[{b:1},{b:0}]},{_id:0,a:[{b:1},{b:2}]}]");
 }
+
+TEST_F(DocumentSourceSortExecutionTest, ParseableSerialization) {
+    // Test that the serialized spec created with SerializationOptions.serializeForCloning option
+    // can be parsed to construct a clone of the DocumentSourceSort instance.
+    auto expCtx = getExpCtx();
+
+    BSONObj spec = fromjson("{$sort: {a: 1, $_internalLimit: 2}}");
+    BSONElement specElement = spec.firstElement();
+    setSort(DocumentSourceSort::createFromBson(specElement, getExpCtx()));
+    ASSERT_EQUALS(*sort()->getLimit(), 2);
+    checkResults({Document{{"_id", 0}, {"a", 1}},
+                  Document{{"_id", 1}, {"a", 2}},
+                  Document{{"_id", 2}, {"a", 3}}},
+                 sort(),
+                 "[{_id:0,a:1},{_id:1,a:2}]");
+
+    vector<Value> arr;
+    sort()->serializeToArray(arr, SerializationOptions{.serializeForCloning = true});
+    ASSERT_EQUALS(arr.size(), 1U);
+    ASSERT_VALUE_EQ(arr[0], Value(fromjson("{$sort: {a: 1, $_internalLimit: 2}}")));
+}
+
+TEST_F(DocumentSourceSortExecutionTest, FailsGracefullyWithInvalidInternalParameters) {
+    auto expCtx = getExpCtx();
+
+    auto spec = fromjson("{$sort: {a: 1, $_internalLimit: 'surprise string!'}}");
+    ASSERT_THROWS_CODE(DocumentSourceSort::createFromBson(spec.firstElement(), expCtx),
+                       AssertionException,
+                       9028702);
+
+    spec = fromjson("{$sort: {a: 1, $_internalOutputSortKey: 'surprise string!'}}");
+    ASSERT_THROWS_CODE(
+        DocumentSourceSort::createFromBson(spec.firstElement(), expCtx), AssertionException, 15974);
+
+    // Must be a boolean, not bool-"ish".
+    spec = fromjson("{$sort: {a: 1, $_internalOutputSortKey: 1}}");
+    ASSERT_THROWS_CODE(
+        DocumentSourceSort::createFromBson(spec.firstElement(), expCtx), AssertionException, 16410);
+}
+
 
 TEST_F(DocumentSourceSortExecutionTest, ShouldPauseWhenAskedTo) {
     auto sort = DocumentSourceSort::create(getExpCtx(), BSON("a" << 1));
@@ -459,12 +545,12 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldBeAbleToPauseLoadingWhileSpilled) 
 
     // Allow the $sort stage to spill to disk.
     unittest::TempDir tempDir("DocumentSourceSortTest");
-    expCtx->tempDir = tempDir.path();
-    expCtx->allowDiskUse = true;
+    expCtx->setTempDir(tempDir.path());
+    expCtx->setAllowDiskUse(true);
     const size_t maxMemoryUsageBytes = 1000;
 
-    auto sort =
-        DocumentSourceSort::create(expCtx, {BSON("_id" << -1), expCtx}, 0, maxMemoryUsageBytes);
+    auto sort = DocumentSourceSort::create(
+        expCtx, {BSON("_id" << -1), expCtx}, {.maxMemoryUsageBytes = maxMemoryUsageBytes});
 
     string largeStr(maxMemoryUsageBytes, 'x');
     auto mock =
@@ -497,11 +583,11 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldBeAbleToPauseLoadingWhileSpilled) 
 TEST_F(DocumentSourceSortExecutionTest,
        ShouldErrorIfNotAllowedToSpillToDiskAndResultSetIsTooLarge) {
     auto expCtx = getExpCtx();
-    expCtx->allowDiskUse = false;
+    expCtx->setAllowDiskUse(false);
     const size_t maxMemoryUsageBytes = 1000;
 
-    auto sort =
-        DocumentSourceSort::create(expCtx, {BSON("_id" << -1), expCtx}, 0, maxMemoryUsageBytes);
+    auto sort = DocumentSourceSort::create(
+        expCtx, {BSON("_id" << -1), expCtx}, {.maxMemoryUsageBytes = maxMemoryUsageBytes});
 
     string largeStr(maxMemoryUsageBytes, 'x');
     auto mock = DocumentSourceMock::createForTest({Document{{"_id", 0}, {"largeStr", largeStr}},
@@ -515,13 +601,13 @@ TEST_F(DocumentSourceSortExecutionTest,
 
 TEST_F(DocumentSourceSortExecutionTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     auto expCtx = getExpCtx();
-    expCtx->allowDiskUse = false;
+    expCtx->setAllowDiskUse(false);
     const size_t maxMemoryUsageBytes = 1000;
 
-    auto sort =
-        DocumentSourceSort::create(expCtx, {BSON("_id" << -1), expCtx}, 0, maxMemoryUsageBytes);
+    auto sort = DocumentSourceSort::create(
+        expCtx, {BSON("_id" << -1), expCtx}, {.maxMemoryUsageBytes = maxMemoryUsageBytes});
 
-    string largeStr(maxMemoryUsageBytes / 2, 'x');
+    string largeStr(maxMemoryUsageBytes / 5, 'x');
     auto mock =
         DocumentSourceMock::createForTest({Document{{"_id", 0}, {"largeStr", largeStr}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
@@ -536,6 +622,124 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldCorrectlyTrackMemoryUsageBetweenPa
     // The next should realize it's used too much memory.
     ASSERT_THROWS_CODE(
         sort->getNext(), AssertionException, ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
+}
+
+TEST_F(DocumentSourceSortTest, Redaction) {
+    createSort(BSON("a" << 1));
+    auto boundedSort = DocumentSourceSort::createBoundedSort(
+        sort()->getSortKeyPattern(), DocumentSourceSort::kMin, 1337, 10, getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"$sort":{"HASH<a>":1}})",
+        redact(*sort(), true));
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$_internalBoundedSort": {
+                "sortKey": {
+                    "HASH<a>": 1
+                },
+                "bound": {
+                    "base": "min",
+                    "offsetSeconds": "?number"
+                },
+                "limit": "?number"
+            }
+        })",
+        redact(*boundedSort, true));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"$sort":{"sortKey":{"HASH<a>":1}}})",
+        redact(*sort(), true, ExplainOptions::Verbosity::kQueryPlanner));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$_internalBoundedSort": {
+                "sortKey": {
+                    "HASH<a>": 1
+                },
+                "bound": {
+                    "base": "min",
+                    "offsetSeconds": "?number"
+                },
+                "limit": "?number"
+            }
+        })",
+        redact(*boundedSort, true, ExplainOptions::Verbosity::kQueryPlanner));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({
+            "$sort": {
+                "sortKey": {
+                    "HASH<a>": 1
+                }
+            },
+            "totalDataSizeSortedBytesEstimate": "?number",
+            "usedDisk": "?bool",
+            "spills": "?number",
+            "spilledDataStorageSize": "?number"
+        })",
+        redact(*sort(), true, ExplainOptions::Verbosity::kExecStats));
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$_internalBoundedSort": {
+                "sortKey": {
+                    "HASH<a>": 1
+                },
+                "bound": {
+                    "base": "min",
+                    "offsetSeconds": "?number"
+                },
+                "limit": "?number"
+            },
+            "totalDataSizeSortedBytesEstimate": "?number",
+            "usedDisk": "?bool",
+            "spills": "?number",
+            "spilledDataStorageSize": "?number"
+        })",
+        redact(*boundedSort, true, ExplainOptions::Verbosity::kExecStats));
+}
+
+void assertProducesSortKeyMetadata(auto expCtx, auto sortStage) {
+    const auto mock =
+        DocumentSourceMock::createForTest({Document{{"_id", 0}}, Document{{"_id", 1}}}, expCtx);
+    sortStage->setSource(mock.get());
+    const auto output1 = sortStage->getNext();
+    ASSERT(output1.isAdvanced());
+    ASSERT(output1.getDocument().metadata().hasSortKey());
+    const auto output2 = sortStage->getNext();
+    ASSERT(output2.isAdvanced());
+    ASSERT(output2.getDocument().metadata().hasSortKey());
+    ASSERT(sortStage->getNext().isEOF());
+}
+
+TEST_F(DocumentSourceSortExecutionTest, ShouldOutputSortKeyMetadataIfRequested) {
+    auto expCtx = getExpCtx();
+    auto sort = DocumentSourceSort::create(
+        expCtx, {BSON("_id" << -1), expCtx}, {.outputSortKeyMetadata = true});
+    assertProducesSortKeyMetadata(expCtx, sort);
+}
+
+TEST_F(DocumentSourceSortExecutionTest, OutputSortKeyHoldsUpOverCloning) {
+    auto expCtx = getExpCtx();
+    auto sortBase = DocumentSourceSort::create(
+        expCtx, {BSON("_id" << -1), expCtx}, {.outputSortKeyMetadata = true});
+    auto clone = sortBase->clone(expCtx);
+    assertProducesSortKeyMetadata(expCtx, clone);
+}
+
+TEST_F(DocumentSourceSortExecutionTest, OutputSortKeyHoldsUpOverSerialization) {
+    auto expCtx = getExpCtx();
+    auto sortBase = DocumentSourceSort::create(
+        expCtx, {BSON("_id" << -1), expCtx}, {.outputSortKeyMetadata = true});
+    BSONObj serializedBson = [&]() {
+        std::vector<Value> serialization;
+        sortBase->serializeToArray(serialization);
+        ASSERT(serialization.size() == 1);
+        return serialization.front().getDocument().toBson();
+    }();
+    auto reparsed = DocumentSourceSort::createFromBson(serializedBson.firstElement(), expCtx);
+    assertProducesSortKeyMetadata(expCtx, reparsed);
 }
 
 }  // namespace

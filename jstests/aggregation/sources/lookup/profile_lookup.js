@@ -2,12 +2,10 @@
 // @tags: [
 //  does_not_support_stepdowns,
 //  requires_profiling,
+//  not_allowed_with_signed_security_token,
 // ]
 
-(function() {
-"use strict";
-
-load("jstests/libs/analyze_plan.js");  // For getAggPlanStages.
+import {getAggPlanStages} from "jstests/libs/query/analyze_plan.js";
 
 const localColl = db.local;
 const foreignColl = db.foreign;
@@ -17,8 +15,12 @@ foreignColl.drop();
 assert.commandWorked(localColl.insert([{a: 1}, {b: 1}, {a: 2}]));
 assert.commandWorked(foreignColl.insert({a: 1}));
 
+db.setProfilingLevel(0);
 db.system.profile.drop();
-db.setProfilingLevel(2);
+// Don't profile the setFCV command, which could be run during this test in the
+// fcv_upgrade_downgrade_replica_sets_jscore_passthrough suite.
+assert.commandWorked(db.setProfilingLevel(
+    1, {filter: {'command.setFeatureCompatibilityVersion': {'$exists': false}}}));
 
 let oldTop = db.adminCommand("top");
 const pipeline =
@@ -53,4 +55,3 @@ if (eqLookupNodes.length === 0) {
     expectedCount += 3;
 }
 assert.eq(expectedCount, actualCount);
-}());

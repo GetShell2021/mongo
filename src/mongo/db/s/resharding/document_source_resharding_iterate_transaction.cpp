@@ -28,12 +28,26 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <utility>
 
-#include "mongo/db/s/resharding/document_source_resharding_iterate_transaction.h"
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/s/resharding/document_source_resharding_iterate_transaction.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -57,7 +71,7 @@ Document appendReshardingId(Document inputDoc, boost::optional<Timestamp> txnCom
 }  // namespace
 
 REGISTER_INTERNAL_DOCUMENT_SOURCE(_internalReshardingIterateTransaction,
-                                  LiteParsedDocumentSourceDefault::parse,
+                                  LiteParsedDocumentSourceInternal::parse,
                                   DocumentSourceReshardingIterateTransaction::createFromBson,
                                   true);
 
@@ -114,7 +128,7 @@ StageConstraints DocumentSourceReshardingIterateTransaction::constraints(
 }
 
 Value DocumentSourceReshardingIterateTransaction::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+    const SerializationOptions& opts) const {
     return Value(
         Document{{kStageName,
                   Value(Document{{kIncludeCommitTransactionTimestampFieldName,
@@ -136,19 +150,19 @@ DepsTracker::State DocumentSourceReshardingIterateTransaction::getDependencies(
 
 DocumentSource::GetModPathsReturn DocumentSourceReshardingIterateTransaction::getModifiedPaths()
     const {
-    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, std::set<std::string>{}, {}};
+    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, OrderedPathSet{}, {}};
 }
 
 DocumentSource::GetNextResult DocumentSourceReshardingIterateTransaction::doGetNext() {
     uassert(5730301,
-            str::stream() << kStageName << " cannot be executed from mongos",
-            !pExpCtx->inMongos);
+            str::stream() << kStageName << " cannot be executed from router",
+            !pExpCtx->getInRouter());
 
     while (true) {
         // If we're unwinding an 'applyOps' from a transaction, check if there are any documents
         // we have stored that can be returned.
         if (_txnIterator) {
-            if (auto next = _txnIterator->getNextApplyOpsTxnEntry(pExpCtx->opCtx)) {
+            if (auto next = _txnIterator->getNextApplyOpsTxnEntry(pExpCtx->getOperationContext())) {
                 return std::move(*next);
             }
 
@@ -183,8 +197,8 @@ DocumentSource::GetNextResult DocumentSourceReshardingIterateTransaction::doGetN
         // call 'getNextTransactionOp' on it. Note that is possible for the transaction iterator
         // to be empty of any relevant operations, meaning that this loop may need to execute
         // multiple times before it encounters a relevant change to return.
-        _txnIterator.emplace(pExpCtx->opCtx,
-                             pExpCtx->mongoProcessInterface,
+        _txnIterator.emplace(pExpCtx->getOperationContext(),
+                             pExpCtx->getMongoProcessInterface(),
                              doc,
                              _includeCommitTransactionTimestamp);
     }
@@ -192,11 +206,15 @@ DocumentSource::GetNextResult DocumentSourceReshardingIterateTransaction::doGetN
 
 bool DocumentSourceReshardingIterateTransaction::_isTransactionOplogEntry(const Document& doc) {
     auto op = doc[repl::OplogEntry::kOpTypeFieldName];
-    auto opType =
-        repl::OpType_parse(IDLParserErrorContext("ReshardingEntry.op"), op.getStringData());
+    auto ctx = IDLParserContext("ReshardingEntry.op");
+    auto opType = repl::OpType_parse(ctx, op.getStringData());
     auto commandVal = doc["o"];
+    repl::MultiOplogEntryType multiOpType = repl::MultiOplogEntryType::kLegacyMultiOpType;
+    if (doc["multiOpType"].getType() == NumberInt)
+        multiOpType = repl::MultiOplogEntryType_parse(ctx, doc["multiOpType"].getInt());
 
     if (opType != repl::OpTypeEnum::kCommand || doc["txnNumber"].missing() ||
+        multiOpType == repl::MultiOplogEntryType::kApplyOpsAppliedSeparately ||
         (commandVal["applyOps"].missing() && commandVal["commitTransaction"].missing())) {
         return false;
     }

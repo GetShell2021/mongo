@@ -30,21 +30,86 @@
 
 #include "mongo/db/s/drop_database_coordinator.h"
 
+#include <absl/container/node_hash_map.h>
+#include <algorithm>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/smart_ptr.hpp>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/api_parameters.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/list_collections_filter.h"
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/generic_argument_util.h"
+#include "mongo/db/logical_time.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/database_sharding_state.h"
+#include "mongo/db/s/ddl_lock_manager.h"
+#include "mongo/db/s/forwardable_operation_metadata.h"
+#include "mongo/db/s/participant_block_gen.h"
 #include "mongo/db/s/shard_metadata_util.h"
+#include "mongo/db/s/sharding_ddl_coordinator.h"
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_logging.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_recovery_service.h"
 #include "mongo/db/s/type_shard_database.h"
+#include "mongo/db/s/type_shard_database_gen.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/tenant_id.h"
+#include "mongo/db/transaction/transaction_api.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/db/vector_clock_mutable.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/executor/async_rpc.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/rpc/reply_interface.h"
+#include "mongo/rpc/unique_message.h"
+#include "mongo/s/analyze_shard_key_documents_gen.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog/type_database_gen.h"
+#include "mongo/s/catalog/type_namespace_placement_gen.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/database_version.h"
+#include "mongo/s/database_version_gen.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/flush_database_cache_updates_gen.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharding_feature_flags_gen.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/future_impl.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/out_of_line_executor.h"
+#include "mongo/util/pcre_util.h"
+#include "mongo/util/str.h"
+#include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -52,87 +117,175 @@
 namespace mongo {
 namespace {
 
-void removeDatabaseMetadataFromConfig(OperationContext* opCtx,
-                                      StringData dbName,
-                                      const DatabaseVersion& dbVersion) {
-    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-
-    ON_BLOCK_EXIT([&, dbName = dbName.toString()] {
-        Grid::get(opCtx)->catalogCache()->purgeDatabase(dbName);
-    });
-
-    // Remove the database entry from the metadata. Making the dbVersion uuid part of the query
-    // ensures idempotency.
-    const Status status = catalogClient->removeConfigDocuments(
-        opCtx,
-        NamespaceString::kConfigDatabasesNamespace,
-        BSON(DatabaseType::kNameFieldName
-             << dbName.toString()
-             << DatabaseType::kVersionFieldName + "." + DatabaseVersion::kUuidFieldName
-             << dbVersion.getUuid()),
-        ShardingCatalogClient::kMajorityWriteConcern);
-    uassertStatusOKWithContext(status,
-                               str::stream()
-                                   << "Could not remove database metadata from config server for '"
-                                   << dbName << "'.");
+BSONObj makeDatabaseQuery(const DatabaseName& dbName, const DatabaseVersion& dbVersion) {
+    // Making the dbVersion timestamp part of the query ensures idempotency.
+    return BSON(DatabaseType::kDbNameFieldName
+                << DatabaseNameUtil::serialize(dbName, SerializationContext::stateCommandRequest())
+                << DatabaseType::kVersionFieldName + "." + DatabaseVersion::kTimestampFieldName
+                << dbVersion.getTimestamp());
 }
 
-class ScopedDatabaseCriticalSection {
-public:
-    ScopedDatabaseCriticalSection(OperationContext* opCtx,
-                                  const std::string dbName,
-                                  const BSONObj reason)
-        : _opCtx(opCtx), _dbName(std::move(dbName)), _reason(std::move(reason)) {
-        // TODO SERVER-67438 Once ScopedDatabaseCriticalSection holds a DatabaseName obj, use dbName
-        // directly
-        DatabaseName databaseName(boost::none, _dbName);
-        Lock::DBLock dbLock(_opCtx, databaseName, MODE_X);
-        auto dss = DatabaseShardingState::get(_opCtx, _dbName);
-        auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(_opCtx, dss);
-        dss->enterCriticalSectionCatchUpPhase(_opCtx, dssLock, _reason);
-        dss->enterCriticalSectionCommitPhase(_opCtx, dssLock, _reason);
+void removeDatabaseFromConfigAndUpdatePlacementHistory(
+    OperationContext* opCtx,
+    const std::shared_ptr<executor::TaskExecutor>& executor,
+    const DatabaseName& dbName,
+    const DatabaseVersion& dbVersion,
+    const OperationSessionInfo& osi) {
+
+    // Run the remove database command on the config server and placemetHistory update in a
+    // multistatement transaction
+
+    // Ensure that this function will only return once the transaction gets majority committed (and
+    // restore the original write concern on exit).
+    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
+
+    /*
+     * The transactionChain callback may be run on a separate thread. For this reason, all the
+     * referenced parameters have to be captured by value (shared_ptrs are used to reduce the memory
+     * footprint).
+     */
+    const auto transactionChain = [opCtx, dbName, dbVersion](
+                                      const txn_api::TransactionClient& txnClient,
+                                      ExecutorPtr txnExec) {
+        write_ops::DeleteOpEntry deleteDatabaseEntryOp{makeDatabaseQuery(dbName, dbVersion), false};
+
+        write_ops::DeleteCommandRequest deleteDatabaseEntry(
+            NamespaceString::kConfigDatabasesNamespace, {deleteDatabaseEntryOp});
+
+        return txnClient.runCRUDOp(deleteDatabaseEntry, {0})
+            .thenRunOn(txnExec)
+            .then([&](const BatchedCommandResponse& deleteDatabaseEntryResponse) {
+                uassertStatusOKWithContext(
+                    deleteDatabaseEntryResponse.toStatus(),
+                    str::stream() << "Could not remove database metadata from config server for '"
+                                  << dbName.toStringForErrorMsg() << "'.");
+
+                const auto currentTime = VectorClock::get(opCtx)->getTime();
+                const auto currentTimestamp = currentTime.clusterTime().asTimestamp();
+                NamespacePlacementType placementInfo(NamespaceString(dbName), currentTimestamp, {});
+
+                write_ops::InsertCommandRequest insertPlacementEntry(
+                    NamespaceString::kConfigsvrPlacementHistoryNamespace, {placementInfo.toBSON()});
+                return txnClient.runCRUDOp(insertPlacementEntry, {1});
+            })
+            .thenRunOn(txnExec)
+            .then([&](const BatchedCommandResponse& insertPlacementEntryResponse) {
+                uassertStatusOK(insertPlacementEntryResponse.toStatus());
+
+                const bool createDatabaseDDLCoordinatorFeatureFlagEnabled =
+                    feature_flags::gCreateDatabaseDDLCoordinator.isEnabled(
+                        serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
+
+                if (!createDatabaseDDLCoordinatorFeatureFlagEnabled) {
+                    BatchedCommandResponse noOpResponse;
+                    noOpResponse.setStatus(Status::OK());
+                    noOpResponse.setN(0);
+                    return SemiFuture<BatchedCommandResponse>(std::move(noOpResponse));
+                }
+
+                // Inserts a document {_id: <dbName>, version: {timestamp: <timestamp>}}
+                // to 'config.dropPendingDBs' collection on the config server. This
+                // blocks createDatabase coordinator from committing the creation of
+                // database with the same name to the sharding catalog.
+                write_ops::InsertCommandRequest insertConfigDropPendingDBsEntry(
+                    NamespaceString::kConfigDropPendingDBsNamespace,
+                    {BSON(DatabaseType::kDbNameFieldName
+                          << DatabaseNameUtil::serialize(
+                                 dbName, SerializationContext::stateCommandRequest())
+                          << DatabaseType::kVersionFieldName
+                          << BSON(DatabaseVersion::kTimestampFieldName
+                                  << dbVersion.getTimestamp()))});
+                return txnClient.runCRUDOp(insertConfigDropPendingDBsEntry, {2});
+            })
+            .thenRunOn(txnExec)
+            .then([](const BatchedCommandResponse& insertConfigDropPendingDBsEntryResponse) {
+                uassertStatusOK(insertConfigDropPendingDBsEntryResponse.toStatus());
+            })
+            .semi();
+    };
+
+    auto wc = WriteConcernOptions{WriteConcernOptions::kMajority,
+                                  WriteConcernOptions::SyncMode::UNSET,
+                                  WriteConcernOptions::kNoTimeout};
+    // This always runs in the shard role so should use a cluster transaction to guarantee targeting
+    // the config server.
+    bool useClusterTransaction = true;
+    sharding_ddl_util::runTransactionOnShardingCatalog(
+        opCtx, std::move(transactionChain), wc, osi, useClusterTransaction, executor);
+}
+
+bool isDbAlreadyDropped(OperationContext* opCtx,
+                        const boost::optional<mongo::DatabaseVersion>& dbVersion,
+                        const DatabaseName& dbName) {
+    if (dbVersion) {
+        try {
+            auto const catalogClient = Grid::get(opCtx)->catalogClient();
+            const auto db = catalogClient->getDatabase(
+                opCtx, dbName, repl::ReadConcernLevel::kMajorityReadConcern);
+            if (dbVersion->getUuid() != db.getVersion().getUuid()) {
+                // The database was dropped and re-created with a different UUID
+                return true;
+            }
+        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+            // The database was already dropped
+            return true;
+        }
     }
+    return false;
+}
 
-    ~ScopedDatabaseCriticalSection() {
-        UninterruptibleLockGuard guard(_opCtx->lockState());
-        // TODO SERVER-67438 Once ScopedDatabaseCriticalSection holds a DatabaseName obj, use dbName
-        // directly
-        DatabaseName databaseName(boost::none, _dbName);
-        Lock::DBLock dbLock(_opCtx, databaseName, MODE_X);
-        auto dss = DatabaseShardingState::get(_opCtx, _dbName);
-        dss->exitCriticalSection(_opCtx, _reason);
-    }
-
-private:
-    OperationContext* _opCtx;
-    const std::string _dbName;
-    const BSONObj _reason;
-};
-
+BSONObj getReasonForDropCollection(const NamespaceString& nss) {
+    return BSON("command"
+                << "dropCollection fromDropDatabase"
+                << "nss"
+                << NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault()));
+}
 
 }  // namespace
 
 void DropDatabaseCoordinator::_dropShardedCollection(
     OperationContext* opCtx,
     const CollectionType& coll,
-    std::shared_ptr<executor::ScopedTaskExecutor> executor) {
+    std::shared_ptr<executor::ScopedTaskExecutor> executor,
+    const CancellationToken& token) {
     const auto& nss = coll.getNss();
 
-    // Acquire the collection distributed lock in order to synchronize with an eventual ongoing
-    // moveChunk and to prevent new ones from happening.
-    const auto coorName = DDLCoordinatorType_serializer(_coordId.getOperationType());
-    auto collDistLock = uassertStatusOK(DistLockManager::get(opCtx)->lock(
-        opCtx, nss.ns(), coorName, DistLockManager::kDefaultLockTimeout));
+    {
+        ShardsvrParticipantBlock blockCRUDOperationsRequest(nss);
+        blockCRUDOperationsRequest.setBlockType(
+            mongo::CriticalSectionBlockTypeEnum::kReadsAndWrites);
+        blockCRUDOperationsRequest.setReason(getReasonForDropCollection(nss));
+        generic_argument_util::setMajorityWriteConcern(blockCRUDOperationsRequest);
+        generic_argument_util::setOperationSessionInfo(blockCRUDOperationsRequest,
+                                                       getNewSession(opCtx));
+        auto opts = std::make_shared<async_rpc::AsyncRPCOptions<ShardsvrParticipantBlock>>(
+            **executor, token, blockCRUDOperationsRequest);
+        sharding_ddl_util::sendAuthenticatedCommandToShards(
+            opCtx, opts, Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx));
+    }
 
+    // This always runs in the shard role so should use a cluster transaction to guarantee
+    // targeting the config server.
+    bool useClusterTransaction = true;
     sharding_ddl_util::removeCollAndChunksMetadataFromConfig(
-        opCtx, coll, ShardingCatalogClient::kMajorityWriteConcern);
+        opCtx,
+        Grid::get(opCtx)->shardRegistry()->getConfigShard(),
+        Grid::get(opCtx)->catalogClient(),
+        coll,
+        ShardingCatalogClient::kMajorityWriteConcern,
+        getNewSession(opCtx),
+        useClusterTransaction,
+        **executor);
 
-    _updateSession(opCtx);
-    sharding_ddl_util::removeTagsMetadataFromConfig(opCtx, nss, getCurrentSession());
+    {
+        const auto session = getNewSession(opCtx);
+        sharding_ddl_util::removeTagsMetadataFromConfig(opCtx, nss, session);
+    }
+
+    // Remove the query sampling configuration documents for the collection, if it exists.
+    sharding_ddl_util::removeQueryAnalyzerMetadata(opCtx, {coll.getUuid()});
 
     const auto primaryShardId = ShardingState::get(opCtx)->shardId();
-    _updateSession(opCtx);
 
     // We need to send the drop to all the shards because both movePrimary and
     // moveChunk leave garbage behind for sharded collections.
@@ -141,26 +294,51 @@ void DropDatabaseCoordinator::_dropShardedCollection(
     participants.erase(std::remove(participants.begin(), participants.end(), primaryShardId),
                        participants.end());
     sharding_ddl_util::sendDropCollectionParticipantCommandToShards(
-        opCtx, nss, participants, **executor, getCurrentSession());
+        opCtx,
+        nss,
+        participants,
+        **executor,
+        getNewSession(opCtx),
+        true /* fromMigrate */,
+        false /* dropSystemCollections */);
 
     // The sharded collection must be dropped on the primary shard after it has been dropped on all
     // of the other shards to ensure it can only be re-created as unsharded with a higher optime
     // than all of the drops.
     sharding_ddl_util::sendDropCollectionParticipantCommandToShards(
-        opCtx, nss, {primaryShardId}, **executor, getCurrentSession());
+        opCtx,
+        nss,
+        {primaryShardId},
+        **executor,
+        getNewSession(opCtx),
+        false /* fromMigrate */,
+        false /* dropSystemCollections */);
+
+    {
+        ShardsvrParticipantBlock unblockCRUDOperationsRequest(nss);
+        unblockCRUDOperationsRequest.setBlockType(CriticalSectionBlockTypeEnum::kUnblock);
+        unblockCRUDOperationsRequest.setReason(getReasonForDropCollection(nss));
+        generic_argument_util::setMajorityWriteConcern(unblockCRUDOperationsRequest);
+        generic_argument_util::setOperationSessionInfo(unblockCRUDOperationsRequest,
+                                                       getNewSession(opCtx));
+        auto opts = std::make_shared<async_rpc::AsyncRPCOptions<ShardsvrParticipantBlock>>(
+            **executor, token, unblockCRUDOperationsRequest);
+        sharding_ddl_util::sendAuthenticatedCommandToShards(
+            opCtx, opts, Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx));
+    }
 }
 
 void DropDatabaseCoordinator::_clearDatabaseInfoOnPrimary(OperationContext* opCtx) {
-    // TODO SERVER-67438 Use _dbName directly once it's of type DatabaseName
-    Lock::DBLock dbLock(opCtx, DatabaseName(boost::none, _dbName), MODE_X);
-    auto dss = DatabaseShardingState::get(opCtx, _dbName);
-    dss->clearDatabaseInfo(opCtx);
+    AutoGetDb autoDb(opCtx, _dbName, MODE_X);
+    auto scopedDss = DatabaseShardingState::assertDbLockedAndAcquireExclusive(opCtx, _dbName);
+    scopedDss->clearDbInfo(opCtx);
 }
 
 void DropDatabaseCoordinator::_clearDatabaseInfoOnSecondaries(OperationContext* opCtx) {
     Status signalStatus = shardmetadatautil::updateShardDatabasesEntry(
         opCtx,
-        BSON(ShardDatabaseType::kNameFieldName << _dbName),
+        BSON(ShardDatabaseType::kDbNameFieldName
+             << DatabaseNameUtil::serialize(_dbName, SerializationContext::stateCommandRequest())),
         BSONObj(),
         BSON(ShardDatabaseType::kEnterCriticalSectionCounterFieldName << 1),
         false /*upsert*/);
@@ -179,10 +357,11 @@ void DropDatabaseCoordinator::_clearDatabaseInfoOnSecondaries(OperationContext* 
 ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancellationToken& token) noexcept {
+    const auto dbNss = NamespaceString(_dbName);
     return ExecutorFuture<void>(**executor)
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kDrop,
-            [this, executor = executor, anchor = shared_from_this()] {
+            [this, token, dbNss, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
@@ -191,12 +370,11 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
                     // Perform a noop write on the participants in order to advance the txnNumber
                     // for this coordinator's lsid so that requests with older txnNumbers can no
                     // longer execute.
-                    _updateSession(opCtx);
                     _performNoopRetryableWriteOnAllShardsAndConfigsvr(
-                        opCtx, getCurrentSession(), **executor);
+                        opCtx, getNewSession(opCtx), **executor);
                 }
 
-                ShardingLogging::get(opCtx)->logChange(opCtx, "dropDatabase.start", _dbName);
+                ShardingLogging::get(opCtx)->logChange(opCtx, "dropDatabase.start", dbNss);
 
                 // Drop all collections under this DB
                 auto const catalogClient = Grid::get(opCtx)->catalogClient();
@@ -208,59 +386,86 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
                 sharding_ddl_util::performNoopMajorityWriteLocally(opCtx);
 
                 // ensure we do not delete collections of a different DB
-                if (!_firstExecution && _doc.getDatabaseVersion()) {
-                    try {
-                        const auto db = catalogClient->getDatabase(
-                            opCtx, _dbName, repl::ReadConcernLevel::kMajorityReadConcern);
-                        if (_doc.getDatabaseVersion()->getUuid() != db.getVersion().getUuid()) {
-                            return;  // skip to FlushDatabaseCacheUpdates
-                        }
-                    } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-                        return;  // skip to FlushDatabaseCacheUpdates
-                    }
+                if (!_firstExecution &&
+                    isDbAlreadyDropped(opCtx, _doc.getDatabaseVersion(), _dbName)) {
+                    VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
+                    return;  // skip to FlushDatabaseCacheUpdates
                 }
 
                 if (_doc.getCollInfo()) {
-                    const auto& coll = _doc.getCollInfo().get();
+                    const auto coll = _doc.getCollInfo().value();
                     LOGV2_DEBUG(5494504,
                                 2,
                                 "Completing collection drop from previous primary",
-                                "namespace"_attr = coll.getNss());
-                    _dropShardedCollection(opCtx, coll, executor);
+                                logAttrs(coll.getNss()));
+                    _dropShardedCollection(opCtx, coll, executor, token);
                 }
 
                 for (const auto& coll : allCollectionsForDb) {
                     const auto& nss = coll.getNss();
-                    LOGV2_DEBUG(5494505, 2, "Dropping collection", "namespace"_attr = nss);
+                    LOGV2_DEBUG(5494505, 2, "Dropping collection", logAttrs(nss));
 
-                    sharding_ddl_util::stopMigrations(opCtx, nss, coll.getUuid());
+                    sharding_ddl_util::stopMigrations(
+                        opCtx, nss, coll.getUuid(), getNewSession(opCtx));
 
                     auto newStateDoc = _doc;
                     newStateDoc.setCollInfo(coll);
                     _updateStateDocument(opCtx, std::move(newStateDoc));
 
-                    _dropShardedCollection(opCtx, coll, executor);
+                    _dropShardedCollection(opCtx, coll, executor, token);
+                }
+
+                // First of all, we will get all namespaces that still have zones associated to
+                // database _dbName from 'config.tags'. As we already have removed all zones
+                // associated with each sharded collections from database _dbName, the returned
+                // zones are owned by unsharded or nonexistent collections. After that, we will
+                // removed these remaining zones.
+                const auto& nssWithZones =
+                    catalogClient->getAllNssThatHaveZonesForDatabase(opCtx, _dbName);
+                for (const auto& nss : nssWithZones) {
+                    sharding_ddl_util::removeTagsMetadataFromConfig(
+                        opCtx, nss, getNewSession(opCtx));
+                }
+
+                // Remove the query sampling configuration documents for all unsharded collections
+                // in this database, if they exist.
+                {
+                    std::vector<UUID> unshardedCollUUIDs;
+                    DBDirectClient dbClient(opCtx);
+                    // NOTE: UUIDs are retrieved through a filter that excludes timeseries
+                    // collections; this is fine, since no query analyzer can be configured on them.
+                    const auto collInfos = dbClient.getCollectionInfos(
+                        _dbName, ListCollectionsFilter::makeTypeCollectionFilter());
+                    for (const auto& collInfo : collInfos) {
+                        unshardedCollUUIDs.push_back(UUID::parse(collInfo.getObjectField("info")));
+                    }
+
+                    sharding_ddl_util::removeQueryAnalyzerMetadata(opCtx,
+                                                                   std::move(unshardedCollUUIDs));
                 }
 
                 const auto allShardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
                 {
                     // Acquire the database critical section in order to disallow implicit
                     // collection creations from happening concurrently with dropDatabase
-                    const auto critSecReason = BSON("dropDatabase" << _dbName);
-                    auto scopedCritSec = ScopedDatabaseCriticalSection(
-                        opCtx, _dbName.toString(), std::move(critSecReason));
+                    auto recoveryService = ShardingRecoveryService::get(opCtx);
+                    recoveryService->acquireRecoverableCriticalSectionBlockWrites(
+                        opCtx, dbNss, _critSecReason, ShardingCatalogClient::kLocalWriteConcern);
+                    recoveryService->promoteRecoverableCriticalSectionToBlockAlsoReads(
+                        opCtx, dbNss, _critSecReason, ShardingCatalogClient::kLocalWriteConcern);
 
                     auto dropDatabaseParticipantCmd = ShardsvrDropDatabaseParticipant();
                     dropDatabaseParticipantCmd.setDbName(_dbName);
-                    const auto cmdObj = CommandHelpers::appendMajorityWriteConcern(
-                        dropDatabaseParticipantCmd.toBSON({}));
+                    generic_argument_util::setMajorityWriteConcern(dropDatabaseParticipantCmd);
 
                     // The database needs to be dropped first on the db primary shard
                     // because otherwise changestreams won't receive the drop event.
                     {
                         DBDirectClient dbDirectClient(opCtx);
-                        const auto commandResponse =
-                            dbDirectClient.runCommand(OpMsgRequest::fromDBAndBody(_dbName, cmdObj));
+                        const auto commandResponse = dbDirectClient.runCommand(
+                            OpMsgRequestBuilder::create(auth::ValidatedTenancyScope::get(opCtx),
+                                                        _dbName,
+                                                        dropDatabaseParticipantCmd.toBSON()));
                         uassertStatusOK(
                             getStatusFromCommandResult(commandResponse->getCommandReply()));
 
@@ -280,15 +485,18 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
                     participants.erase(
                         std::remove(participants.begin(), participants.end(), primaryShardId),
                         participants.end());
+
+                    generic_argument_util::setMajorityWriteConcern(dropDatabaseParticipantCmd);
+                    generic_argument_util::setDbVersionIfPresent(dropDatabaseParticipantCmd,
+                                                                 *metadata().getDatabaseVersion());
                     // Drop DB on all other shards, attaching the dbVersion to the request to ensure
                     // idempotency.
+                    auto opts = std::make_shared<
+                        async_rpc::AsyncRPCOptions<ShardsvrDropDatabaseParticipant>>(
+                        **executor, token, dropDatabaseParticipantCmd);
                     try {
                         sharding_ddl_util::sendAuthenticatedCommandToShards(
-                            opCtx,
-                            _dbName,
-                            appendDbVersionIfPresent(cmdObj, *metadata().getDatabaseVersion()),
-                            participants,
-                            **executor);
+                            opCtx, opts, participants);
                     } catch (ExceptionFor<ErrorCodes::StaleDbVersion>&) {
                         // The DB metadata could have been removed by a network-partitioned former
                         // primary
@@ -300,11 +508,29 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
                     _clearDatabaseInfoOnPrimary(opCtx);
                     _clearDatabaseInfoOnSecondaries(opCtx);
 
-                    removeDatabaseMetadataFromConfig(
-                        opCtx, _dbName, *metadata().getDatabaseVersion());
+                    {
+                        const auto& session = getNewSession(opCtx);
+                        removeDatabaseFromConfigAndUpdatePlacementHistory(
+                            opCtx, **executor, _dbName, *metadata().getDatabaseVersion(), session);
+                    }
+
+                    VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
                 }
             }))
-        .then([this, executor = executor, anchor = shared_from_this()] {
+        .then([this, executor = executor, dbNss, anchor = shared_from_this()] {
+            auto opCtxHolder = cc().makeOperationContext();
+            auto* opCtx = opCtxHolder.get();
+            getForwardableOpMetadata().setOn(opCtx);
+            ShardingRecoveryService::get(opCtx)->releaseRecoverableCriticalSection(
+                opCtx,
+                dbNss,
+                _critSecReason,
+                WriteConcerns::kMajorityWriteConcernNoTimeout,
+                ShardingRecoveryService::FilteringMetadataClearer(
+                    true /*includeStepsForNamespaceDropped*/),
+                false /* throwIfReasonDiffers */);
+        })
+        .then([this, token, dbNss, executor = executor, anchor = shared_from_this()] {
             auto opCtxHolder = cc().makeOperationContext();
             auto* opCtx = opCtxHolder.get();
             getForwardableOpMetadata().setOn(opCtx);
@@ -315,32 +541,46 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
                     std::remove(participants.begin(), participants.end(), primaryShardId),
                     participants.end());
                 // Send _flushDatabaseCacheUpdates to all shards
-                FlushDatabaseCacheUpdatesWithWriteConcern flushDbCacheUpdatesCmd(
-                    _dbName.toString());
+                const auto db = DatabaseNameUtil::serialize(
+                    _dbName, SerializationContext::stateCommandRequest());
+                FlushDatabaseCacheUpdatesWithWriteConcern flushDbCacheUpdatesCmd(db);
                 flushDbCacheUpdatesCmd.setSyncFromConfig(true);
-                flushDbCacheUpdatesCmd.setDbName(_dbName);
+                flushDbCacheUpdatesCmd.setDbName(DatabaseName::kAdmin);
+                generic_argument_util::setMajorityWriteConcern(flushDbCacheUpdatesCmd);
 
                 IgnoreAPIParametersBlock ignoreApiParametersBlock{opCtx};
-                sharding_ddl_util::sendAuthenticatedCommandToShards(
-                    opCtx,
-                    "admin",
-                    CommandHelpers::appendMajorityWriteConcern(flushDbCacheUpdatesCmd.toBSON({})),
-                    participants,
-                    **executor);
+                auto opts = std::make_shared<
+                    async_rpc::AsyncRPCOptions<FlushDatabaseCacheUpdatesWithWriteConcern>>(
+                    **executor, token, flushDbCacheUpdatesCmd);
+                sharding_ddl_util::sendAuthenticatedCommandToShards(opCtx, opts, participants);
             }
 
-            ShardingLogging::get(opCtx)->logChange(opCtx, "dropDatabase", _dbName);
+            ShardingLogging::get(opCtx)->logChange(opCtx, "dropDatabase", dbNss);
             LOGV2(5494506, "Database dropped", "db"_attr = _dbName);
         })
-        .onError([this, anchor = shared_from_this()](const Status& status) {
-            if (!status.isA<ErrorCategory::NotPrimaryError>() &&
-                !status.isA<ErrorCategory::ShutdownError>()) {
-                LOGV2_ERROR(5494507,
-                            "Error running drop database",
-                            "db"_attr = _dbName,
-                            "error"_attr = redact(status));
-            }
-            return status;
+        .then([this, anchor = shared_from_this()] {
+            auto opCtxHolder = cc().makeOperationContext();
+            auto* opCtx = opCtxHolder.get();
+            getForwardableOpMetadata().setOn(opCtx);
+
+            BatchedCommandRequest request([&] {
+                write_ops::DeleteOpEntry deleteDatabaseEntryOp{
+                    makeDatabaseQuery(_dbName, *metadata().getDatabaseVersion()), false};
+
+                write_ops::DeleteCommandRequest deleteDatabaseEntry(
+                    NamespaceString::kConfigDropPendingDBsNamespace, {deleteDatabaseEntryOp});
+
+                return deleteDatabaseEntry;
+            }());
+
+            auto configServer = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+            uassertStatusOK(configServer
+                                ->runBatchWriteCommand(opCtx,
+                                                       Milliseconds::max(),
+                                                       request,
+                                                       ShardingCatalogClient::kMajorityWriteConcern,
+                                                       Shard::RetryPolicy::kIdempotent)
+                                .toStatus());
         });
 }
 

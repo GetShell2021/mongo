@@ -29,13 +29,20 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <string>
 #include <vector>
 
+#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
-
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_chunk_range.h"
 
 namespace mongo {
 
@@ -50,8 +57,7 @@ public:
                       OID epoch,
                       boost::optional<Timestamp> timestamp,
                       ChunkRange chunkRange,
-                      std::vector<BSONObj> splitPoints,
-                      bool fromChunkSplitter);
+                      std::vector<BSONObj> splitPoints);
 
     /**
      * Parses the provided BSON content as the internal _configsvrCommitChunkSplit command, and if
@@ -64,7 +70,6 @@ public:
      *   max: <BSONObj chunkToSplitMax>,
      *   splitPoints: [<BSONObj key>, ...],
      *   shard: <string shard>,
-     *   fromChunkSplitter: <bool>
      * }
      */
     static StatusWith<SplitChunkRequest> parseFromConfigCommand(const BSONObj& cmdObj);
@@ -90,7 +95,6 @@ public:
     const ChunkRange& getChunkRange() const;
     const std::vector<BSONObj>& getSplitPoints() const;
     const std::string& getShardName() const;
-    bool isFromChunkSplitter() const;
 
 private:
     /**
@@ -105,8 +109,6 @@ private:
     ChunkRange _chunkRange;
     std::vector<BSONObj> _splitPoints;
     std::string _shardName;
-
-    bool _fromChunkSplitter;
 };
 
 }  // namespace mongo

@@ -1,20 +1,15 @@
 /**
  * Tests that point-in-time pre- and post-images are retrieved for update/replace/delete operations
- * performed in a transaction and non-atomic "applyOps" command.
+ * performed in a transaction and "applyOps" command.
  * @tags: [
- * requires_fcv_60,
- * featureFlagChangeStreamPreAndPostImages,
+ * requires_fcv_62,
  * uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/change_stream_util.js");        // For isChangeStreamPreAndPostImagesEnabled and
-                                                   // ChangeStreamTest.
-load("jstests/libs/collection_drop_recreate.js");  // For assertDropAndRecreateCollection.
-load("jstests/libs/fixture_helpers.js");           // For FixtureHelpers.isMongos.
-load("jstests/libs/transactions_util.js");         // For TransactionsUtil.runInTransaction.
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ChangeStreamTest} from "jstests/libs/query/change_stream_util.js";
+import {TxnUtil} from "jstests/libs/txns/txn_util.js";
 
 const testDB = db.getSiblingDB(jsTestName());
 const cst = new ChangeStreamTest(testDB);
@@ -61,7 +56,7 @@ function getCollections(db) {
 }
 
 jsTestLog("Testing a transaction consisting of a single 'applyOps' entry.");
-TransactionsUtil.runInTransaction(testDB, getCollections, function(db, {coll, otherColl}) {
+TxnUtil.runInTransaction(testDB, getCollections, function(db, {coll, otherColl}) {
     assert.commandWorked(coll.updateOne({_id: 1}, {$inc: {a: 1}}));
     assert.commandWorked(coll.replaceOne({_id: 2}, {a: "Long string"}));
     assert.commandWorked(coll.deleteOne({_id: 3}));
@@ -81,7 +76,7 @@ jsTestLog("Testing a transaction consisting of multiple 'applyOps' entries.");
 const largeStringSizeInBytes = 15 * 1024 * 1024;
 const largeString = "b".repeat(largeStringSizeInBytes);
 assert.commandWorked(coll.insert([{_id: 3, a: 1}]));
-TransactionsUtil.runInTransaction(testDB, getCollections, function(db, {coll, otherColl}) {
+TxnUtil.runInTransaction(testDB, getCollections, function(db, {coll, otherColl}) {
     assert.commandWorked(otherColl.insert({b: largeString}));
     assert.commandWorked(coll.updateOne({_id: 1}, {$inc: {a: 1}}));
 
@@ -111,7 +106,7 @@ jsTestLog("Testing a transaction consisting of multiple 'applyOps' entries with 
 const largePreImageSizeInBytes = 7 * 1024 * 1024;
 const largePreImageValue = "c".repeat(largePreImageSizeInBytes);
 assert.commandWorked(coll.insert([{_id: 3, a: largePreImageValue}]));
-TransactionsUtil.runInTransaction(testDB, getCollections, function(db, {coll, otherColl}) {
+TxnUtil.runInTransaction(testDB, getCollections, function(db, {coll, otherColl}) {
     assert.commandWorked(coll.updateOne({_id: 3}, {$set: {b: 1}}));
     assert.commandWorked(coll.deleteOne({_id: 3}));
 });
@@ -132,14 +127,13 @@ assertChangeEventsReturned(changeStreamCursor, [
 
 // "applyOps" command can only be issued on a replica set.
 if (!FixtureHelpers.isMongos(testDB)) {
-    jsTestLog("Testing non-atomic 'applyOps' command.");
+    jsTestLog("Testing 'applyOps' command.");
     assert.commandWorked(coll.insert([{_id: 5, a: 1}, {_id: 6, a: 1}]));
     assert.commandWorked(testDB.runCommand({
         applyOps: [
-            {op: "u", ns: coll.getFullName(), o2: {_id: 5}, o: {$set: {a: 2}}},
+            {op: "u", ns: coll.getFullName(), o2: {_id: 5}, o: {$v: 2, diff: {u: {a: 2}}}},
             {op: "d", ns: coll.getFullName(), o: {_id: 6}}
-        ],
-        allowAtomic: false,
+        ]
     }));
     assertChangeEventsReturned(changeStreamCursor, [
         {_id: 5, operationType: "insert", postImage: {_id: 5, a: 1}},
@@ -148,4 +142,3 @@ if (!FixtureHelpers.isMongos(testDB)) {
         {_id: 6, operationType: "delete", preImage: {_id: 6, a: 1}},
     ]);
 }
-})();

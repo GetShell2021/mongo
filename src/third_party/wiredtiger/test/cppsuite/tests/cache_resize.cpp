@@ -37,7 +37,7 @@ using namespace test_harness;
 /* Defines what data is written to the tracking table for use in custom validation. */
 class operation_tracker_cache_resize : public operation_tracker {
 
-    public:
+public:
     operation_tracker_cache_resize(
       configuration *config, const bool use_compression, timestamp_manager &tsm)
         : operation_tracker(config, use_compression, tsm)
@@ -70,7 +70,7 @@ class operation_tracker_cache_resize : public operation_tracker {
  * be allowed.
  */
 class cache_resize : public test {
-    public:
+public:
     cache_resize(const test_args &args) : test(args)
     {
         init_operation_tracker(
@@ -163,22 +163,27 @@ class cache_resize : public test {
         }
 
         /* Make sure the last transaction is rolled back now the work is finished. */
-        if (tc->txn.active())
-            tc->txn.rollback();
+        tc->txn.try_rollback();
     }
 
     void
-    validate(const std::string &operation_table_name, const std::string &,
-      const std::vector<uint64_t> &) override final
+    validate(bool tracking_enabled, const std::string &operation_table_name, const std::string &,
+      database &) override final
     {
         bool first_record = true;
         int ret;
         uint64_t cache_size, num_records = 0, prev_txn_id;
         const uint64_t cache_size_500mb = 500000000;
 
-        /* FIXME-WT-9339. */
+        /* FIXME-WT-12931. */
         (void)cache_size;
         (void)cache_size_500mb;
+
+        /*
+         * This validate logic uses data from operation tracking, it must have been enabled during
+         * the test.
+         */
+        testutil_assert(tracking_enabled);
 
         /* Open a cursor on the tracking table to read it. */
         scoped_session session = connection_manager::instance().create_session();
@@ -222,15 +227,15 @@ class cache_resize : public test {
                  * We have moved to a new transaction, make sure the cache was big enough when the
                  * previous transaction was committed.
                  *
-                 * FIXME-WT-9339 - Somehow we have some transactions that go through while the cache
-                 * is very low. Enable the check when this is no longer the case.
+                 * FIXME-WT-12931 - Somehow we have some transactions that go through while the
+                 * cache is very low. Enable the check when this is no longer the case.
                  *
                  * testutil_assert(cache_size > cache_size_500mb);
                  */
             }
             prev_txn_id = tracked_txn_id;
             /*
-             * FIXME-WT-9339 - Save the last cache size seen by the transaction.
+             * FIXME-WT-12931 - Save the last cache size seen by the transaction.
              *
              * cache_size = tracked_cache_size;
              */
@@ -240,8 +245,8 @@ class cache_resize : public test {
         testutil_assert(ret == WT_NOTFOUND);
         testutil_assert(num_records > 0);
         /*
-         * FIXME-WT-9339 - Somehow we have some transactions that go through while the cache is very
-         * low. Enable the check when this is no longer the case.
+         * FIXME-WT-12931 - Somehow we have some transactions that go through while the cache is
+         * very low. Enable the check when this is no longer the case.
          *
          * testutil_assert(cache_size > cache_size_500mb);
          */

@@ -46,6 +46,7 @@ from wtscenario import make_scenarios
 # an interesting scenario. The concern is getting the matching version
 # of WiredTigerCheckpoint and hanging onto it.
 
+@wttest.skip_for_hook("tiered", "Fails with tiered storage")
 class test_checkpoint(wttest.WiredTigerTestCase):
     conn_config = 'statistics=(all),timing_stress_for_test=[checkpoint_slow]'
     session_config = 'isolation=snapshot'
@@ -126,7 +127,7 @@ class test_checkpoint(wttest.WiredTigerTestCase):
             ckpt_started = 0
             while not ckpt_started:
                 stat_cursor = self.session.open_cursor('statistics:', None, None)
-                ckpt_started = stat_cursor[stat.conn.txn_checkpoint_running][2]
+                ckpt_started = stat_cursor[stat.conn.checkpoint_state][2] != 0
                 stat_cursor.close()
                 time.sleep(1)
 
@@ -158,6 +159,3 @@ class test_checkpoint(wttest.WiredTigerTestCase):
         # Note that it would be nice to crosscheck that the first checkpoint was in fact
         # inconsistent. Could do that by copying the database before the second checkpoint
         # and opening the copy here, I guess. FUTURE?
-
-if __name__ == '__main__':
-    wttest.run()

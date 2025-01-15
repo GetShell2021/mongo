@@ -1,5 +1,4 @@
 // db.js
-
 var DB;
 
 (function() {
@@ -66,26 +65,23 @@ DB.prototype.commandHelp = function(name) {
     return res.help;
 };
 
-// utility to attach readPreference if needed.
+// Utility to attach readPreference if needed.
 DB.prototype._attachReadPreferenceToCommand = function(cmdObj, readPref) {
     "use strict";
-    // if the user has not set a readpref, return the original cmdObj
+    // If the user has not set a read pref, return the original 'cmdObj'.
     if ((readPref === null) || typeof (readPref) !== "object") {
         return cmdObj;
     }
 
-    // if user specifies $readPreference manually, then don't change it
+    // If user specifies $readPreference manually, then don't change it.
     if (cmdObj.hasOwnProperty("$readPreference")) {
         return cmdObj;
     }
 
-    // copy object so we don't mutate the original
+    // Copy object so we don't mutate the original.
     var clonedCmdObj = Object.extend({}, cmdObj);
-    // The server selection spec mandates that the key is '$query', but
-    // the shell has historically used 'query'. The server accepts both,
-    // so we maintain the existing behavior
-    var cmdObjWithReadPref = {query: clonedCmdObj, $readPreference: readPref};
-    return cmdObjWithReadPref;
+    clonedCmdObj["$readPreference"] = readPref;
+    return clonedCmdObj;
 };
 
 /**
@@ -266,23 +262,6 @@ DB.prototype._runAggregate = function(cmdObj, aggregateOptions) {
     }
 
     const res = this.runReadCommand(cmdObj);
-
-    if (!res.ok && (res.code == 17020 || res.errmsg == "unrecognized field \"cursor") &&
-        !("cursor" in aggregateOptions)) {
-        // If the command failed because cursors aren't supported and the user didn't explicitly
-        // request a cursor, try again without requesting a cursor.
-        delete cmdObj.cursor;
-
-        res = doAgg(cmdObj);
-
-        if ('result' in res && !("cursor" in res)) {
-            // convert old-style output to cursor-style output
-            res.cursor = {ns: '', id: NumberLong(0)};
-            res.cursor.firstBatch = res.result;
-            delete res.result;
-        }
-    }
-
     assert.commandWorked(res, "aggregate failed");
 
     if ("cursor" in res) {
@@ -473,6 +452,7 @@ DB.prototype.help = function() {
     print("\tdb.eval() - deprecated");
     print("\tdb.fsyncLock() flush data to disk and lock server for backups");
     print("\tdb.fsyncUnlock() unlocks server following a db.fsyncLock()");
+    print("\tdb.checkMetadataConsistency() checks the consistency of the metadata in the db");
     print("\tdb.getCollection(cname) same as db['cname'] or db.cname");
     print("\tdb.getCollectionInfos([filter]) - returns a list that contains the names and options" +
           " of the db's collections");
@@ -635,9 +615,9 @@ DB.prototype.dbEval = DB.prototype.eval;
  */
 DB.prototype.groupeval = function(parmsObj) {
     var groupFunction = function() {
-        var parms = args[0];
-        var c = db[parms.ns].find(parms.cond || {});
-        var map = new Map();
+        var parms = args[0];  // eslint-disable-line
+        var c = globalThis.db[parms.ns].find(parms.cond || {});
+        var map = new BSONAwareMap();
         var pks = parms.key ? Object.keySet(parms.key) : null;
         var pkl = pks ? pks.length : 0;
         var key = {};
@@ -709,7 +689,7 @@ DB.prototype._getCollectionInfosCommand = function(
 DB.prototype._getCollectionInfosFromPrivileges = function() {
     let ret = this.runCommand({connectionStatus: 1, showPrivileges: 1});
     if (!ret.ok) {
-        throw _getErrorWithCode(res, "Failed to acquire collection information from privileges");
+        throw _getErrorWithCode(ret, "Failed to acquire collection information from privileges");
     }
 
     // Parse apart collection information.
@@ -801,13 +781,6 @@ DB.prototype.hello = function() {
 };
 
 DB.prototype.currentOp = function(arg) {
-    // TODO CLOUDP-89361: The shell is connected to the Atlas Proxy, which currently does not
-    // support the $currentOp aggregation stage. Remove the legacy server command path once the
-    // proxy can support $currentOp.
-    if (this.serverStatus().hasOwnProperty("atlasVersion")) {
-        return this.currentOpLegacy(arg);
-    }
-
     try {
         const results = this.currentOpCursor(arg).toArray();
         let res = {"inprog": results.length > 0 ? results : [], "ok": 1};
@@ -821,21 +794,6 @@ DB.prototype.currentOp = function(arg) {
     } catch (e) {
         return {"ok": 0, "code": e.code, "errmsg": "Error executing $currentOp: " + e.message};
     }
-};
-DB.prototype.currentOP = DB.prototype.currentOp;
-
-DB.prototype.currentOpLegacy = function(arg) {
-    let q = {};
-    if (arg) {
-        if (typeof (arg) == "object")
-            Object.extend(q, arg);
-        else if (arg)
-            q["$all"] = true;
-    }
-
-    var commandObj = {"currentOp": 1};
-    Object.extend(commandObj, q);
-    return this.adminCommand(commandObj);
 };
 
 DB.prototype.currentOpCursor = function(arg) {
@@ -1012,7 +970,7 @@ DB.prototype.printSecondaryReplicationInfo = function() {
     }
 
     function getPrimary(members) {
-        for (i in members) {
+        for (let i in members) {
             var row = members[i];
             if (row.state === 1) {
                 return row;
@@ -1056,14 +1014,14 @@ DB.prototype.printSecondaryReplicationInfo = function() {
         // no primary, find the most recent op among all members
         else {
             startOptimeDate = new Date(0, 0);
-            for (i in status.members) {
+            for (let i in status.members) {
                 if (status.members[i].optimeDate > startOptimeDate) {
                     startOptimeDate = status.members[i].optimeDate;
                 }
             }
         }
 
-        for (i in status.members) {
+        for (let i in status.members) {
             if (status.members[i].self && status.members[i].state === 5) {
                 print("source: " + status.members[i].name);
                 if (!status.initialSyncStatus) {
@@ -1081,35 +1039,11 @@ DB.prototype.printSecondaryReplicationInfo = function() {
     }
 };
 
+// Checking the server buildinfo requires the client to be authenticated
+// This is the deprecated version used by the jstest fuzzer, prefer using the getServerBuildInfo.
 DB.prototype.serverBuildInfo = function() {
-    return this.getSiblingDB("admin")._runCommandWithoutApiStrict({buildinfo: 1});
-};
-
-// Used to trim entries from the metrics.commands that have never been executed
-getActiveCommands = function(tree) {
-    var result = {};
-    for (var i in tree) {
-        if (!tree.hasOwnProperty(i))
-            continue;
-        if (tree[i].hasOwnProperty("total")) {
-            if (tree[i].total > 0) {
-                result[i] = tree[i];
-            }
-            continue;
-        }
-        if (i == "<UNKNOWN>") {
-            if (tree[i] > 0) {
-                result[i] = tree[i];
-            }
-            continue;
-        }
-        // Handles nested commands
-        var subStatus = getActiveCommands(tree[i]);
-        if (Object.keys(subStatus).length > 0) {
-            result[i] = tree[i];
-        }
-    }
-    return result;
+    return assert.commandWorked(
+        this.getSiblingDB("admin")._runCommandWithoutApiStrict({buildinfo: 1}));
 };
 
 DB.prototype.serverStatus = function(options) {
@@ -1117,12 +1051,8 @@ DB.prototype.serverStatus = function(options) {
     if (options) {
         Object.extend(cmd, options);
     }
-    var res = this._adminCommand(cmd);
-    // Only prune if we have a metrics tree with commands.
-    if (res.metrics && res.metrics.commands) {
-        res.metrics.commands = getActiveCommands(res.metrics.commands);
-    }
-    return res;
+
+    return this._adminCommand(cmd);
 };
 
 DB.prototype.hostInfo = function() {
@@ -1133,12 +1063,14 @@ DB.prototype.serverCmdLineOpts = function() {
     return this._adminCommand("getCmdLineOpts");
 };
 
+// Throws if client connection is not authenticated.
 DB.prototype.version = function() {
-    return this.serverBuildInfo().version;
+    return this.getServerBuildInfo().getVersion();
 };
 
+// Throws if client connection is not authenticated.
 DB.prototype.serverBits = function() {
-    return this.serverBuildInfo().bits;
+    return this.getServerBuildInfo().getBits();
 };
 
 DB.prototype.listCommands = function() {
@@ -1219,7 +1151,7 @@ DB.prototype.getQueryOptions = function() {
  */
 DB.prototype.loadServerScripts = function() {
     var global = Function('return this')();
-    this.system.js.find().forEach(function(u) {
+    this.getCollection('system.js').find().forEach(function(u) {
         if (u.value.constructor === Code) {
             global[u._id] = eval("(" + u.value.code + ")");
         } else {
@@ -1698,61 +1630,9 @@ DB.prototype.watch = function(pipeline, options) {
     pipeline = pipeline || [];
     assert(pipeline instanceof Array, "'pipeline' argument must be an array");
 
-    let changeStreamStage;
-    [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
-    pipeline.unshift(changeStreamStage);
-    return this._runAggregate({aggregate: 1, pipeline: pipeline}, aggOptions);
-};
-
-DB.prototype.getFreeMonitoringStatus = function() {
-    'use strict';
-    return assert.commandWorked(this.adminCommand({getFreeMonitoringStatus: 1}));
-};
-
-DB.prototype.enableFreeMonitoring = function() {
-    'use strict';
-    let reply, isPrimary;
-    if (this.getMongo().getApiParameters().apiVersion) {
-        reply = this.hello();
-        isPrimary = reply.isWritablePrimary;
-    } else {
-        reply = this.isMaster();
-        isPrimary = reply.ismaster;
-    }
-
-    if (!isPrimary) {
-        print("ERROR: db.enableFreeMonitoring() may only be run on a primary");
-        return;
-    }
-
-    assert.commandWorked(this.adminCommand({setFreeMonitoring: 1, action: 'enable'}));
-
-    const cmd = this.adminCommand({getFreeMonitoringStatus: 1});
-    if (!cmd.ok && (cmd.code == ErrorCode.Unauthorized)) {
-        // Edge case: It's technically possible that a user can change free-mon state,
-        // but is not allowed to inspect it.
-        print("Successfully initiated free monitoring, but unable to determine status " +
-              "as you lack the 'checkFreeMonitoringStatus' privilege.");
-        return;
-    }
-    assert.commandWorked(cmd);
-
-    if (cmd.state !== 'enabled') {
-        const url = this.adminCommand({'getParameter': 1, 'cloudFreeMonitoringEndpointURL': 1})
-                        .cloudFreeMonitoringEndpointURL;
-
-        print("Unable to get immediate response from the Cloud Monitoring service. We will" +
-              "continue to retry in the background. Please check your firewall " +
-              "settings to ensure that mongod can communicate with \"" + url + "\"");
-        return;
-    }
-
-    print(tojson(cmd));
-};
-
-DB.prototype.disableFreeMonitoring = function() {
-    'use strict';
-    assert.commandWorked(this.adminCommand({setFreeMonitoring: 1, action: 'disable'}));
+    const [changeStreamStage, aggOptions] = this.getMongo()._extractChangeStreamOptions(options);
+    return this._runAggregate({aggregate: 1, pipeline: [changeStreamStage, ...pipeline]},
+                              aggOptions);
 };
 
 // Writing `this.hasOwnProperty` would cause DB.prototype.getCollection() to be called since the
@@ -1791,15 +1671,13 @@ DB.prototype.createEncryptedCollection = function(name, opts) {
     assert.commandWorked(
         this.createCollection(ef.escCollection, {clusteredIndex: {key: {_id: 1}, unique: true}}));
     assert.commandWorked(
-        this.createCollection(ef.eccCollection, {clusteredIndex: {key: {_id: 1}, unique: true}}));
-    assert.commandWorked(
         this.createCollection(ef.ecocCollection, {clusteredIndex: {key: {_id: 1}, unique: true}}));
 
     return res;
 };
 
 DB.prototype.dropEncryptedCollection = function(name) {
-    const ci = db.getCollectionInfos({name: name})[0];
+    const ci = globalThis.db.getCollectionInfos({name: name})[0];
     if (ci == undefined) {
         throw `Encrypted Collection '${name}' not found`;
     }
@@ -1810,8 +1688,81 @@ DB.prototype.dropEncryptedCollection = function(name) {
     }
 
     this.getCollection(ef.escCollection).drop();
-    this.getCollection(ef.eccCollection).drop();
     this.getCollection(ef.ecocCollection).drop();
     return this.getCollection(name).drop();
 };
+
+DB.prototype.checkMetadataConsistency = function(options = {}) {
+    assert(options instanceof Object,
+           `'options' parameter expected to be type object but found: ${typeof options}`);
+    const res = assert.commandWorked(
+        this.runCommand(Object.extend({checkMetadataConsistency: 1}, options)));
+    return new DBCommandCursor(this, res);
+};
+
+DB.prototype.getDatabasePrimaryShardId = function() {
+    // TODO SERVER-92098 user $listDatabases to retrieve primary shard
+    let x = this.getSiblingDB('config').databases.findOne({_id: this.getName()});
+    if (!x) {
+        throw Error(`Database '${this.getName()}' not found`);
+    }
+    return x.primary;
+};
 }());
+
+// Checking the server buildinfo requires the client to be authenticated
+DB.prototype.getServerBuildInfo = function() {
+    let BuildInfo = function(buildInfo) {
+        let _sanitizeMatch = function(flag) {
+            const sanitizeMatch =
+                /-fsanitize=([^\s]+) /.exec(buildInfo["buildEnvironment"]["ccflags"]);
+            if (flag && sanitizeMatch && RegExp(flag).exec(sanitizeMatch[1])) {
+                return true;
+            } else {
+                return false;
+            }
+        };
+
+        return {
+            rawData: function() {
+                return buildInfo;
+            },
+
+            getVersion: function() {
+                return buildInfo.version;
+            },
+
+            getBits: function() {
+                return buildInfo.bits;
+            },
+
+            isOptimizationsEnabled: function() {
+                const optimizationsMatch =
+                    /(\s|^)-O2(\s|$)/.exec(buildInfo["buildEnvironment"]["ccflags"]);
+                return Boolean(optimizationsMatch);
+            },
+
+            isAddressSanitizerActive: function() {
+                return _sanitizeMatch("address");
+            },
+
+            isLeakSanitizerActive: function() {
+                return _sanitizeMatch("leak");
+            },
+
+            isThreadSanitizerActive: function() {
+                return _sanitizeMatch("thread");
+            },
+
+            isUndefinedBehaviorSanitizerActive: function() {
+                return _sanitizeMatch("undefined");
+            },
+
+            isDebug: function() {
+                return buildInfo.debug;
+            }
+        };
+    };
+
+    return new BuildInfo(assert.commandWorked(this._runCommandWithoutApiStrict({buildinfo: 1})));
+};

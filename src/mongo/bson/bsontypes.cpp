@@ -27,12 +27,17 @@
  *    it in the license file.
  */
 
+#include <absl/container/flat_hash_map.h>
+#include <boost/none.hpp>
 #include <fmt/format.h>
+#include <ostream>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
-
-#include "mongo/config.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/config.h"  // IWYU pragma: keep
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -199,6 +204,10 @@ const char* typeName(BinDataType type) {
             return "encrypt";
         case Column:
             return "column";
+        case Sensitive:
+            return "sensitive";
+        case Vector:
+            return "vector";
         case bdtCustom:
             return "Custom";
         default:
@@ -217,6 +226,8 @@ bool isValidBinDataType(int type) {
         case Encrypt:
         case Column:
         case bdtCustom:
+        case Sensitive:
+        case Vector:
             return true;
         default:
             return false;

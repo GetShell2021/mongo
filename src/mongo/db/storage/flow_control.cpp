@@ -28,22 +28,34 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/storage/flow_control.h"
-
-#include <algorithm>
+#include <absl/container/node_hash_map.h>
 #include <fmt/format.h>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <limits>
+#include <string>
+#include <utility>
 
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands/server_status.h"
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/concurrency/lock_stats.h"
 #include "mongo/db/repl/member_data.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/server_options.h"
+#include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/flow_control_parameters_gen.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/background.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/platform/compiler.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
@@ -56,6 +68,26 @@ namespace mongo {
 MONGO_FAIL_POINT_DEFINE(flowControlTicketOverride);
 
 namespace {
+class FlowControlServerStatusSection : public ServerStatusSection {
+public:
+    using ServerStatusSection::ServerStatusSection;
+
+    bool includeByDefault() const override {
+        return true;
+    }
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
+        auto fc = FlowControl::get(opCtx);
+        if (!fc) {
+            return {};
+        }
+        return fc->generateSection(opCtx, configElement);
+    }
+};
+
+auto& flowControlSection =
+    *ServerStatusSectionBuilder<FlowControlServerStatusSection>("flowControl").forShard();
+
 const auto getFlowControl = ServiceContext::declareDecoration<std::unique_ptr<FlowControl>>();
 
 int multiplyWithOverflowCheck(double term1, double term2, int maxValue) {
@@ -107,8 +139,6 @@ bool sustainerAdvanced(const std::vector<repl::MemberData>& prevMemberData,
                        const std::vector<repl::MemberData>& currMemberData) {
     if (currMemberData.size() == 0 || currMemberData.size() != prevMemberData.size()) {
         LOGV2_WARNING(22223,
-                      "Flow control detected a change in topology. PrevMemberSize: "
-                      "{prevSize} CurrMemberSize: {currSize}",
                       "Flow control detected a change in topology",
                       "prevSize"_attr = prevMemberData.size(),
                       "currSize"_attr = currMemberData.size());
@@ -120,8 +150,6 @@ bool sustainerAdvanced(const std::vector<repl::MemberData>& prevMemberData,
 
     if (currSustainerAppliedTs < prevSustainerAppliedTs) {
         LOGV2_WARNING(22224,
-                      "Flow control's sustainer time decreased. PrevSustainer: "
-                      "{prevApplied} CurrSustainer: {currApplied}",
                       "Flow control's sustainer time decreased",
                       "prevApplied"_attr = prevSustainerAppliedTs,
                       "currApplied"_attr = currSustainerAppliedTs);
@@ -133,14 +161,10 @@ bool sustainerAdvanced(const std::vector<repl::MemberData>& prevMemberData,
 }  // namespace
 
 FlowControl::FlowControl(repl::ReplicationCoordinator* replCoord)
-    : ServerStatusSection("flowControl"),
-      _replCoord(replCoord),
-      _lastTimeSustainerAdvanced(Date_t::now()) {}
+    : _replCoord(replCoord), _lastTimeSustainerAdvanced(Date_t::now()) {}
 
 FlowControl::FlowControl(ServiceContext* service, repl::ReplicationCoordinator* replCoord)
-    : ServerStatusSection("flowControl"),
-      _replCoord(replCoord),
-      _lastTimeSustainerAdvanced(Date_t::now()) {
+    : _replCoord(replCoord), _lastTimeSustainerAdvanced(Date_t::now()) {
     // Initialize _lastTargetTicketsPermitted to maximum tickets to make sure flow control doesn't
     // cause a slow start on start up.
     FlowControlTicketholder::set(service, std::make_unique<FlowControlTicketholder>(kMaxTickets));
@@ -150,7 +174,8 @@ FlowControl::FlowControl(ServiceContext* service, repl::ReplicationCoordinator* 
          [this](Client* client) {
              FlowControlTicketholder::get(client->getServiceContext())->refreshTo(getNumTickets());
          },
-         Seconds(1)});
+         Seconds(1),
+         true /*isKillableByStepdown*/});
     _jobAnchor.start();
 }
 
@@ -191,7 +216,7 @@ double FlowControl::_getLocksPerOp() {
     Sample backOne;
     std::size_t numSamples;
     {
-        stdx::lock_guard<Latch> lk(_sampledOpsMutex);
+        stdx::lock_guard<stdx::mutex> lk(_sampledOpsMutex);
         numSamples = _sampledOpsApplied.size();
         if (numSamples >= 2) {
             backTwo = _sampledOpsApplied[numSamples - 2];
@@ -212,17 +237,17 @@ BSONObj FlowControl::generateSection(OperationContext* opCtx,
                                      const BSONElement& configElement) const {
     BSONObjBuilder bob;
     // Most of these values are only computed and meaningful when flow control is enabled.
-    bob.append("enabled", gFlowControlEnabled.load());
-    bob.append("targetRateLimit", _lastTargetTicketsPermitted.load());
+    bob.append("enabled", gFlowControlEnabled.loadRelaxed());
+    bob.append("targetRateLimit", _lastTargetTicketsPermitted.loadRelaxed());
     bob.append("timeAcquiringMicros",
                FlowControlTicketholder::get(opCtx)->totalTimeAcquiringMicros());
     // Ensure sufficient significant figures of locksPerOp are reported in FTDC, which stores data
     // as integers.
-    bob.append("locksPerKiloOp", _lastLocksPerOp.load() * 1000);
-    bob.append("sustainerRate", _lastSustainerAppliedCount.load());
-    bob.append("isLagged", _isLagged.load());
-    bob.append("isLaggedCount", _isLaggedCount.load());
-    bob.append("isLaggedTimeMicros", _isLaggedTimeMicros.load());
+    bob.append("locksPerKiloOp", _lastLocksPerOp.loadRelaxed() * 1000);
+    bob.append("sustainerRate", _lastSustainerAppliedCount.loadRelaxed());
+    bob.append("isLagged", _isLagged.loadRelaxed());
+    bob.append("isLaggedCount", _isLaggedCount.loadRelaxed());
+    bob.append("isLaggedTimeMicros", _isLaggedTimeMicros.loadRelaxed());
 
     return bob.obj();
 }
@@ -352,8 +377,7 @@ int FlowControl::getNumTickets(Date_t now) {
     const double locksPerOp = _getLocksPerOp();
     const std::int64_t locksUsedLastPeriod = _getLocksUsedLastPeriod();
 
-    if (serverGlobalParams.enableMajorityReadConcern == false ||
-        gFlowControlEnabled.load() == false || canAcceptWrites == false || locksPerOp < 0.0) {
+    if (gFlowControlEnabled.load() == false || canAcceptWrites == false || locksPerOp < 0.0) {
         _trimSamples(std::min(lastCommitted.opTime.getTimestamp(),
                               getMedianAppliedTimestamp(_prevMemberData)));
         return kMaxTickets;
@@ -444,7 +468,7 @@ std::int64_t FlowControl::_approximateOpsBetween(Timestamp prevTs, Timestamp cur
     std::int64_t prevApplied = -1;
     std::int64_t currApplied = -1;
 
-    stdx::lock_guard<Latch> lk(_sampledOpsMutex);
+    stdx::lock_guard<stdx::mutex> lk(_sampledOpsMutex);
     for (auto&& sample : _sampledOpsApplied) {
         if (prevApplied == -1 && prevTs.asULL() <= std::get<0>(sample)) {
             prevApplied = std::get<1>(sample);
@@ -468,11 +492,7 @@ std::int64_t FlowControl::_approximateOpsBetween(Timestamp prevTs, Timestamp cur
 }
 
 void FlowControl::sample(Timestamp timestamp, std::uint64_t opsApplied) {
-    if (serverGlobalParams.enableMajorityReadConcern == false) {
-        return;
-    }
-
-    stdx::lock_guard<Latch> lk(_sampledOpsMutex);
+    stdx::lock_guard<stdx::mutex> lk(_sampledOpsMutex);
     _numOpsSinceStartup += opsApplied;
     if (_numOpsSinceStartup - _lastSample <
         static_cast<std::size_t>(gFlowControlSamplePeriod.load())) {
@@ -519,7 +539,7 @@ void FlowControl::sample(Timestamp timestamp, std::uint64_t opsApplied) {
 
 void FlowControl::_trimSamples(const Timestamp trimTo) {
     int numTrimmed = 0;
-    stdx::lock_guard<Latch> lk(_sampledOpsMutex);
+    stdx::lock_guard<stdx::mutex> lk(_sampledOpsMutex);
     // Always leave at least two samples for calculating `locksPerOp`.
     while (_sampledOpsApplied.size() > 2 &&
            std::get<0>(_sampledOpsApplied.front()) < trimTo.asULL()) {

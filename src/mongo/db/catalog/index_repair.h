@@ -30,8 +30,14 @@
 #pragma once
 
 #include "mongo/base/status_with.h"
-#include "mongo/db/catalog/validate_state.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/catalog/validate/validate_results.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string/key_string.h"
 
 namespace mongo {
 namespace index_repair {
@@ -44,7 +50,7 @@ namespace index_repair {
 StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
                                          const NamespaceString& ns,
                                          const NamespaceString& lostAndFoundNss,
-                                         RecordId dupRecord);
+                                         const RecordId& dupRecord);
 
 /**
  * If repair mode is enabled, tries the inserting missingIndexEntry into indexes. If the
@@ -52,8 +58,8 @@ StatusWith<int> moveRecordToLostAndFound(OperationContext* opCtx,
  * in a local lost and found collection.
  */
 int repairMissingIndexEntry(OperationContext* opCtx,
-                            std::shared_ptr<const IndexCatalogEntry>& index,
-                            const KeyString::Value& ks,
+                            const IndexCatalogEntry* index,
+                            const key_string::Value& ks,
                             const KeyFormat& keyFormat,
                             const NamespaceString& nss,
                             const CollectionPtr& coll,

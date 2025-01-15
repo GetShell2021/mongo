@@ -7,8 +7,7 @@
  * ]
  */
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const name = jsTestName();
 const replSetA = new ReplSetTest({
@@ -93,4 +92,3 @@ assert.eq(ReplSetTest.State.PRIMARY, statusB.members[0].state);
 
 replSetB.stopSet();
 replSetA.stopSet();
-})();

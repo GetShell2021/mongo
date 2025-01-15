@@ -29,17 +29,35 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+// IWYU pragma: no_include "ext/alloc_traits.h"
+#include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bson_field.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/catalog/collection_options.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/catalog/type_chunk_base_gen.h"
+#include "mongo/s/catalog/type_chunk_range.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/type_traits.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -48,95 +66,11 @@ class Status;
 template <typename T>
 class StatusWith;
 
-/**
- * Contains the minimum representation of a chunk - its bounds in the format [min, max) along with
- * utilities for parsing and persistence.
- */
-class ChunkRange {
-public:
-    static constexpr char kMinKey[] = "min";
-    static constexpr char kMaxKey[] = "max";
-
-    ChunkRange(BSONObj minKey, BSONObj maxKey);
-
-    /**
-     * Parses a chunk range using the format { min: <min bound>, max: <max bound> }.
-     */
-    static StatusWith<ChunkRange> fromBSON(const BSONObj& obj);
-
-    /**
-     * A throwing version of 'fromBSON'.
-     */
-    static ChunkRange fromBSONThrowing(const BSONObj& obj) {
-        return uassertStatusOK(fromBSON(obj));
-    }
-
-    const BSONObj& getMin() const {
-        return _minKey;
-    }
-
-    const BSONObj& getMax() const {
-        return _maxKey;
-    }
-
-    Status extractKeyPattern(KeyPattern* shardKeyPatternOut) const;
-
-    /**
-     * Checks whether the specified key is within the bounds of this chunk range.
-     */
-    bool containsKey(const BSONObj& key) const;
-
-    /**
-     * Writes the contents of this chunk range as { min: <min bound>, max: <max bound> }.
-     */
-    void append(BSONObjBuilder* builder) const;
-
-    BSONObj toBSON() const;
-
-    std::string toString() const;
-
-    /**
-     * Returns true if two chunk ranges match exactly in terms of the min and max keys (including
-     * element order within the keys).
-     */
-    bool operator==(const ChunkRange& other) const;
-    bool operator!=(const ChunkRange& other) const;
-
-    /**
-     * Returns true iff the union of *this and the argument range is the same as *this.
-     */
-    bool covers(ChunkRange const& other) const;
-
-    /**
-     * Returns the range of overlap between *this and other, if any.
-     */
-    boost::optional<ChunkRange> overlapWith(ChunkRange const& other) const;
-
-    /**
-     * Returns true if there is any overlap between the two ranges.
-     */
-    bool overlaps(const ChunkRange& other) const;
-
-    /**
-     * Returns a range that includes *this and other. If the ranges do not overlap, it includes
-     * all the space between, as well.
-     */
-    ChunkRange unionWith(ChunkRange const& other) const;
-
-private:
-    /** Does not enforce the non-empty range invariant. */
-    ChunkRange() = default;
-
-    friend ChunkRange idlPreparsedValue(stdx::type_identity<ChunkRange>) {
-        return {};
-    }
-
-    BSONObj _minKey;
-    BSONObj _maxKey;
-};
-
 class ChunkHistory : public ChunkHistoryBase {
 public:
+    using ChunkHistoryBase::serialize;
+    using ChunkHistoryBase::toBSON;
+
     ChunkHistory() : ChunkHistoryBase() {}
     ChunkHistory(mongo::Timestamp ts, mongo::ShardId shard) : ChunkHistoryBase() {
         setValidAfter(std::move(ts));
@@ -209,6 +143,7 @@ public:
     static const BSONField<Date_t> lastmod;
     static const BSONField<BSONObj> history;
     static const BSONField<int64_t> estimatedSizeBytes;
+    static const BSONField<Timestamp> onCurrentShardSince;
     static const BSONField<bool> historyIsAt40;
 
     ChunkType();
@@ -217,14 +152,14 @@ public:
     /**
      * Constructs a new ChunkType object from BSON with the following format:
      * {min: <>, max: <>, shard: <>, uuid: <>, history: <>, jumbo: <>, lastmod: <>,
-     * lastmodEpoch: <>, lastmodTimestamp: <>}
+     * lastmodEpoch: <>, lastmodTimestamp: <>, onCurrentShardSince: <>}
      */
     static StatusWith<ChunkType> parseFromNetworkRequest(const BSONObj& source);
 
     /**
      * Constructs a new ChunkType object from BSON with the following format:
      * {_id: <>, min: <>, max: <>, shard: <>, uuid: <>, history: <>, jumbo: <>, lastmod: <>,
-     * estimatedSizeByte: <>}
+     * estimatedSizeByte: <>, onCurrentShardSince: <>}
      *
      * Returns ErrorCodes::NoSuchKey if the '_id' field is missing
      */
@@ -234,7 +169,7 @@ public:
 
     /**
      * Constructs a new ChunkType object from BSON with the following format:
-     * {_id: <>, max: <>, shard: <>, history: <>, lastmod: <>}
+     * {_id: <>, max: <>, shard: <>, history: <>, lastmod: <>, onCurrentShardSince: <>}
      * Also does validation of the contents.
      */
     static StatusWith<ChunkType> parseFromShardBSON(const BSONObj& source,
@@ -266,22 +201,22 @@ public:
     void setCollectionUUID(const UUID& uuid);
 
     const BSONObj& getMin() const {
-        return _min.get();
+        return _range->getMin();
     }
-    void setMin(const BSONObj& min);
 
     const BSONObj& getMax() const {
-        return _max.get();
+        return _range->getMax();
     }
-    void setMax(const BSONObj& max);
 
-    ChunkRange getRange() const {
-        return ChunkRange(getMin(), getMax());
+    const ChunkRange& getRange() const {
+        return _range.get();
     }
+    void setRange(const ChunkRange& chunkRange);
 
     bool isVersionSet() const {
         return _version.is_initialized();
     }
+
     const ChunkVersion& getVersion() const {
         return _version.get();
     }
@@ -302,6 +237,11 @@ public:
         return _jumbo.get_value_or(false);
     }
     void setJumbo(bool jumbo);
+
+    const boost::optional<Timestamp>& getOnCurrentShardSince() const {
+        return _onCurrentShardSince;
+    }
+    void setOnCurrentShardSince(const Timestamp& onCurrentShardSince);
 
     void setHistory(std::vector<ChunkHistory> history) {
         _history = std::move(history);
@@ -329,7 +269,7 @@ public:
 private:
     /**
      * Parses the base chunk data on all usages:
-     * {history: <>, shard: <>}
+     * {history: <>, shard: <>, onCurrentShardSince: <>}
      */
     static StatusWith<ChunkType> _parseChunkBase(const BSONObj& source);
 
@@ -340,10 +280,8 @@ private:
     boost::optional<OID> _id;
     // (O)(C)     uuid of the collection in the CollectionCatalog
     boost::optional<UUID> _collectionUUID;
-    // (M)(C)(S)  first key of the range, inclusive
-    boost::optional<BSONObj> _min;
-    // (M)(C)(S)  last key of the range, non-inclusive
-    boost::optional<BSONObj> _max;
+    // (M)(C)(S)  key range
+    boost::optional<ChunkRange> _range;
     // (M)(C)(S)  version of this chunk
     boost::optional<ChunkVersion> _version;
     // (M)(C)(S)  shard this chunk lives in
@@ -352,6 +290,8 @@ private:
     boost::optional<int64_t> _estimatedSizeBytes;
     // (O)(C)     too big to move?
     boost::optional<bool> _jumbo;
+    // (M)(C)(S)  timestamp since this chunk belongs to the current shard
+    boost::optional<Timestamp> _onCurrentShardSince;
     // history of the chunk
     std::vector<ChunkHistory> _history;
 };

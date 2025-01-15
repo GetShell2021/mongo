@@ -30,8 +30,19 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/match_details.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
@@ -51,10 +62,10 @@ public:
     }
 
     MatchExpression* getChild(size_t i) const final {
-        MONGO_UNREACHABLE;
+        MONGO_UNREACHABLE_TASSERT(6400211);
     }
 
-    void resetChild(size_t, MatchExpression*) {
+    void resetChild(size_t, MatchExpression*) override {
         MONGO_UNREACHABLE;
     };
 
@@ -69,7 +80,9 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final;
 
-    void serialize(BSONObjBuilder* out, bool includePath) const final;
+    void serialize(BSONObjBuilder* out,
+                   const SerializationOptions& opts = {},
+                   bool includePath = true) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 
@@ -77,7 +90,7 @@ public:
         return MatchCategory::kOther;
     }
 
-    void setInputParamId(InputParamId paramId) {
+    void setInputParamId(boost::optional<InputParamId> paramId) {
         _inputParamId = paramId;
     }
 
@@ -85,14 +98,15 @@ public:
         return _inputParamId;
     }
 
-protected:
     const std::string& getCode() const {
         return _code;
     }
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     const std::string _code;

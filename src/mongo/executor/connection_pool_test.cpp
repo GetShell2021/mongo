@@ -27,21 +27,32 @@
  *    it in the license file.
  */
 
-#include "mongo/executor/connection_pool_test_fixture.h"
-
 #include <algorithm>
+#include <array>
+#include <boost/smart_ptr.hpp>
 #include <memory>
 #include <random>
+#include <ratio>
+#include <set>
 #include <stack>
 #include <tuple>
+#include <type_traits>
 
-#include <fmt/format.h>
-#include <fmt/ostream.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/executor/connection_pool.h"
-#include "mongo/stdx/future.h"
+#include "mongo/executor/connection_pool_stats.h"
+#include "mongo/executor/connection_pool_test_fixture.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/unittest/matcher.h"
+#include "mongo/unittest/matcher_core.h"
 #include "mongo/unittest/thread_assertion_monitor.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/executor_test_util.h"
+#include "mongo/util/net/hostandport.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -50,6 +61,8 @@ namespace connection_pool_test_details {
 
 class ConnectionPoolTest : public unittest::Test {
 public:
+    constexpr static Milliseconds kNoTimeout = Milliseconds{-1};
+
 protected:
     void setUp() override {}
 
@@ -66,6 +79,10 @@ protected:
         _pool = std::make_shared<ConnectionPool>(
             std::make_shared<PoolImpl>(_executor), "test pool", options);
         return _pool;
+    }
+
+    void dropPool() {
+        _pool = {};
     }
 
     /**
@@ -89,6 +106,12 @@ protected:
         ExecutorFuture(_executor).getAsync([conn = std::move(conn)](auto) {});
     }
 
+    void doneWithError(ConnectionPool::ConnectionHandle& conn, Status error) {
+        dynamic_cast<ConnectionImpl*>(conn.get())->indicateFailure(error);
+
+        ExecutorFuture(_executor).getAsync([conn = std::move(conn)](auto) {});
+    }
+
     using StatusWithConn = StatusWith<ConnectionPool::ConnectionHandle>;
 
     auto getId(const ConnectionPool::ConnectionHandle& conn) {
@@ -103,17 +126,18 @@ protected:
     template <typename Ptr>
     void dropConnectionsTest(std::shared_ptr<ConnectionPool> const& pool, Ptr t);
 
+    void singleUseConnectionsTest(bool singleUseConnections);
+
     /**
-     * Helper for asserting the various connection pool time-out behaviours.
+     * Helper for asserting connection pool time-out behaviours.
      *
-     * Gets a connection from a new pool with a different timeout duration and code,
-     * asserting the connection times out with the appropriate code.
+     * Gets a connection from a new pool with a timeout duration,
+     * asserting the connection times out with the appropriate expected code
+     * associated with the matcher.
      *
      * The controller's refresh timeout is set to 250ms.
      */
-    void assertTimeoutHelper(Milliseconds hostTimeout,
-                             ErrorCodes::Error expectedErrorCode,
-                             ErrorCodes::Error timeoutCode) {
+    void assertTimeoutHelper(Milliseconds acquisitionTimeout, ErrorCodes::Error errorCode) {
         ConnectionPool::Options options;
         options.refreshTimeout = Milliseconds{250};
         auto pool = makePool(options);
@@ -123,16 +147,18 @@ protected:
 
         StatusWith<ConnectionPool::ConnectionHandle> connectionHandle{nullptr};
         pool->get_forTest(HostAndPort(),
-                          hostTimeout,
-                          timeoutCode,
+                          acquisitionTimeout,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               connectionHandle = std::move(swConn);
                           });
 
-        PoolImpl::setNow(now + hostTimeout);
+        // Ensure only one timeout fires.
+        auto minTimeout = std::min(options.refreshTimeout, acquisitionTimeout);
+
+        PoolImpl::setNow(now + minTimeout);
 
         ASSERT(!connectionHandle.isOK());
-        ASSERT_EQ(connectionHandle.getStatus(), expectedErrorCode);
+        ASSERT_EQ(connectionHandle.getStatus().code(), errorCode);
     }
 
 private:
@@ -152,7 +178,6 @@ TEST_F(ConnectionPoolTest, SameConn) {
     ConnectionImpl::pushSetup(Status::OK());
     pool->get_forTest(HostAndPort(),
                       Milliseconds(5000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           conn1Id = verifyAndGetId(swConn);
                           doneWith(swConn.getValue());
@@ -163,7 +188,6 @@ TEST_F(ConnectionPoolTest, SameConn) {
     ConnectionImpl::pushSetup(Status::OK());
     pool->get_forTest(HostAndPort(),
                       Milliseconds(5000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           conn2Id = verifyAndGetId(swConn);
                           doneWith(swConn.getValue());
@@ -180,6 +204,8 @@ TEST_F(ConnectionPoolTest, SameConn) {
  */
 TEST_F(ConnectionPoolTest, ConnectionsAreAcquiredInMRUOrder) {
     auto pool = makePool();
+    std::random_device rd;
+    std::mt19937 rng(rd());
 
     // Obtain a set of connections
     constexpr size_t kSize = 100;
@@ -202,18 +228,24 @@ TEST_F(ConnectionPoolTest, ConnectionsAreAcquiredInMRUOrder) {
         }
     });
 
+    std::uniform_int_distribution<> dist{0, 1};
     for (size_t i = 0; i != kSize; ++i) {
         ConnectionImpl::pushSetup(Status::OK());
-        pool->get_forTest(HostAndPort(),
-                          Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
-                          [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
-                              monitors[i].exec([&]() {
-                                  ASSERT(swConn.isOK());
-                                  connections.push_back(std::move(swConn.getValue()));
-                                  monitors[i].notifyDone();
-                              });
-                          });
+        auto cb = [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+            monitors[i].exec([&]() {
+                ASSERT(swConn.isOK());
+                connections.push_back(std::move(swConn.getValue()));
+                monitors[i].notifyDone();
+            });
+        };
+        auto timeout = Milliseconds(5000);
+
+        // Randomly lease or check out connection.
+        if (dist(rng)) {
+            pool->get_forTest(HostAndPort(), timeout, cb);
+        } else {
+            pool->lease_forTest(HostAndPort(), timeout, cb);
+        }
     }
 
     for (auto& monitor : monitors) {
@@ -223,8 +255,6 @@ TEST_F(ConnectionPoolTest, ConnectionsAreAcquiredInMRUOrder) {
     ASSERT_EQ(connections.size(), kSize);
 
     // Shuffle them into a random order
-    std::random_device rd;
-    std::mt19937 rng(rd());
     std::shuffle(connections.begin(), connections.end(), rng);
 
     // Return them to the pool in that random order, recording IDs in a stack
@@ -244,19 +274,24 @@ TEST_F(ConnectionPoolTest, ConnectionsAreAcquiredInMRUOrder) {
     // as the IDs in the stack, since the pool returns them in MRU order.
     for (size_t i = 0; i != kSize; ++i) {
         ConnectionImpl::pushSetup(Status::OK());
-        pool->get_forTest(HostAndPort(),
-                          Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
-                          [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
-                              monitors[i].exec([&]() {
-                                  ASSERT(swConn.isOK());
-                                  const auto id = verifyAndGetId(swConn);
-                                  connections.push_back(std::move(swConn.getValue()));
-                                  ASSERT_EQ(id, ids.top());
-                                  ids.pop();
-                                  monitors[i].notifyDone();
-                              });
-                          });
+        auto cb = [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+            monitors[i].exec([&]() {
+                ASSERT(swConn.isOK());
+                const auto id = verifyAndGetId(swConn);
+                connections.push_back(std::move(swConn.getValue()));
+                ASSERT_EQ(id, ids.top());
+                ids.pop();
+                monitors[i].notifyDone();
+            });
+        };
+        auto timeout = Milliseconds(5000);
+
+        // Randomly lease or check out connection.
+        if (dist(rng)) {
+            pool->get_forTest(HostAndPort(), timeout, cb);
+        } else {
+            pool->lease_forTest(HostAndPort(), timeout, cb);
+        }
     }
 
     for (auto& monitor : monitors) {
@@ -309,7 +344,6 @@ TEST_F(ConnectionPoolTest, ConnectionsNotUsedRecentlyArePurged) {
         ConnectionImpl::pushSetup(Status::OK());
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitors[i].exec([&]() {
                                   ASSERT(swConn.isOK());
@@ -350,7 +384,6 @@ TEST_F(ConnectionPoolTest, ConnectionsNotUsedRecentlyArePurged) {
         ConnectionImpl::pushSetup(Status::OK());
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitors[i].exec([&]() {
                                   ASSERT(swConn.isOK());
@@ -398,7 +431,6 @@ TEST_F(ConnectionPoolTest, FailedConnDifferentConn) {
     ConnectionImpl::pushSetup(Status::OK());
     pool->get_forTest(HostAndPort(),
                       Milliseconds(5000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           conn1Id = verifyAndGetId(swConn);
                           swConn.getValue()->indicateFailure(Status(ErrorCodes::BadValue, "error"));
@@ -409,7 +441,6 @@ TEST_F(ConnectionPoolTest, FailedConnDifferentConn) {
     ConnectionImpl::pushSetup(Status::OK());
     pool->get_forTest(HostAndPort(),
                       Milliseconds(5000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           conn2Id = verifyAndGetId(swConn);
                           doneWith(swConn.getValue());
@@ -419,6 +450,157 @@ TEST_F(ConnectionPoolTest, FailedConnDifferentConn) {
     ASSERT(conn1Id);
     ASSERT(conn2Id);
     ASSERT_NE(conn1Id, conn2Id);
+}
+
+/**
+ * Verify that a connection returned with an error indicating the remote
+ * is unavailable drops current generation connections to that remote.
+ */
+TEST_F(ConnectionPoolTest, FailedHostDropsConns) {
+    auto pool = makePool();
+
+    ASSERT_EQ(pool->getNumConnectionsPerHost(HostAndPort()), 0U);
+
+    constexpr size_t kSize = 100;
+    std::vector<ConnectionPool::ConnectionHandle> connections;
+    std::vector<unittest::ThreadAssertionMonitor> monitors(kSize);
+
+    // Ensure that no matter how we leave the test, we mark any
+    // checked out connections as OK before implicity returning them
+    // to the pool by destroying the 'connections' vector. Otherwise,
+    // this test would cause an invariant failure instead of a normal
+    // test failure if it fails, which would be confusing.
+    auto drainConnPool = [&] {
+        while (!connections.empty()) {
+            try {
+                ConnectionPool::ConnectionHandle conn = std::move(connections.back());
+                connections.pop_back();
+                doneWith(conn);
+            } catch (...) {
+            }
+        }
+    };
+    const ScopeGuard guard(drainConnPool);
+
+    auto now = Date_t::now();
+    PoolImpl::setNow(now);
+
+    // Check out kSize connections from the pool.
+    for (size_t i = 0; i != kSize; ++i) {
+        ConnectionImpl::pushSetup(Status::OK());
+        auto cb = [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+            monitors[i].exec([&]() {
+                ASSERT(swConn.isOK());
+                connections.push_back(std::move(swConn.getValue()));
+                monitors[i].notifyDone();
+            });
+        };
+        auto timeout = Milliseconds(5000);
+
+        pool->get_forTest(HostAndPort(), timeout, cb);
+    }
+
+    for (auto& monitor : monitors) {
+        monitor.wait();
+    }
+
+    ASSERT_EQ(pool->getNumConnectionsPerHost(HostAndPort()), kSize);
+
+    // Return one connection with a network error.
+    ConnectionPool::ConnectionHandle conn = std::move(connections.back());
+    connections.pop_back();
+    doneWithError(conn, {ErrorCodes::HostUnreachable, "error"});
+
+    // We should still have all of the connections open, minus the one we just returned with an
+    // error.
+    ASSERT_EQ(pool->getNumConnectionsPerHost(HostAndPort()), kSize - 1);
+
+    // Put the remaining connections back.
+    drainConnPool();
+
+    // They should all be discarded since the host should be marked as down
+    // due to the connection returned with a network error.
+    ASSERT_EQ(pool->getNumConnectionsPerHost(HostAndPort()), 0);
+}
+
+/**
+ * Verify that a connection returned with an error that does _not_ indicate
+ * the remote is unavailable does _not_ drop current generation connections to that remote.
+ */
+TEST_F(ConnectionPoolTest, OtherErrorsDontDropConns) {
+    auto pool = makePool();
+
+    ASSERT_EQ(pool->getNumConnectionsPerHost(HostAndPort()), 0U);
+
+    constexpr size_t kSize = 100;
+    std::vector<ConnectionPool::ConnectionHandle> connections;
+
+    // Ensure that no matter how we leave the test, we mark any
+    // checked out connections as OK before implicity returning them
+    // to the pool by destroying the 'connections' vector. Otherwise,
+    // this test would cause an invariant failure instead of a normal
+    // test failure if it fails, which would be confusing.
+    auto drainConnPool = [&] {
+        while (!connections.empty()) {
+            try {
+                ConnectionPool::ConnectionHandle conn = std::move(connections.back());
+                connections.pop_back();
+                doneWith(conn);
+            } catch (...) {
+            }
+        }
+    };
+    const ScopeGuard guard(drainConnPool);
+
+    auto now = Date_t::now();
+    PoolImpl::setNow(now);
+
+    auto checkOutConnections = [&] {
+        std::vector<unittest::ThreadAssertionMonitor> monitors(kSize);
+        for (size_t i = 0; i != kSize; ++i) {
+            ConnectionImpl::pushSetup(Status::OK());
+            auto cb = [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+                monitors[i].exec([&]() {
+                    ASSERT(swConn.isOK());
+                    connections.push_back(std::move(swConn.getValue()));
+                    monitors[i].notifyDone();
+                });
+            };
+            auto timeout = Milliseconds(5000);
+
+            pool->get_forTest(HostAndPort(), timeout, cb);
+        }
+
+        for (auto& monitor : monitors) {
+            monitor.wait();
+        }
+
+        ASSERT_EQ(pool->getNumConnectionsPerHost(HostAndPort()), kSize);
+    };
+
+    // All three types of error that shouldn't result in us dropping connections - a non-network
+    // error; a network timeout error, and a network error that we can isolate to a specific
+    // connection.
+    std::array<ErrorCodes::Error, 3> errors = {
+        ErrorCodes::InternalError, ErrorCodes::NetworkTimeout, ErrorCodes::ConnectionError};
+    for (size_t i = 0; i < errors.size(); ++i) {
+        // Check out kSize connections from the pool.
+        checkOutConnections();
+        // Return one connection with a non-network error.
+        ConnectionPool::ConnectionHandle conn = std::move(connections.back());
+        connections.pop_back();
+        doneWithError(conn, {errors[i], "error"});
+
+        // We should still have all of the connections open, minus the one we just returned with an
+        // error.
+        ASSERT_EQ(pool->getNumConnectionsPerHost(HostAndPort()), kSize - 1);
+
+        // Put the remaining connections back.
+        drainConnPool();
+
+        // They should all still be open.
+        ASSERT_EQ(pool->getNumConnectionsPerHost(HostAndPort()), kSize - 1);
+    }
 }
 
 /**
@@ -433,7 +615,6 @@ TEST_F(ConnectionPoolTest, DifferentHostDifferentConn) {
     ConnectionImpl::pushSetup(Status::OK());
     pool->get_forTest(HostAndPort("localhost:30000"),
                       Milliseconds(5000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           conn1Id = verifyAndGetId(swConn);
                           doneWith(swConn.getValue());
@@ -444,7 +625,6 @@ TEST_F(ConnectionPoolTest, DifferentHostDifferentConn) {
     ConnectionImpl::pushSetup(Status::OK());
     pool->get_forTest(HostAndPort("localhost:30001"),
                       Milliseconds(5000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           conn2Id = verifyAndGetId(swConn);
                           doneWith(swConn.getValue());
@@ -468,7 +648,6 @@ TEST_F(ConnectionPoolTest, DifferentConnWithoutReturn) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT(swConn.isOK());
@@ -484,7 +663,6 @@ TEST_F(ConnectionPoolTest, DifferentConnWithoutReturn) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT(swConn.isOK());
@@ -501,40 +679,23 @@ TEST_F(ConnectionPoolTest, DifferentConnWithoutReturn) {
 }
 
 /**
- * When the timeout duration comes from the parameter, and no timeout code is specified the
- * connection timeout status should always be `NetworkInterfaceExceededTimeLimit`
+ * When the timeout duration comes from the parameter, the connection timeout status should
+ * always be `PooledConnectionAcquisitionExceededTimeLimit`.
  */
-TEST_F(ConnectionPoolTest, TimeoutOnSetup) {
+TEST_F(ConnectionPoolTest, TimeoutOnAquisitionTimeout) {
     assertTimeoutHelper(
         /* timeout duration */ Milliseconds{100},
-        /* expected timeout code */ ErrorCodes::NetworkInterfaceExceededTimeLimit,
-        /* user-defined timeout code */ ErrorCodes::NetworkInterfaceExceededTimeLimit);
+        /* expected timeout codes */ ErrorCodes::PooledConnectionAcquisitionExceededTimeLimit);
 }
 
 /**
- * When the timeout duration and timeout code come from the parameters, the connection timeout
- * status should be the same as specified.
+ * When the timeout duration comes from controller refresh, the connection timeout status should
+ * always be `HostUnreachable`.
  */
-TEST_F(ConnectionPoolTest, TimeoutOnSetupWithErrorCode) {
-    assertTimeoutHelper(
-        /* timeout duration */ Milliseconds{100},
-        /* expected timeout code */ ErrorCodes::MaxTimeMSExpired,
-        /* user-defined timeout code */ ErrorCodes::MaxTimeMSExpired);
-}
-
-/**
- * When the timeout duration comes from controller, the connection timeout status should always
- * be `NetworkInterfaceExceededTimeLimit`.
- *
- * This test verifies that for a duration longer than what is specified in the connection pool
- * controller, the controller timeout duration takes precendence over what was requested and
- * the returned status is always `NetworkInterfaceExceededTimeLimit`
- */
-TEST_F(ConnectionPoolTest, ControllerTimeoutOnSetup) {
+TEST_F(ConnectionPoolTest, TimeoutOnControllerRefresh) {
     assertTimeoutHelper(
         /* timeout duration */ Milliseconds{500},
-        /* expected timeout code */ ErrorCodes::NetworkInterfaceExceededTimeLimit,
-        /* user-defined timeout code */ ErrorCodes::MaxTimeMSExpired);
+        /* expected timeout codes */ ErrorCodes::HostUnreachable);
 }
 
 /**
@@ -566,7 +727,6 @@ TEST_F(ConnectionPoolTest, refreshHappens) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT(swConn.isOK());
@@ -609,7 +769,6 @@ TEST_F(ConnectionPoolTest, refreshTimeoutHappens) {
         ConnectionImpl::pushSetup(Status::OK());
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   conn1Id = verifyAndGetId(swConn);
@@ -625,7 +784,6 @@ TEST_F(ConnectionPoolTest, refreshTimeoutHappens) {
         // Make sure we still get the first one
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   conn2Id = verifyAndGetId(swConn);
@@ -646,7 +804,6 @@ TEST_F(ConnectionPoolTest, refreshTimeoutHappens) {
         ConnectionImpl::pushSetup(Status::OK());
         pool->get_forTest(HostAndPort(),
                           Milliseconds(1000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT(!swConn.isOK());
@@ -666,7 +823,6 @@ TEST_F(ConnectionPoolTest, refreshTimeoutHappens) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(1000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT_NE(verifyAndGetId(swConn), conn1Id);
@@ -693,7 +849,6 @@ TEST_F(ConnectionPoolTest, requestsServedByUrgency) {
     unittest::ThreadAssertionMonitor c1;
     pool->get_forTest(HostAndPort(),
                       Milliseconds(2000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           c1.exec([&]() {
                               ASSERT(swConn.isOK());
@@ -706,7 +861,6 @@ TEST_F(ConnectionPoolTest, requestsServedByUrgency) {
     unittest::ThreadAssertionMonitor c2;
     pool->get_forTest(HostAndPort(),
                       Milliseconds(1000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           c2.exec([&]() {
                               ASSERT(swConn.isOK());
@@ -751,7 +905,6 @@ TEST_F(ConnectionPoolTest, maxPoolRespected) {
     unittest::ThreadAssertionMonitor c3;
     pool->get_forTest(HostAndPort(),
                       Milliseconds(3000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           c3.exec([&]() {
                               ASSERT(swConn.isOK());
@@ -763,7 +916,6 @@ TEST_F(ConnectionPoolTest, maxPoolRespected) {
     unittest::ThreadAssertionMonitor c2;
     pool->get_forTest(HostAndPort(),
                       Milliseconds(2000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           c2.exec([&]() {
                               ASSERT(swConn.isOK());
@@ -775,7 +927,6 @@ TEST_F(ConnectionPoolTest, maxPoolRespected) {
     unittest::ThreadAssertionMonitor c1;
     pool->get_forTest(HostAndPort(),
                       Milliseconds(1000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           c1.exec([&]() {
                               ASSERT(swConn.isOK());
@@ -826,7 +977,6 @@ TEST_F(ConnectionPoolTest, maxConnectingRespected) {
     unittest::ThreadAssertionMonitor c3;
     pool->get_forTest(HostAndPort(),
                       Milliseconds(3000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           c3.exec([&]() {
                               ASSERT(swConn.isOK());
@@ -838,7 +988,6 @@ TEST_F(ConnectionPoolTest, maxConnectingRespected) {
     unittest::ThreadAssertionMonitor c2;
     pool->get_forTest(HostAndPort(),
                       Milliseconds(2000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           c2.exec([&]() {
                               ASSERT(swConn.isOK());
@@ -850,7 +999,6 @@ TEST_F(ConnectionPoolTest, maxConnectingRespected) {
     unittest::ThreadAssertionMonitor c1;
     pool->get_forTest(HostAndPort(),
                       Milliseconds(1000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           c1.exec([&]() {
                               ASSERT(swConn.isOK());
@@ -903,7 +1051,6 @@ TEST_F(ConnectionPoolTest, maxConnectingWithRefresh) {
     unittest::ThreadAssertionMonitor c1;
     pool->get_forTest(HostAndPort(),
                       Milliseconds(5000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           c1.exec([&]() {
                               ASSERT(swConn.isOK());
@@ -924,7 +1071,6 @@ TEST_F(ConnectionPoolTest, maxConnectingWithRefresh) {
     unittest::ThreadAssertionMonitor c2;
     pool->get_forTest(HostAndPort(),
                       Milliseconds(5000),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
                       [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                           c2.exec([&]() {
                               ASSERT(swConn.isOK());
@@ -961,7 +1107,6 @@ TEST_F(ConnectionPoolTest, maxConnectingWithMultipleRefresh) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT(swConn.isOK());
@@ -987,7 +1132,6 @@ TEST_F(ConnectionPoolTest, maxConnectingWithMultipleRefresh) {
     for (size_t i = 0; i < conns.size(); ++i) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(static_cast<int>(1000 + i)),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&conns, &ams, i](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               ams[i].exec([&]() {
                                   ASSERT(swConn.isOK());
@@ -1076,7 +1220,6 @@ TEST_F(ConnectionPoolTest, minPoolRespected) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(1000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT(swConn.isOK());
@@ -1109,7 +1252,6 @@ TEST_F(ConnectionPoolTest, minPoolRespected) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(2000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT(swConn.isOK());
@@ -1121,7 +1263,6 @@ TEST_F(ConnectionPoolTest, minPoolRespected) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(3000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT(swConn.isOK());
@@ -1192,7 +1333,6 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappens) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   connId = verifyAndGetId(swConn);
@@ -1213,7 +1353,6 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappens) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT_NE(connId, verifyAndGetId(swConn));
@@ -1250,7 +1389,6 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappensMoreGetsDelay) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   connId = verifyAndGetId(swConn);
@@ -1269,7 +1407,6 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappensMoreGetsDelay) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT_EQ(connId, verifyAndGetId(swConn));
@@ -1287,7 +1424,6 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappensMoreGetsDelay) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT_EQ(connId, verifyAndGetId(swConn));
@@ -1307,7 +1443,6 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappensMoreGetsDelay) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT_NE(connId, verifyAndGetId(swConn));
@@ -1344,7 +1479,6 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappensCheckoutDelays) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   conn1Id = verifyAndGetId(swConn);
@@ -1359,7 +1493,6 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappensCheckoutDelays) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   conn2Id = verifyAndGetId(swConn);
@@ -1378,7 +1511,6 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappensCheckoutDelays) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT_EQ(conn2Id, verifyAndGetId(swConn));
@@ -1402,7 +1534,6 @@ TEST_F(ConnectionPoolTest, hostTimeoutHappensCheckoutDelays) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT_NE(conn1Id, verifyAndGetId(swConn));
@@ -1436,7 +1567,6 @@ TEST_F(ConnectionPoolTest, dropConnections) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   conn1Id = verifyAndGetId(swConn);
@@ -1451,7 +1581,6 @@ TEST_F(ConnectionPoolTest, dropConnections) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT_EQ(verifyAndGetId(swConn), conn1Id);
@@ -1468,7 +1597,6 @@ TEST_F(ConnectionPoolTest, dropConnections) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT(!swConn.isOK());
@@ -1492,7 +1620,6 @@ TEST_F(ConnectionPoolTest, dropConnections) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   conn2Id = verifyAndGetId(swConn);
@@ -1519,7 +1646,6 @@ TEST_F(ConnectionPoolTest, dropConnections) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(5000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() {
                                   ASSERT_NE(verifyAndGetId(swConn), conn2Id);
@@ -1531,10 +1657,80 @@ TEST_F(ConnectionPoolTest, dropConnections) {
     ASSERT(reachedB);
 }
 
+TEST_F(ConnectionPoolTest, DropAllConnectionsWithKeepOpen) {
+    ConnectionPool::Options options;
+
+    options.maxConnections = 2;
+    options.refreshRequirement = Seconds(1);
+    options.refreshTimeout = Seconds(2);
+    auto pool = makePool(options);
+
+    PoolImpl::setNow(Date_t::now());
+
+    auto requestConnection = [&](HostAndPort hp,
+                                 CancellationToken token = CancellationToken::uncancelable()) {
+        return getFromPool(hp, transport::kGlobalSSLMode, Seconds{5}, token);
+    };
+
+    HostAndPort hostKeepOpen("a");
+    HostAndPort hostNoKeepOpen("b");
+
+    // Initialize pools for two hosts by getting connections from them so we can control
+    // keepOpen for those pools individually. Keep a connection checked out from each one so
+    // that the next request won't immediately ready a connection.
+    ConnectionImpl::pushSetup(Status::OK());
+    auto ch1 = requestConnection(hostKeepOpen).get();
+    ConnectionImpl::pushSetup(Status::OK());
+    auto ch2 = requestConnection(hostNoKeepOpen).get();
+
+    ScopeGuard cleanupHandles([&] {
+        if (ch1)
+            doneWith(ch1);
+        if (ch2)
+            doneWith(ch2);
+    });
+
+    ASSERT(ch1);
+    ASSERT(ch2);
+
+    // Pools for hosts have been created, set keepOpen accordingly.
+    pool->setKeepOpen(hostKeepOpen, true);
+    pool->setKeepOpen(hostNoKeepOpen, false);
+
+    // Request a connection from the non-keepOpen pool. We should see that fail once we drop
+    // connections.
+    auto noKeepOpenConnFuture = requestConnection(hostNoKeepOpen);
+
+    // Request a connection from the keepOpen pool. This one should not be dropped. We'll later
+    // cancel it instead of messing with pushSetup (which at this point would fulfill the request
+    // above that we want to see get dropped).
+    CancellationSource keepOpenCancelSource;
+    auto keepOpenConnFuture = requestConnection(hostKeepOpen, keepOpenCancelSource.token());
+
+    // Dropping connections should fail the pending request on the non-keepOpen pool.
+    ASSERT_FALSE(noKeepOpenConnFuture.isReady());
+    pool->dropConnections();
+    {
+        auto swConn = std::move(noKeepOpenConnFuture).getNoThrow();
+        ASSERT_EQ(swConn.getStatus().code(), ErrorCodes::PooledConnectionsDropped);
+    }
+
+    // Cancel the keepOpen pool request.
+    ASSERT_FALSE(keepOpenConnFuture.isReady());
+    keepOpenCancelSource.cancel();
+    {
+        auto swConn = std::move(keepOpenConnFuture).getNoThrow();
+        ASSERT_EQ(swConn.getStatus().code(), ErrorCodes::CallbackCanceled);
+    }
+}
+
 /**
- * Verify that timeouts during setup don't prematurely time out unrelated requests
+ * Verify that setup timeouts time out other pending requests. This is in adherence with
+ * the SDAM specification which states that timeouts during setup should mark the timed
+ * out host as Unknown. Therefore, pending connections may be dropped in this layer as
+ * a reaction to setup timeout.
  */
-TEST_F(ConnectionPoolTest, SetupTimeoutsDontTimeoutUnrelatedRequests) {
+TEST_F(ConnectionPoolTest, SetupTimeoutsFailOtherPendingRequests) {
     ConnectionPool::Options options;
 
     options.maxConnections = 1;
@@ -1546,38 +1742,40 @@ TEST_F(ConnectionPoolTest, SetupTimeoutsDontTimeoutUnrelatedRequests) {
 
     boost::optional<StatusWith<ConnectionPool::ConnectionHandle>> conn1;
     pool->get_forTest(
-        HostAndPort(),
-        Seconds(10),
-        ErrorCodes::NetworkInterfaceExceededTimeLimit,
-        [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) { conn1 = std::move(swConn); });
+        HostAndPort(), Seconds(10), [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+            conn1 = std::move(swConn);
+        });
 
-    // initially we haven't called our callback
+    // Initially we haven't called our callback.
     ASSERT(!conn1);
 
     PoolImpl::setNow(now + Seconds(1));
 
-    // Still haven't fired on conn1
+    // Still haven't fired on conn1.
     ASSERT(!conn1);
 
-    // Get conn2 (which should have an extra second before the timeout)
-    pool->get_forTest(HostAndPort(),
-                      Seconds(10),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
-                      [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
-                          ASSERT_EQ(swConn.getStatus(), ErrorCodes::ShutdownInProgress);
-                      });
+    boost::optional<StatusWith<ConnectionPool::ConnectionHandle>> conn2;
+    // Get conn2 (which should have an extra second before the timeout).
+    pool->get_forTest(
+        HostAndPort(), Seconds(10), [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+            conn2 = std::move(swConn);
+        });
 
     PoolImpl::setNow(now + Seconds(2));
 
     ASSERT(conn1);
     ASSERT(!conn1->isOK());
-    ASSERT_EQ(conn1->getStatus(), ErrorCodes::NetworkInterfaceExceededTimeLimit);
+    ASSERT_EQ(conn1->getStatus(), ErrorCodes::HostUnreachable);
+    ASSERT(conn2);
+    ASSERT(!conn2->isOK());
+    // Pending connection fails with the same timeout status.
+    ASSERT_EQ(conn2->getStatus(), ErrorCodes::HostUnreachable);
 }
 
 /**
- * Verify that timeouts during refresh don't prematurely time out unrelated requests
+ * Verify that timeouts during refresh time out other pending requests.
  */
-TEST_F(ConnectionPoolTest, RefreshTimeoutsDontTimeoutRequests) {
+TEST_F(ConnectionPoolTest, RefreshTimeoutsFailPendingRequests) {
     ConnectionPool::Options options;
 
     options.maxConnections = 1;
@@ -1591,13 +1789,11 @@ TEST_F(ConnectionPoolTest, RefreshTimeoutsDontTimeoutRequests) {
     // Successfully get a new connection
     size_t conn1Id = 0;
     ConnectionImpl::pushSetup(Status::OK());
-    pool->get_forTest(HostAndPort(),
-                      Seconds(1),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
-                      [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
-                          conn1Id = verifyAndGetId(swConn);
-                          doneWith(swConn.getValue());
-                      });
+    pool->get_forTest(
+        HostAndPort(), Seconds(1), [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+            conn1Id = verifyAndGetId(swConn);
+            doneWith(swConn.getValue());
+        });
     ASSERT(conn1Id);
 
     // Force it into refresh
@@ -1605,10 +1801,9 @@ TEST_F(ConnectionPoolTest, RefreshTimeoutsDontTimeoutRequests) {
 
     boost::optional<StatusWith<ConnectionPool::ConnectionHandle>> conn1;
     pool->get_forTest(
-        HostAndPort(),
-        Seconds(10),
-        ErrorCodes::NetworkInterfaceExceededTimeLimit,
-        [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) { conn1 = std::move(swConn); });
+        HostAndPort(), Seconds(10), [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+            conn1 = std::move(swConn);
+        });
 
     // initially we haven't called our callback
     ASSERT(!conn1);
@@ -1618,18 +1813,16 @@ TEST_F(ConnectionPoolTest, RefreshTimeoutsDontTimeoutRequests) {
     ASSERT(!conn1);
 
     // Get conn2 (which should have an extra second before the timeout)
-    pool->get_forTest(HostAndPort(),
-                      Seconds(10),
-                      ErrorCodes::NetworkInterfaceExceededTimeLimit,
-                      [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
-                          ASSERT_EQ(swConn.getStatus(), ErrorCodes::ShutdownInProgress);
-                      });
+    pool->get_forTest(
+        HostAndPort(), Seconds(10), [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+            ASSERT_EQ(swConn.getStatus(), ErrorCodes::HostUnreachable);
+        });
 
     PoolImpl::setNow(now + Seconds(5));
 
     ASSERT(conn1);
     ASSERT(!conn1->isOK());
-    ASSERT_EQ(conn1->getStatus(), ErrorCodes::NetworkInterfaceExceededTimeLimit);
+    ASSERT_EQ(conn1->getStatus(), ErrorCodes::HostUnreachable);
 }
 
 template <typename Ptr>
@@ -1644,70 +1837,52 @@ void ConnectionPoolTest::dropConnectionsTest(std::shared_ptr<ConnectionPool> con
 
     // Successfully get connections to two hosts
     ConnectionImpl::pushSetup(Status::OK());
-    pool->get_forTest(
-        hap1,
-        Seconds(1),
-        ErrorCodes::NetworkInterfaceExceededTimeLimit,
-        [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) { doneWith(swConn.getValue()); });
-
-    ConnectionImpl::pushSetup(Status::OK());
-    pool->get_forTest(
-        hap2,
-        Seconds(1),
-        ErrorCodes::NetworkInterfaceExceededTimeLimit,
-        [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) { doneWith(swConn.getValue()); });
-
-    ConnectionImpl::pushSetup(Status::OK());
-    pool->get_forTest(
-        hap3,
-        Seconds(1),
-        ErrorCodes::NetworkInterfaceExceededTimeLimit,
-        [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) { doneWith(swConn.getValue()); });
-
-    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap1));
-    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap2));
-    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap3));
-
-    t->dropConnections(transport::Session::kPending);
-
-    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap1));
-    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap2));
-    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap3));
-
-    t->mutateTags(hap1, [](transport::Session::TagMask tags) {
-        return transport::Session::kKeepOpen | transport::Session::kInternalClient;
+    pool->get_forTest(hap1, Seconds(1), [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+        doneWith(swConn.getValue());
     });
 
-    t->mutateTags(hap2,
-                  [](transport::Session::TagMask tags) { return transport::Session::kKeepOpen; });
+    ConnectionImpl::pushSetup(Status::OK());
+    pool->get_forTest(hap2, Seconds(1), [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+        doneWith(swConn.getValue());
+    });
 
-    t->mutateTags(
-        hap3, [](transport::Session::TagMask tags) { return transport::Session::kEmptyTagMask; });
+    ConnectionImpl::pushSetup(Status::OK());
+    pool->get_forTest(hap3, Seconds(1), [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+        doneWith(swConn.getValue());
+    });
 
-    t->dropConnections(transport::Session::kKeepOpen);
+    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap1));
+    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap2));
+    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap3));
+
+    t->dropConnections();
+
+    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap1));
+    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap2));
+    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap3));
+
+    t->setKeepOpen(hap1, true);
+
+    t->setKeepOpen(hap2, true);
+
+    t->setKeepOpen(hap3, false);
+
+    t->dropConnections();
 
     ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap1));
     ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap2));
     ASSERT_EQ(0ul, pool->getNumConnectionsPerHost(hap3));
 
-    t->dropConnections(transport::Session::kInternalClient);
-
-    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap1));
-    ASSERT_EQ(0ul, pool->getNumConnectionsPerHost(hap2));
-    ASSERT_EQ(0ul, pool->getNumConnectionsPerHost(hap3));
-
     ConnectionImpl::pushSetup(Status::OK());
-    pool->get_forTest(
-        hap4,
-        Seconds(1),
-        ErrorCodes::NetworkInterfaceExceededTimeLimit,
-        [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) { doneWith(swConn.getValue()); });
+    pool->get_forTest(hap4, Seconds(1), [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+        doneWith(swConn.getValue());
+    });
 
     // drop connections by hostAndPort
     t->dropConnections(hap1);
 
     ASSERT_EQ(0ul, pool->getNumConnectionsPerHost(hap1));
-    ASSERT_EQ(0ul, pool->getNumConnectionsPerHost(hap2));
+    ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap2));
     ASSERT_EQ(0ul, pool->getNumConnectionsPerHost(hap3));
     ASSERT_EQ(1ul, pool->getNumConnectionsPerHost(hap4));
 }
@@ -1721,10 +1896,10 @@ TEST_F(ConnectionPoolTest, DropConnections) {
 }
 
 TEST_F(ConnectionPoolTest, DropConnectionsInMultipleViaManager) {
-    EgressTagCloserManager manager;
+    EgressConnectionCloserManager manager;
     ConnectionPool::Options options;
     options.minConnections = 0;
-    options.egressTagCloserManager = &manager;
+    options.egressConnectionCloserManager = &manager;
     auto pool = makePool(options);
 
     dropConnectionsTest(pool, &manager);
@@ -1820,7 +1995,6 @@ TEST_F(ConnectionPoolTest, NegativeTimeout) {
     unittest::threadAssertionMonitoredTest([&](auto& monitor) {
         pool->get_forTest(HostAndPort(),
                           Milliseconds(1000),
-                          ErrorCodes::NetworkInterfaceExceededTimeLimit,
                           [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
                               monitor.exec([&]() { ASSERT(!swConn.isOK()); });
                           });
@@ -1843,6 +2017,300 @@ TEST_F(ConnectionPoolTest, ReturnAfterShutdown) {
     doneWith(conn);
 
     pool->shutdown();
+}
+
+TEST_F(ConnectionPoolTest, TotalConnUseTimeIncreasedForCheckedOutConnection) {
+    constexpr Milliseconds checkOutLength = Milliseconds(10);
+    auto pool = makePool();
+
+    ConnectionPoolStats initialStats;
+    pool->appendConnectionStats(&initialStats);
+
+    auto startTimePoint = Date_t::now();
+    auto endTimePoint = startTimePoint + checkOutLength;
+    PoolImpl::setNow(startTimePoint);
+
+    ConnectionImpl::pushSetup(Status::OK());
+    pool->get_forTest(HostAndPort(),
+                      Milliseconds(5000),
+                      [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+                          PoolImpl::setNow(endTimePoint);
+                          doneWith(swConn.getValue());
+                      });
+
+    ConnectionPoolStats finalStats;
+    pool->appendConnectionStats(&finalStats);
+
+    auto totalTimeUsageDelta = finalStats.totalConnUsageTime - initialStats.totalConnUsageTime;
+    ASSERT_GREATER_THAN_OR_EQUALS(totalTimeUsageDelta, checkOutLength);
+}
+
+TEST_F(ConnectionPoolTest, OverlappingCheckoutsAdditivelyContributeToTotalUsageTime) {
+    constexpr Milliseconds checkOutLength = Milliseconds(10);
+    auto pool = makePool();
+
+    ConnectionPoolStats initialStats;
+    pool->appendConnectionStats(&initialStats);
+
+    auto startTimePoint = Date_t::now();
+    auto endTimePoint = startTimePoint + checkOutLength;
+    PoolImpl::setNow(startTimePoint);
+
+    // Check out multiple connections.
+    constexpr int numConnections = 2;
+    std::vector<ConnectionPool::ConnectionHandle> connections;
+    // Ensure that no matter how we leave the test, we mark any
+    // checked out connections as OK before implicity returning them
+    // to the pool by destroying the 'connections' vector. Otherwise,
+    // this test would cause an invariant failure instead of a normal
+    // test failure if it fails, which would be confusing.
+    ScopeGuard guard([&] {
+        while (!connections.empty()) {
+            try {
+                ConnectionPool::ConnectionHandle conn = std::move(connections.back());
+                connections.pop_back();
+                doneWith(conn);
+            } catch (...) {
+            }
+        }
+    });
+
+    for (int i = 0; i < numConnections; ++i) {
+        ConnectionImpl::pushSetup(Status::OK());
+        pool->get_forTest(HostAndPort(),
+                          Milliseconds(5000),
+                          [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+                              ASSERT(swConn.isOK());
+                              connections.push_back(std::move(swConn.getValue()));
+                          });
+    }
+    ASSERT_EQ(connections.size(), numConnections);
+    // Advance the time and return the connections.
+    PoolImpl::setNow(endTimePoint);
+    while (!connections.empty()) {
+        try {
+            ConnectionPool::ConnectionHandle conn = std::move(connections.back());
+            ASSERT(conn);
+            connections.pop_back();
+            doneWith(conn);
+        } catch (...) {
+        }
+    }
+    guard.dismiss();
+
+    ConnectionPoolStats finalStats;
+    pool->appendConnectionStats(&finalStats);
+
+    auto totalTimeUsageDelta = finalStats.totalConnUsageTime - initialStats.totalConnUsageTime;
+    // Since each connection was used for checkOutLength, the total usage time should be >= the
+    // product.
+    ASSERT_GREATER_THAN_OR_EQUALS(totalTimeUsageDelta, checkOutLength * numConnections);
+}
+
+TEST_F(ConnectionPoolTest, LeasedConnectionsDontCountTowardsUsageTime) {
+    constexpr Milliseconds checkOutLength = Milliseconds(10);
+    auto pool = makePool();
+
+    ConnectionPoolStats initialStats;
+    pool->appendConnectionStats(&initialStats);
+
+    auto startTimePoint = Date_t::now();
+    auto endTimePoint = startTimePoint + checkOutLength;
+    PoolImpl::setNow(startTimePoint);
+
+    ConnectionImpl::pushSetup(Status::OK());
+    pool->lease_forTest(HostAndPort(),
+                        Milliseconds(5000),
+                        [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+                            PoolImpl::setNow(endTimePoint);
+                            doneWith(swConn.getValue());
+                        });
+
+    ConnectionPoolStats finalStats;
+    pool->appendConnectionStats(&finalStats);
+
+    auto totalTimeUsageDelta = finalStats.totalConnUsageTime - initialStats.totalConnUsageTime;
+    ASSERT_EQ(totalTimeUsageDelta, Milliseconds(0));
+}
+
+TEST_F(ConnectionPoolTest, LeasedConnectionsDontInterfereWithOrdinaryCheckoutUsageTime) {
+    constexpr Milliseconds checkOutLength = Milliseconds(10);
+    auto pool = makePool();
+
+    ConnectionPoolStats initialStats;
+    pool->appendConnectionStats(&initialStats);
+
+    auto startTimePoint = Date_t::now();
+    auto endTimePoint = startTimePoint + checkOutLength;
+    PoolImpl::setNow(startTimePoint);
+
+    ConnectionImpl::pushSetup(Status::OK());
+
+    // Checkout one connection and lease one connection.
+    ConnectionPool::ConnectionHandle normal;
+    ConnectionPool::ConnectionHandle leased;
+    pool->get_forTest(HostAndPort(),
+                      Milliseconds(5000),
+                      [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+                          normal = std::move(swConn.getValue());
+                      });
+    pool->lease_forTest(HostAndPort(),
+                        Milliseconds(5000),
+                        [&](StatusWith<ConnectionPool::ConnectionHandle> swConn) {
+                            leased = std::move(swConn.getValue());
+                        });
+
+    // Advance the time and return the connections.
+    PoolImpl::setNow(endTimePoint);
+    doneWith(normal);
+    doneWith(leased);
+
+    ConnectionPoolStats finalStats;
+    pool->appendConnectionStats(&finalStats);
+
+    auto totalTimeUsageDelta = finalStats.totalConnUsageTime - initialStats.totalConnUsageTime;
+    // Should only include usage time from the checkout, not the lease
+    ASSERT_GREATER_THAN_OR_EQUALS(totalTimeUsageDelta, checkOutLength);
+    ASSERT_LESS_THAN(totalTimeUsageDelta, checkOutLength * 2);
+}
+
+TEST_F(ConnectionPoolTest, CancelGetBeforeCallDoesntPullConnection) {
+    CancellationSource source;
+    auto pool = makePool();
+
+    source.cancel();
+    auto connFuture =
+        getFromPool(HostAndPort(), transport::kGlobalSSLMode, Seconds(1), source.token());
+    ASSERT_TRUE(connFuture.isReady());
+    ASSERT_THROWS_CODE(connFuture.get(), DBException, ErrorCodes::CallbackCanceled);
+}
+
+TEST_F(ConnectionPoolTest, CancelGetEarlyDoesntPullConnection) {
+    CancellationSource source;
+    auto pool = makePool();
+
+    auto connFuture =
+        getFromPool(HostAndPort(), transport::kGlobalSSLMode, Seconds(1), source.token());
+    ASSERT_FALSE(connFuture.isReady());
+
+    source.cancel();
+    ASSERT_TRUE(connFuture.isReady());
+    ASSERT_THROWS_CODE(connFuture.get(), DBException, ErrorCodes::CallbackCanceled);
+}
+
+TEST_F(ConnectionPoolTest, CancelGetEarlyWithReadyConnectionDoesntPullConnection) {
+    CancellationSource source;
+    auto pool = makePool();
+
+    // Make a connection and return it so that the next request is immediately fulfillable.
+    ConnectionImpl::pushSetup(Status::OK());
+    {
+        auto connFuture = getFromPool(HostAndPort(), transport::kGlobalSSLMode, Seconds(1));
+        ASSERT_TRUE(connFuture.isReady());
+        doneWith(connFuture.get());
+    }
+
+    ASSERT_EQ(pool->getNumConnectionsPerHost(HostAndPort()), 1);
+
+    source.cancel();
+    {
+        auto connFuture =
+            getFromPool(HostAndPort(), transport::kGlobalSSLMode, Seconds(1), source.token());
+        ASSERT_TRUE(connFuture.isReady());
+        ASSERT_THROWS_CODE(connFuture.get(), DBException, ErrorCodes::CallbackCanceled);
+    }
+}
+
+TEST_F(ConnectionPoolTest, CancelGetLatePullsConnection) {
+    CancellationSource source;
+    auto pool = makePool();
+
+    auto connFuture =
+        getFromPool(HostAndPort(), transport::kGlobalSSLMode, Seconds(1), source.token());
+    ASSERT_FALSE(connFuture.isReady());
+
+    ConnectionImpl::pushSetup(Status::OK());
+    ASSERT_TRUE(connFuture.isReady());
+
+    source.cancel();
+    doneWith(connFuture.get());
+}
+
+TEST_F(ConnectionPoolTest, CancelGetAfterDestruction) {
+    CancellationSource source;
+    auto pool = makePool();
+
+    auto connFuture =
+        getFromPool(HostAndPort(), transport::kGlobalSSLMode, Seconds(1), source.token());
+    ASSERT_FALSE(connFuture.isReady());
+
+    ConnectionImpl::pushSetup(Status::OK());
+    ASSERT_TRUE(connFuture.isReady());
+    doneWith(connFuture.get());
+
+    pool->shutdown();
+    pool = {};
+    dropPool();
+
+    source.cancel();
+}
+
+TEST_F(ConnectionPoolTest, DismissBeforeCancelGet) {
+    CancellationSource source;
+    auto pool = makePool();
+
+    auto connFuture =
+        getFromPool(HostAndPort(), transport::kGlobalSSLMode, Seconds(1), source.token());
+    ASSERT_FALSE(connFuture.isReady());
+
+    source = {};
+    ASSERT_FALSE(connFuture.isReady());
+
+    ConnectionImpl::pushSetup(Status::OK());
+    ASSERT_TRUE(connFuture.isReady());
+    doneWith(connFuture.get());
+}
+
+void ConnectionPoolTest::singleUseConnectionsTest(bool singleUseConnections) {
+    auto host = HostAndPort();
+    ConnectionPool::Options options;
+    options.minConnections = 1;
+    options.singleUseConnections = singleUseConnections;
+    auto numExpected = singleUseConnections ? 1 : 2;
+
+    auto pool = makePool(options);
+    ASSERT_EQ(pool->getNumConnectionsPerHost(host), 0);
+
+    // Make two connections
+    auto connFuture1 = getFromPool(host, transport::kGlobalSSLMode, Seconds(1));
+    auto connFuture2 = getFromPool(host, transport::kGlobalSSLMode, Seconds(1));
+    ASSERT_EQ(pool->getNumConnectionsPerHost(host), 2);
+
+    ConnectionImpl::pushSetup(Status::OK());
+    ASSERT_TRUE(connFuture1.isReady());
+
+    // Depending on the value of singleUseConnections, we either return the connection back into the
+    // pool or don't.
+    auto conn1 = std::move(connFuture1).get();
+    doneWith(conn1);
+    ASSERT_EQ(pool->getNumConnectionsPerHost(host), numExpected);
+
+    ConnectionImpl::pushSetup(Status::OK());
+    ASSERT_TRUE(connFuture2.isReady());
+
+    // We should still have at least minConnections connections even if singleUseConnections is
+    // enabled.
+    auto conn2 = std::move(connFuture2).get();
+    doneWith(conn2);
+    ASSERT_EQ(pool->getNumConnectionsPerHost(host), numExpected);
+}
+
+TEST_F(ConnectionPoolTest, SingleUseConnectionsDisabled) {
+    singleUseConnectionsTest(false);
+}
+
+TEST_F(ConnectionPoolTest, SingleUseConnectionsEnabled) {
+    singleUseConnectionsTest(true);
 }
 
 }  // namespace connection_pool_test_details

@@ -29,6 +29,9 @@
 
 #pragma once
 
+#include <boost/optional/optional.hpp>
+#include <cstddef>
+#include <new>
 #include <ostream>
 #include <string>
 
@@ -38,6 +41,8 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/util/static_immortal.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -46,14 +51,17 @@ namespace mongo {
  */
 class TenantId {
 public:
+    static const boost::optional<TenantId>& systemTenantId() {
+        static StaticImmortal<boost::optional<TenantId>> systemTenantId{};
+        return *systemTenantId;
+    }
+
     /**
-     * kSystemTenantId must be unique across all possible tenant IDs.
-     * Since the first four bytes of an OID are a unix epoch timestamp,
-     * we can simply select a value prior to the inception of MongoDB,
-     * and be guaranteed to never have a collision with a value
-     * produced by OID::gen().
+     * Parse a tenantId from a StringData. This method asserts if the tenantId is empty or not in an
+     * OID format.
+     * Returns a TenantId object from the parsed string.
      */
-    static const TenantId kSystemTenantId;
+    static TenantId parseFromString(StringData tenantId);
 
     explicit TenantId(const OID& oid) : _oid(oid) {}
 
@@ -89,7 +97,18 @@ public:
      */
     template <typename H>
     friend H AbslHashValue(H h, const TenantId& tenantId) {
-        return H::combine(std::move(h), tenantId.hash());
+        return H::combine(std::move(h), tenantId._oid);
+    }
+
+    /**
+     * Hash function compatible with absl::Hash with an absl::unordered_{map,set} keyed with
+     * boost::optional<TenantId>.
+     */
+    template <typename H>
+    friend H AbslHashValue(H h, const boost::optional<TenantId>& tenantId) {
+        if (tenantId)
+            h = H::combine(std::move(h), tenantId->_oid);
+        return H::combine(std::move(h), tenantId.has_value());
     }
 
     /**
@@ -104,6 +123,9 @@ public:
     void serializeToBSON(BSONArrayBuilder* builder) const;
 
 private:
+    friend class NamespaceString;
+    friend class DatabaseName;
+
     OID _oid;
 };
 

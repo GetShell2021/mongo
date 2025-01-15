@@ -30,13 +30,15 @@
 #include "mongo/stdx/unordered_map.h"
 
 #include <algorithm>
-#include <iterator>
+#include <fmt/format.h>
 #include <stdexcept>
 #include <string>
 
-#include <fmt/format.h>
+#include <absl/container/node_hash_map.h>
 
-#include "mongo/unittest/unittest.h"
+#include "mongo/base/string_data.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 
 namespace {
 
@@ -72,7 +74,9 @@ TEST(StdxUnorderedMapTest, EraseIf) {
         {106, 6},
         {107, 7},
     };
-    auto pred = [](auto&& e) { return e.second < 0; };
+    auto pred = [](auto&& e) {
+        return e.second < 0;
+    };
     size_t predCount = std::count_if(pre.begin(), pre.end(), pred);
 
     auto map = pre;

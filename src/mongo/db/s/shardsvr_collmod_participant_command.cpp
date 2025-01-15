@@ -28,26 +28,82 @@
  */
 
 
+#include <memory>
+#include <string>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/basic_types.h"
+#include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
+#include "mongo/db/coll_mod_gen.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/collmod_coordinator.h"
-#include "mongo/db/s/database_sharding_state.h"
-#include "mongo/db/s/recoverable_critical_section_service.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharded_collmod_gen.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_recovery_service.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/timeseries/catalog_helper.h"
 #include "mongo/db/timeseries/timeseries_collmod.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/executor/task_executor_pool.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/namespace_string_util.h"
+#include "mongo/util/out_of_line_executor.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-
 namespace mongo {
 namespace {
+
+void releaseCriticalSectionInEmptySession(OperationContext* opCtx,
+                                          ShardingRecoveryService* service,
+                                          const NamespaceString& bucketNs,
+                                          const BSONObj& reason) {
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    if (txnParticipant) {
+        auto newClient = getGlobalServiceContext()
+                             ->getService(ClusterRole::ShardServer)
+                             ->makeClient("ShardsvrMovePrimaryExitCriticalSection");
+        AlternativeClientRegion acr(newClient);
+        auto newOpCtx = CancelableOperationContext(
+            cc().makeOperationContext(),
+            opCtx->getCancellationToken(),
+            Grid::get(opCtx->getServiceContext())->getExecutorPool()->getFixedExecutor());
+        newOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
+        service->releaseRecoverableCriticalSection(
+            newOpCtx.get(),
+            bucketNs,
+            reason,
+            ShardingCatalogClient::kLocalWriteConcern,
+            ShardingRecoveryService::FilteringMetadataClearer());
+    } else {
+        // No need to create a new operation context if no session is checked-out
+        service->releaseRecoverableCriticalSection(
+            opCtx,
+            bucketNs,
+            reason,
+            ShardingCatalogClient::kLocalWriteConcern,
+            ShardingRecoveryService::FilteringMetadataClearer());
+    }
+}
 
 class ShardSvrCollModParticipantCommand final
     : public TypedCommand<ShardSvrCollModParticipantCommand> {
@@ -78,13 +134,12 @@ public:
         using InvocationBase::InvocationBase;
 
         Response typedRun(OperationContext* opCtx) {
-            uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+            ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
 
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
-
             // If the needsUnblock flag is set, we must have blocked the CRUD operations in the
             // previous phase of collMod operation for granularity updates. Unblock it now after we
             // have updated the granularity.
@@ -95,22 +150,19 @@ public:
                         timeseries::getTimeseriesOptions(opCtx, ns(), true));
                 auto bucketNs = ns().makeTimeseriesBucketsNamespace();
 
-                try {
-                    forceShardFilteringMetadataRefresh(opCtx, bucketNs);
-                } catch (const DBException&) {
-                    // If the refresh fails, then set the shard version to UNKNOWN and let a future
-                    // operation to refresh the metadata.
-                    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-                    AutoGetCollection autoColl(opCtx, bucketNs, MODE_IX);
-                    CollectionShardingRuntime::get(opCtx, bucketNs)->clearFilteringMetadata(opCtx);
-                }
-
-                auto service = RecoverableCriticalSectionService::get(opCtx);
+                auto service = ShardingRecoveryService::get(opCtx);
                 const auto reason = BSON("command"
                                          << "ShardSvrParticipantBlockCommand"
-                                         << "ns" << bucketNs.toString());
-                service->releaseRecoverableCriticalSection(
-                    opCtx, bucketNs, reason, ShardingCatalogClient::kLocalWriteConcern);
+                                         << "ns"
+                                         << NamespaceStringUtil::serialize(
+                                                bucketNs, SerializationContext::stateDefault()));
+                // In order to guarantee replay protection ShardsvrCollModParticipant will run
+                // within a retryable write. Any local transaction or retryable write spawned by
+                // this command (such as the release of the critical section) using the original
+                // operation context will cause a dead lock since the session has been already
+                // checked-out. We prevent the issue by using a new operation context with an
+                // empty session.
+                releaseCriticalSectionInEmptySession(opCtx, service, bucketNs, reason);
             }
 
             BSONObjBuilder builder;
@@ -122,7 +174,23 @@ public:
             auto performViewChange = request().getPerformViewChange();
             uassertStatusOK(timeseries::processCollModCommandWithTimeSeriesTranslation(
                 opCtx, ns(), cmd, performViewChange, &builder));
-            return CollModReply::parse(IDLParserErrorContext("CollModReply"), builder.obj());
+            auto collmodReply =
+                CollModReply::parse(IDLParserContext("CollModReply"), builder.obj());
+
+            // Since no write that generated a retryable write oplog entry with this sessionId
+            // and txnNumber happened, we need to make a dummy write so that the session gets
+            // durably persisted on the oplog. This must be the last operation done on this
+            // command.
+            auto txnParticipant = TransactionParticipant::get(opCtx);
+            if (txnParticipant) {
+                DBDirectClient dbClient(opCtx);
+                dbClient.update(NamespaceString::kServerConfigurationNamespace,
+                                BSON("_id" << Request::kCommandName),
+                                BSON("$inc" << BSON("count" << 1)),
+                                true /* upsert */,
+                                false /* multi */);
+            }
+            return collmodReply;
         }
 
     private:
@@ -138,11 +206,13 @@ public:
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
-                                                           ActionType::internal));
+                        ->isAuthorizedForActionsOnResource(
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::internal));
         }
     };
-} shardsvrCollModParticipantCommand;
+};
+MONGO_REGISTER_COMMAND(ShardSvrCollModParticipantCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

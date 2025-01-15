@@ -8,14 +8,13 @@
  *   requires_fcv_60,
  * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({shards: 2});
 
 const db = st.s.getDB(jsTestName());
-assert.commandWorked(st.s.adminCommand({enableSharding: db.getName()}));
-st.ensurePrimaryShard(db.getName(), st.shard0.shardName);
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: db.getName(), primaryShard: st.shard0.shardName}));
 
 const coll = db.coll;
 assert.commandWorked(st.s.adminCommand({shardCollection: coll.getFullName(), key: {_id: 1}}));
@@ -55,4 +54,3 @@ assert.eq(res[0].shard, st.shard1.shardName);
 checkResult(res);
 
 st.stop();
-})();

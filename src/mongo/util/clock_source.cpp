@@ -28,9 +28,12 @@
  */
 
 #include "mongo/util/clock_source.h"
-#include "mongo/platform/basic.h"
-#include "mongo/platform/mutex.h"
-#include "mongo/stdx/thread.h"
+
+// IWYU pragma: no_include "cxxabi.h"
+#include <memory>
+#include <mutex>
+#include <utility>
+
 #include "mongo/util/system_clock_source.h"
 #include "mongo/util/waitable.h"
 
@@ -57,7 +60,7 @@ stdx::cv_status ClockSource::waitForConditionUntil(stdx::condition_variable& cv,
     }
 
     struct AlarmInfo {
-        stdx::mutex mutex;  // NOLINT
+        stdx::mutex mutex;
 
         stdx::condition_variable* cv;
         stdx::cv_status result = stdx::cv_status::no_timeout;

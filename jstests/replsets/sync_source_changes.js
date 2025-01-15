@@ -4,11 +4,12 @@
  * (eventually).
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {assertSyncSourceChangesTo} from "jstests/replsets/libs/sync_source.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
-load("jstests/replsets/rslib.js");             // reconfig
-load("jstests/replsets/libs/sync_source.js");  // assertSyncSourceMatchesSoon
+// Replication verbosity 2 includes the sync source change debug logs.
+TestData["setParameters"]["logComponentVerbosity"]["replication"]["verbosity"] = 2;
 
 // Start RST with only one voting node, node 0 -- this will be the only valid voting node and sync
 // source
@@ -21,14 +22,18 @@ const primary = rst.getPrimary();
 assert.eq(primary, rst.nodes[0]);
 
 // Add a new voting node, node 2 -- voting nodes will choose voting nodes as sync sources.
+jsTestLog("Adding node 2");
 const newNode = rst.add({});
 rst.reInitiate();
-rst.waitForState(newNode, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [newNode]);
 rst.awaitReplication();
 rst.awaitSecondaryNodes();
 
+// Wait for the new node to no longer be newlyAdded, so that it becomes a voting node.
+rst.waitForAllNewlyAddedRemovals();
+
 // Assure that node 2 will set node 0 as its sync source, since it is the best option.
-assertSyncSourceMatchesSoon(newNode, rst.nodes[0].host);
+assertSyncSourceChangesTo(rst, newNode, rst.nodes[0]);
 
 // Make node 1 a voter so that it will be a valid option for sync source
 let cfg = rst.getReplSetConfigFromNode();
@@ -38,36 +43,17 @@ reconfig(rst, cfg);
 
 // Force a stepup of node 1 -- we need to step node 0 down so that we can set it as a non-voter
 // without causing errors.
+jsTestLog("Stepping up node 1");
 rst.stepUp(rst.nodes[1]);
 
+jsTestLog("Reconfiguring node 0 as nonvoter");
 // Make node 0 a nonvoter so that it will be an invalid option for sync source
 cfg = rst.getReplSetConfigFromNode();
 cfg.members[0].priority = 0;
 cfg.members[0].votes = 0;
 reconfig(rst, cfg);
+jsTestLog("Reconfig complete");
 
-// Run this repeatedly, as sometimes the stop, insert, restart won't cause the sync source to be
-// switched correctly due to transient issues with the sync source we want to switch to.
-assert.soon(() => {
-    // Insert a document while newNode is not replicating to force it to run shouldChangeSyncSource
-    stopServerReplication(newNode);
-    assert.commandWorked(
-        rst.getPrimary().getDB("testSyncSourceChangesDb").getCollection("coll").insert({a: 1}, {
-            writeConcern: {w: 1}
-        }));
-    restartServerReplication(newNode);
-    try {
-        assertSyncSourceMatchesSoon(newNode,
-                                    cfg.members[1].host,
-                                    undefined /* msg */,
-                                    5 * 1000 /* timeout */,
-                                    undefined /* interval */,
-                                    {runHangAnalyzer: false});
-        return true;
-    } catch (e) {
-        return false;
-    }
-});
+assertSyncSourceChangesTo(rst, newNode, rst.nodes[1]);
 
 rst.stopSet();
-})();

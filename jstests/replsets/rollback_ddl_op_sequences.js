@@ -11,10 +11,9 @@
  * 6. B rejoins the set and goes through the rollback process.
  * 7. The contents of A and B are compare to ensure the rollback results in consistent nodes.
  */
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {awaitOpTime} from "jstests/replsets/rslib.js";
 
-(function() {
-"use strict";
 // helper function for verifying contents at the end of the test
 var checkFinalResults = function(db) {
     assert.eq(2, db.b.getIndexes().length);
@@ -48,7 +47,9 @@ replTest.initiate({
         {"_id": 1, "host": nodes[1]},
         {"_id": 2, "host": nodes[2], arbiterOnly: true}
     ]
-});
+},
+                  null,
+                  {initiateWithDefaultElectionTimeout: true});
 
 // Make sure we have a primary and that that primary is node A
 replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY);
@@ -177,4 +178,3 @@ replTest.checkReplicatedDataHashes();
 replTest.checkOplogs();
 
 replTest.stopSet(15);
-}());

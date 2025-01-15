@@ -2,14 +2,13 @@
 // Do not run in whole-cluster passthrough since this test assumes that the change stream will be
 // invalidated by a database drop.
 // @tags: [do_not_run_in_whole_cluster_passthrough]
-(function() {
-"use strict";
-
-load("jstests/libs/change_stream_util.js");        // For ChangeStreamTest,
-                                                   // isChangeStreamsOptimizationEnabled.
-load('jstests/replsets/libs/two_phase_drops.js');  // For 'TwoPhaseDropCollectionTest'.
-load("jstests/libs/collection_drop_recreate.js");  // For assert[Drop|Create]Collection.
-load("jstests/libs/fixture_helpers.js");           // For FixtureHelpers.
+import {
+    assertCreateCollection,
+    assertDropAndRecreateCollection,
+    assertDropCollection,
+} from "jstests/libs/collection_drop_recreate.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {ChangeStreamTest} from "jstests/libs/query/change_stream_util.js";
 
 const testDB = db.getSiblingDB(jsTestName());
 testDB.dropDatabase();
@@ -48,15 +47,12 @@ const resumeToken = change._id;
 
 // For whole-db streams, it is possible to resume at a point before a collection is dropped.
 assertDropCollection(testDB, collAgg.getName());
-// Wait for two-phase drop to complete, so that the UUID no longer exists.
-assert.soon(function() {
-    return !TwoPhaseDropCollectionTest.collectionIsPendingDropInDatabase(testDB, collAgg.getName());
-});
 assert.commandWorked(testDB.runCommand(
     {aggregate: 1, pipeline: [{$changeStream: {resumeAfter: resumeToken}}], cursor: {}}));
 
 // Test that invalidation entries for other databases are filtered out.
 const otherDB = testDB.getSiblingDB(jsTestName() + "other");
+otherDB.dropDatabase();
 const otherDBColl = otherDB[collName + "_other"];
 assert.commandWorked(otherDBColl.insert({_id: 0}));
 
@@ -202,17 +198,14 @@ cst.assertDatabaseDrop({cursor: aggCursor, db: testDB});
 const invalidateEvent = cst.assertNextChangesEqual(
     {cursor: aggCursor, expectedChanges: [{operationType: "invalidate"}]});
 
-// Test that if change stream optimization is enabled, then even after the 'invalidate' event has
-// been filtered out, the cursor should hold the resume token of the 'invalidate' event.
-if (isChangeStreamsOptimizationEnabled(testDB)) {
-    const resumeStream =
-        testDB.watch([{$match: {operationType: "DummyOperationType"}}], {resumeAfter: change._id});
-    assert.soon(() => {
-        assert(!resumeStream.hasNext());
-        return resumeStream.isExhausted();
-    });
-    assert.eq(resumeStream.getResumeToken(), invalidateEvent[0]._id);
-}
+// Even after the 'invalidate' event has been filtered out, the cursor should hold the resume token
+// of the 'invalidate' event.
+const resumeStream =
+    testDB.watch([{$match: {operationType: "DummyOperationType"}}], {resumeAfter: change._id});
+assert.soon(() => {
+    assert(!resumeStream.hasNext());
+    return resumeStream.isExhausted();
+});
+assert.eq(resumeStream.getResumeToken(), invalidateEvent[0]._id);
 
 cst.cleanUp();
-}());

@@ -27,13 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/rpc/write_concern_error_detail.h"
-#include "mongo/rpc/write_concern_error_gen.h"
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/error_extra_info.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/field_parser.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/rpc/write_concern_error_gen.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -63,7 +70,7 @@ BSONObj WriteConcernErrorDetail::toBSON() const {
 
     auto wce = WriteConcernError();
     wce.setCode(_status.code());
-    wce.setCodeName(boost::optional<StringData>(_status.codeString()));
+    wce.setCodeName(_status.codeString());
     wce.setErrmsg(_status.reason());
     wce.setErrInfo(_errInfo);
     wce.serialize(&builder);
@@ -82,9 +89,9 @@ bool WriteConcernErrorDetail::parseBSON(const BSONObj& source, string* errMsg) {
         errMsg = &dummy;
 
     try {
-        auto wce = WriteConcernError::parse({"writeConcernError"}, source);
+        auto wce = WriteConcernError::parse(IDLParserContext{"writeConcernError"}, source);
         _status = Status(ErrorCodes::Error(wce.getCode()), wce.getErrmsg(), source);
-        if ((_isErrInfoSet = wce.getErrInfo().is_initialized())) {
+        if ((_isErrInfoSet = wce.getErrInfo().has_value())) {
             _errInfo = wce.getErrInfo().value().getOwned();
         }
     } catch (DBException& ex) {

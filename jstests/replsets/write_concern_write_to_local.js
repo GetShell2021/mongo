@@ -2,10 +2,11 @@
  * Tests that we are silently ignoring writeConcern when we write to local db.
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/write_concern_util.js");  // For stopReplicationOnSecondaries.
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    restartReplicationOnSecondaries,
+    stopReplicationOnSecondaries
+} from "jstests/libs/write_concern_util.js";
 
 const rst = new ReplSetTest(
     {nodes: [{}, {rsConfig: {priority: 0}}], nodeOptions: {setParameter: {logLevel: 1}}});
@@ -38,4 +39,3 @@ primaryColl.insertOne({x: 6}, {writeConcern: {w: 2}});
 
 restartReplicationOnSecondaries(rst);
 rst.stopSet();
-})();

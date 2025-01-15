@@ -27,9 +27,11 @@
  *    it in the license file.
  */
 
+#include <utility>
 
-#include "mongo/platform/basic.h"
-
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
@@ -37,8 +39,9 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/flow_control_parameters_gen.h"
-#include "mongo/logv2/log_debug.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/fail_point.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
@@ -47,7 +50,7 @@ namespace mongo {
 
 class FlowControlTest : public ServiceContextMongoDTest {
 public:
-    void setUp() {
+    void setUp() override {
         ServiceContextMongoDTest::setUp();
 
         auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(getServiceContext());
@@ -62,11 +65,11 @@ public:
         gFlowControlSamplePeriod.store(1);
         flowControl = std::make_unique<FlowControl>(replCoordPtr);
 
-        client = getServiceContext()->makeClient("FlowControl Client");
+        client = getServiceContext()->getService()->makeClient("FlowControl Client");
         opCtx = client->makeOperationContext();
     }
 
-    void tearDown() {
+    void tearDown() override {
         ServiceContextMongoDTest::tearDown();
     }
 
@@ -125,10 +128,10 @@ TEST_F(FlowControlTest, AddingSamples) {
     // becomes more sophisticated.
     const bool assertSampledTimestamps = true;
     if (assertSampledTimestamps) {
-        ASSERT_EQ(5u, std::get<0>(samples[0]));
-        ASSERT_EQ(6u, std::get<0>(samples[1]));
-        ASSERT_EQ(11u, std::get<0>(samples[2]));
-        ASSERT_EQ(21u, std::get<0>(samples[3]));
+        ASSERT_EQ(5u, get<0>(samples[0]));
+        ASSERT_EQ(6u, get<0>(samples[1]));
+        ASSERT_EQ(11u, get<0>(samples[2]));
+        ASSERT_EQ(21u, get<0>(samples[3]));
     }
 }
 
@@ -159,15 +162,15 @@ TEST_F(FlowControlTest, OutOfOrderSamplesDropped) {
     flowControl->sample(Timestamp(1), 1);
     const auto& samples = flowControl->_getSampledOpsApplied_forTest();
     ASSERT_EQ(1u, samples.size());
-    ASSERT_EQ(1u, std::get<0>(samples[0]));
+    ASSERT_EQ(1u, get<0>(samples[0]));
 
     flowControl->sample(Timestamp(3), 1);
     ASSERT_EQ(2u, samples.size());
-    ASSERT_EQ(3u, std::get<0>(samples[1]));
+    ASSERT_EQ(3u, get<0>(samples[1]));
 
     flowControl->sample(Timestamp(2), 1);
     ASSERT_EQ(2u, samples.size());
-    ASSERT_EQ(3u, std::get<0>(samples[1]));
+    ASSERT_EQ(3u, get<0>(samples[1]));
 }
 
 TEST_F(FlowControlTest, QueryingSamples) {

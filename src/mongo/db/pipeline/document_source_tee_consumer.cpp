@@ -27,13 +27,10 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/pipeline/document_source_tee_consumer.h"
 
-#include <boost/intrusive_ptr.hpp>
-#include <boost/optional.hpp>
-#include <vector>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/expression_context.h"
@@ -45,7 +42,7 @@ using boost::intrusive_ptr;
 DocumentSourceTeeConsumer::DocumentSourceTeeConsumer(const intrusive_ptr<ExpressionContext>& expCtx,
                                                      size_t facetId,
                                                      const intrusive_ptr<TeeBuffer>& bufferSource,
-                                                     const StringData& stageName)
+                                                     StringData stageName)
     : DocumentSource(stageName, expCtx),
       _facetId(facetId),
       _bufferSource(bufferSource),
@@ -55,7 +52,7 @@ boost::intrusive_ptr<DocumentSourceTeeConsumer> DocumentSourceTeeConsumer::creat
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     size_t facetId,
     const boost::intrusive_ptr<TeeBuffer>& bufferSource,
-    const StringData& stageName) {
+    StringData stageName) {
     return new DocumentSourceTeeConsumer(expCtx, facetId, bufferSource, stageName);
 }
 
@@ -71,9 +68,8 @@ void DocumentSourceTeeConsumer::doDispose() {
     _bufferSource->dispose(_facetId);
 }
 
-Value DocumentSourceTeeConsumer::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceTeeConsumer::serialize(const SerializationOptions& opts) const {
     // We only serialize this stage in the context of explain.
-    return explain ? Value(DOC(_stageName << Document())) : Value();
+    return opts.verbosity ? Value(DOC(_stageName << Document())) : Value();
 }
 }  // namespace mongo

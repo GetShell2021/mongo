@@ -3,17 +3,15 @@
  * before starting another reconfig.
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/rslib.js");
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {isConfigCommitted} from "jstests/replsets/rslib.js";
 
 var replTest = new ReplSetTest({nodes: 2, useBridge: true});
 replTest.startSet();
 // Initiating with a high election timeout prevents unnecessary elections and also prevents
 // the primary from stepping down if it cannot communicate with the secondary.
-replTest.initiateWithHighElectionTimeout();
+replTest.initiate();
 var primary = replTest.getPrimary();
 var secondary = replTest.getSecondary();
 
@@ -47,9 +45,8 @@ secondary.reconnect(primary);
 // Reconfig should now succeed.
 config.version++;
 assert.commandWorked(primary.getDB("admin").runCommand({replSetReconfig: config}));
-assert(isConfigCommitted(primary));
+assert.soon(() => isConfigCommitted(primary));
 
 reconfigFailPoint.off();
 
 replTest.stopSet();
-}());

@@ -5,9 +5,7 @@ Import("env")
 env = env.Clone()
 
 env.CppUnitTest(
-    target='algebra_test',
-    source=[
-        'algebra_test.cpp',
-    ],
+    target="algebra_test",
+    source=[],
     LIBDEPS=[],
 )

@@ -8,11 +8,12 @@
  * duplicate operation.
  * @tags: [uses_transactions, uses_prepare_transaction]
  */
-(function() {
-"use strict";
-
-load("jstests/libs/write_concern_util.js");
-load("jstests/core/txns/libs/prepare_helpers.js");
+import {PrepareHelpers} from "jstests/core/txns/libs/prepare_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {
+    restartReplicationOnSecondaries,
+    stopReplicationOnSecondaries
+} from "jstests/libs/write_concern_util.js";
 
 const dbName = "test";
 const collNameBase = "coll";
@@ -107,19 +108,19 @@ function runTest(readConcernLevel) {
 
     jsTestLog("Prepared Abort Test");
     assert.commandFailedWithCode(session2.abortTransaction_forTesting(),
-                                 ErrorCodes.WriteConcernFailed);
+                                 ErrorCodes.WriteConcernTimeout);
 
     jsTestLog("Prepare Test");
     assert.commandFailedWithCode(
         session3.getDatabase('admin').adminCommand(
             {prepareTransaction: 1, writeConcern: {w: "majority", wtimeout: failTimeoutMS}}),
-        ErrorCodes.WriteConcernFailed);
+        ErrorCodes.WriteConcernTimeout);
     assert.commandFailedWithCode(session3.abortTransaction_forTesting(),
-                                 ErrorCodes.WriteConcernFailed);
+                                 ErrorCodes.WriteConcernTimeout);
 
     jsTestLog("Unprepared Commit Test");
     assert.commandFailedWithCode(session4.commitTransaction_forTesting(),
-                                 ErrorCodes.WriteConcernFailed);
+                                 ErrorCodes.WriteConcernTimeout);
 
     jsTestLog("Prepared Commit Test");
     assert.commandFailedWithCode(session5.getDatabase('admin').adminCommand({
@@ -127,10 +128,10 @@ function runTest(readConcernLevel) {
         commitTimestamp: prepareTS5,
         writeConcern: {w: "majority", wtimeout: failTimeoutMS}
     }),
-                                 ErrorCodes.WriteConcernFailed);
+                                 ErrorCodes.WriteConcernTimeout);
     // Send commit with the shell helper to reset the shell's state.
     assert.commandFailedWithCode(session5.commitTransaction_forTesting(),
-                                 ErrorCodes.WriteConcernFailed);
+                                 ErrorCodes.WriteConcernTimeout);
 
     jsTestLog("Restart replication");
     restartReplicationOnSecondaries(rst);
@@ -187,4 +188,3 @@ runTest("majority");
 runTest("snapshot");
 
 rst.stopSet();
-}());

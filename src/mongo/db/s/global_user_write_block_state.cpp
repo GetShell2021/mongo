@@ -28,10 +28,17 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
+
+#include "mongo/base/error_codes.h"
+#include "mongo/db/cluster_role.h"
 #include "mongo/db/s/global_user_write_block_state.h"
+#include "mongo/db/server_options.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/db/write_block_bypass.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -51,26 +58,26 @@ GlobalUserWriteBlockState* GlobalUserWriteBlockState::get(OperationContext* opCt
 }
 
 void GlobalUserWriteBlockState::enableUserWriteBlocking(OperationContext* opCtx) {
-    _globalUserWritesBlocked = true;
+    _globalUserWritesBlocked.store(true);
 }
 
 void GlobalUserWriteBlockState::disableUserWriteBlocking(OperationContext* opCtx) {
-    _globalUserWritesBlocked = false;
+    _globalUserWritesBlocked.store(false);
 }
 
 void GlobalUserWriteBlockState::checkUserWritesAllowed(OperationContext* opCtx,
                                                        const NamespaceString& nss) const {
-    invariant(opCtx->lockState()->isLocked());
+    invariant(shard_role_details::getLocker(opCtx)->isLocked());
     uassert(ErrorCodes::UserWritesBlocked,
             "User writes blocked",
-            !_globalUserWritesBlocked || WriteBlockBypass::get(opCtx).isWriteBlockBypassEnabled() ||
-                nss.isOnInternalDb() || nss.isTemporaryReshardingCollection() ||
-                nss.isSystemDotProfile());
+            !_globalUserWritesBlocked.load() ||
+                WriteBlockBypass::get(opCtx).isWriteBlockBypassEnabled() || nss.isOnInternalDb() ||
+                nss.isTemporaryReshardingCollection() || nss.isSystemDotProfile());
 }
 
 bool GlobalUserWriteBlockState::isUserWriteBlockingEnabled(OperationContext* opCtx) const {
-    invariant(opCtx->lockState()->isLocked());
-    return _globalUserWritesBlocked;
+    invariant(shard_role_details::getLocker(opCtx)->isLocked());
+    return _globalUserWritesBlocked.load();
 }
 
 void GlobalUserWriteBlockState::enableUserShardedDDLBlocking(OperationContext* opCtx) {
@@ -83,7 +90,7 @@ void GlobalUserWriteBlockState::disableUserShardedDDLBlocking(OperationContext* 
 
 void GlobalUserWriteBlockState::checkShardedDDLAllowedToStart(OperationContext* opCtx,
                                                               const NamespaceString& nss) const {
-    invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
     uassert(ErrorCodes::UserWritesBlocked,
             "User writes blocked",
             !_userShardedDDLBlocked.load() ||

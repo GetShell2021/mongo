@@ -27,10 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
 
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/shutdown.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace {
@@ -45,8 +48,8 @@ public:
     }
 
     static void beginShutdown(OperationContext* opCtx, bool force, Milliseconds timeout) {}
-
-} clusterShutdownCmd;
+};
+MONGO_REGISTER_COMMAND(ClusterShutdownCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

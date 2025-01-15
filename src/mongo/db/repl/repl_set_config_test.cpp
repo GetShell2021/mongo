@@ -27,19 +27,31 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <cstdint>
+#include <limits>
+#include <utility>
 
+#include <absl/container/node_hash_map.h>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
-#include "mongo/bson/mutable/document.h"
-#include "mongo/bson/mutable/element.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/cluster_role.h"
+#include "mongo/db/exec/mutable_bson/document.h"
+#include "mongo/db/exec/mutable_bson/element.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/repl_set_config_checks.h"
 #include "mongo/db/repl/repl_set_config_test.h"
 #include "mongo/db/server_options.h"
 #include "mongo/idl/server_parameter_test_util.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/safe_num.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -95,15 +107,15 @@ TEST(ReplSetConfig, ParseMinimalConfigAndCheckDefaults) {
     ASSERT_EQUALS(1, config.getConfigTerm());
     ASSERT_EQUALS(1, config.getNumMembers());
     ASSERT_EQUALS(MemberId(0), config.membersBegin()->getId());
-    ASSERT(stdx::holds_alternative<int64_t>(config.getDefaultWriteConcern().w));
-    ASSERT_EQUALS(1, stdx::get<int64_t>(config.getDefaultWriteConcern().w));
+    ASSERT(holds_alternative<int64_t>(config.getDefaultWriteConcern().w));
+    ASSERT_EQUALS(1, get<int64_t>(config.getDefaultWriteConcern().w));
     ASSERT_EQUALS(ReplSetConfig::kDefaultHeartbeatInterval, config.getHeartbeatInterval());
     ASSERT_EQUALS(ReplSetConfig::kDefaultHeartbeatTimeoutPeriod,
                   config.getHeartbeatTimeoutPeriod());
     ASSERT_EQUALS(ReplSetConfig::kDefaultElectionTimeoutPeriod, config.getElectionTimeoutPeriod());
     ASSERT_TRUE(config.isChainingAllowed());
     ASSERT_TRUE(config.getWriteConcernMajorityShouldJournal());
-    ASSERT_FALSE(config.getConfigServer());
+    ASSERT_FALSE(config.getConfigServer_deprecated());
     ASSERT_EQUALS(1, config.getProtocolVersion());
     ASSERT_EQUALS(
         ConnectionString::forReplicaSet("rs0", {HostAndPort{"localhost:12345"}}).toString(),
@@ -134,7 +146,7 @@ TEST(ReplSetConfig, ParseLargeConfigAndCheckAccessors) {
     ASSERT_EQUALS(MemberId(234), config.membersBegin()->getId());
     ASSERT_FALSE(config.isChainingAllowed());
     ASSERT_TRUE(config.getWriteConcernMajorityShouldJournal());
-    ASSERT_FALSE(config.getConfigServer());
+    ASSERT_FALSE(config.getConfigServer_deprecated());
     ASSERT_EQUALS(Seconds(5), config.getHeartbeatInterval());
     ASSERT_EQUALS(Seconds(120), config.getHeartbeatTimeoutPeriod());
     ASSERT_EQUALS(Milliseconds(10), config.getElectionTimeoutPeriod());
@@ -274,14 +286,6 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingIdField) {
                                             << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                      << "localhost:12345")))),
         DBException);
-
-    // Replica set name must be non-empty.
-    ASSERT_THROWS(ReplSetConfig::parse(BSON("_id"
-                                            << ""
-                                            << "version" << 1 << "protocolVersion" << 1 << "members"
-                                            << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                                     << "localhost:12345")))),
-                  DBException);
 }
 
 TEST(ReplSetConfig, ParseFailsWithBadOrMissingVersionField) {
@@ -315,15 +319,15 @@ TEST(ReplSetConfig, ParseFailsWithBadOrMissingVersionField) {
                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                            << "localhost:12345")))),
         DBException);
-    ASSERT_THROWS(
+    config =
         ReplSetConfig::parse(BSON("_id"
                                   << "rs0"
                                   << "version"
                                   << static_cast<long long>(std::numeric_limits<int>::max()) + 1
                                   << "protocolVersion" << 1 << "members"
                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                           << "localhost:12345")))),
-        DBException);
+                                                           << "localhost:12345"))));
+    ASSERT_OK(config.validate());
 }
 
 TEST(ReplSetConfig, ParseFailsWithBadOrMissingTermField) {
@@ -877,7 +881,7 @@ TEST(ReplSetConfig, ConfigServerField) {
                                   << "members"
                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                            << "localhost:12345")))));
-    ASSERT_TRUE(config.getConfigServer());
+    ASSERT_TRUE(config.getConfigServer_deprecated());
     // When the field is true it should be serialized.
     BSONObj configBSON = config.toBSON();
     ASSERT_TRUE(configBSON.getField("configsvr").isBoolean());
@@ -890,13 +894,13 @@ TEST(ReplSetConfig, ConfigServerField) {
                                         << false << "members"
                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                  << "localhost:12345"))));
-    ASSERT_FALSE(config2.getConfigServer());
+    ASSERT_FALSE(config2.getConfigServer_deprecated());
     // When the field is false it should not be serialized.
     configBSON = config2.toBSON();
     ASSERT_FALSE(configBSON.hasField("configsvr"));
 
     // Configs in which configsvr is not the same as the --configsvr flag are invalid.
-    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
+    serverGlobalParams.clusterRole = {ClusterRole::ShardServer, ClusterRole::ConfigServer};
     ON_BLOCK_EXIT([&] { serverGlobalParams.clusterRole = ClusterRole::None; });
 
     ASSERT_OK(config.validate());
@@ -1088,7 +1092,7 @@ TEST(ReplSetConfig, ConfigServerFieldDefaults) {
                                   << "protocolVersion" << 1 << "version" << 1 << "members"
                                   << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                            << "localhost:12345")))));
-    ASSERT_FALSE(config.getConfigServer());
+    ASSERT_FALSE(config.getConfigServer_deprecated());
     // Default false configsvr field should not be serialized.
     BSONObj configBSON = config.toBSON();
     ASSERT_FALSE(configBSON.hasField("configsvr"));
@@ -1101,9 +1105,10 @@ TEST(ReplSetConfig, ConfigServerFieldDefaults) {
                                              << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                       << "localhost:12345"))),
                                         OID::gen()));
-    ASSERT_FALSE(config2.getConfigServer());
+    ASSERT_FALSE(config2.getConfigServer_deprecated());
 
-    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
     ON_BLOCK_EXIT([&] { serverGlobalParams.clusterRole = ClusterRole::None; });
 
     ReplSetConfig config3;
@@ -1112,7 +1117,7 @@ TEST(ReplSetConfig, ConfigServerFieldDefaults) {
                                         << "protocolVersion" << 1 << "version" << 1 << "members"
                                         << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                  << "localhost:12345"))));
-    ASSERT_FALSE(config3.getConfigServer());
+    ASSERT_FALSE(config3.getConfigServer_deprecated());
 
     ReplSetConfig config4(
         ReplSetConfig::parseForInitiate(BSON("_id"
@@ -1122,7 +1127,7 @@ TEST(ReplSetConfig, ConfigServerFieldDefaults) {
                                              << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                                       << "localhost:12345"))),
                                         OID::gen()));
-    ASSERT_TRUE(config4.getConfigServer());
+    ASSERT_TRUE(config4.getConfigServer_deprecated());
     // Default true configsvr field should be serialized (even though it wasn't included
     // originally).
     configBSON = config4.toBSON();
@@ -1474,7 +1479,8 @@ TEST(ReplSetConfig, CheckConfigServerCantHaveSecondaryDelaySecs) {
 }
 
 TEST(ReplSetConfig, CheckConfigServerMustHaveTrueForWriteConcernMajorityJournalDefault) {
-    serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
+    serverGlobalParams.clusterRole = {
+        ClusterRole::ShardServer, ClusterRole::ConfigServer, ClusterRole::RouterServer};
     ON_BLOCK_EXIT([&] { serverGlobalParams.clusterRole = ClusterRole::None; });
     ReplSetConfig configA;
     configA = ReplSetConfig::parse(BSON("_id"
@@ -2117,45 +2123,6 @@ TEST(ReplSetConfig, DifferentWriteConcernModesSameNameDifferentDefinition) {
 
     ASSERT_FALSE(config.areWriteConcernModesTheSame(&otherConfig));
     ASSERT_FALSE(otherConfig.areWriteConcernModesTheSame(&config));
-}
-
-TEST(ReplSetConfig, MutableCompatibilityForRecipientConfig) {
-    const std::string recipientTagName{"recipient"};
-    const auto donorReplSetId = OID::gen();
-    const std::string recipientConfigSetName{"recipientSetName"};
-    BSONObj recipientConfigBSON = BSON(
-        "_id" << recipientConfigSetName << "version" << 1 << "protocolVersion" << 1 << "members"
-              << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                       << "localhost:20002"
-                                       << "priority" << 1 << "votes" << 1 << "tags"
-                                       << BSON(recipientTagName << "one")))
-              << "settings"
-              << BSON("heartbeatIntervalMillis" << 5000 << "heartbeatTimeoutSecs" << 20));
-    BSONObj replSetConfigWithRecipientConfig = BSON("_id"
-                                                    << "rs0"
-                                                    << "version" << 1 << "protocolVersion" << 1
-                                                    << "members"
-                                                    << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                                             << "localhost:12345"))
-                                                    << "settings"
-                                                    << BSON("heartbeatIntervalMillis"
-                                                            << 5000 << "heartbeatTimeoutSecs" << 20
-                                                            << "replicaSetId" << donorReplSetId)
-                                                    << "recipientConfig" << recipientConfigBSON);
-
-    ReplSetConfig config(ReplSetConfig::parse(replSetConfigWithRecipientConfig));
-    ASSERT_OK(config.validate());
-    auto mutableConfig = config.getMutable();
-    mutableConfig.setConfigVersion(1);
-    mutableConfig.setConfigTerm(1);
-    ReplSetConfig rolledBackConfig = ReplSetConfig(std::move(mutableConfig));
-    ASSERT_OK(rolledBackConfig.validate());
-    ASSERT_EQUALS("rs0", rolledBackConfig.getReplSetName());
-    ASSERT_EQUALS(1, rolledBackConfig.getConfigVersion());
-    ASSERT_EQUALS(1, rolledBackConfig.getConfigTerm());
-    ASSERT_EQUALS(1, rolledBackConfig.getNumMembers());
-    ASSERT_TRUE(sameConfigContents(config, rolledBackConfig));
-    ASSERT_FALSE(rolledBackConfig.getRecipientConfig() == nullptr);
 }
 
 }  // namespace

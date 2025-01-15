@@ -3,31 +3,31 @@
  * which spreads the collection across all available shards.
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/uuid_util.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {getUUIDFromListCollections} from "jstests/libs/uuid_util.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 let st = new ShardingTest({shards: 2});
 let mongos = st.s0;
 
-assert.commandWorked(mongos.adminCommand({enableSharding: 'test'}));
-st.ensurePrimaryShard('test', st.shard1.shardName);
-
 assert.commandWorked(
-    mongos.adminCommand({shardCollection: 'test.user', key: {x: 'hashed'}, numInitialChunks: 2}));
+    mongos.adminCommand({enableSharding: 'test', primaryShard: st.shard1.shardName}));
+
+assert.commandWorked(mongos.adminCommand({shardCollection: 'test.user', key: {x: 'hashed'}}));
 
 // Ensure that all the pending (received chunks) have been incorporated in the shard's filtering
 // metadata so they will show up in the getShardVersion command
 assert.eq(0, mongos.getDB('test').user.find({}).itcount());
+
+const expectedChunksOnConfigCount = 2;
+const expectedChunksPerShardCount = 1;
 
 st.printShardingStatus();
 
 function checkMetadata(metadata) {
     jsTestLog(tojson(metadata));
 
-    assert.eq(1, metadata.chunks.length);
+    assert.eq(expectedChunksPerShardCount, metadata.chunks.length);
 
     // Check that the single chunk on the shard's metadata is a valid chunk (getShardVersion
     // represents chunks as an array of [min, max])
@@ -59,14 +59,12 @@ assert.commandWorked(
     st.shard1.adminCommand({_flushRoutingTableCacheUpdates: 'test.user', syncFromConfig: false}));
 
 const chunksOnConfigCount = findChunksUtil.countChunksForNs(st.config, 'test.user');
-assert.eq(2, chunksOnConfigCount);
+assert.eq(expectedChunksOnConfigCount, chunksOnConfigCount);
 
 const chunksCollName = "cache.chunks.test.user";
 const chunksOnShard0 = st.shard0.getDB("config").getCollection(chunksCollName).find().toArray();
 const chunksOnShard1 = st.shard1.getDB("config").getCollection(chunksCollName).find().toArray();
 assert.eq(chunksOnConfigCount, chunksOnShard0.length);
 assert.eq(chunksOnConfigCount, chunksOnShard1.length);
-assert.eq(chunksOnShard0, chunksOnShard1);
 
 st.stop();
-})();

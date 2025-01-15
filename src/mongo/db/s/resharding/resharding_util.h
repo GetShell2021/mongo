@@ -26,28 +26,54 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <cstdint>
+#include <iterator>
+#include <memory>
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/checked_cast.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/db/catalog/database.h"
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/primary_only_service.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/resharding/coordinator_document_gen.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
-#include "mongo/db/s/sharding_state_lock.h"
+#include "mongo/db/s/shard_key_util.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/request_types/reshard_collection_gen.h"
 #include "mongo/s/resharding/common_types_gen.h"
-#include "mongo/s/shard_id.h"
-#include "mongo/util/str.h"
+#include "mongo/s/resharding/resharding_feature_flag_gen.h"
+#include "mongo/s/shard_key_pattern.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/uuid.h"
+
 
 namespace mongo {
 namespace resharding {
@@ -74,6 +100,37 @@ void emplaceCloneTimestampIfExists(ClassWithCloneTimestamp& c,
     }
 
     c.setCloneTimestamp(*cloneTimestamp);
+}
+
+template <typename ClassWithRelaxed>
+void emplaceRelaxedIfExists(ClassWithRelaxed& c, OptionalBool relaxed) {
+    if (!relaxed.has_value()) {
+        return;
+    }
+
+    if (auto alreadyExistingRelaxed = c.getRelaxed()) {
+        uassert(ErrorCodes::BadValue,
+                "Existing and new values for relaxed are expected to be equal.",
+                relaxed == alreadyExistingRelaxed);
+    }
+
+    c.setRelaxed(relaxed);
+}
+
+template <typename ClassWithOplogBatchTaskCount>
+void emplaceOplogBatchTaskCountIfExists(ClassWithOplogBatchTaskCount& c,
+                                        boost::optional<std::int64_t> oplogBatchTaskCount) {
+    if (!oplogBatchTaskCount) {
+        return;
+    }
+
+    if (auto alreadyExistingOplogBatchTaskCount = c.getOplogBatchTaskCount()) {
+        uassert(ErrorCodes::BadValue,
+                "Existing and new values for oplogBatchTaskCount are expected to be equal.",
+                oplogBatchTaskCount == alreadyExistingOplogBatchTaskCount);
+    }
+
+    c.setOplogBatchTaskCount(*oplogBatchTaskCount);
 }
 
 template <class ReshardingDocumentWithApproxCopySize>
@@ -221,15 +278,9 @@ RecipientShardEntry makeRecipientShard(ShardId shardId,
  * namespace components.
  *
  *      <db>.system.resharding.<existing collection's UUID>
+ * or   <db>.system.buckets.resharding.<existing collection's UUID> for a timeseries source ns.
  */
-NamespaceString constructTemporaryReshardingNss(StringData db, const UUID& sourceUuid);
-
-/**
- * Gets the recipient shards for a resharding operation.
- */
-std::set<ShardId> getRecipientShards(OperationContext* opCtx,
-                                     const NamespaceString& reshardNss,
-                                     const UUID& reshardingUUID);
+NamespaceString constructTemporaryReshardingNss(const NamespaceString& nss, const UUID& sourceUuid);
 
 /**
  * Asserts that there is not a hole or overlap in the chunks.
@@ -262,7 +313,15 @@ void checkForOverlappingZones(std::vector<ReshardingZoneType>& zones);
  * Builds documents to insert into config.tags from zones provided to reshardCollection cmd.
  */
 std::vector<BSONObj> buildTagsDocsFromZones(const NamespaceString& tempNss,
-                                            const std::vector<ReshardingZoneType>& zones);
+                                            std::vector<ReshardingZoneType>& zones,
+                                            const ShardKeyPattern& shardKey);
+
+/**
+ * Create an array of resharding zones from the existing collection. This is used for forced
+ * same-key resharding.
+ */
+std::vector<ReshardingZoneType> getZonesFromExistingCollection(OperationContext* opCtx,
+                                                               const NamespaceString& sourceNss);
 
 /**
  * Creates a pipeline that can be serialized into a query for fetching oplog entries. `startAfter`
@@ -302,6 +361,7 @@ boost::optional<Milliseconds> estimateRemainingRecipientTime(bool applyingBegan,
                                                              int64_t oplogEntriesApplied,
                                                              int64_t oplogEntriesFetched,
                                                              Milliseconds timeSpentApplying);
+
 /**
  * Looks up the StateMachine by namespace of the collection being resharded. If it does not exist,
  * returns boost::none.
@@ -325,6 +385,87 @@ std::vector<std::shared_ptr<Instance>> getReshardingStateMachines(OperationConte
     return result;
 }
 
-}  // namespace resharding
+/**
+ * Validate the shardDistribution parameter in reshardCollection cmd, which should satisfy the
+ * following properties:
+ * - The shardKeyRanges should be continuous and cover the full data range.
+ * - Every shardKeyRange should be on the same key.
+ * - A shardKeyRange should either have no min/max or have a min/max pair.
+ * - All shardKeyRanges in the array should have the same min/max pattern.
+ * Not satisfying the rules above will cause an uassert failure.
+ */
+void validateShardDistribution(const std::vector<ShardKeyRange>& shardDistribution,
+                               OperationContext* opCtx,
+                               const ShardKeyPattern& keyPattern);
 
+/**
+ * Returns true if the provenance is moveCollection or balancerMoveCollection.
+ */
+bool isMoveCollection(const boost::optional<ProvenanceEnum>& provenance);
+
+/**
+ * Returns true if the provenance is unshardCollection.
+ */
+bool isUnshardCollection(const boost::optional<ProvenanceEnum>& provenance);
+
+/**
+ * Helper function to create a thread pool for _markKilledExecutor member of resharding POS.
+ */
+std::shared_ptr<ThreadPool> makeThreadPoolForMarkKilledExecutor(const std::string& poolName);
+
+boost::optional<Status> coordinatorAbortedError();
+
+/**
+ * If 'implicitlyCreateIndex' is false, asserts that
+ * featureFlagHashedShardKeyIndexOptionalUponShardingCollection is enabled and the shard key is
+ * hashed.
+ */
+void validateImplicitlyCreateIndex(bool implicitlyCreateIndex, const BSONObj& shardKey);
+
+/**
+ * If 'performVerification' is true, asserts that featureFlagReshardingVerification is enabled.
+ */
+void validatePerformVerification(boost::optional<bool> performVerification);
+void validatePerformVerification(bool performVerification);
+
+/**
+ * Verifies that for each index spec in sourceIndexSpecs, there is an identical spec in
+ * localIndexSpecs. Field order does not matter.
+ */
+template <typename InputIterator1, typename InputIterator2>
+void verifyIndexSpecsMatch(InputIterator1 sourceIndexSpecsBegin,
+                           InputIterator1 sourceIndexSpecsEnd,
+                           InputIterator2 localIndexSpecsBegin,
+                           InputIterator2 localIndexSpecsEnd) {
+    stdx::unordered_map<std::string, BSONObj> localIndexSpecMap;
+    std::transform(
+        localIndexSpecsBegin,
+        localIndexSpecsEnd,
+        std::inserter(localIndexSpecMap, localIndexSpecMap.end()),
+        [](const auto& spec) { return std::pair(spec.getStringField("name").toString(), spec); });
+
+    UnorderedFieldsBSONObjComparator bsonCmp;
+    for (auto it = sourceIndexSpecsBegin; it != sourceIndexSpecsEnd; ++it) {
+        auto spec = *it;
+        auto specName = spec.getStringField("name").toString();
+        uassert(9365601,
+                str::stream() << "Resharded collection missing source collection index: "
+                              << specName,
+                localIndexSpecMap.find(specName) != localIndexSpecMap.end());
+        uassert(9365602,
+                str::stream() << "Resharded collection created non-matching index. Source spec: "
+                              << spec << " Resharded collection spec: "
+                              << localIndexSpecMap.find(specName)->second,
+                bsonCmp.evaluate(spec == localIndexSpecMap.find(specName)->second));
+    }
+}
+
+ReshardingCoordinatorDocument createReshardingCoordinatorDoc(
+    OperationContext* opCtx,
+    const ConfigsvrReshardCollection& request,
+    const CollectionType& collEntry,
+    const NamespaceString& nss,
+    const bool& setProvenance);
+
+}  // namespace resharding
 }  // namespace mongo

@@ -28,16 +28,38 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
 #include <iostream>
 #include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/decorable.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -86,7 +108,7 @@ public:
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbName,
+                                 const DatabaseName& dbName,
                                  const BSONObj& cmdObj) const override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         if (!AuthorizationSession::get(opCtx->getClient())
@@ -98,29 +120,28 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
-        LOGV2_DEBUG(22757,
-                    1,
-                    "setIndexCommitQuorum",
-                    "namespace"_attr = nss,
-                    "command"_attr = redact(cmdObj));
+        LOGV2_DEBUG(
+            22757, 1, "setIndexCommitQuorum", logAttrs(nss), "command"_attr = redact(cmdObj));
 
-        auto routingInfo =
+        auto cri =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
         auto shardResponses = scatterGatherVersionedTargetByRoutingTable(
             opCtx,
-            nss.db(),
+            nss.dbName(),
             nss,
-            routingInfo,
+            cri,
             applyReadWriteConcern(
                 opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
             ReadPreferenceSetting::get(opCtx),
             Shard::RetryPolicy::kNotIdempotent,
-            BSONObj() /* query */,
-            BSONObj() /* collation */);
+            BSONObj() /*query*/,
+            BSONObj() /*collation*/,
+            boost::none /*letParameters*/,
+            boost::none /*runtimeConstants*/);
 
         std::string errmsg;
         const bool ok =
@@ -128,13 +149,13 @@ public:
         CommandHelpers::appendSimpleCommandStatus(result, ok, errmsg);
 
         if (ok) {
-            LOGV2(5688700, "Index commit quorums set", "namespace"_attr = nss);
+            LOGV2(5688700, "Index commit quorums set", logAttrs(nss));
         }
 
         return ok;
     }
-
-} setCommitQuorumCmd;
+};
+MONGO_REGISTER_COMMAND(SetIndexCommitQuorumCommand).forRouter();
 
 }  // namespace
 }  // namespace mongo

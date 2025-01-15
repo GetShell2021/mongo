@@ -5,10 +5,7 @@
  * 2. Make sure that one of the highest priority nodes becomes PRIMARY.
  * 3. Step down the PRIMARY and confirm that the other high priority node becomes PRIMARY.
  */
-load('jstests/replsets/rslib.js');
-
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var name = 'priority_takeover_two_nodes_equal_priority';
 var replTest = new ReplSetTest(
@@ -33,8 +30,8 @@ assert.soon(
         return primaryIndex !== defaultPriorityNodeIndex;
     },
     'Neither of the high priority nodes was elected primary.',
-    replTest.kDefaultTimeoutMS,  // timeout
-    1000                         // interval
+    replTest.timeoutMS,  // timeout
+    1000                 // interval
 );
 
 jsTestLog("Stepping down the current primary.");
@@ -51,4 +48,3 @@ jsTestLog("Waiting for the other high priority node to become PRIMARY.");
 var expectedNewPrimary = replTest.nodes[expectedNewPrimaryIndex];
 replTest.waitForState(expectedNewPrimary, ReplSetTest.State.PRIMARY);
 replTest.stopSet();
-})();

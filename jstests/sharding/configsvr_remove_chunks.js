@@ -4,11 +4,9 @@
  * ]
  */
 
-(function() {
-'use strict';
-
-load("jstests/libs/retryable_writes_util.js");
-load("jstests/sharding/libs/find_chunks_util.js");
+import {RetryableWritesUtil} from "jstests/libs/retryable_writes_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 function runConfigsvrRemoveChunksWithRetries(conn, uuid, lsid, txnNumber) {
     var res;
@@ -43,12 +41,15 @@ function insertLeftoverChunks(configDB, uuid) {
         newChunk.uuid = otherCollectionUUID;
         chunksToInsert.push(newChunk);
     });
-    assert.commandWorked(configDB.getCollection("chunks").insertMany(chunksToInsert));
+    assert.commandWorked(
+        configDB.getCollection("chunks").insertMany(chunksToInsert, {ordered: false}));
 }
 
 let st = new ShardingTest({mongos: 1, shards: 1});
 
-const configDB = st.s.getDB('config');
+// Use retriable writes when writing to the config server since these are not automatically retried
+const mongosSession = st.s.startSession({retryWrites: true});
+const configDB = mongosSession.getDatabase("config");
 
 const dbName = "test";
 const collName = "foo";
@@ -88,4 +89,3 @@ assert.eq(1, configDB.getCollection("chunks").find({uuid: otherCollectionUUID}).
 configDB.getCollection("chunks").remove({uuid: otherCollectionUUID});
 
 st.stop();
-})();

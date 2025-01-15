@@ -1,17 +1,28 @@
 // Basic test that the CompactStructuredEncryptionDataCoordinator runs.
-// @tags: [requires_sharding,requires_fcv_60]
+// @tags: [
+//     requires_sharding,
+//     requires_fcv_80,
+// ]
 
-(function() {
-'use strict';
+import {EncryptedClient, isEnterpriseShell} from "jstests/fle2/libs/encrypted_client_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
-load('jstests/fle2/libs/encrypted_client_util.js');
+if (!isEnterpriseShell()) {
+    jsTestLog("Skipping test as it requires the enterprise module");
+    quit();
+}
 
 const options = {
     mongos: 1,
-    config: 1,
     shards: 1,
     rs: {nodes: [{}]},
 };
+
+if (!TestData.configShard) {
+    // Setting config options will override shard options in config shard mode, which doesn't set
+    // the right audit node options on the config shard.
+    options.config = 1;
+}
 
 const kHaveAuditing = buildInfo().modules.includes("enterprise");
 if (kHaveAuditing) {
@@ -41,41 +52,21 @@ assert.commandWorked(
     client.createEncryptionCollection("encrypted", {encryptedFields: encryptedFields}));
 assert.commandWorked(test.createCollection("unencrypted"));
 
-assert.commandFailedWithCode(test.unencrypted.compact(), 6346807);
+client.runEncryptionOperation(() => {
+    assert.commandFailedWithCode(test.unencrypted.compact(), 6346807);
 
-const reply = assert.commandWorked(test.encrypted.compact());
-jsTest.log(reply);
+    const reply = assert.commandWorked(test.encrypted.compact());
+    jsTest.log(reply);
 
-// Validate dummy data we expect the placeholder compaction algorithm to return.
-assert.eq(reply.stats.ecoc.read, 0);
-assert.eq(reply.stats.ecoc.deleted, 0);
+    // Validate dummy data we expect the placeholder compaction algorithm to return.
+    assert.eq(reply.stats.ecoc.read, 0);
+    assert.eq(reply.stats.ecoc.deleted, 0);
 
-assert.eq(reply.stats.ecc.read, 0);
-assert.eq(reply.stats.ecc.inserted, 0);
-assert.eq(reply.stats.ecc.updated, 0);
-assert.eq(reply.stats.ecc.deleted, 0);
-
-assert.eq(reply.stats.esc.read, 0);
-assert.eq(reply.stats.esc.inserted, 0);
-assert.eq(reply.stats.esc.updated, 0);
-assert.eq(reply.stats.esc.deleted, 0);
-
-// The eccoc collection is gone, so we should return quickly with no work done.
-const nowork = assert.commandWorked(test.encrypted.compact());
-jsTest.log(nowork);
-
-assert.eq(nowork.stats.ecoc.read, 0);
-assert.eq(nowork.stats.ecoc.deleted, 0);
-
-assert.eq(nowork.stats.ecc.read, 0);
-assert.eq(nowork.stats.ecc.inserted, 0);
-assert.eq(nowork.stats.ecc.updated, 0);
-assert.eq(nowork.stats.ecc.deleted, 0);
-
-assert.eq(nowork.stats.esc.read, 0);
-assert.eq(nowork.stats.esc.inserted, 0);
-assert.eq(nowork.stats.esc.updated, 0);
-assert.eq(nowork.stats.esc.deleted, 0);
+    assert.eq(reply.stats.esc.read, 0);
+    assert.eq(reply.stats.esc.inserted, 0);
+    assert.eq(reply.stats.esc.updated, 0);
+    assert.eq(reply.stats.esc.deleted, 0);
+});
 
 if (kHaveAuditing) {
     jsTest.log('Verifying audit contents');
@@ -100,6 +91,3 @@ if (kHaveAuditing) {
 }
 
 st.stop();
-
-jsTest.log(reply);
-})();

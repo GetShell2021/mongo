@@ -2,12 +2,11 @@
  * Fixture to test rollback permutations with index builds.
  */
 
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {IndexBuildTest} from "jstests/noPassthrough/libs/index_build.js";
+import {RollbackTest} from "jstests/replsets/libs/rollback_test.js";
 
-load("jstests/noPassthrough/libs/index_build.js");  // for IndexBuildTest
-load('jstests/replsets/libs/rollback_test.js');     // for RollbackTest
-
-class RollbackIndexBuildsTest {
+export class RollbackIndexBuildsTest {
     constructor(expectedErrors) {
         jsTestLog("Set up a Rollback Test.");
         const replTest = new ReplSetTest({
@@ -19,7 +18,7 @@ class RollbackIndexBuildsTest {
         let config = replTest.getReplSetConfig();
         config.members[2].priority = 0;
         config.settings = {chainingAllowed: false};
-        replTest.initiateWithHighElectionTimeout(config);
+        replTest.initiate(config);
         this.rollbackTest = new RollbackTest(jsTestName(), replTest);
         this.expectedErrors = expectedErrors;
     }
@@ -81,10 +80,11 @@ class RollbackIndexBuildsTest {
                         assert.commandWorked(primary.adminCommand(
                             {configureFailPoint: 'disableSnapshotting', mode: 'alwaysOn'}));
                         break;
-                    case "transitionToRollback":
+                    case "transitionToRollback": {
                         const curPrimary = self.rollbackTest.transitionToRollbackOperations();
                         assert.eq(curPrimary, primary);
                         break;
+                    }
                     case "transitionToSteadyState":
                         self.rollbackTest.transitionToSyncSourceOperationsBeforeRollback();
 
@@ -125,12 +125,13 @@ class RollbackIndexBuildsTest {
                         IndexBuildTest.resumeIndexBuilds(primary);
                         IndexBuildTest.waitForIndexBuildToStop(primaryDB, collName, "a_1");
                         break;
-                    case "abort":
+                    case "abort": {
                         const opId = IndexBuildTest.getIndexBuildOpId(primaryDB, collName, "a_1");
                         assert.commandWorked(primaryDB.killOp(opId));
                         IndexBuildTest.resumeIndexBuilds(primary);
                         IndexBuildTest.waitForIndexBuildToStop(primaryDB, collName, "a_1");
                         break;
+                    }
                     case "drop":
                         collection.dropIndexes(indexSpec);
                         break;

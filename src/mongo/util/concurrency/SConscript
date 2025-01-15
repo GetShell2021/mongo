@@ -4,67 +4,31 @@ Import("env")
 
 env = env.Clone()
 
-env.Library(
-    target='thread_pool',
-    source=[
-        'thread_pool.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.Library(
-    target='thread_pool_test_fixture',
-    source=['thread_pool_test_common.cpp', 'thread_pool_test_fixture.cpp'],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/unittest/unittest',
-    ],
-)
-
-env.Library(
-    'ticketholder',
-    ['ticketholder.cpp'],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/third_party/shim_boost',
-    ],
-)
-
-env.Library(
-    target='spin_lock',
-    source=[
-        "spin_lock.cpp",
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
 env.CppUnitTest(
-    target='util_concurrency_test',
-    source=[
-        'spin_lock_test.cpp',
-        'thread_pool_test.cpp',
-        'ticketholder_test.cpp',
-        'with_lock_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/service_context_test_fixture',
-        'spin_lock',
-        'thread_pool',
-        'thread_pool_test_fixture',
-        'ticketholder',
-    ],
+    target="util_concurrency_test",
+    source=[],
+    LIBDEPS=[],
+    PROVE_ALIASES=["server-programmability"],
+)
+
+env.CppUnitTest(target="ticketholder_test", source=[])
+
+env.Benchmark(
+    target="ticketholder_bm",
+    source=[],
+    LIBDEPS=[],
+    BAZEL_BENCHMARK_TAG="second_half_bm",
 )
 
 env.Benchmark(
-    target='ticketholder_bm',
-    source=[
-        'ticketholder_bm.cpp',
-    ],
-    LIBDEPS=[
-        'ticketholder',
-    ],
+    target="lock_free_read_list_bm",
+    source=[],
+    LIBDEPS=[],
+)
+
+env.CppUnitTest(
+    target="lock_free_read_list_test",
+    source=[],
+    LIBDEPS=[],
+    PROVE_ALIASES=["server-programmability"],
 )

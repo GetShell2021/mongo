@@ -29,10 +29,16 @@
 
 #include "mongo/db/coll_mod_reply_validation.h"
 
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
 namespace mongo::coll_mod_reply_validation {
 void validateReply(const CollModReply& reply) {
-    auto hidden_new = reply.getHidden_new().is_initialized();
-    auto hidden_old = reply.getHidden_old().is_initialized();
+    auto hidden_new = reply.getHidden_new().has_value();
+    auto hidden_old = reply.getHidden_old().has_value();
 
     if ((!hidden_new && hidden_old) || (hidden_new && !hidden_old)) {
         uassert(ErrorCodes::CommandResultSchemaViolation,
@@ -41,8 +47,8 @@ void validateReply(const CollModReply& reply) {
                 false);
     }
 
-    auto prepareUnique_new = reply.getPrepareUnique_new().is_initialized();
-    auto prepareUnique_old = reply.getPrepareUnique_old().is_initialized();
+    auto prepareUnique_new = reply.getPrepareUnique_new().has_value();
+    auto prepareUnique_old = reply.getPrepareUnique_old().has_value();
 
     if ((!prepareUnique_new && prepareUnique_old) || (prepareUnique_new && !prepareUnique_old)) {
         uassert(ErrorCodes::CommandResultSchemaViolation,

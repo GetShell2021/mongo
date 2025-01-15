@@ -2,23 +2,23 @@
  * Test that change streams returns refineCollectionShardKey events.
  *
  *  @tags: [
- *    requires_fcv_61,
  *    requires_sharding,
  *    uses_change_streams,
  *    change_stream_does_not_expect_txns,
  *    assumes_unsharded_collection,
  *    assumes_read_preference_unchanged,
- *    featureFlagChangeStreamsVisibility,
- *    featureFlagChangeStreamsFurtherEnrichedEvents
  * ]
  */
 
-(function() {
-"use strict";
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
 
-load("jstests/libs/collection_drop_recreate.js");  // For assertDropCollection.
-load('jstests/libs/change_stream_util.js');        // For 'ChangeStreamTest' and
-                                                   // 'assertChangeStreamEventEq'.
+import {assertDropCollection} from "jstests/libs/collection_drop_recreate.js";
+import {
+    assertChangeStreamEventEq,
+    ChangeStreamTest
+} from "jstests/libs/query/change_stream_util.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var st = new ShardingTest({
     shards: 2,
@@ -99,8 +99,7 @@ function validateExpectedEventAndConfirmResumability(collParam, expectedOutput) 
     });
 }
 
-assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, primaryShard);
+assert.commandWorked(mongos.adminCommand({enableSharding: kDbName, primaryShard: primaryShard}));
 
 // Test the behaviour of refineCollectionShardKey for a single-collection stream
 validateExpectedEventAndConfirmResumability(kCollName, {
@@ -117,4 +116,3 @@ validateExpectedEventAndConfirmResumability(1, {
 });
 
 st.stop();
-}());

@@ -1,10 +1,13 @@
 /**
  * Tests the Config server observer.
  *
- *  @tags: [multiversion_incompatible]
+ * @tags: [
+ *   multiversion_incompatible,
+ *   # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *   embedded_router_incompatible,
+ * ]
  */
-(function() {
-'use strict';
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const kWaitForCompletedChecksCount = 20;
 const kWaitForPassedChecksCount = 10;
@@ -17,7 +20,6 @@ const params = {
             ]
         }),
         healthMonitoringIntervals: tojson({values: [{type: "configServer", interval: 200}]}),
-        featureFlagHealthMonitoring: true
     }
 };
 
@@ -45,4 +47,3 @@ assert.soon(() => {
 }, 'Config server health check did not reach necessary count of passed checks', 60000, 1000);
 
 st.stop();
-})();

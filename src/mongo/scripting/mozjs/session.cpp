@@ -28,19 +28,31 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/scripting/mozjs/session.h"
-
+#include <cstdint>
+#include <js/CallArgs.h>
 #include <js/Object.h>
+#include <js/RootingAPI.h>
+#include <string>
+#include <utility>
 
+#include <js/PropertySpec.h>
+#include <js/TypeDecls.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/database_name.h"
 #include "mongo/logv2/log.h"
-#include "mongo/scripting/mozjs/bson.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/scripting/mozjs/implscope.h"
-#include "mongo/scripting/mozjs/mongo.h"
 #include "mongo/scripting/mozjs/scripting_util_gen.h"
+#include "mongo/scripting/mozjs/session.h"
 #include "mongo/scripting/mozjs/valuereader.h"
-#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
+#include "mongo/scripting/mozjs/valuewriter.h"
+#include "mongo/scripting/mozjs/wrapconstrainedmethod.h"  // IWYU pragma: keep
+#include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
@@ -109,7 +121,7 @@ SessionHolder::TransactionState transactionStateEnum(StringData name) {
 }
 
 SessionHolder* getHolder(JSObject* thisv) {
-    return static_cast<SessionHolder*>(JS::GetPrivate(thisv));
+    return JS::GetMaybePtrFromReservedSlot<SessionHolder>(thisv, SessionInfo::SessionHolderSlot);
 }
 
 SessionHolder* getHolder(JS::CallArgs& args) {
@@ -128,21 +140,23 @@ void endSession(SessionHolder* holder) {
         BSONObj abortObj = BSON("abortTransaction" << 1 << "lsid" << holder->lsid << "txnNumber"
                                                    << holder->txnNumber << "autocommit" << false);
 
-        [[maybe_unused]] auto ignored = holder->client->runCommand("admin", abortObj, out);
+        [[maybe_unused]] auto ignored =
+            holder->client->runCommand(DatabaseName::kAdmin, abortObj, out);
     }
 
     EndSessions es;
 
     es.setEndSessions({holder->lsid});
 
-    [[maybe_unused]] auto ignored = holder->client->runCommand("admin", es.toBSON(), out);
+    [[maybe_unused]] auto ignored =
+        holder->client->runCommand(DatabaseName::kAdmin, es.toBSON(), out);
 
     holder->client.reset();
 }
 
 }  // namespace
 
-void SessionInfo::finalize(JSFreeOp* fop, JSObject* obj) {
+void SessionInfo::finalize(JS::GCContext* gcCtx, JSObject* obj) {
     auto holder = getHolder(obj);
 
     if (holder) {
@@ -163,7 +177,7 @@ void SessionInfo::finalize(JSFreeOp* fop, JSObject* obj) {
             }
         }
 
-        getScope(fop)->trackedDelete(holder);
+        getScope(gcCtx)->trackedDelete(holder);
     }
 }
 
@@ -235,7 +249,10 @@ void SessionInfo::make(JSContext* cx,
     auto scope = getScope(cx);
 
     scope->getProto<SessionInfo>().newObject(obj);
-    JS::SetPrivate(obj, scope->trackedNew<SessionHolder>(std::move(client), std::move(lsid)));
+    JS::SetReservedSlot(
+        obj,
+        SessionHolderSlot,
+        JS::PrivateValue(scope->trackedNew<SessionHolder>(std::move(client), std::move(lsid))));
 }
 
 }  // namespace mozjs

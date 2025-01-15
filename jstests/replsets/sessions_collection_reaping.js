@@ -3,8 +3,7 @@
  * session, and that arbiters never try to a reap session.
  */
 
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 // This test makes assertions about the number of sessions, which are not compatible with
 // implicit sessions.
@@ -17,12 +16,7 @@ let replTest = new ReplSetTest({
         {/* secondary */ rsConfig: {priority: 0}},
         {/* arbiter */ rsConfig: {arbiterOnly: true}}
     ],
-    nodeOptions: {
-        setParameter: {
-            TransactionRecordMinimumLifetimeMinutes: 0,
-            storeFindAndModifyImagesInSideCollection: true
-        }
-    }
+    nodeOptions: {setParameter: {TransactionRecordMinimumLifetimeMinutes: 0}}
 });
 let nodes = replTest.startSet();
 
@@ -60,6 +54,7 @@ assert.commandWorked(sessionsCollOnPrimary.remove({}));
 // Test that a reap on a secondary does not lead to the on-disk state reaping of the session
 // since the session does not exist in the secondary's session catalog.
 {
+    replTest.awaitReplication();
     assert.commandWorked(secondary.adminCommand({clearLog: 'global'}));
     assert.commandWorked(secondary.adminCommand({reapLogicalSessionCacheNow: 1}));
 
@@ -90,4 +85,3 @@ assert.commandWorked(sessionsCollOnPrimary.remove({}));
 }
 
 replTest.stopSet();
-})();

@@ -28,14 +28,22 @@
  */
 
 
-#include "mongo/platform/basic.h"
+// IWYU pragma: no_include "cxxabi.h"
+#include <mutex>
+#include <utility>
 
-#include "mongo/db/storage/storage_engine_change_context.h"
-
+#include "mongo/base/error_codes.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/db/operation_id.h"
+#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/storage_engine_change_context.h"
+#include "mongo/db/transaction_resources.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/decorable.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
@@ -88,11 +96,11 @@ void StorageEngineChangeOperationContextDoneNotifier::setNotifyWhenDone(ServiceC
     _service = service;
 }
 
-StorageChangeLock::Token StorageEngineChangeContext::killOpsForStorageEngineChange(
+WriteRarelyRWMutex::WriteLock StorageEngineChangeContext::killOpsForStorageEngineChange(
     ServiceContext* service) {
     invariant(this == StorageEngineChangeContext::get(service));
     // Prevent new operations from being created.
-    auto storageChangeLk = service->getStorageChangeLock().acquireExclusiveStorageChangeToken();
+    auto storageChangeLk = service->getStorageChangeMutex().writeLock();
     stdx::unique_lock lk(_mutex);
     {
         ServiceContext::LockedClientsCursor clientCursor(service);
@@ -102,21 +110,23 @@ StorageChangeLock::Token StorageEngineChangeContext::killOpsForStorageEngineChan
                 continue;
             OperationId killedOperationId;
             {
-                stdx::lock_guard<Client> lk(*client);
+                ClientLock lk(client);
                 auto opCtxToKill = client->getOperationContext();
-                if (!opCtxToKill || !opCtxToKill->recoveryUnit() ||
-                    opCtxToKill->recoveryUnit()->isNoop())
+                if (!opCtxToKill || !shard_role_details::getRecoveryUnit(opCtxToKill) ||
+                    shard_role_details::getRecoveryUnit(opCtxToKill)->isNoop())
                     continue;
                 service->killOperation(lk, opCtxToKill, ErrorCodes::InterruptedDueToStorageChange);
                 auto& doneNotifier =
                     StorageEngineChangeOperationContextDoneNotifier::get(opCtxToKill);
                 doneNotifier.setNotifyWhenDone(service);
                 ++_numOpCtxtsToWaitFor;
+                killedOperationId = opCtxToKill->getOpID();
             }
             LOGV2_DEBUG(5781190,
                         1,
                         "Killed OpCtx for storage change",
-                        "killedOperationId"_attr = killedOperationId);
+                        "killedOperationId"_attr = killedOperationId,
+                        "client"_attr = client->desc());
         }
     }
 
@@ -128,12 +138,11 @@ StorageChangeLock::Token StorageEngineChangeContext::killOpsForStorageEngineChan
 }
 
 void StorageEngineChangeContext::changeStorageEngine(ServiceContext* service,
-                                                     StorageChangeLock::Token token,
+                                                     WriteRarelyRWMutex::WriteLock lk,
                                                      std::unique_ptr<StorageEngine> engine) {
     invariant(this == StorageEngineChangeContext::get(service));
     service->setStorageEngine(std::move(engine));
-    // Token -- which is a lock -- is released at end of scope, allowing OperationContexts to be
-    // created again.
+    // The lock is released at end of scope, allowing OperationContexts to be created again.
 }
 
 void StorageEngineChangeContext::notifyOpCtxDestroyed() noexcept {

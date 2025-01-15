@@ -15,10 +15,7 @@
  * @tags: [requires_v4_0]
  */
 
-(function() {
-'use strict';
-
-load('jstests/libs/index_catalog_helpers.js');
+import {IndexCatalogHelpers} from "jstests/libs/index_catalog_helpers.js";
 
 const dbpath = MongoRunner.dataPath + 'skip_level_upgrade';
 resetDbpath(dbpath);
@@ -29,10 +26,18 @@ const defaultOptions = {
     noCleanData: true,
 };
 
-// This lists all binary versions older than the last-lts version.
+// This contains lists of LTS binary versions > 5.0 but < last-lts.
+// TODO SERVER-76166: Generate this list programmatically.
+//
+// Note: To support PIT truncate functionality, the on-disk data format has been changed,
+// which older versions (5.0 and below) cannot understand. This functionality is enabled
+// for MongoDB from version 8.0 onwards. So, illegal skip-level upgrades from version 5.0 and older
+// to version 8.0 or later would cause 8.0 (and later) to rewrite the older files to the newer
+// format, which older versions don't understand. This requires manual intervention for the user to
+// revert the database back to the older version. (See WT-12869 and WT-10307 for details). That's
+// the reason this test will test from 6.0+.
 const versions = [
-    {binVersion: '4.0', testCollection: 'four_zero'},
-    {binVersion: '4.2', testCollection: 'four_two'}
+    {binVersion: '6.0', testCollection: 'six_zero'},
 ];
 
 // Iterate through versions specified in the versions list, and follow the steps outlined at
@@ -86,4 +91,3 @@ for (let i = 0; i < versions.length; i++) {
 
     resetDbpath(dbpath);
 }
-})();

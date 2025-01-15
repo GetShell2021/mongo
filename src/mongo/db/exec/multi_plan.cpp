@@ -28,31 +28,45 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/exec/multi_plan.h"
 
 #include <algorithm>
-#include <math.h>
+#include <boost/move/utility_core.hpp>
+#include <deque>
+#include <fmt/format.h>
 #include <memory>
+#include <string>
+#include <utility>
 
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/client.h"
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/exec/histogram_server_status_metric.h"
-#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/trial_period_utils.h"
-#include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/query/classic_plan_cache.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/collection_query_info.h"
-#include "mongo/db/query/explain.h"
 #include "mongo/db/query/multiple_collection_accessor.h"
-#include "mongo/db/query/plan_cache_key_factory.h"
+#include "mongo/db/query/plan_cache/classic_plan_cache.h"
+#include "mongo/db/query/plan_cache/plan_cache_key_factory.h"
+#include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/plan_explainer_factory.h"
 #include "mongo/db/query/plan_ranker.h"
-#include "mongo/db/query/plan_ranker_util.h"
+#include "mongo/db/query/plan_ranking_decision.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/histogram.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/redaction.h"
+#include "mongo/platform/atomic_proxy.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/str.h"
+#include "mongo/util/tick_source.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -72,60 +86,61 @@ void markShouldCollectTimingInfoOnSubtree(PlanStage* root) {
     }
 }
 
-Counter64 classicMicrosTotal;
-Counter64 classicWorksTotal;
-Counter64 classicCount;
-
 /**
  * Aggregation of the total number of microseconds spent (in the classic multiplanner).
  */
-ServerStatusMetricField<Counter64> classicMicrosTotalDisplay("query.multiPlanner.classicMicros",
-                                                             &classicMicrosTotal);
+auto& classicMicrosTotal = *MetricBuilder<Counter64>{"query.multiPlanner.classicMicros"};
 
 /**
  * Aggregation of the total number of "works" performed (in the classic multiplanner).
  */
-ServerStatusMetricField<Counter64> classicWorksTotalDisplay("query.multiPlanner.classicWorks",
-                                                            &classicWorksTotal);
+auto& classicWorksTotal = *MetricBuilder<Counter64>{"query.multiPlanner.classicWorks"};
 
 /**
  * Aggregation of the total number of invocations (of the classic multiplanner).
  */
-ServerStatusMetricField<Counter64> classicCountDisplay("query.multiPlanner.classicCount",
-                                                       &classicCount);
+auto& classicCount = *MetricBuilder<Counter64>{"query.multiPlanner.classicCount"};
 
 /**
  * An element in this histogram is the number of microseconds spent in an invocation (of the
  * classic multiplanner).
  */
-HistogramServerStatusMetric classicMicrosHistogram("query.multiPlanner.histograms.classicMicros",
-                                                   HistogramServerStatusMetric::pow(11, 1024, 4));
+auto& classicMicrosHistogram =
+    *MetricBuilder<HistogramServerStatusMetric>{"query.multiPlanner.histograms.classicMicros"}.bind(
+        HistogramServerStatusMetric::pow(11, 1024, 4));
 
 /**
  * An element in this histogram is the number of "works" performed during an invocation (of the
  * classic multiplanner).
  */
-HistogramServerStatusMetric classicWorksHistogram("query.multiPlanner.histograms.classicWorks",
-                                                  HistogramServerStatusMetric::pow(9, 128, 2));
+auto& classicWorksHistogram =
+    *MetricBuilder<HistogramServerStatusMetric>{"query.multiPlanner.histograms.classicWorks"}.bind(
+        HistogramServerStatusMetric::pow(9, 128, 2));
 
 /**
  * An element in this histogram is the number of plans in the candidate set of an invocation (of the
  * classic multiplanner).
  */
-HistogramServerStatusMetric classicNumPlansHistogram(
-    "query.multiPlanner.histograms.classicNumPlans", HistogramServerStatusMetric::pow(5, 2, 2));
+auto& classicNumPlansHistogram =
+    *MetricBuilder<HistogramServerStatusMetric>{"query.multiPlanner.histograms.classicNumPlans"}
+         .bind(HistogramServerStatusMetric::pow(5, 2, 2));
 
 }  // namespace
 
+MONGO_FAIL_POINT_DEFINE(sleepWhileMultiplanning);
+
 MultiPlanStage::MultiPlanStage(ExpressionContext* expCtx,
-                               const CollectionPtr& collection,
+                               VariantCollectionPtrOrAcquisition collection,
                                CanonicalQuery* cq,
-                               PlanCachingMode cachingMode)
+                               OnPickBestPlan onPickBestPlan,
+                               boost::optional<std::string> replanReason)
     : RequiresCollectionStage(kStageType, expCtx, collection),
-      _cachingMode(cachingMode),
       _query(cq),
+      _onPickBestPlan(std::move(onPickBestPlan)),
       _bestPlanIdx(kNoSuchPlan),
-      _backupPlanIdx(kNoSuchPlan) {}
+      _backupPlanIdx(kNoSuchPlan) {
+    _specificStats.replanReason = replanReason;
+}
 
 void MultiPlanStage::addPlan(std::unique_ptr<QuerySolution> solution,
                              std::unique_ptr<PlanStage> root,
@@ -139,7 +154,7 @@ void MultiPlanStage::addPlan(std::unique_ptr<QuerySolution> solution,
     markShouldCollectTimingInfoOnSubtree(newChild);
 }
 
-bool MultiPlanStage::isEOF() {
+bool MultiPlanStage::isEOF() const {
     // If _bestPlanIdx hasn't been found, can't be at EOF
     if (!bestPlanChosen()) {
         return false;
@@ -175,18 +190,17 @@ PlanStage::StageState MultiPlanStage::doWork(WorkingSetID* out) {
 
         LOGV2_DEBUG(20588, 5, "Best plan errored, switching to backup plan");
 
-        CollectionQueryInfo::get(collection())
+        CollectionQueryInfo::get(collectionPtr())
             .getPlanCache()
-            ->remove(plan_cache_key_factory::make<PlanCacheKey>(*_query, collection()));
+            ->remove(plan_cache_key_factory::make<PlanCacheKey>(*_query, collectionPtr()));
 
-        _bestPlanIdx = _backupPlanIdx;
-        _backupPlanIdx = kNoSuchPlan;
+        switchToBackupPlan();
         return _candidates[_bestPlanIdx].root->work(out);
     }
 
     if (hasBackupPlan() && PlanStage::ADVANCED == state) {
         LOGV2_DEBUG(20589, 5, "Best plan had a blocking stage, became unblocked");
-        _backupPlanIdx = kNoSuchPlan;
+        removeBackupPlan();
     }
 
     return state;
@@ -198,15 +212,23 @@ void MultiPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
     //   2) some stage requested a yield, or
     //   3) we need to yield and retry due to a WriteConflictException.
     // In all cases, the actual yielding happens here.
-    if (yieldPolicy->shouldYieldOrInterrupt(expCtx()->opCtx)) {
-        uassertStatusOK(yieldPolicy->yieldOrInterrupt(expCtx()->opCtx));
+    if (yieldPolicy->shouldYieldOrInterrupt(expCtx()->getOperationContext())) {
+        uassertStatusOK(yieldPolicy->yieldOrInterrupt(
+            expCtx()->getOperationContext(), nullptr, RestoreContext::RestoreType::kYield));
     }
 }
 
 Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
-    // Adds the amount of time taken by pickBestPlan() to executionTimeMillis. There's lots of
-    // execution work that happens here, so this is needed for the time accounting to
-    // make sense.
+    if (bestPlanChosen()) {
+        return Status::OK();
+    }
+
+    if (MONGO_unlikely(sleepWhileMultiplanning.shouldFail())) {
+        sleepWhileMultiplanning.execute(
+            [&](const BSONObj& data) { sleepmillis(data["ms"].numberInt()); });
+    }
+    // Adds the amount of time taken by pickBestPlan() to executionTime. There's lots of execution
+    // work that happens here, so this is needed for the time accounting to make sense.
     auto optTimer = getOptTimer();
 
     auto tickSource = opCtx()->getServiceContext()->getTickSource();
@@ -217,7 +239,7 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
 
     const size_t numWorks =
         trial_period::getTrialPeriodMaxWorks(opCtx(),
-                                             collection(),
+                                             collectionPtr(),
                                              internalQueryPlanEvaluationWorks.load(),
                                              internalQueryPlanEvaluationCollFraction.load());
     size_t numResults = trial_period::getTrialPeriodNumToReturn(*_query);
@@ -245,7 +267,7 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
 
     // After picking best plan, ranking will own plan stats from candidate solutions (winner and
     // losers).
-    auto statusWithRanking = plan_ranker::pickBestPlan<PlanStageStats>(_candidates);
+    auto statusWithRanking = plan_ranker::pickBestPlan(_candidates);
     if (!statusWithRanking.isOK()) {
         return statusWithRanking.getStatus();
     }
@@ -256,14 +278,17 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     invariant(ranking);
     _bestPlanIdx = ranking->candidateOrder[0];
 
-    verify(_bestPlanIdx >= 0 && _bestPlanIdx < static_cast<int>(_candidates.size()));
+    MONGO_verify(_bestPlanIdx >= 0 && _bestPlanIdx < static_cast<int>(_candidates.size()));
 
     auto& bestCandidate = _candidates[_bestPlanIdx];
     const auto& alreadyProduced = bestCandidate.results;
     const auto& bestSolution = bestCandidate.solution;
 
-    LOGV2_DEBUG(
-        20590, 5, "Winning solution", "bestSolution"_attr = redact(bestSolution->toString()));
+    LOGV2_DEBUG(20590,
+                5,
+                "Winning solution",
+                "bestSolution"_attr = redact(bestSolution->toString()),
+                "bestSolutionHash"_attr = bestSolution->hash());
 
     auto explainer =
         plan_explainer_factory::make(bestCandidate.root, bestSolution->_enumeratorExplainInfo);
@@ -281,12 +306,11 @@ Status MultiPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         }
     }
 
-    plan_cache_util::updatePlanCache(expCtx()->opCtx,
-                                     MultipleCollectionAccessor(collection()),
-                                     _cachingMode,
-                                     *_query,
-                                     std::move(ranking),
-                                     _candidates);
+    // Invoke the callback provided on construction, passing 'ranking' and '_candidates' to describe
+    // the results of plan selection.
+    _onPickBestPlan(*_query, *this, std::move(ranking), _candidates);
+
+    removeRejectedPlans();
 
     return Status::OK();
 }
@@ -342,8 +366,13 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
             doneWorking = true;
         } else if (PlanStage::NEED_YIELD == state) {
             invariant(id == WorkingSet::INVALID_ID);
+            // Run-time plan selection occurs before a WriteUnitOfWork is opened and it's not
+            // subject to TemporarilyUnavailableException's.
+            invariant(!expCtx()->getTemporarilyUnavailableException());
             if (!yieldPolicy->canAutoYield()) {
-                throwWriteConflictException();
+                throwWriteConflictException(
+                    "Write conflict during multi-planning selection period "
+                    "and yielding is disabled.");
             }
 
             if (yieldPolicy->canAutoYield()) {
@@ -355,6 +384,54 @@ bool MultiPlanStage::workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolic
     }
 
     return !doneWorking;
+}
+
+void MultiPlanStage::removeRejectedPlans() {
+    // Move the best plan and the backup plan to the front of 'children'.
+    if (_bestPlanIdx != 0) {
+        std::swap(_children[_bestPlanIdx], _children[0]);
+        std::swap(_candidates[_bestPlanIdx], _candidates[0]);
+        if (_backupPlanIdx == 0) {
+            _backupPlanIdx = _bestPlanIdx;
+        }
+        _bestPlanIdx = 0;
+    }
+    size_t startIndex = 1;
+    if (_backupPlanIdx != kNoSuchPlan) {
+        if (_backupPlanIdx != 1) {
+            std::swap(_children[_backupPlanIdx], _children[1]);
+            std::swap(_candidates[_backupPlanIdx], _candidates[1]);
+            _backupPlanIdx = 1;
+        }
+        startIndex = 2;
+    }
+
+    _rejected.reserve(_children.size() - startIndex);
+    for (size_t i = startIndex; i < _children.size(); ++i) {
+        rejectPlan(i);
+    }
+    _children.resize(startIndex);
+}
+
+void MultiPlanStage::switchToBackupPlan() {
+    std::swap(_children[_backupPlanIdx], _children[_bestPlanIdx]);
+    std::swap(_candidates[_backupPlanIdx], _candidates[_bestPlanIdx]);
+    removeBackupPlan();
+}
+
+void MultiPlanStage::rejectPlan(size_t planIdx) {
+    auto rejectedPlan = std::move(_children[planIdx]);
+    if (opCtx() != nullptr) {
+        rejectedPlan->saveState();
+        rejectedPlan->detachFromOperationContext();
+    }
+    _rejected.emplace_back(std::move(rejectedPlan));
+}
+
+void MultiPlanStage::removeBackupPlan() {
+    rejectPlan(_backupPlanIdx);
+    _children.resize(1);
+    _backupPlanIdx = kNoSuchPlan;
 }
 
 bool MultiPlanStage::hasBackupPlan() const {
@@ -376,11 +453,18 @@ const QuerySolution* MultiPlanStage::bestSolution() const {
     return _candidates[_bestPlanIdx].solution.get();
 }
 
-std::unique_ptr<QuerySolution> MultiPlanStage::bestSolution() {
+std::unique_ptr<QuerySolution> MultiPlanStage::extractBestSolution() {
     if (_bestPlanIdx == kNoSuchPlan)
         return nullptr;
 
+    _bestPlanScore = _candidates[_bestPlanIdx].solution->score;
     return std::move(_candidates[_bestPlanIdx].solution);
+}
+
+bool MultiPlanStage::bestSolutionEof() const {
+    tassert(8523500, "The best plan is not chosen by the multi-planner", bestPlanChosen());
+    auto& bestPlan = _candidates[_bestPlanIdx];
+    return bestPlan.root->isEOF();
 }
 
 unique_ptr<PlanStageStats> MultiPlanStage::getStats() {
@@ -391,6 +475,9 @@ unique_ptr<PlanStageStats> MultiPlanStage::getStats() {
     for (auto&& child : _children) {
         ret->children.emplace_back(child->getStats());
     }
+    for (auto&& child : _rejected) {
+        ret->children.emplace_back(child->getStats());
+    }
     return ret;
 }
 
@@ -398,11 +485,22 @@ const SpecificStats* MultiPlanStage::getSpecificStats() const {
     return &_specificStats;
 }
 
+const plan_ranker::CandidatePlan& MultiPlanStage::getCandidate(size_t candidateIdx) const {
+    tassert(8223800,
+            str::stream() << "Invalid candidate plan index: " << candidateIdx
+                          << ", size: " << _candidates.size(),
+            candidateIdx < _candidates.size());
+    return _candidates[candidateIdx];
+}
+
 boost::optional<double> MultiPlanStage::getCandidateScore(size_t candidateIdx) const {
     tassert(5408301,
             str::stream() << "Invalid candidate plan index: " << candidateIdx
                           << ", size: " << _candidates.size(),
             candidateIdx < _candidates.size());
+    if (candidateIdx == static_cast<size_t>(_bestPlanIdx) && !_candidates[candidateIdx].solution) {
+        return _bestPlanScore;
+    }
     return _candidates[candidateIdx].solution->score;
 }
 

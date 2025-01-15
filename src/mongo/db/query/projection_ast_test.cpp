@@ -27,20 +27,34 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <boost/optional/optional_io.hpp>
-#include <map>
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <functional>
+#include <limits>
+#include <memory>
 #include <string>
-#include <vector>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/json.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
+#include "mongo/db/query/projection.h"
 #include "mongo/db/query/projection_ast.h"
 #include "mongo/db/query/projection_ast_util.h"
 #include "mongo/db/query/projection_parser.h"
-#include "mongo/db/query/query_planner_test_fixture.h"
+#include "mongo/db/query/projection_policies.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/platform/decimal128.h"
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace {
 
@@ -79,7 +93,7 @@ public:
     }
 };
 
-void assertCanClone(Projection proj) {
+void assertCanClone(Projection proj, size_t expectedNumGrandChildren) {
     boost::optional<Projection> optProj(std::move(proj));
 
     auto clone = optProj->root()->clone();
@@ -94,6 +108,19 @@ void assertCanClone(Projection proj) {
     // Make sure we can still serialize the clone.
     auto cloneBSON2 = projection_ast::astToDebugBSON(clone.get());
     ASSERT_BSONOBJ_EQ(cloneBSON, cloneBSON2);
+
+    // Iterate through the children to access the grandchildren. We want to make sure the cloned
+    // children aren't pointing to the original children. ASAN will pick this up if there's an
+    // issue.
+    size_t numGrandChildren = 0;
+    auto asPathNode = static_cast<projection_ast::ProjectionPathASTNode*>(clone.get());
+    for (const auto& field : asPathNode->fieldNames()) {
+        auto child = asPathNode->getChild(field);
+        // Use the "child" variable so it doesn't get optimized away. Without this, there is no
+        // access of "child" so ASAN won't pick up any potential errors.
+        numGrandChildren += child->children().size();
+    }
+    ASSERT_EQ(numGrandChildren, expectedNumGrandChildren);
 }
 
 TEST_F(ProjectionASTTest, TestParsingTypeEmptyProjectionIsExclusionInFind) {
@@ -335,21 +362,39 @@ TEST_F(ProjectionASTTest, TestCloningWithPositionalAndSlice) {
         parseWithFindFeaturesEnabled(fromjson("{'a.b': 1, b: 1, 'c.d.$': 1, f: {$slice: [1, 2]}}"),
                                      fromjson("{'c.d': {$gt: 1}}"));
     ASSERT(proj.type() == ProjectType::kInclusion);
-    assertCanClone(std::move(proj));
+    assertCanClone(std::move(proj), 2);
 }
 
 TEST_F(ProjectionASTTest, TestCloningWithElemMatch) {
     Projection proj =
         parseWithFindFeaturesEnabled(fromjson("{'a.b': 1, b: 1, f: {$elemMatch: {foo: 'bar'}}}"));
     ASSERT(proj.type() == ProjectType::kInclusion);
-    assertCanClone(std::move(proj));
+    assertCanClone(std::move(proj), 2);
 }
 
 TEST_F(ProjectionASTTest, TestCloningWithExpression) {
     Projection proj =
         parseWithDefaultPolicies(fromjson("{'a.b': 1, b: 1, f: {$add: [1, 2, '$a']}}"));
     ASSERT(proj.type() == ProjectType::kInclusion);
-    assertCanClone(std::move(proj));
+    assertCanClone(std::move(proj), 1);
+}
+
+TEST_F(ProjectionASTTest, TestCloningWithLargeProject) {
+    const size_t numFields = 200;
+    StringBuilder sb;
+    sb.append("{");
+    for (size_t i = 0; i < numFields; i++) {
+        sb.append("a" + std::to_string(i) + ": 1");
+        if (i == numFields - 1) {
+            sb.append("}");
+        } else {
+            sb.append(", ");
+        }
+    }
+
+    Projection proj = parseWithDefaultPolicies(fromjson(sb.str()));
+    ASSERT(proj.type() == ProjectType::kInclusion);
+    assertCanClone(std::move(proj), 0);
 }
 
 TEST_F(ProjectionASTTest, TestDebugBSONWithPositionalAndSliceSkipLimit) {
@@ -477,6 +522,62 @@ TEST_F(ProjectionASTTest, TestDebugBSONWithLiteralValue) {
     BSONObj output = projection_ast::astToDebugBSON(proj.root());
     BSONObj expected = fromjson("{a: {$const: 'abc'}, _id: true}");
     ASSERT_BSONOBJ_EQ(output, expected);
+}
+
+TEST_F(ProjectionASTTest, TestDebugLargeBSONWithLiteralValue) {
+    using namespace fmt::literals;
+    const auto joinFields = [](const std::vector<std::string>& fields) {
+        return "{{{}}}"_format(fmt::join(fields, ", "));
+    };
+    const auto compareProjectionAndFields = [&](const Projection& projection,
+                                                const std::vector<std::string>& fields) {
+        auto output = projection_ast::astToDebugBSON(projection.root());
+        auto expected = fromjson(joinFields(fields));
+        ASSERT_BSONOBJ_EQ(output, expected);
+    };
+
+    const size_t numFields = 2 * projection_ast::ProjectionPathASTNode::kUseMapThreshold;
+    std::vector<std::string> fields;
+    // Create a list of strings of the form "ai: {$const: 'i'}" where "i" is an integer. We will
+    // add/remove and eventually join this list together for testing debug output.
+    for (size_t i = 0; i < numFields; i++) {
+        std::string i_str = std::to_string(i);
+        fields.push_back("a{}: {{$const: '{}'}}"_format(i_str, i_str));
+    }
+
+    Projection proj = parseWithDefaultPolicies(fromjson(joinFields(fields)));
+
+    // _id: true is implicit.
+    fields.push_back("_id: true");
+    compareProjectionAndFields(proj, fields);
+
+    // Test removal of fields.
+    proj.root()->removeChild("a150");
+    fields.erase(fields.begin() + 150);
+    compareProjectionAndFields(proj, fields);
+
+    proj.root()->removeChild("a0");
+    fields.erase(fields.begin());
+    compareProjectionAndFields(proj, fields);
+
+    proj.root()->removeChild("a" + std::to_string(numFields - 1));
+    // We use -2 because we've removed two children previously.
+    fields.erase(fields.end() - 2);
+    compareProjectionAndFields(proj, fields);
+
+    // Test removal of implicit _id.
+    proj.root()->removeChild("_id");
+    fields.pop_back();
+    compareProjectionAndFields(proj, fields);
+
+    // Remove enough fields so that we are below the map threshold (100). Test that we still get
+    // the expected output below this size.
+    for (size_t i = 0; i < projection_ast::ProjectionPathASTNode::kUseMapThreshold + 50; i++) {
+        auto lastFieldName = proj.root()->fieldNames().back();
+        proj.root()->removeChild(lastFieldName);
+        fields.pop_back();
+        compareProjectionAndFields(proj, fields);
+    }
 }
 
 TEST_F(ProjectionASTTest, TestDebugBSONWithNestedLiteralValue) {
@@ -771,5 +872,63 @@ TEST_F(ProjectionASTTest, ShouldThrowWithPositionalOnExclusion) {
         parseWithFindFeaturesEnabled(fromjson("{'c.d.$': 0}"), fromjson("{'c.d': 1}")),
         DBException,
         31395);
+}
+
+TEST_F(ProjectionASTTest, TestASTRedaction) {
+    SerializationOptions options = SerializationOptions::kDebugShapeAndMarkIdentifiers_FOR_TEST;
+
+    auto proj = fromjson("{'a.b': 1}");
+    BSONObj output = projection_ast::serialize(*parseWithFindFeaturesEnabled(proj).root(), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<a>":{"HASH<b>":true},"HASH<_id>":true})",
+        output);
+
+    proj = fromjson("{'a.b': 0}");
+    output = projection_ast::serialize(*parseWithFindFeaturesEnabled(proj).root(), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<a>":{"HASH<b>":false}})",
+        output);
+
+    proj = fromjson("{a: 1, b: 1}");
+    output = projection_ast::serialize(*parseWithFindFeaturesEnabled(proj).root(), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<a>":true,"HASH<b>":true,"HASH<_id>":true})",
+        output);
+
+    // ElemMatch projection
+    proj = fromjson("{f: {$elemMatch: {foo: 'bar'}}}");
+    output = projection_ast::serialize(*parseWithFindFeaturesEnabled(proj).root(), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<f>":{"$elemMatch":{"HASH<foo>":{"$eq":"?string"}}},"HASH<_id>":true})",
+        output);
+
+    // Positional projection
+    proj = fromjson("{'x.$': 1}");
+    output = projection_ast::serialize(
+        *parseWithFindFeaturesEnabled(proj, fromjson("{'x.a': 2}")).root(), {});
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"x.$":true,"_id":true})",
+        output);
+
+    // Slice (first form)
+    proj = fromjson("{a: {$slice: 1}}");
+    output = projection_ast::serialize(*parseWithFindFeaturesEnabled(proj).root(), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<a>":{"$slice":"?number"}})",
+        output);
+
+    // Slice (second form)
+    proj = fromjson("{a: {$slice: [1, 3]}}");
+    output = projection_ast::serialize(*parseWithFindFeaturesEnabled(proj).root(), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<a>":{"$slice":["?number","?number"]}})",
+        output);
+
+    /// $meta projection
+    proj = fromjson("{foo: {$meta: 'indexKey'}}");
+    output = projection_ast::serialize(*parseWithFindFeaturesEnabled(proj).root(), options);
+    ASSERT_BSONOBJ_EQ_AUTO(  //
+        R"({"HASH<foo>":{"$meta":"indexKey"}})",
+        output);
 }
 }  // namespace

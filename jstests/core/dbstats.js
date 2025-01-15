@@ -1,14 +1,16 @@
 // Confirms that the dbStats command returns expected content.
 //
 // @tags: [
+//   # Asserts on the total number of indexes in dbStats.
+//   assumes_no_implicit_index_creation,
 //   requires_dbstats,
 //   requires_fcv_53,
 //   # The `dbstats` command builds in-memory structures that are not causally consistent.
 //   does_not_support_causal_consistency,
 // ]
-
-(function() {
-"use strict";
+import {
+    ClusteredCollectionUtil
+} from "jstests/libs/clustered_collections/clustered_collection_util.js";
 
 function serverIsMongos() {
     const res = db.runCommand("hello");
@@ -47,6 +49,9 @@ assert.eq(dataSize, dbStats.dataSize, tojson(dbStats));
 // Index count will vary on mongoS if an additional index is needed to support sharding.
 if (isMongoS) {
     assert(dbStats.hasOwnProperty("indexes"), tojson(dbStats));
+} else if (ClusteredCollectionUtil.areAllCollectionsClustered(db.getMongo())) {
+    // A clustered collection has no actual index on _id.
+    assert.eq(1, dbStats.indexes, tojson(dbStats));
 } else {
     assert.eq(2, dbStats.indexes, tojson(dbStats));
 }
@@ -99,4 +104,3 @@ const statsEmptyDB = testEmptyAndNonExistingDB.runCommand({dbStats: 1, freeStora
 assert.sameMembers(Object.keys(statsNonExistingDB),
                    Object.keys(statsEmptyDB),
                    "dbStats for non-existing and empty dbs should return the same fields");
-})();

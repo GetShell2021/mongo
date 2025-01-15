@@ -27,16 +27,18 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <iterator>
+#include <variant>
 
 #include "mongo/base/data_range_cursor.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/server_options.h"
-#include "mongo/rpc/object_check.h"
+#include "mongo/rpc/object_check.h"  // IWYU pragma: keep
+#include "mongo/stdx/type_traits.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/scopeguard.h"
 
 namespace {
@@ -44,11 +46,12 @@ namespace {
 using namespace mongo;
 using std::begin;
 using std::end;
-using std::swap;
 
 TEST(DataTypeValidated, BSONValidationEnabled) {
     bool wasEnabled = serverGlobalParams.objcheck;
-    const auto setValidation = [&](bool enabled) { serverGlobalParams.objcheck = enabled; };
+    const auto setValidation = [&](bool enabled) {
+        serverGlobalParams.objcheck = enabled;
+    };
     ON_BLOCK_EXIT([=] { setValidation(wasEnabled); });
 
     BSONObj valid = BSON("baz"

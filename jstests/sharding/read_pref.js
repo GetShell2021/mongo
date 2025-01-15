@@ -7,11 +7,10 @@
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
-(function() {
-'use strict';
-
-load("jstests/replsets/rslib.js");
+import {awaitRSClientHosts} from "jstests/replsets/rslib.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 var PRI_TAG = {dc: 'ny'};
 var SEC_TAGS = [{dc: 'sf', s: "1"}, {dc: 'ma', s: "2"}, {dc: 'eu', s: "3"}, {dc: 'jp', s: "4"}];
@@ -156,10 +155,14 @@ var doTest = function() {
     assert.eq(replTest.getPrimary().name, explainServer);
     assert.eq(1, explain.executionStats.nReturned);
 
+    // TODO (SERVER-83433): Add back the test coverage for running db hash check and validation
+    // on replica set that is fsync locked and has replica set endpoint enabled.
+    const stopOpts = {skipValidation: replTest.isReplicaSetEndpointActive()};
+
     // Kill all members except one
     var stoppedNodes = [];
     for (var x = 0; x < NODES - 1; x++) {
-        replTest.stop(x);
+        replTest.stop(x, null, stopOpts);
         stoppedNodes.push(replTest.nodes[x]);
     }
 
@@ -183,8 +186,7 @@ var doTest = function() {
         getExplain("primary");
     });
 
-    st.stop();
+    st.stop(stopOpts);
 };
 
 doTest();
-})();

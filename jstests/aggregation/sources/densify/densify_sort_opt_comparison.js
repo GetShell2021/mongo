@@ -4,17 +4,12 @@
  *   requires_fcv_53,
  *   requires_pipeline_optimization,
  *   do_not_wrap_aggregations_in_facets,
+ *   not_allowed_with_signed_security_token,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/window_function_helpers.js");
-load("jstests/aggregation/extras/utils.js");  // For arrayEq.
-load("jstests/libs/feature_flag_util.js");    // For isEnabled.
-load("jstests/libs/fixture_helpers.js");      // For FixtureHelpers.
-load("jstests/libs/fail_point_util.js");      // For configureFailPoint
+import {getExplainedPipelineFromAggregation} from "jstests/aggregation/extras/utils.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 function checkResults(pipeline, expectedNumberOfStatesInPipeline) {
     FixtureHelpers.runCommandOnEachPrimary({
@@ -125,4 +120,3 @@ FixtureHelpers.runCommandOnEachPrimary({
 });
 assert.commandWorked(
     db.adminCommand({'configureFailPoint': 'disablePipelineOptimization', 'mode': 'off'}));
-})();

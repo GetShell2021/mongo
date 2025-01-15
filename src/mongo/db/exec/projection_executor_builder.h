@@ -30,9 +30,14 @@
 #pragma once
 
 #include <bitset>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <memory>
 
 #include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/projection.h"
 #include "mongo/db/query/projection_ast.h"
+#include "mongo/db/query/projection_policies.h"
 
 namespace mongo::projection_executor {
 /**
@@ -63,6 +68,13 @@ enum BuilderParams : char {
      * implementation.
      */
     kAllowFastPath,
+
+    /**
+     * Indicates whether the projection executor is for inclusion only projection or not. The
+     * semantics of this flag should be consistent with the same flag in the
+     * 'InclusionProjectionExecutor'.
+     */
+    kNotInclusionOnly,
 
     /**
      * An internal value holding the total number of projection executor builder parameters.

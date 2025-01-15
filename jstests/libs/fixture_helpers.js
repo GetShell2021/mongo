@@ -1,12 +1,11 @@
-"use strict";
-
 /**
  * Helper functions that help get information or manipulate nodes in the fixture, whether it's a
  * replica set, a sharded cluster, etc.
  */
-var FixtureHelpers = (function() {
-    load("jstests/concurrency/fsm_workload_helpers/server_types.js");  // For isMongos.
+import {isMongos} from "jstests/concurrency/fsm_workload_helpers/server_types.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
+export var FixtureHelpers = (function() {
     function _getHostStringForReplSet(connectionToNodeInSet) {
         const isMaster = assert.commandWorked(connectionToNodeInSet.getDB("test").isMaster());
         assert(
@@ -55,8 +54,78 @@ var FixtureHelpers = (function() {
      * sharded.
      */
     function isSharded(coll) {
-        const db = coll.getDB();
-        return db.getSiblingDB("config").collections.find({_id: coll.getFullName()}).count() > 0;
+        const collEntry =
+            coll.getDB().getSiblingDB("config").collections.findOne({_id: coll.getFullName()});
+        if (collEntry === null) {
+            return false;
+        }
+        return collEntry.unsplittable === null || !collEntry.unsplittable;
+    }
+
+    /**
+     * Looks for an entry in the sharding catalog for the given collection, to check whether it's
+     * unsplittable.
+     */
+    function isUnsplittable(coll) {
+        const collEntry =
+            coll.getDB().getSiblingDB("config").collections.findOne({_id: coll.getFullName()});
+        if (collEntry === null) {
+            return false;
+        }
+        return collEntry.unsplittable !== null && collEntry.unsplittable;
+    }
+
+    /**
+     * Looks for an entry in the sharding catalog for the given collection to check whether it is
+     * present.
+     *
+     * TODO (SERVER-86443): remove this utility once all collections are tracked.
+     */
+    function isTracked(coll) {
+        return isSharded(coll) || isUnsplittable(coll);
+    }
+
+    /**
+     * Returns an array with the shardIds that own data for the given collection.
+     */
+    function getShardsOwningDataForCollection(coll) {
+        if (isSharded(coll) || isUnsplittable(coll)) {
+            const res = db.getSiblingDB('config')
+                .collections
+                .aggregate([
+                    {$match: {_id: coll.getFullName()}},
+                    {
+                        $lookup:
+                            {from: 'chunks', localField: 'uuid', foreignField: 'uuid', as: 'chunks'}
+                    },
+                    {$group: {_id: '$chunks.shard'}}
+                ])
+                .toArray();
+            return res.map((x) => x._id).flat();
+        } else {
+            const dbMetadata =
+                db.getSiblingDB('config').databases.findOne({_id: coll.getDB().getName()});
+            return dbMetadata ? [dbMetadata.primary] : [];
+        }
+    }
+
+    /**
+     * Utility to determine whether the collections in 'collList' are colocated or not.
+     */
+    function areCollectionsColocated(collList) {
+        if (!FixtureHelpers.isMongos(db)) {
+            return true;
+        }
+        let set = new Set();
+        for (const coll of collList) {
+            for (const shard of getShardsOwningDataForCollection(coll)) {
+                set.add(shard);
+                if (set.size > 1) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /**
@@ -64,6 +133,16 @@ var FixtureHelpers = (function() {
      */
     function getViewDefinition(db, collName) {
         return db.getCollectionInfos({type: "view", name: collName}).shift();
+    }
+
+    function getTopologyTime(db) {
+        const shards =
+            db.getSiblingDB('config').shards.find({}).sort({'topologyTime': -1}).limit(1).toArray();
+        if (!shards.length) {
+            // In case we are on a replicaset config.shards is empty
+            return Timestamp();
+        }
+        return shards[0].topologyTime;
     }
 
     /**
@@ -96,13 +175,12 @@ var FixtureHelpers = (function() {
      * functions. If the fixture is a standalone, will run the function on the database directly.
      */
     function mapOnEachShardNode({db, func, primaryNodeOnly}) {
-        function getRequestedConns(host) {
-            const conn = new Mongo(host);
+        function getRequestedConns(conn) {
             const isMaster = conn.getDB("test").isMaster();
 
             if (isMaster.hasOwnProperty("setName")) {
                 // It's a repl set.
-                const rs = new ReplSetTest(host);
+                const rs = new ReplSetTest(isMaster.me);
                 return primaryNodeOnly ? [rs.getPrimary()] : rs.nodes;
             } else {
                 // It's a standalone.
@@ -115,10 +193,12 @@ var FixtureHelpers = (function() {
             const shardObjs = db.getSiblingDB("config").shards.find().sort({_id: 1}).toArray();
 
             for (let shardObj of shardObjs) {
-                connList = connList.concat(getRequestedConns(shardObj.host));
+                connList = connList.concat(
+                    getRequestedConns(new Mongo(shardObj.host, undefined, {gRPC: false})));
             }
         } else {
-            connList = connList.concat(getRequestedConns(db.getMongo().host));
+            connList = getRequestedConns(
+                new Mongo(db.getMongo().host, undefined, {gRPC: db.getMongo().isGRPC()}));
         }
 
         return connList.map((conn) => func(conn.getDB(db.getName())));
@@ -158,7 +238,7 @@ var FixtureHelpers = (function() {
         configDB.databases.find().forEach(function(dbObj) {
             if (dbObj._id === db.getName()) {
                 const shardObj = configDB.shards.findOne({_id: dbObj.primary});
-                shardConn = new Mongo(shardObj.host);
+                shardConn = new Mongo(shardObj.host, undefined, {gRPC: false});
             }
         });
         assert.neq(null, shardConn, "could not find shard hosting database " + db.getName());
@@ -189,9 +269,21 @@ var FixtureHelpers = (function() {
         return primaryInfo.hasOwnProperty('setName');
     }
 
+    /**
+     * Returns true if we have a standalone mongod.
+     */
+    function isStandalone(db) {
+        return !isMongos(db) && !isReplSet(db);
+    }
+
     return {
         isMongos: isMongos,
         isSharded: isSharded,
+        isUnsplittable: isUnsplittable,
+        isTracked: isTracked,
+        areCollectionsColocated: areCollectionsColocated,
+        getShardsOwningDataForCollection: getShardsOwningDataForCollection,
+        getTopologyTime: getTopologyTime,
         getViewDefinition: getViewDefinition,
         numberOfShardsForCollection: numberOfShardsForCollection,
         awaitReplication: awaitReplication,
@@ -204,5 +296,6 @@ var FixtureHelpers = (function() {
         getSecondaries: getSecondaries,
         getPrimaryForNodeHostingDatabase: getPrimaryForNodeHostingDatabase,
         isReplSet: isReplSet,
+        isStandalone: isStandalone,
     };
 })();

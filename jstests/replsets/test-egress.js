@@ -2,8 +2,7 @@
 // @tags: [
 // ]
 
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const rst = new ReplSetTest({nodes: 3});
 rst.startSet();
@@ -24,4 +23,3 @@ rst.nodeList().forEach(function(host) {
 });
 
 rst.stopSet();
-}());

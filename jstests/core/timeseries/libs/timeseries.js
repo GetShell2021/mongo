@@ -1,67 +1,108 @@
 // Helper functions for testing time-series collections.
 
-load("jstests/libs/feature_flag_util.js");
-load("jstests/aggregation/extras/utils.js");
+import {documentEq} from "jstests/aggregation/extras/utils.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
-var TimeseriesTest = class {
-    /**
-     * Returns whether time-series bucket compression are supported.
-     */
-    static timeseriesBucketCompressionEnabled(conn) {
-        return FeatureFlagUtil.isEnabled(conn, "TimeseriesBucketCompression");
+export var TimeseriesTest = class {
+    static verifyAndDropIndex(coll, bucketsColl, shouldHaveOriginalSpec, indexName) {
+        const checkIndexSpec = function(spec, userIndex) {
+            assert(spec.hasOwnProperty("v"));
+            assert(spec.hasOwnProperty("name"));
+            assert(spec.hasOwnProperty("key"));
+
+            if (userIndex) {
+                assert(!spec.hasOwnProperty("originalSpec"));
+                return;
+            }
+
+            if (shouldHaveOriginalSpec) {
+                assert(spec.hasOwnProperty("originalSpec"));
+                assert.eq(spec.v, spec.originalSpec.v);
+                assert.eq(spec.name, spec.originalSpec.name);
+                assert.neq(spec.key, spec.originalSpec.key);
+                assert.eq(spec.collation, spec.originalSpec.collation);
+            } else {
+                assert(!spec.hasOwnProperty("originalSpec"));
+            }
+        };
+        let sawIndex = false;
+
+        let userIndexes = coll.getIndexes();
+        for (const index of userIndexes) {
+            if (index.name === indexName) {
+                sawIndex = true;
+                checkIndexSpec(index, /*userIndex=*/ true);
+            }
+        }
+
+        let bucketIndexes = bucketsColl.getIndexes();
+        for (const index of bucketIndexes) {
+            if (index.name === indexName) {
+                sawIndex = true;
+                checkIndexSpec(index, /*userIndex=*/ false);
+            }
+        }
+
+        assert(sawIndex,
+               `Index with name: ${indexName} is missing: ${tojson({userIndexes, bucketIndexes})}`);
+
+        assert.commandWorked(coll.dropIndexes(indexName));
     }
 
-    /**
-     * Returns whether time-series scalability improvements (like bucket reopening) are enabled.
-     */
-    static timeseriesScalabilityImprovementsEnabled(conn) {
-        return FeatureFlagUtil.isEnabled(conn, "TimeseriesScalabilityImprovements");
+    static insertManyDocs(coll) {
+        jsTestLog("Inserting documents to a bucket.");
+        coll.insertMany(
+            [...Array(10).keys()].map(i => ({
+                                          "metadata": {"sensorId": 1, "type": "temperature"},
+                                          "timestamp": ISODate(),
+                                          "temp": i
+                                      })),
+            {ordered: false});
+    }
+    static getBucketMaxSpanSecondsFromGranularity(granularity) {
+        switch (granularity) {
+            case 'seconds':
+                return 60 * 60;
+            case 'minutes':
+                return 60 * 60 * 24;
+            case 'hours':
+                return 60 * 60 * 24 * 30;
+            default:
+                assert(false, 'Invalid granularity: ' + granularity);
+        }
     }
 
-    /**
-     * Returns whether time-series updates and deletes are supported.
-     */
-    static timeseriesUpdatesAndDeletesEnabled(conn) {
-        return assert
-            .commandWorked(
-                conn.adminCommand({getParameter: 1, featureFlagTimeseriesUpdatesAndDeletes: 1}))
-            .featureFlagTimeseriesUpdatesAndDeletes.value;
+    static getBucketRoundingSecondsFromGranularity(granularity) {
+        switch (granularity) {
+            case 'seconds':
+                return 60;
+            case 'minutes':
+                return 60 * 60;
+            case 'hours':
+                return 60 * 60 * 24;
+            default:
+                assert(false, 'Invalid granularity: ' + granularity);
+        }
     }
 
-    /**
-     * Returns whether sharded time-series updates and deletes are supported.
-     */
-    static shardedTimeseriesUpdatesAndDeletesEnabled(conn) {
-        return assert
-            .commandWorked(
-                conn.adminCommand({getParameter: 1, featureFlagShardedTimeSeriesUpdateDelete: 1}))
-            .featureFlagShardedTimeSeriesUpdateDelete.value;
+    static bucketsMayHaveMixedSchemaData(coll) {
+        const catalog = coll.aggregate([{$listCatalog: {}}]).toArray()[0];
+        const tsMixedSchemaOptionNewFormat = catalog.md.options.storageEngine &&
+            catalog.md.options.storageEngine.wiredTiger &&
+            catalog.md.options.storageEngine.wiredTiger.configString;
+        // TODO SERVER-92533 Simplify once SERVER-91195 is backported to all supported branches
+        if (tsMixedSchemaOptionNewFormat !== undefined) {
+            return tsMixedSchemaOptionNewFormat ==
+                "app_metadata=(timeseriesBucketsMayHaveMixedSchemaData=true)";
+        } else {
+            return catalog.md.timeseriesBucketsMayHaveMixedSchemaData;
+        }
     }
 
-    static shardedtimeseriesCollectionsEnabled(conn) {
-        return assert
-            .commandWorked(conn.adminCommand({getParameter: 1, featureFlagShardedTimeSeries: 1}))
-            .featureFlagShardedTimeSeries.value;
-    }
-
-    static shardedTimeseriesUpdatesAndDeletesEnabled(conn) {
-        return assert
-            .commandWorked(
-                conn.adminCommand({getParameter: 1, featureFlagShardedTimeSeriesUpdateDelete: 1}))
-            .featureFlagShardedTimeSeriesUpdateDelete.value;
-    }
-
-    static timeseriesMetricIndexesEnabled(conn) {
-        return assert
-            .commandWorked(
-                conn.adminCommand({getParameter: 1, featureFlagTimeseriesMetricIndexes: 1}))
-            .featureFlagTimeseriesMetricIndexes.value;
-    }
-
-    static bucketUnpackWithSortEnabled(conn) {
-        return assert
-            .commandWorked(conn.adminCommand({getParameter: 1, featureFlagBucketUnpackWithSort: 1}))
-            .featureFlagBucketUnpackWithSort.value;
+    // TODO SERVER-68058 remove this helper.
+    static arbitraryUpdatesEnabled(conn) {
+        return FeatureFlagUtil.isPresentAndEnabled(conn, "TimeseriesUpdatesSupport");
     }
 
     /**
@@ -74,6 +115,28 @@ var TimeseriesTest = class {
             fields[field] = Math.max(fields[field], 0);
             fields[field] = Math.min(fields[field], 100);
         }
+    }
+
+    /**
+     * Decompresses a compressed bucket document. Replaces the compressed data in-place.
+     */
+    static decompressBucket(compressedBucket) {
+        assert.hasFields(
+            compressedBucket,
+            ["control"],
+            "TimeseriesTest.decompressBucket() should only be called on a bucket document");
+        if (compressedBucket.control.version == 1) {
+            // Bucket is already decompressed.
+            return;
+        }
+
+        for (const column in compressedBucket.data) {
+            compressedBucket.data[column] = decompressBSONColumn(compressedBucket.data[column]);
+        }
+
+        // The control object should reflect that the data is uncompressed.
+        compressedBucket.control.version = TimeseriesTest.BucketVersion.kUncompressed;
+        delete compressedBucket.control.count;
     }
 
     /**
@@ -206,7 +269,7 @@ var TimeseriesTest = class {
 
     static ensureDataIsDistributedIfSharded(coll, splitPointDate) {
         const db = coll.getDB();
-        const buckets = db["system.buckets." + coll.getName()];
+        const buckets = db[this.getBucketsCollName(coll.getName())];
         if (FixtureHelpers.isSharded(buckets)) {
             const timeFieldName =
                 db.getCollectionInfos({name: coll.getName()})[0].options.timeseries.timeField;
@@ -255,4 +318,81 @@ var TimeseriesTest = class {
             }
         }
     }
+
+    static getBucketsCollName(collName) {
+        return `system.buckets.${collName}`;
+    }
+
+    static assertInsertWorked(res) {
+        // TODO (SERVER-85548): Remove helper and revert to assert.commandWorked, no expected error
+        // codes
+        return assert.commandWorkedOrFailedWithCode(res, [8555700, 8555701]);
+    }
+
+    static isBucketCompressed(version) {
+        return (version == TimeseriesTest.BucketVersion.kCompressedSorted ||
+                version == TimeseriesTest.BucketVersion.kCompressedUnsorted);
+    }
+
+    // Timeseries stats are not returned if there are no timeseries collection. This is a helper to
+    // handle that case when tests drop their timeseries collections.
+    static getStat(stats, name) {
+        if (stats.hasOwnProperty(name))
+            return stats[name];
+        return 0;
+    }
+
+    // Check that the hint method can be used with the bucket/user collection index specified by
+    // `indexName`. Ensure that this is not possible when the specified index is hidden. Note that
+    // the `indexName` parameter is expected to be the same for both the buckets collection and
+    // timeseries view.
+    static checkHint(coll, indexName, numDocsExpected) {
+        const db = coll.getDB();
+        const bucketsColl = db[this.getBucketsCollName(coll.getName())];
+
+        // Tests hint() using the index name.
+        assert.eq(numDocsExpected, bucketsColl.find().hint(indexName).toArray().length);
+        assert.eq(numDocsExpected, coll.find().hint(indexName).toArray().length);
+
+        // Tests that hint() cannot be used when the index is hidden.
+        assert.commandWorked(coll.hideIndex(indexName));
+        assert.commandFailedWithCode(
+            assert.throws(() => bucketsColl.find().hint(indexName).toArray()), ErrorCodes.BadValue);
+        assert.commandFailedWithCode(assert.throws(() => coll.find().hint(indexName).toArray()),
+                                                  ErrorCodes.BadValue);
+
+        // Unhide the index and make sure that it can be used again.
+        assert.commandWorked(coll.unhideIndex(indexName));
+        assert.eq(numDocsExpected, bucketsColl.find().hint(indexName).toArray().length);
+        assert.eq(numDocsExpected, coll.find().hint(indexName).toArray().length);
+    }
+
+    static checkIndex(coll, userKeyPattern, bucketsKeyPattern, numDocsExpected) {
+        const db = coll.getDB();
+        const bucketsColl = db[this.getBucketsCollName(coll.getName())];
+
+        const expectedName =
+            Object.entries(userKeyPattern).map(([key, value]) => `${key}_${value}`).join('_');
+
+        // Check definition on view
+        const userIndexes = Object.fromEntries(coll.getIndexes().map(idx => [idx.name, idx]));
+        assert.contains(expectedName, Object.keys(userIndexes));
+        assert.eq(expectedName, userIndexes[expectedName].name);
+        assert.eq(userKeyPattern, userIndexes[expectedName].key);
+
+        // Check definition on buckets collection
+        const bucketIndexes =
+            Object.fromEntries(bucketsColl.getIndexes().map(idx => [idx.name, idx]));
+        assert.contains(expectedName, Object.keys(bucketIndexes));
+        assert.eq(expectedName, bucketIndexes[expectedName].name);
+        assert.eq(bucketsKeyPattern, bucketIndexes[expectedName].key);
+
+        this.checkHint(coll, expectedName, numDocsExpected);
+    }
+};
+
+TimeseriesTest.BucketVersion = {
+    kUncompressed: 1,
+    kCompressedSorted: 2,
+    kCompressedUnsorted: 3
 };

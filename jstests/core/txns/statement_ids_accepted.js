@@ -1,14 +1,15 @@
 // Makes sure all commands which are supposed to take statement ids do.  This should test all
 // commands that are allowed in transactions.
+//
 // @tags: [
+//    # The test runs commands that are not allowed with security token: endSession,
+//    # prepareTransaction.
+//    not_allowed_with_signed_security_token,
 //    uses_transactions,
 //    uses_prepare_transaction,
-//    # Tenant migrations don't support applyOps.
-//    tenant_migration_incompatible
 // ]
 
-(function() {
-"use strict";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
 
 const dbName = "test";
 const collName = "statement_ids_accepted";
@@ -170,8 +171,7 @@ assert.commandWorked(sessionDb.adminCommand({
     autocommit: false
 }));
 
-const isMongos = assert.commandWorked(db.runCommand("hello")).msg === "isdbgrid";
-if (!isMongos) {
+if (!FixtureHelpers.isMongos(db)) {
     // Skip commands that do not exist on mongos.
 
     jsTestLog("Check that prepareTransaction accepts a statement ID");
@@ -230,4 +230,3 @@ assert.commandWorked(sessionDb.adminCommand({
 }));
 
 session.endSession();
-}());

@@ -7,17 +7,21 @@
  *   requires_majority_read_concern,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");  // For arrayEq().
-load("jstests/libs/analyze_plan.js");         // For assertStagesForExplainOfCommand().
-load("jstests/libs/profiler.js");             // For profilerHas*OrThrow helper functions.
-load("jstests/sharding/libs/find_chunks_util.js");
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
+import {
+    profilerHasAtLeastOneMatchingEntryOrThrow,
+    profilerHasSingleMatchingEntryOrThrow,
+    profilerHasZeroMatchingEntriesOrThrow,
+} from "jstests/libs/profiler.js";
+import {assertStagesForExplainOfCommand} from "jstests/libs/query/analyze_plan.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {findChunksUtil} from "jstests/sharding/libs/find_chunks_util.js";
 
 const st = new ShardingTest({shards: 2});
 const kDbName = jsTestName();
 const ns = kDbName + '.coll';
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: kDbName, primaryShard: st.shard0.shardName}));
 
 // Enable 'retryWrites' so that the shard key fields are updatable.
 const session = st.s.startSession({retryWrites: true});
@@ -25,9 +29,6 @@ const sessionDB = session.getDatabase(kDbName);
 const coll = sessionDB["coll"];
 const shard0DB = st.shard0.getDB(kDbName);
 const shard1DB = st.shard1.getDB(kDbName);
-
-assert.commandWorked(st.s.adminCommand({enableSharding: kDbName}));
-st.ensurePrimaryShard(kDbName, st.shard0.shardName);
 
 /**
  * Enables profiling on both shards so that we can verify the targeting behaviour.
@@ -265,9 +266,10 @@ profileFilter = {
 };
 verifyProfilerEntryOnCorrectShard(0, profileFilter);
 
-// Op-style update with range query on hashed field, cannot route to single shard and hence
-// should fail.
-assert.commandFailedWithCode(coll.update({a: {$lt: 1}}, updateObj), ErrorCodes.InvalidOptions);
+// Sharded updateOnes that do not directly target a shard can now use the two phase write
+// protocol to execute.
+res = assert.commandWorked(coll.update({a: {$lt: 1}}, updateObj));
+assert.eq(res.nMatched, 1, res);
 
 // Test to verify that delete with full shard key in the query can be routed correctly.
 res = assert.commandWorked(coll.deleteOne({a: 1, b: {subObj: "str_1"}, c: 1}));
@@ -280,10 +282,9 @@ profileFilter = {
 };
 verifyProfilerEntryOnCorrectShard(1, profileFilter);
 
-// Test to verify that delete with limit:1, without full shard key in query fails.
-assert.commandFailedWithCode(
-    coll.runCommand({delete: coll.getName(), deletes: [{q: {a: 1}, limit: 1}], ordered: false}),
-    ErrorCodes.ShardKeyNotFound);
+// Sharded deleteOnes that do not directly target a shard can now use the two phase write
+// protocol to execute.
+assert.commandWorked(
+    coll.runCommand({delete: coll.getName(), deletes: [{q: {a: 1}, limit: 1}], ordered: false}));
 
 st.stop();
-})();

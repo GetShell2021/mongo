@@ -4,10 +4,8 @@
  * use.
  */
 
-(function() {
-"use strict";
-load("jstests/libs/write_concern_util.js");
-load("jstests/replsets/rslib.js");
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {reconfig} from "jstests/replsets/rslib.js";
 
 const name = jsTestName();
 const rst = new ReplSetTest({
@@ -52,4 +50,3 @@ assert.commandWorked(coll.insert({a: 1}));
 rst.awaitReplication();
 
 rst.stopSet();
-})();

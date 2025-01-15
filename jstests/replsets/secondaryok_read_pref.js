@@ -1,7 +1,6 @@
 // Test that secondaryOk is implicitly allowed for queries on a secondary with a read preference
 // other than 'primary', and that queries which do have 'primary' read preference fail.
-(function() {
-"use strict";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const readPrefs =
     [undefined, "primary", "secondary", "primaryPreferred", "secondaryPreferred", "nearest"];
@@ -23,7 +22,7 @@ const priDB = rst.getPrimary().getDB(jsTestName());
 assert(priDB.dropDatabase());
 
 assert.commandWorked(priDB.test.insert({a: 1}, {writeConcern: {w: "majority"}}));
-
+rst.awaitReplication();
 const secDB = rst.getSecondary().getDB(jsTestName());
 
 for (let readPref of readPrefs) {
@@ -62,9 +61,10 @@ assertNotPrimaryNoSecondaryOk(
         secondaryColl
             .aggregate([{$merge: {into: "target", whenMatched: "fail", whenNotMatched: "insert"}}])
             .itcount());
+/* eslint-disable */
 assertNotPrimaryNoSecondaryOk(() => secondaryColl.mapReduce(() => emit(this.a),
                                                             (k, v) => Array.sum(b),
                                                             {out: {replace: "target"}}));
+/* eslint-enable */
 
 rst.stopSet();
-})();

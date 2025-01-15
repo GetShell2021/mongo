@@ -32,7 +32,7 @@ global:
         - "mongo/s/catalog/types_validators.h" 
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/sharding_types.idl"
 
 structs:
@@ -43,8 +43,8 @@ structs:
         fields:
             _id:
                 description: "Database name."
-                cpp_name: name
-                type: string
+                cpp_name: dbName
+                type: database_name
                 validator:
                     callback: "validateDatabaseName"
                 optional: false
@@ -52,15 +52,7 @@ structs:
                 description: "Primary shard for this database."
                 type: shard_id
                 validator:
-                    callback: "validateShardId"
-                optional: false
-            # The following field has been deprecated in 6.0 and should not be used
-            # TODO SERVER-63983 make this field optional
-            partitioned:
-                description: "Specify if it is allowed to create sharded collection on this database."
-                cpp_name: sharded
-                type: bool
-                default: false
+                    callback: "ShardId::validate"
                 optional: false
             version:
                 description: "Version of the database."

@@ -5,22 +5,15 @@
  * @tags: [requires_fcv_60, uses_transactions]
  */
 
-(function() {
-"use strict";
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 // This test makes assertions about the number of sessions, which are not compatible with
 // implicit sessions.
 TestData.disableImplicitSessions = true;
 
-const st = new ShardingTest({
-    shards: 1,
-    shardOptions: {
-        setParameter: {
-            TransactionRecordMinimumLifetimeMinutes: 0,
-            storeFindAndModifyImagesInSideCollection: true,
-        }
-    }
-});
+const st = new ShardingTest(
+    {shards: 1, rsOptions: {setParameter: {TransactionRecordMinimumLifetimeMinutes: 0}}});
 
 const shard0Rst = st.rs0;
 const shard0Primary = shard0Rst.getPrimary();
@@ -42,7 +35,8 @@ const parentLsid = {
     id: sessionUUID
 };
 
-const kInternalTxnNumber = NumberLong(0);
+const kInitialInternalTxnNumber = 50123;
+let currentInternalTxnNumber = kInitialInternalTxnNumber;
 
 let numTransactionsCollEntries = 0;
 let numImageCollEntries = 0;
@@ -54,21 +48,34 @@ const childLsid0 = {
     id: sessionUUID,
     txnUUID: UUID()
 };
-assert.commandWorked(testDB.runCommand({
-    update: kCollName,
-    updates: [{q: {_id: 0}, u: {$set: {a: 0}}}],
-    lsid: childLsid0,
-    txnNumber: kInternalTxnNumber,
-    startTransaction: true,
-    autocommit: false
-}));
-assert.commandWorked(testDB.adminCommand(
-    {commitTransaction: 1, lsid: childLsid0, txnNumber: kInternalTxnNumber, autocommit: false}));
+
+withRetryOnTransientTxnError(() => {
+    currentInternalTxnNumber++;
+
+    assert.commandWorked(testDB.runCommand({
+        update: kCollName,
+        updates: [{q: {_id: 0}, u: {$set: {a: 0}}}],
+        lsid: childLsid0,
+        txnNumber: NumberLong(currentInternalTxnNumber),
+        startTransaction: true,
+        autocommit: false
+    }));
+
+    assert.commandWorked(testDB.adminCommand({
+        commitTransaction: 1,
+        lsid: childLsid0,
+        txnNumber: NumberLong(currentInternalTxnNumber),
+        autocommit: false
+    }));
+});
 numTransactionsCollEntries++;
 
-assert.eq(numTransactionsCollEntries, transactionsCollOnPrimary.find().itcount());
+// Use a filter to skip transactions from internal metadata operations if we're running in catalog
+// shard mode.
+assert.eq(numTransactionsCollEntries,
+          transactionsCollOnPrimary.find({txnNum: currentInternalTxnNumber}).itcount());
 
-const parentTxnNumber1 = NumberLong(1);
+const parentTxnNumber1 = NumberLong(55123);
 
 assert.commandWorked(testDB.runCommand({
     update: kCollName,
@@ -84,22 +91,41 @@ const childLsid1 = {
     txnNumber: parentTxnNumber1,
     txnUUID: UUID()
 };
-assert.commandWorked(testDB.runCommand({
-    findAndModify: kCollName,
-    query: {_id: 0},
-    update: {$set: {c: 0}},
-    lsid: childLsid1,
-    txnNumber: kInternalTxnNumber,
-    stmtId: NumberInt(1),
-    startTransaction: true,
-    autocommit: false
-}));
-assert.commandWorked(testDB.adminCommand(
-    {commitTransaction: 1, lsid: childLsid1, txnNumber: kInternalTxnNumber, autocommit: false}));
+
+withRetryOnTransientTxnError(() => {
+    currentInternalTxnNumber++;
+
+    assert.commandWorked(testDB.runCommand({
+        findAndModify: kCollName,
+        query: {_id: 0},
+        update: {$set: {c: 0}},
+        lsid: childLsid1,
+        txnNumber: NumberLong(currentInternalTxnNumber),
+        stmtId: NumberInt(1),
+        startTransaction: true,
+        autocommit: false
+    }));
+
+    assert.commandWorked(testDB.adminCommand({
+        commitTransaction: 1,
+        lsid: childLsid1,
+        txnNumber: NumberLong(currentInternalTxnNumber),
+        autocommit: false
+    }));
+});
+
 numTransactionsCollEntries++;
 numImageCollEntries++;
 
-assert.eq(numTransactionsCollEntries, transactionsCollOnPrimary.find().itcount());
+assert.eq(numTransactionsCollEntries,
+          transactionsCollOnPrimary
+              .find({
+                  $or: [
+                      {txnNum: {$gte: kInitialInternalTxnNumber, $lte: currentInternalTxnNumber}},
+                      {txnNum: parentTxnNumber1}
+                  ]
+              })
+              .itcount());
 assert.eq(numImageCollEntries, imageCollOnPrimary.find().itcount());
 
 assert.commandWorked(shard0Primary.adminCommand({refreshLogicalSessionCacheNow: 1}));
@@ -114,10 +140,13 @@ assert.commandWorked(shard0Primary.adminCommand({reapLogicalSessionCacheNow: 1})
 jsTest.log(
     "Verify that the config.transactions entries and config.image_collection got reaped " +
     "since the config.system.sessions entry for the parent session had already been deleted");
-assert.eq(0,
-          transactionsCollOnPrimary.find().itcount(),
-          tojson(transactionsCollOnPrimary.find().toArray()));
+let txnsOnPrimary = transactionsCollOnPrimary.find({
+    $or: [
+        {txnNum: {$gte: kInitialInternalTxnNumber, $lte: currentInternalTxnNumber}},
+        {txnNum: parentTxnNumber1}
+    ]
+});
+assert.eq(0, txnsOnPrimary.itcount(), tojson(txnsOnPrimary.toArray()));
 assert.eq(0, imageCollOnPrimary.find().itcount());
 
 st.stop();
-})();

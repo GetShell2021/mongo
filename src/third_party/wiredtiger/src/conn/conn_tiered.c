@@ -30,153 +30,6 @@ __tiered_server_run_chk(WT_SESSION_IMPL *session)
 }
 
 /*
- * __flush_tier_wait --
- *     Wait for all previous work units queued to be processed.
- */
-static int
-__flush_tier_wait(WT_SESSION_IMPL *session, const char **cfg)
-{
-    WT_CONFIG_ITEM cval;
-    WT_CONNECTION_IMPL *conn;
-    uint64_t now, start, timeout;
-    int yield_count;
-
-    conn = S2C(session);
-    yield_count = 0;
-    now = start = 0;
-    /*
-     * The internal thread needs the schema lock to perform its operations and flush tier also
-     * acquires the schema lock. We cannot be waiting in this function while holding that lock or no
-     * work will get done.
-     */
-    WT_ASSERT(session, !FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_SCHEMA));
-    WT_RET(__wt_config_gets(session, cfg, "timeout", &cval));
-    timeout = (uint64_t)cval.val;
-    if (timeout != 0)
-        __wt_seconds(session, &start);
-
-    /*
-     * It may be worthwhile looking at the add and decrement values and make choices of whether to
-     * yield or wait based on how much of the workload has been performed. Flushing operations could
-     * take a long time so yielding may not be effective.
-     */
-    while (!WT_FLUSH_STATE_DONE(conn->flush_state)) {
-        if (start != 0) {
-            __wt_seconds(session, &now);
-            if (now - start > timeout)
-                return (EBUSY);
-        }
-        if (++yield_count < WT_THOUSAND)
-            __wt_yield();
-        else {
-            __wt_cond_signal(session, conn->tiered_cond);
-            __wt_cond_wait(session, conn->flush_cond, 200, NULL);
-        }
-    }
-    return (0);
-}
-
-/*
- * __flush_tier_once --
- *     Perform one iteration of tiered storage maintenance.
- */
-static int
-__flush_tier_once(WT_SESSION_IMPL *session, uint32_t flags)
-{
-    WT_CKPT ckpt;
-    WT_CONFIG_ITEM cval;
-    WT_CONNECTION_IMPL *conn;
-    WT_CURSOR *cursor;
-    WT_DECL_RET;
-    uint64_t ckpt_time, flush_time;
-    const char *key, *value;
-
-    WT_UNUSED(flags);
-    __wt_verbose(session, WT_VERB_TIERED, "FLUSH_TIER_ONCE: Called flags %" PRIx32, flags);
-
-    conn = S2C(session);
-    cursor = NULL;
-    /*
-     * For supporting splits and merge:
-     * - See if there is any merging work to do to prepare and create an object that is
-     *   suitable for placing onto tiered storage.
-     * - Do the work to create said objects.
-     * - Move the objects.
-     */
-    conn->flush_state = 0;
-
-    /*
-     * We hold the checkpoint lock so we know no other thread can be doing a checkpoint at this time
-     * but our time can move backward with respect to the time set by a different thread that did a
-     * checkpoint. Update time value for most recent flush_tier, taking the more recent of now or
-     * the checkpoint time.
-     */
-    WT_ASSERT(session, FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_CHECKPOINT));
-    __wt_seconds(session, &flush_time);
-    /*
-     * XXX If/when flush tier no longer requires the checkpoint lock, all of these global values and
-     * their settings need consideration to make sure they don't race with a checkpoint.
-     */
-    conn->flush_ckpt_complete = false;
-    conn->flush_most_recent = WT_MAX(flush_time, conn->ckpt_most_recent);
-    conn->flush_ts = conn->txn_global.last_ckpt_timestamp;
-
-    /*
-     * Walk the metadata cursor to find tiered tables to flush. This should be optimized to avoid
-     * flushing tables that haven't changed.
-     */
-    WT_RET(__wt_metadata_cursor(session, &cursor));
-    while (cursor->next(cursor) == 0) {
-        cursor->get_key(cursor, &key);
-        cursor->get_value(cursor, &value);
-        /* For now just switch tiers which just does metadata manipulation. */
-        if (WT_PREFIX_MATCH(key, "tiered:")) {
-            __wt_verbose(
-              session, WT_VERB_TIERED, "FLUSH_TIER_ONCE: %s %s 0x%" PRIx32, key, value, flags);
-            if (!LF_ISSET(WT_FLUSH_TIER_FORCE)) {
-                /*
-                 * Check the table's last checkpoint time and only flush trees that have a
-                 * checkpoint more recent than the last flush time.
-                 */
-                WT_ERR(__wt_meta_checkpoint(session, key, NULL, &ckpt));
-                /*
-                 * XXX If/when flush tier no longer requires the checkpoint lock, this needs
-                 * consideration.
-                 */
-                ckpt_time = ckpt.sec;
-                __wt_meta_checkpoint_free(session, &ckpt);
-                WT_ERR(__wt_config_getones(session, value, "flush_time", &cval));
-
-                /* If nothing has changed, there's nothing to do. */
-                if (ckpt_time == 0 || (uint64_t)cval.val > ckpt_time) {
-                    WT_STAT_CONN_INCR(session, flush_tier_skipped);
-                    continue;
-                }
-            }
-            /* Only instantiate the handle if we need to flush. */
-            WT_ERR(__wt_session_get_dhandle(session, key, NULL, NULL, 0));
-            /*
-             * When we call wt_tiered_switch the session->dhandle points to the tiered: entry and
-             * the arg is the config string that is currently in the metadata.
-             */
-            WT_ERR(__wt_tiered_switch(session, value));
-            WT_STAT_CONN_INCR(session, flush_tier_switched);
-            WT_ERR(__wt_session_release_dhandle(session));
-        }
-    }
-    WT_ERR(__wt_metadata_cursor_release(session, &cursor));
-
-    /* Clear the flag on success. */
-    F_CLR(conn, WT_CONN_TIERED_FIRST_FLUSH);
-    return (0);
-
-err:
-    WT_TRET(__wt_session_release_dhandle(session));
-    WT_TRET(__wt_metadata_cursor_release(session, &cursor));
-    return (ret);
-}
-
-/*
  * __tier_storage_remove_local --
  *     Perform one iteration of tiered storage local object removal.
  */
@@ -187,6 +40,7 @@ __tier_storage_remove_local(WT_SESSION_IMPL *session)
     WT_TIERED_WORK_UNIT *entry;
     uint64_t now;
     const char *object;
+    bool removed;
 
     entry = NULL;
     for (;;) {
@@ -195,41 +49,37 @@ __tier_storage_remove_local(WT_SESSION_IMPL *session)
             break;
 
         __wt_seconds(session, &now);
-        __wt_tiered_get_drop_local(session, now, &entry);
+        __wt_tiered_get_remove_local(session, now, &entry);
         if (entry == NULL)
             break;
         WT_ERR(__wt_tiered_name(
           session, &entry->tiered->iface, entry->id, WT_TIERED_NAME_OBJECT, &object));
-        __wt_verbose(session, WT_VERB_TIERED, "REMOVE_LOCAL: %s at %" PRIu64, object, now);
+        __wt_verbose_debug2(session, WT_VERB_TIERED, "REMOVE_LOCAL: %s at %" PRIu64, object, now);
         WT_PREFIX_SKIP_REQUIRED(session, object, "object:");
         /*
          * If the handle is still open, it could still be in use for reading. In that case put the
          * work unit back on the work queue and keep trying.
          */
-        if (__wt_handle_is_open(session, object)) {
-            __wt_verbose(session, WT_VERB_TIERED, "REMOVE_LOCAL: %s in USE, queue again", object);
+        ret = __wt_remove_locked(session, object, &removed);
+        if (removed) {
+            /*
+             * We are responsible for freeing the work unit when we're done with it.
+             */
+            WT_ASSERT(session, ret == 0);
+            __wt_tiered_work_free(session, entry);
+        } else {
+            __wt_verbose_debug2(
+              session, WT_VERB_TIERED, "REMOVE_LOCAL: %s in USE, queue again", object);
             WT_STAT_CONN_INCR(session, local_objects_inuse);
             /*
-             * FIXME-WT-7470: If the object we want to remove is in use this is the place to call
-             * object sweep to clean up block->ofh file handles. Another alternative would be to try
-             * to sweep and then try the remove call below rather than pushing it back on the work
-             * queue. NOTE: Remove 'ofh' from s_string.ok when removing this comment.
-             *
              * Update the time on the entry before pushing it back on the queue so that we don't get
              * into an infinite loop trying to drop an open file that may be in use a while.
              */
             WT_ASSERT(session, entry->tiered != NULL && entry->tiered->bstorage != NULL);
             entry->op_val = now + entry->tiered->bstorage->retain_secs;
-            __wt_tiered_push_work(session, entry);
-        } else {
-            __wt_verbose(session, WT_VERB_TIERED, "REMOVE_LOCAL: actually remove %s", object);
-            WT_STAT_CONN_INCR(session, local_objects_removed);
-            WT_ERR(__wt_fs_remove(session, object, false));
-            /*
-             * We are responsible for freeing the work unit when we're done with it.
-             */
-            __wt_tiered_work_free(session, entry);
+            __wt_tiered_requeue_work(session, entry);
         }
+        WT_ERR(ret);
         entry = NULL;
     }
 err:
@@ -247,6 +97,7 @@ static int
 __tier_flush_meta(
   WT_SESSION_IMPL *session, WT_TIERED *tiered, const char *local_uri, const char *obj_uri)
 {
+    WT_BTREE *btree;
     WT_CONNECTION_IMPL *conn;
     WT_DATA_HANDLE *dhandle;
     WT_DECL_ITEM(buf);
@@ -262,6 +113,10 @@ __tier_flush_meta(
     WT_RET(__wt_scr_alloc(session, 512, &buf));
     dhandle = &tiered->iface;
 
+    WT_ASSERT_SPINLOCK_OWNED(session, &conn->checkpoint_lock);
+    WT_ASSERT_SPINLOCK_OWNED(session, &conn->schema_lock);
+    WT_UNUSED(conn); /* Avoid "unused variable" warnings in non-debug builds. */
+
     newconfig = obj_value = NULL;
     WT_ERR(__wt_meta_track_on(session));
     tracking = true;
@@ -271,10 +126,11 @@ __tier_flush_meta(
     /*
      * Once the flush call succeeds we want to first remove the file: entry from the metadata and
      * then update the object: metadata to indicate the flush is complete. Record the flush
-     * timestamp from the flush call. We know that no new flush_tier call can begin until all work
-     * from the last call completes, so the connection field is correct.
+     * timestamp from the btree handle, which is the last timestamp when this tree was flushed.
      */
-    __wt_timestamp_to_hex_string(conn->flush_ts, hex_timestamp);
+    WT_ASSERT_ALWAYS(session, WT_DHANDLE_BTREE(dhandle), "Expected a btree handle");
+    btree = dhandle->handle;
+    __wt_timestamp_to_hex_string(btree->flush_most_recent_ts, hex_timestamp);
     WT_ERR(__wt_metadata_remove(session, local_uri));
     WT_ERR(__wt_metadata_search(session, obj_uri, &obj_value));
     __wt_seconds(session, &now);
@@ -301,6 +157,35 @@ err:
 }
 
 /*
+ * __tier_release_local_object --
+ *     We no longer need the local object that was recently flushed to the cloud. Allow it to be
+ *     removed.
+ */
+static int
+__tier_release_local_object(WT_SESSION_IMPL *session, WT_TIERED *tiered, uint32_t id)
+{
+    WT_BM *bm;
+    WT_BTREE *btree;
+    WT_DECL_RET;
+    bool release;
+
+    release = false;
+    WT_ERR(__wt_session_get_dhandle(session, tiered->iface.name, NULL, NULL, 0));
+    release = true;
+
+    btree = S2BT(session);
+    bm = btree->bm;
+
+    WT_ERR(bm->switch_object_end(bm, session, id));
+
+err:
+    if (release)
+        WT_TRET(__wt_session_release_dhandle(session));
+
+    return (ret);
+}
+
+/*
  * __tier_do_operation --
  *     Perform one iteration of copying newly flushed objects to shared storage or post-flush
  *     processing.
@@ -310,17 +195,31 @@ __tier_do_operation(WT_SESSION_IMPL *session, WT_TIERED *tiered, uint32_t id, co
   const char *obj_uri, uint32_t op)
 {
     WT_CONFIG_ITEM pfx;
+    WT_DATA_HANDLE *dhandle;
     WT_DECL_RET;
     WT_FILE_SYSTEM *bucket_fs;
     WT_STORAGE_SOURCE *storage_source;
     size_t len;
     char *tmp;
-    const char *cfg[2], *local_name, *obj_name;
+    const char *cfg[2], *local_name, *obj_name, *sp_obj_name;
 
     WT_ASSERT(session, (op == WT_TIERED_WORK_FLUSH || op == WT_TIERED_WORK_FLUSH_FINISH));
+    dhandle = (WT_DATA_HANDLE *)tiered;
     tmp = NULL;
+    /*
+     * The work unit holds a reference on the dhandle so that the structure is valid to look at, but
+     * the dhandle could have been dropped. If it is, there is nothing to do.
+     */
+    WT_ASSERT(session, tiered->bstorage != NULL);
+    if (F_ISSET(dhandle, WT_DHANDLE_DROPPED)) {
+        __wt_verbose(session, WT_VERB_TIERED,
+          "DO_OP: DH %s flags 0x%" PRIx32 " not open or dropped tiered %p.", dhandle->name,
+          dhandle->flags, (void *)tiered);
+        return (0);
+    }
     storage_source = tiered->bstorage->storage_source;
     bucket_fs = tiered->bstorage->file_system;
+    WT_ASSERT(session, bucket_fs != NULL);
 
     local_name = local_uri;
     WT_PREFIX_SKIP_REQUIRED(session, local_name, "file:");
@@ -352,21 +251,35 @@ __tier_do_operation(WT_SESSION_IMPL *session, WT_TIERED *tiered, uint32_t id, co
          */
         if (ret == ENOENT)
             ret = 0;
-        else {
-            WT_ERR(ret);
+        else if (ret == 0) {
+            /* Cache the flushed content into chunk cache. */
+            WT_ERR(__wt_tiered_name(
+              session, &tiered->iface, 0, WT_TIERED_NAME_SKIP_PREFIX, &sp_obj_name));
+            WT_ERR_ERROR_OK(
+              __wt_chunkcache_ingest(session, local_name, sp_obj_name, id), ENOSPC, false);
+
+            /* We can now release the local object. */
+            WT_ERR(__tier_release_local_object(session, tiered, id));
 
             /*
              * After successful flushing, push a work unit to perform whatever post-processing the
              * shared storage wants to do for this object. Note that this work unit is unrelated to
-             * the drop local work unit below. They do not need to be in any order and do not
+             * the remove local work unit below. They do not need to be in any order and do not
              * interfere with each other.
              */
             WT_ERR(__wt_tiered_put_flush_finish(session, tiered, id));
             /*
-             * After successful flushing, push a work unit to drop the local object in the future.
+             * After successful flushing, push a work unit to remove the local object in the future.
              * The object will be removed locally after the local retention period expires.
              */
-            WT_ERR(__wt_tiered_put_drop_local(session, tiered, id));
+            WT_ERR(__wt_tiered_put_remove_local(session, tiered, id));
+        } else {
+            /*
+             * Continue with the error ignored if we've been told to do that.
+             */
+            if (FLD_ISSET(S2C(session)->debug_flags, WT_CONN_DEBUG_TIERED_FLUSH_ERROR_CONTINUE))
+                ret = 0;
+            WT_ERR(ret);
         }
     }
 
@@ -445,11 +358,15 @@ err:
 static int
 __tier_storage_copy(WT_SESSION_IMPL *session)
 {
+    WT_CONNECTION_IMPL *conn;
     WT_DECL_RET;
     WT_TIERED_WORK_UNIT *entry;
+    uint64_t ckpt_gen;
+    bool ckpt_running;
 
+    conn = S2C(session);
     /* There is nothing to do until the checkpoint after the flush completes. */
-    if (!S2C(session)->flush_ckpt_complete)
+    if (!__wt_atomic_loadbool(&conn->flush_ckpt_complete))
         return (0);
     entry = NULL;
     for (;;) {
@@ -458,13 +375,17 @@ __tier_storage_copy(WT_SESSION_IMPL *session)
             break;
 
         /*
-         * We probably need some kind of flush generation so that we don't process flush items for
-         * tables that are added during an in-progress flush_tier. This thread could run due to a
-         * condition timeout rather than a signal. Checking that generation number would be part of
-         * calling __wt_tiered_get_flush so that we don't pull it off the queue until we're sure we
-         * want to process it.
+         * We use the checkpoint generation to avoid processing the flush items for tables that are
+         * added during an in-progress flush_tier. This thread could run due to a condition timeout
+         * rather than a signal. First get the checkpoint generation, then check if it is running.
+         * If the checkpoint is running we can't process items from this generation count. If the
+         * checkpoint is not running, we can process the items with the read generation count. If
+         * the checkpoint starts after checking, it would push flush units of a higher count.
          */
-        __wt_tiered_get_flush(session, &entry);
+        ckpt_gen = __wt_gen(session, WT_GEN_CHECKPOINT);
+        WT_ACQUIRE_BARRIER();
+        WT_ACQUIRE_READ_WITH_BARRIER(ckpt_running, conn->txn_global.checkpoint_running);
+        __wt_tiered_get_flush(session, (ckpt_running ? ckpt_gen : ckpt_gen + 1), &entry);
         if (entry == NULL)
             break;
         WT_ERR(__tier_operation(session, entry->tiered, entry->id, WT_TIERED_WORK_FLUSH));
@@ -500,79 +421,6 @@ __tier_storage_remove(WT_SESSION_IMPL *session, bool force)
 }
 
 /*
- * __wt_flush_tier --
- *     Entry function for flush_tier method.
- */
-int
-__wt_flush_tier(WT_SESSION_IMPL *session, const char *config)
-{
-    WT_CONFIG_ITEM cval;
-    WT_CONNECTION_IMPL *conn;
-    WT_DECL_RET;
-    uint32_t flags;
-    const char *cfg[3];
-    const char *checkpoint_cfg[] = {WT_CONFIG_BASE(session, WT_SESSION_checkpoint), NULL};
-    bool locked, wait;
-
-    conn = S2C(session);
-    WT_STAT_CONN_INCR(session, flush_tier);
-    flags = 0;
-    cfg[0] = WT_CONFIG_BASE(session, WT_SESSION_flush_tier);
-    cfg[1] = (char *)config;
-    cfg[2] = NULL;
-    WT_RET(__wt_config_gets(session, cfg, "force", &cval));
-    if (cval.val)
-        LF_SET(WT_FLUSH_TIER_FORCE);
-    WT_RET(__wt_config_gets(session, cfg, "sync", &cval));
-    if (WT_STRING_MATCH("off", cval.str, cval.len))
-        LF_SET(WT_FLUSH_TIER_OFF);
-    else if (WT_STRING_MATCH("on", cval.str, cval.len))
-        LF_SET(WT_FLUSH_TIER_ON);
-
-    WT_RET(__wt_config_gets(session, cfg, "lock_wait", &cval));
-    if (cval.val)
-        wait = true;
-    else
-        wait = false;
-
-    /*
-     * We have to hold the lock around both the wait call for a previous flush tier and the
-     * execution of the current flush tier call.
-     */
-    if (wait)
-        __wt_spin_lock(session, &conn->flush_tier_lock);
-    else
-        WT_RET(__wt_spin_trylock(session, &conn->flush_tier_lock));
-    locked = true;
-
-    /*
-     * We cannot perform another flush tier until any earlier ones are done. Often threads will wait
-     * after the flush tier based on the sync setting so this check will be fast. But if sync is
-     * turned off then any following call must wait and will do so here. We have to wait while not
-     * holding the schema lock.
-     */
-    WT_ERR(__flush_tier_wait(session, cfg));
-    if (wait)
-        WT_WITH_CHECKPOINT_LOCK(
-          session, WT_WITH_SCHEMA_LOCK(session, ret = __flush_tier_once(session, flags)));
-    else
-        WT_WITH_CHECKPOINT_LOCK_NOWAIT(session, ret,
-          WT_WITH_SCHEMA_LOCK_NOWAIT(session, ret, ret = __flush_tier_once(session, flags)));
-    __wt_spin_unlock(session, &conn->flush_tier_lock);
-    locked = false;
-    if (FLD_ISSET(conn->debug_flags, WT_CONN_DEBUG_FLUSH_CKPT))
-        WT_ERR(__wt_txn_checkpoint(session, checkpoint_cfg, true));
-
-    if (ret == 0 && LF_ISSET(WT_FLUSH_TIER_ON))
-        WT_ERR(__flush_tier_wait(session, cfg));
-
-err:
-    if (locked)
-        __wt_spin_unlock(session, &conn->flush_tier_lock);
-    return (ret);
-}
-
-/*
  * __tiered_server --
  *     The tiered storage server thread.
  */
@@ -584,6 +432,7 @@ __tiered_server(void *arg)
     WT_ITEM path, tmp;
     WT_SESSION_IMPL *session;
     uint64_t cond_time, time_start, time_stop, timediff;
+    const char *msg;
     bool signalled;
 
     session = arg;
@@ -614,8 +463,11 @@ __tiered_server(void *arg)
          *  - Remove any cached objects that are aged out.
          */
         if (timediff >= conn->tiered_interval || signalled) {
+            msg = "tier_storage_copy";
             WT_ERR(__tier_storage_copy(session));
+            msg = "tier_storage_finish";
             WT_ERR(__tier_storage_finish(session));
+            msg = "tier_storage_remove";
             WT_ERR(__tier_storage_remove(session, false));
             time_start = time_stop;
         }
@@ -623,7 +475,7 @@ __tiered_server(void *arg)
 
     if (0) {
 err:
-        WT_IGNORE_RET(__wt_panic(session, ret, "storage server error"));
+        WT_IGNORE_RET(__wt_panic(session, ret, "storage server error from %s", msg));
     }
     __wt_buf_free(session, &path);
     __wt_buf_free(session, &tmp);
@@ -631,11 +483,11 @@ err:
 }
 
 /*
- * __wt_tiered_storage_create --
+ * __wti_tiered_storage_create --
  *     Start the tiered storage subsystem.
  */
 int
-__wt_tiered_storage_create(WT_SESSION_IMPL *session)
+__wti_tiered_storage_create(WT_SESSION_IMPL *session)
 {
     WT_CONNECTION_IMPL *conn;
     WT_DECL_RET;
@@ -663,17 +515,17 @@ __wt_tiered_storage_create(WT_SESSION_IMPL *session)
     if (0) {
 err:
         FLD_CLR(conn->server_flags, WT_CONN_SERVER_TIERED);
-        WT_TRET(__wt_tiered_storage_destroy(session, false));
+        WT_TRET(__wti_tiered_storage_destroy(session, false));
     }
     return (ret);
 }
 
 /*
- * __wt_tiered_storage_destroy --
+ * __wti_tiered_storage_destroy --
  *     Destroy the tiered storage server thread.
  */
 int
-__wt_tiered_storage_destroy(WT_SESSION_IMPL *session, bool final_flush)
+__wti_tiered_storage_destroy(WT_SESSION_IMPL *session, bool final_flush)
 {
     WT_CONNECTION_IMPL *conn;
     WT_DECL_RET;
@@ -689,7 +541,7 @@ __wt_tiered_storage_destroy(WT_SESSION_IMPL *session, bool final_flush)
         __wt_cond_signal(session, conn->flush_cond);
     if (final_flush && conn->tiered_cond != NULL) {
         __wt_cond_signal(session, conn->tiered_cond);
-        WT_TRET(__wt_tiered_flush_work_wait(session, 30));
+        __wt_tiered_flush_work_wait(session, 30);
     }
     FLD_CLR(conn->server_flags, WT_CONN_SERVER_TIERED);
     if (conn->tiered_tid_set) {

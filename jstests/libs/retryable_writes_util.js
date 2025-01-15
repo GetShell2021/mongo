@@ -1,7 +1,7 @@
 /**
  * Utilities for testing retryable writes.
  */
-var RetryableWritesUtil = (function() {
+export var RetryableWritesUtil = (function() {
     /**
      * Returns true if the error code is retryable, assuming the command is idempotent.
      *
@@ -33,7 +33,8 @@ var RetryableWritesUtil = (function() {
         "findAndModify",
         "insert",
         "update",
-        "testInternalTransactions"
+        "testInternalTransactions",
+        "bulkWrite"
     ]);
 
     /**
@@ -85,6 +86,48 @@ var RetryableWritesUtil = (function() {
         } else {
             assert.commandFailedWithCode(res, expectedErrorCode);
         }
+        return res;
+    }
+
+    function isFailedToSatisfyPrimaryReadPreferenceError(res) {
+        const kReplicaSetMonitorError =
+            /Could not find host matching read preference.*mode:.*primary/;
+        if (res.hasOwnProperty("errmsg")) {
+            return res.errmsg.match(kReplicaSetMonitorError);
+        }
+        if (res.hasOwnProperty("message")) {
+            return res.message.match(kReplicaSetMonitorError);
+        }
+        if (res.hasOwnProperty("writeErrors")) {
+            for (let writeError of res.writeErrors) {
+                if (writeError.errmsg.match(kReplicaSetMonitorError)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    function retryOnRetryableCode(fn, prefix) {
+        let ret;
+        assert.soon(() => {
+            try {
+                ret = fn();
+                return true;
+            } catch (e) {
+                if (RetryableWritesUtil.isRetryableCode(e.code)) {
+                    print(prefix + ", err: " + tojson(e));
+                    return false;
+                }
+                throw e;
+            }
+        });
+        return ret;
+    }
+
+    function runCommandWithRetries(conn, cmd) {
+        return retryOnRetryableCode(() => assert.commandWorked(conn.runCommand(cmd)),
+                                    "Retry interrupt: runCommand(" + tojson(cmd) + ")");
     }
 
     return {
@@ -94,5 +137,8 @@ var RetryableWritesUtil = (function() {
         checkTransactionTable,
         assertSameRecordOnBothConnections,
         runRetryableWrite,
+        isFailedToSatisfyPrimaryReadPreferenceError,
+        retryOnRetryableCode,
+        runCommandWithRetries
     };
 })();

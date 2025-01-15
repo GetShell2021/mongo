@@ -27,14 +27,20 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <vector>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
-#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/util/make_data_structure.h"
+#include "mongo/unittest/assert.h"
 #include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -56,7 +62,7 @@ TEST_F(InternalUnpackBucketSplitMatchOnMetaAndRename, OptimizeSplitsMatchAndMaps
     // predicate on 'control.min.a'. These two created $match stages should be added before
     // $_internalUnpackBucket and merged.
     auto serialized = pipeline->serializeToBson();
-    ASSERT_EQ(3u, serialized.size());
+    ASSERT_EQ(2u, serialized.size());
     ASSERT_BSONOBJ_EQ(fromjson("{$match: {$and: ["
                                "  {meta: {$gte: 0}},"
                                "  {meta: {$lte: 5}},"
@@ -68,8 +74,13 @@ TEST_F(InternalUnpackBucketSplitMatchOnMetaAndRename, OptimizeSplitsMatchAndMaps
                                "  ]}"
                                "]}}"),
                       serialized[0]);
-    ASSERT_BSONOBJ_EQ(unpack, serialized[1]);
-    ASSERT_BSONOBJ_EQ(fromjson("{$match: {a: {$lte: 4}}}"), serialized[2]);
+    ASSERT_BSONOBJ_EQ(fromjson("{ $_internalUnpackBucket: { "
+                               "exclude: [], "
+                               "timeField: \"foo\", "
+                               "metaField: \"myMeta\", "
+                               "bucketMaxSpanSeconds: 3600, "
+                               "eventFilter: { a: { $lte: 4 } } } }"),
+                      serialized[1]);
 }
 
 TEST_F(InternalUnpackBucketSplitMatchOnMetaAndRename, OptimizeMovesMetaMatchBeforeUnpack) {
@@ -94,10 +105,6 @@ TEST_F(InternalUnpackBucketSplitMatchOnMetaAndRename,
     auto unpack = fromjson(
         "{$_internalUnpackBucket: { exclude: [], timeField: 'foo', metaField: 'myMeta', "
         "bucketMaxSpanSeconds: 3600}}");
-    auto unpackExcluded = fromjson(
-        "{$_internalUnpackBucket: { include: ['_id', 'data'], timeField: 'foo', metaField: "
-        "'myMeta', "
-        "bucketMaxSpanSeconds: 3600}}");
     auto pipeline = Pipeline::parse(makeVector(unpack,
                                                fromjson("{$project: {data: 1}}"),
                                                fromjson("{$match: {myMeta: {$gte: 0}}}")),
@@ -109,7 +116,10 @@ TEST_F(InternalUnpackBucketSplitMatchOnMetaAndRename,
     // The $match on meta is not moved before $_internalUnpackBucket since the field is excluded.
     auto serialized = pipeline->serializeToBson();
     ASSERT_EQ(2u, serialized.size());
-    ASSERT_BSONOBJ_EQ(unpackExcluded, serialized[0]);
+    ASSERT_BSONOBJ_EQ(fromjson("{ $_internalUnpackBucket: { include: [ '_id', 'data' ], "
+                               "timeField: 'foo', metaField: 'myMeta', bucketMaxSpanSeconds: "
+                               "3600} }"),
+                      serialized[0]);
     ASSERT_BSONOBJ_EQ(fromjson("{$match: {myMeta: {$gte: 0}}}"), serialized[1]);
 }
 
@@ -134,7 +144,7 @@ TEST_F(InternalUnpackBucketSplitMatchOnMetaAndRename,
     // We should fail to split the match because of the $or clause. We should still be able to
     // map the predicate on 'x' to a predicate on the control field.
     auto serialized = pipeline->serializeToBson();
-    ASSERT_EQ(3u, serialized.size());
+    ASSERT_EQ(2u, serialized.size());
     auto expected = fromjson(
         "{$match: {$and: ["
         // Result of pushing down {x: {$lte: 1}}.
@@ -154,8 +164,13 @@ TEST_F(InternalUnpackBucketSplitMatchOnMetaAndRename,
         "  ]}"
         "]}}");
     ASSERT_BSONOBJ_EQ(expected, serialized[0]);
-    ASSERT_BSONOBJ_EQ(unpack, serialized[1]);
-    ASSERT_BSONOBJ_EQ(match, serialized[2]);
+    ASSERT_BSONOBJ_EQ(
+        fromjson(
+            "{ $_internalUnpackBucket: { "
+            "exclude: [], timeField: \"foo\", metaField: \"myMeta\", bucketMaxSpanSeconds: 3600, "
+            "eventFilter: { $and: [ { x: { $lte: 1 } }, { $or: [ { \"myMeta.a\": { $gt: 1 } }, { "
+            "y: { $lt: 1 } } ] } ] } } }"),
+        serialized[1]);
 }
 }  // namespace
 }  // namespace mongo

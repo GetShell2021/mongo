@@ -29,17 +29,24 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <cstdint>
 #include <string>
 
-#include <boost/optional.hpp>
-
 #include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/crypto/encryption_fields_gen.h"
 #include "mongo/db/catalog/clustered_collection_options_gen.h"
 #include "mongo/db/catalog/collection_options_gen.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/change_stream_pre_and_post_images_options_gen.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/util/string_map.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -80,8 +87,7 @@ struct CollectionOptions {
     /**
      * Converts a client "create" command invocation.
      */
-    static CollectionOptions fromCreateCommand(const NamespaceString& nss,
-                                               const CreateCommand& cmd);
+    static CollectionOptions fromCreateCommand(const CreateCommand& cmd);
 
     static StatusWith<long long> checkAndAdjustCappedSize(long long cappedSize);
     static StatusWith<long long> checkAndAdjustCappedMaxDocs(long long cappedMaxDocs);
@@ -125,11 +131,10 @@ struct CollectionOptions {
     } autoIndexId = DEFAULT;
 
     bool temp = false;
-    bool recordPreImages = false;
 
     // Change stream options define whether or not to store the pre-images of the documents affected
     // by update and delete operations in a dedicated collection, that will be used for reading data
-    // via changeStreams. Can not be enabled together with 'recordPreImages' (mutually exclusive).
+    // via changeStreams.
     ChangeStreamPreAndPostImagesOptions changeStreamPreAndPostImagesOptions{false};
 
     // Storage engine collection options. Always owned or empty.
@@ -169,5 +174,11 @@ struct CollectionOptions {
 
     // The options for collections with encrypted fields
     boost::optional<EncryptedFieldConfig> encryptedFieldConfig;
+
+    // When 'true', will use the same recordIds across all nodes in the replica set.
+    bool recordIdsReplicated = false;
 };
+
+Status validateChangeStreamPreAndPostImagesOptionIsPermitted(const NamespaceString& ns);
+
 }  // namespace mongo

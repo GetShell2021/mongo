@@ -1,6 +1,6 @@
 // Tests that adding an equivalent shard multiple times returns success.
-(function() {
-'use strict';
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 const st = new ShardingTest({name: "add_shard_idempotent", shards: 1});
 
@@ -40,4 +40,3 @@ for (let i = 0; i < shards.length; i++) {
 assert.gt(shard2TopologyTime, shard1TopologyTime);
 shard2.stopSet();
 st.stop();
-})();

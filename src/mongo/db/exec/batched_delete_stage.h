@@ -29,11 +29,25 @@
 
 #pragma once
 
+#include <cstddef>
+#include <memory>
+#include <set>
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/exec/batched_delete_stage_buffer.h"
 #include "mongo/db/exec/batched_delete_stage_gen.h"
 #include "mongo/db/exec/delete_stage.h"
+#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/write_stage_common.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/stage_types.h"
+#include "mongo/db/shard_role.h"
+#include "mongo/platform/atomic_word.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 
@@ -107,26 +121,26 @@ public:
                        std::unique_ptr<DeleteStageParams> params,
                        std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams,
                        WorkingSet* ws,
-                       const CollectionPtr& collection,
+                       CollectionAcquisition collection,
                        PlanStage* child);
-    ~BatchedDeleteStage();
+    ~BatchedDeleteStage() override;
 
     // Returns true when no more work can be done (there are no more deletes to commit).
-    bool isEOF() final;
+    bool isEOF() const final;
 
-    std::unique_ptr<PlanStageStats> getStats() final;
+    std::unique_ptr<mongo::PlanStageStats> getStats() final;
 
     const SpecificStats* getSpecificStats() const final;
 
-    StageState doWork(WorkingSetID* out);
+    StageState doWork(WorkingSetID* out) override;
 
     StageType stageType() const final {
         return STAGE_BATCHED_DELETE;
     }
 
 private:
-    // Returns NEED_YIELD when there is a write conflict. Otherwise, returns NEED_TIME when
-    // some, or all, of the documents staged in the _stagedDeletesBuffer are successfully deleted.
+    // Returns NEED_TIME when some, or all, of the documents staged in the _stagedDeletesBuffer are
+    // successfully deleted. Returns NEED_YIELD otherwise.
     PlanStage::StageState _deleteBatch(WorkingSetID* out);
 
     // Attempts to delete the documents staged for deletion in a WriteUnitOfWork. Updates
@@ -137,6 +151,7 @@ private:
     long long _commitBatch(WorkingSetID* out,
                            std::set<WorkingSetID>* recordsToSkip,
                            unsigned int* docsDeleted,
+                           unsigned int* bytesDeleted,
                            unsigned int* bufferOffset);
 
     // Attempts to stage a new delete in the _stagedDeletesBuffer. Returns the PlanStage::StageState
@@ -150,13 +165,13 @@ private:
     void _stageNewDelete(WorkingSetID* workingSetMemberID);
 
     // Tries to restore the child's state. Returns NEED_TIME if the restore succeeds, NEED_YIELD
-    // upon write conflict.
+    // otherwise.
     PlanStage::StageState _tryRestoreState(WorkingSetID* out);
 
-    // Prepares to retry draining the _stagedDeletesBuffer after a write conflict. Removes
-    // 'recordsThatNoLongerMatch' then yields.
-    PlanStage::StageState _prepareToRetryDrainAfterWCE(
-        WorkingSetID* out, const std::set<WorkingSetID>& recordsThatNoLongerMatch);
+    // Prepares to retry draining the _stagedDeletesBuffer after a WriteConflictException or a
+    // TemporarilyUnavailableException. Removes 'recordsThatNoLongerMatch' then yields.
+    void _prepareToRetryDrainAfterYield(WorkingSetID* out,
+                                        const std::set<WorkingSetID>& recordsThatNoLongerMatch);
 
     BatchedDeleteStats _specificStats;
 

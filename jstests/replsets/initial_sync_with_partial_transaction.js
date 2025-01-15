@@ -7,10 +7,8 @@
  *   uses_transactions,
  * ]
  */
-(function() {
-"use strict";
-load("jstests/replsets/rslib.js");  // For reconnect()
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 const replTest = new ReplSetTest({
     nodes: [{}, {rsConfig: {priority: 0}}],
@@ -23,7 +21,7 @@ const replTest = new ReplSetTest({
 });
 
 replTest.startSet();
-replTest.initiateWithHighElectionTimeout();
+replTest.initiate();
 
 // We have to add and pause the initial sync node here, because we cannot re-initiate the set while
 // the failpoints are held.
@@ -95,4 +93,3 @@ assert.eq(4, initialSyncNode.getDB(dbName)[collName].find().itcount());
 printjson(initialSyncNode.getDB("local").oplog.rs.find().toArray());
 
 replTest.stopSet();
-})();

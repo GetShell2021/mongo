@@ -1,8 +1,16 @@
 /**
  * Test that running a $currentOp aggregation on a cluster with no shards returns an empty result
  * set, and does not cause the mongoS floating point failure described in SERVER-30084.
+ *
+ * Requires no shards so there can't be a config shard.
+ * @tags: [
+ *   config_shard_incompatible,
+ *    # TODO (SERVER-97257): Re-enable this test or add an explanation why it is incompatible.
+ *    embedded_router_incompatible,
+ * ]
  */
-(function() {
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 const st = new ShardingTest({shards: 0});
 
 const adminDB = st.s.getDB("admin");
@@ -14,4 +22,3 @@ assert.eq(adminDB.aggregate([{$currentOp: {}}]).itcount(), 0);
 assert.eq(adminDB.currentOp().inprog.length, 0);
 
 st.stop();
-})();

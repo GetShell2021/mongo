@@ -111,16 +111,16 @@ uncheckedParallelShellPidsString = function() {
 };
 
 startParallelShell = function(jsCode, port, noConnect, ...optionArgs) {
-    var shellPath = MongoRunner.mongoShellPath;
+    var shellPath = MongoRunner.getMongoShellPath();
     var args = [shellPath];
 
-    if (typeof db == "object") {
+    if (typeof globalThis.db === "object") {
         if (!port) {
             // If no port override specified, just passthrough connect string.
-            args.push("--host", db.getMongo().host);
+            args.push("--host", globalThis.db.getMongo().host);
         } else {
             // Strip port numbers from connect string.
-            const uri = new MongoURI(db.getMongo().host);
+            const uri = new MongoURI(globalThis.db.getMongo().host);
             var connString = uri.servers
                                  .map(function(server) {
                                      return server.host;
@@ -138,18 +138,24 @@ startParallelShell = function(jsCode, port, noConnect, ...optionArgs) {
 
     // Convert function into call-string
     if (typeof (jsCode) == "function") {
-        jsCode = "(" + jsCode.toString() + ")();";
+        if (jsCode.constructor.name === 'AsyncFunction') {
+            jsCode = `await (${jsCode.toString()})();`;
+        } else {
+            jsCode = `(${jsCode.toString()})();`;
+        }
     } else if (typeof (jsCode) == "string") {
-    }
-    // do nothing
-    else {
+        // do nothing
+    } else {
         throw Error("bad first argument to startParallelShell");
     }
 
     if (noConnect) {
         args.push("--nodb");
-    } else if (typeof (db) == "object") {
-        jsCode = "db = db.getSiblingDB('" + db.getName() + "');" + jsCode;
+    } else if (typeof (globalThis.db) == "object") {
+        if (globalThis.db.getMongo().isGRPC()) {
+            args.push("--gRPC");
+        }
+        jsCode = "db = db.getSiblingDB('" + globalThis.db.getName() + "');" + jsCode;
     }
 
     if (TestData) {

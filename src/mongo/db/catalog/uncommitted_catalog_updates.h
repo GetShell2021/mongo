@@ -29,17 +29,29 @@
 
 #pragma once
 
+#include <boost/container/small_vector.hpp>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <vector>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/catalog/views_for_database.h"
 #include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/views/view.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util_core.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 
 /**
- * Decoration on RecoveryUnit to store cloned Collections until they are committed or rolled back.
+ * Decoration on Snapshot to store cloned Collections until they are committed or rolled back.
  */
 class UncommittedCatalogUpdates {
 public:
@@ -61,6 +73,8 @@ public:
             kAddViewResource,
             // Remove a view resource
             kRemoveViewResource,
+            // Dropped index instance
+            kDroppedIndex,
         };
 
         boost::optional<UUID> uuid() const {
@@ -94,6 +108,14 @@ public:
         // New set of view information for a database.
         // Set for action kReplacedViewsForDatabase, boost::none otherwise.
         boost::optional<ViewsForDatabase> viewsForDb;
+
+        // Storage for the actual index entry.
+        // Set for action kDroppedIndex and nullptr otherwise.
+        std::shared_ptr<IndexCatalogEntry> indexEntry;
+
+        // Whether the collection or index entry is drop pending.
+        // Set for actions kDroppedCollection and kDroppedIndex, boost::none otherwise.
+        boost::optional<bool> isDropPending;
     };
 
     struct CollectionLookupResult {
@@ -101,8 +123,7 @@ public:
         bool found;
 
         // Storage for the actual collection.
-        // Set for actions kWritableCollection, kCreatedCollection, kRecreatedCollection (nullptr
-        // otherwise).
+        // Set for actions kWritableCollection, kCreatedCollection, and kRecreatedCollection.
         std::shared_ptr<Collection> collection;
 
         // True if the collection was created during this transaction for the first time.
@@ -116,6 +137,20 @@ public:
      * Determine if an entry is associated with a collection action (as opposed to a view action).
      */
     static bool isCollectionEntry(const Entry& entry) {
+        return (entry.action == Entry::Action::kCreatedCollection ||
+                entry.action == Entry::Action::kWritableCollection ||
+                entry.action == Entry::Action::kRenamedCollection ||
+                entry.action == Entry::Action::kDroppedCollection ||
+                entry.action == Entry::Action::kRecreatedCollection);
+    }
+
+    /**
+     * Determine if an entry uses two-phase commit to write into the CollectionCatalog.
+     * kCreatedCollection is also committed using two-phase commit but using a separate system and
+     * is excluded from this list. kDroppedIndex is covered by kWritableCollection as a writable
+     * collection must be used to drop an index.
+     */
+    static bool isTwoPhaseCommitEntry(const Entry& entry) {
         return (entry.action == Entry::Action::kCreatedCollection ||
                 entry.action == Entry::Action::kWritableCollection ||
                 entry.action == Entry::Action::kRenamedCollection ||
@@ -165,9 +200,16 @@ public:
     void renameCollection(const Collection* collection, const NamespaceString& from);
 
     /**
+     * Manages an uncommitted index entry drop.
+     */
+    void dropIndex(const NamespaceString& nss,
+                   std::shared_ptr<IndexCatalogEntry> indexEntry,
+                   bool isDropPending);
+
+    /**
      * Manage an uncommitted collection drop.
      */
-    void dropCollection(const Collection* collection);
+    void dropCollection(const Collection* collection, bool isDropPending);
 
     /**
      * Replace the ViewsForDatabase instance assocated with database `dbName` with `vfdb`. This is
@@ -186,6 +228,11 @@ public:
      * Removes the ResourceID associated with a view namespace.
      */
     void removeView(const NamespaceString& nss);
+
+    /**
+     * Returns all entries without releasing them.
+     */
+    const std::vector<Entry>& entries() const;
 
     /**
      * Releases all entries, needs to be done when WriteUnitOfWork commits or rolls back.
@@ -217,6 +264,38 @@ public:
         return _entries.empty();
     }
 
+    /**
+     * Flag to check of callbacks with the RecoveryUnit has been registered for this instance.
+     */
+    bool hasRegisteredWithRecoveryUnit() const {
+        return _callbacksRegisteredWithRecoveryUnit;
+    }
+
+    /**
+     * Mark that callbacks with the RecoveryUnit has been registered for this instance.
+     */
+    void markRegisteredWithRecoveryUnit() {
+        invariant(!_callbacksRegisteredWithRecoveryUnit);
+        _callbacksRegisteredWithRecoveryUnit = true;
+    }
+
+    /**
+     * Flag to check if precommit has executed successfully and all uncommitted collections have
+     * been registered as pending commit
+     */
+    bool hasPrecommitted() const {
+        return _preCommitted;
+    }
+
+    /**
+     * Mark that precommit has executed successfully and all uncommitted collections have
+     * been registered as pending commit
+     */
+    void markPrecommitted() {
+        invariant(!_preCommitted);
+        _preCommitted = true;
+    }
+
     static UncommittedCatalogUpdates& get(OperationContext* opCtx);
 
 private:
@@ -235,6 +314,60 @@ private:
     std::vector<Entry> _entries;
 
     stdx::unordered_set<DatabaseName> _ignoreExternalViewChanges;
+
+    bool _callbacksRegisteredWithRecoveryUnit = false;
+    bool _preCommitted = false;
+};
+
+/**
+ * Decoration on Snapshot to store Collections instantiated from durable catalog data. Lifetime tied
+ * to Snapshot lifetime.
+ */
+class OpenedCollections {
+public:
+    static OpenedCollections& get(OperationContext* opCtx);
+
+    /**
+     * Lookup collection instance by namespace.
+     *
+     * May return nullptr which indicates that the namespace does not exist in the snapshot.
+     *
+     * Returns boost::none if this namespace is unknown to OpenedCollections.
+     */
+    boost::optional<std::shared_ptr<const Collection>> lookupByNamespace(
+        const NamespaceString& ns) const;
+
+    /**
+     * Lookup collection instance by UUID.
+     *
+     * May return nullptr which indicates that the UUID does not exist in the snapshot.
+     *
+     * Returns boost::none if this UUID is unknown to OpenedCollections.
+     */
+    boost::optional<std::shared_ptr<const Collection>> lookupByUUID(UUID uuid) const;
+
+    /**
+     * Stores a Collection instance. Lifetime of instance will be tied to lifetime of opened storage
+     * snapshot.
+     *
+     * Collection instance may be nullptr to indicate that the namespace and/or UUID does not exist
+     * in the snapshot.
+     */
+    void store(std::shared_ptr<const Collection> coll,
+               boost::optional<NamespaceString> nss,
+               boost::optional<UUID> uuid);
+
+private:
+    struct Entry {
+        std::shared_ptr<const Collection> collection;
+        // TODO(SERVER-78226): Replace `nss` and `uuid` with a type which can express "nss and uuid"
+        boost::optional<NamespaceString> nss;
+        boost::optional<UUID> uuid;
+    };
+
+    // Static storage for one entry. The expected common case is that only a single collection will
+    // be needed so we optimize for that.
+    boost::container::small_vector<Entry, 1> _collections;
 };
 
 }  // namespace mongo

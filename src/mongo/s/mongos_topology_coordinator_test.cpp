@@ -27,46 +27,50 @@
  *    it in the license file.
  */
 
+#include <ratio>
+#include <string>
 
-#include "mongo/logv2/log.h"
+#include <boost/none.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/util/builder_fwd.h"
+#include "mongo/db/client.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
-#include "mongo/platform/basic.h"
-#include "mongo/s/concurrency/locker_mongos_client_observer.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/mongos_topology_coordinator.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/transport/hello_metrics.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/clock_source.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
-
-using std::unique_ptr;
-
 namespace mongo {
 namespace {
 
-class MongosTopoCoordTest : public ServiceContextTest {
+class MongosTopoCoordTest : public SharedClockSourceAdapterServiceContextTest {
+    explicit MongosTopoCoordTest(std::shared_ptr<ClockSourceMock> mockClock)
+        : SharedClockSourceAdapterServiceContextTest(mockClock), _clkSource(std::move(mockClock)) {}
+
 public:
-    MongosTopoCoordTest() {
-        auto service = getServiceContext();
-        service->registerClientObserver(std::make_unique<LockerMongosClientObserver>());
-    }
+    MongosTopoCoordTest() : MongosTopoCoordTest(std::make_shared<ClockSourceMock>()) {}
 
-    virtual void setUp() {
+    void setUp() override {
         _topo = std::make_unique<MongosTopologyCoordinator>();
-
-        // The fast clock is used by OperationContext::hasDeadlineExpired.
-        getServiceContext()->setFastClockSource(
-            std::make_unique<SharedClockSourceAdapter>(_clkSource));
-        // The precise clock is used by waitForConditionOrInterruptNoAssertUntil.
-        getServiceContext()->setPreciseClockSource(
-            std::make_unique<SharedClockSourceAdapter>(_clkSource));
     }
 
-    virtual void tearDown() {}
+    void tearDown() override {}
 
 protected:
     /**
@@ -92,7 +96,7 @@ protected:
 
 private:
     std::unique_ptr<MongosTopologyCoordinator> _topo;
-    std::shared_ptr<ClockSourceMock> _clkSource = std::make_shared<ClockSourceMock>();
+    std::shared_ptr<ClockSourceMock> _clkSource;
 };
 
 TEST_F(MongosTopoCoordTest, MongosTopologyVersionCounterInitializedAtStartup) {
@@ -129,7 +133,7 @@ TEST_F(MongosTopoCoordTest, AwaitHelloResponseReturnsCurrentMongosTopologyVersio
 
     bool helloReturned = false;
     stdx::thread getHelloThread([&] {
-        Client::setCurrent(getServiceContext()->makeClient("getHelloThread"));
+        Client::setCurrent(getServiceContext()->getService()->makeClient("getHelloThread"));
         auto threadOpCtx = cc().makeOperationContext();
         const auto response =
             getTopoCoord().awaitHelloResponse(threadOpCtx.get(), currentTopologyVersion, deadline);
@@ -278,7 +282,7 @@ TEST_F(MongosTopoCoordTest, HelloReturnsErrorOnEnteringQuiesceMode) {
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
     stdx::thread getHelloThread([&] {
-        Client::setCurrent(getServiceContext()->makeClient("getHelloThread"));
+        Client::setCurrent(getServiceContext()->getService()->makeClient("getHelloThread"));
         auto threadOpCtx = cc().makeOperationContext();
         auto maxAwaitTime = Milliseconds(5000);
         auto deadline = now() + maxAwaitTime;
@@ -316,7 +320,7 @@ TEST_F(MongosTopoCoordTest, AlwaysDecrementNumAwaitingTopologyChangesOnErrorMong
 
     AtomicWord<bool> helloReturned{false};
     stdx::thread getHelloThread([&] {
-        Client::setCurrent(getServiceContext()->makeClient("getHelloThread"));
+        Client::setCurrent(getServiceContext()->getService()->makeClient("getHelloThread"));
         auto threadOpCtx = cc().makeOperationContext();
         ASSERT_THROWS_CODE(
             getTopoCoord().awaitHelloResponse(threadOpCtx.get(), currentTopologyVersion, deadline),

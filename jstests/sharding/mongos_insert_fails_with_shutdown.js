@@ -1,6 +1,10 @@
 /**
-@tags: [multiversion_incompatible]
-*/
+ * @tags: [
+ *    multiversion_incompatible,
+ *    # This tests needs to stop mongoS, which is impossible with an embedded router.
+ *    embedded_router_incompatible,
+ * ]
+ */
 
 // Don't check for UUID index consistency,orphans and routine table across the cluster at the end,
 // since the test shuts down a mongos
@@ -8,12 +12,15 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
 TestData.skipCheckRoutingTableConsistency = true;
-(function() {
-"use strict";
+TestData.skipCheckShardFilteringMetadata = true;
 
-load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallelTester.js');
-load("jstests/libs/retryable_writes_util.js");
+// Do not check metadata consistency as mongos is stopped for testing purposes.
+TestData.skipCheckMetadataConsistency = true;
+
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {Thread} from "jstests/libs/parallelTester.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
 const st = new ShardingTest({
     mongos: 1,
     config: 1,
@@ -56,4 +63,3 @@ st.stopMongos(0);
 insertThread.join();
 
 st.stop();
-})();

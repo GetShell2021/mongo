@@ -25,14 +25,9 @@ __wt_hs_modify(WT_CURSOR_BTREE *hs_cbt, WT_UPDATE *hs_upd)
      * We don't have exclusive access to the history store page so we need to pass "false" here to
      * ensure that we're locking when inserting new keys to an insert list.
      */
-#ifdef HAVE_DIAGNOSTIC
     WT_WITH_BTREE(CUR2S(hs_cbt), CUR2BT(hs_cbt),
-      ret =
-        __wt_row_modify(hs_cbt, &hs_cbt->iface.key, NULL, hs_upd, WT_UPDATE_INVALID, false, false));
-#else
-    WT_WITH_BTREE(CUR2S(hs_cbt), CUR2BT(hs_cbt),
-      ret = __wt_row_modify(hs_cbt, &hs_cbt->iface.key, NULL, hs_upd, WT_UPDATE_INVALID, false));
-#endif
+      ret = __wt_row_modify(
+        hs_cbt, &hs_cbt->iface.key, NULL, &hs_upd, WT_UPDATE_INVALID, false, false));
     return (ret);
 }
 
@@ -68,6 +63,7 @@ __wt_hs_find_upd(WT_SESSION_IMPL *session, uint32_t btree_id, WT_ITEM *key,
     WT_UPDATE_VECTOR modifies;
     wt_timestamp_t durable_timestamp, durable_timestamp_tmp;
     wt_timestamp_t hs_stop_durable_ts, hs_stop_durable_ts_tmp, read_timestamp;
+    size_t max_memsize;
     uint64_t upd_type_full;
     uint8_t *p, recno_key_buf[WT_INTPACK64_MAXSIZE], upd_type;
     bool upd_found;
@@ -80,7 +76,7 @@ __wt_hs_find_upd(WT_SESSION_IMPL *session, uint32_t btree_id, WT_ITEM *key,
     txn_shared = WT_SESSION_TXN_SHARED(session);
     upd_found = false;
 
-    WT_STAT_CONN_DATA_INCR(session, cursor_search_hs);
+    WT_STAT_CONN_DSRC_INCR(session, cursor_search_hs);
 
     /* Row-store key is as passed to us, create the column-store key as needed. */
     WT_ASSERT(
@@ -198,12 +194,18 @@ __wt_hs_find_upd(WT_SESSION_IMPL *session, uint32_t btree_id, WT_ITEM *key,
             upd_type = (uint8_t)upd_type_full;
         }
         WT_ASSERT(session, upd_type == WT_UPDATE_STANDARD);
+
+        if (modifies.size > 0) {
+            __wt_modifies_max_memsize(&modifies, value_format, hs_value->size, &max_memsize);
+            WT_ERR(__wt_buf_set_and_grow(
+              session, hs_value, hs_value->data, hs_value->size, max_memsize));
+        }
         while (modifies.size > 0) {
             __wt_update_vector_pop(&modifies, &mod_upd);
             WT_ERR(__wt_modify_apply_item(session, value_format, hs_value, mod_upd->data));
             __wt_free_update_list(session, &mod_upd);
         }
-        WT_STAT_CONN_DATA_INCR(session, cache_hs_read_squash);
+        WT_STAT_CONN_DSRC_INCR(session, cache_hs_read_squash);
     }
 
     /*
@@ -234,10 +236,10 @@ err:
 
     if (ret == 0) {
         if (upd_found)
-            WT_STAT_CONN_DATA_INCR(session, cache_hs_read);
+            WT_STAT_CONN_DSRC_INCR(session, cache_hs_read);
         else {
             upd_value->type = WT_UPDATE_INVALID;
-            WT_STAT_CONN_DATA_INCR(session, cache_hs_read_miss);
+            WT_STAT_CONN_DSRC_INCR(session, cache_hs_read_miss);
         }
     }
 

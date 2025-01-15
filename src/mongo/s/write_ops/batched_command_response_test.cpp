@@ -27,11 +27,29 @@
  *    it in the license file.
  */
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/ops/write_ops.h"
+#include <boost/none.hpp>
+#include <ostream>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/write_ops/write_ops_gen.h"
+#include "mongo/db/shard_id.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/shard_version.h"
+#include "mongo/s/shard_version_factory.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/bson_test_util.h"
+#include "mongo/unittest/framework.h"
 
 namespace mongo {
 namespace {
@@ -70,10 +88,14 @@ TEST(BatchedCommandResponseTest, Basic) {
 TEST(BatchedCommandResponseTest, StaleConfigInfo) {
     OID epoch = OID::gen();
 
-    StaleConfigInfo staleInfo(NamespaceString("TestDB.TestColl"),
-                              ChunkVersion({epoch, Timestamp(100, 0)}, {1, 0}),
-                              ChunkVersion({epoch, Timestamp(100, 0)}, {2, 0}),
-                              ShardId("TestShard"));
+    StaleConfigInfo staleInfo(
+        NamespaceString::createNamespaceString_forTest("TestDB.TestColl"),
+        ShardVersionFactory::make(ChunkVersion({epoch, Timestamp(100, 0)}, {1, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        ShardVersionFactory::make(ChunkVersion({epoch, Timestamp(100, 0)}, {2, 0}),
+                                  boost::optional<CollectionIndexes>(boost::none)),
+        ShardId("TestShard"));
+
     BSONObjBuilder builder(BSON("index" << 0 << "code" << ErrorCodes::StaleConfig << "errmsg"
                                         << "StaleConfig error"));
     staleInfo.serialize(&builder);
@@ -156,13 +178,16 @@ TEST(BatchedCommandResponseTest, TooManyBigErrors) {
 }
 
 TEST(BatchedCommandResponseTest, CompatibilityFromWriteErrorToBatchCommandResponse) {
-    ChunkVersion versionReceived({OID::gen(), Timestamp(2, 0)}, {1, 0});
+    CollectionGeneration gen(OID::gen(), Timestamp(2, 0));
+    const auto versionReceived = ShardVersionFactory::make(
+        ChunkVersion(gen, {1, 0}), boost::optional<CollectionIndexes>(boost::none));
 
     write_ops::UpdateCommandReply reply;
     reply.getWriteCommandReplyBase().setN(1);
     reply.getWriteCommandReplyBase().setWriteErrors(std::vector<write_ops::WriteError>{
         write_ops::WriteError(1,
-                              Status(StaleConfigInfo(NamespaceString("TestDB", "TestColl"),
+                              Status(StaleConfigInfo(NamespaceString::createNamespaceString_forTest(
+                                                         "TestDB", "TestColl"),
                                                      versionReceived,
                                                      boost::none,
                                                      ShardId("TestShard")),
@@ -175,7 +200,7 @@ TEST(BatchedCommandResponseTest, CompatibilityFromWriteErrorToBatchCommandRespon
     ASSERT_EQ(ErrorCodes::StaleConfig, response.getErrDetailsAt(0).getStatus().code());
     ASSERT_EQ("Test stale config", response.getErrDetailsAt(0).getStatus().reason());
     auto staleInfo = response.getErrDetailsAt(0).getStatus().extraInfo<StaleConfigInfo>();
-    ASSERT_EQ("TestDB.TestColl", staleInfo->getNss().ns());
+    ASSERT_EQ("TestDB.TestColl", staleInfo->getNss().ns_forTest());
     ASSERT_EQ(versionReceived, staleInfo->getVersionReceived());
     ASSERT(!staleInfo->getVersionWanted());
     ASSERT_EQ(ShardId("TestShard"), staleInfo->getShardId());

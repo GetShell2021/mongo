@@ -1,21 +1,27 @@
-// Test initial sync with documents moving forward.
-//
-// This tests that initial sync succeeds when the clone phase encounters the same _id twice. We test
-// that the destination node has the correct document with that _id at the end of initial sync.
-//
-// We also test that the initial sync succeeds when the clone phase encounters the same 'x' value
-// twice, for a collection with a unique index {x: 1}.
-//
-// It works by deleting a document at the end of the range we are cloning, then growing a document
-// from the beginning of the range so that it moves to the hole in the end of the range.
-//
-// This also works for wiredTiger, because we grow the document by deleting and reinserting it, so
-// the newly inserted document is included in the cursor on the source.
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/index_catalog_helpers.js");
+/**
+ * Test initial sync with documents moving forward.
+ *
+ * This tests that initial sync succeeds when the clone phase encounters the same _id twice. We test
+ * that the destination node has the correct document with that _id at the end of initial sync.
+ *
+ * We also test that the initial sync succeeds when the clone phase encounters the same 'x' value
+ * twice, for a collection with a unique index {x: 1}.
+ *
+ * It works by deleting a document at the end of the range we are cloning, then growing a document
+ * from the beginning of the range so that it moves to the hole in the end of the range.
+ *
+ * This also works for wiredTiger, because we grow the document by deleting and reinserting it, so
+ * the newly inserted document is included in the cursor on the source.
+ *
+ * @tags: [
+ *   # This test inserts a lot of documents,
+ *   # so it is taking longer on the code coverage variants and can cause assert.soon failures.
+ *   incompatible_with_gcov,
+ * ]
+ */
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {IndexCatalogHelpers} from "jstests/libs/index_catalog_helpers.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 var rst = new ReplSetTest({name: "initial_sync_move_forward", nodes: 1});
 rst.startSet();
@@ -85,4 +91,3 @@ var indexSpec = IndexCatalogHelpers.findByKeyPattern(secondaryColl.getIndexes(),
 assert.neq(null, indexSpec);
 assert.eq(true, indexSpec.unique);
 rst.stopSet();
-})();

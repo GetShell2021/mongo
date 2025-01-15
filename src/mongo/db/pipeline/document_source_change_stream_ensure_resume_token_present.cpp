@@ -27,12 +27,22 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/optional/optional.hpp>
+#include <memory>
+#include <utility>
 
-#include "mongo/db/pipeline/document_source_change_stream_ensure_resume_token_present.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
 #include "mongo/db/pipeline/change_stream_start_after_invalidate_info.h"
-#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_change_stream_ensure_resume_token_present.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -45,7 +55,7 @@ boost::intrusive_ptr<DocumentSourceChangeStreamEnsureResumeTokenPresent>
 DocumentSourceChangeStreamEnsureResumeTokenPresent::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const DocumentSourceChangeStreamSpec& spec) {
-    auto resumeToken = DocumentSourceChangeStream::resolveResumeTokenFromSpec(expCtx, spec);
+    auto resumeToken = change_stream::resolveResumeTokenFromSpec(expCtx, spec);
     tassert(5666902,
             "Expected non-high-water-mark resume token",
             !ResumeToken::isHighWaterMarkToken(resumeToken));
@@ -71,13 +81,14 @@ StageConstraints DocumentSourceChangeStreamEnsureResumeTokenPresent::constraints
                                  UnionRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage};
 
-    // The '$match' and 'DocumentSourceSingleDocumentTransformation' stages can swap with this
-    // stage, allowing filtering and reshaping to occur earlier in the pipeline. For sharded cluster
-    // pipelines, swaps can allow $match and 'DocumentSourceSingleDocumentTransformation' stages to
-    // execute on the shards, providing inter-node parallelism and potentially reducing the amount
-    // of data sent form each shard to the mongoS.
+    // The '$match', '$redact', and 'DocumentSourceSingleDocumentTransformation' stages can swap
+    // with this stage, allowing filtering and reshaping to occur earlier in the pipeline. For
+    // sharded cluster pipelines, swaps can allow $match, $redact and
+    // 'DocumentSourceSingleDocumentTransformation' stages to execute on the shards, providing
+    // inter-node parallelism and potentially reducing the amount of data sent form each shard to
+    // the mongoS.
     constraints.canSwapWithMatch = true;
-    constraints.canSwapWithSingleDocTransform = true;
+    constraints.canSwapWithSingleDocTransformOrRedact = true;
 
     return constraints;
 }
@@ -135,11 +146,12 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamEnsureResumeTokenPresent
         const auto extraInfo = ex.extraInfo<ChangeStreamStartAfterInvalidateInfo>();
         tassert(5779200, "Missing ChangeStreamStartAfterInvalidationInfo on exception", extraInfo);
 
-        const DocumentSource::GetNextResult nextInput =
+        DocumentSource::GetNextResult nextInput =
             Document::fromBsonWithMetaData(extraInfo->getStartAfterInvalidateEvent());
+
         _resumeStatus =
             DocumentSourceChangeStreamCheckResumability::compareAgainstClientResumeToken(
-                pExpCtx, nextInput.getDocument(), _tokenFromClient);
+                nextInput.getDocument(), _tokenFromClient);
 
         // This exception should always contain the client-provided resume token.
         tassert(5779201,
@@ -150,16 +162,20 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamEnsureResumeTokenPresent
     }
 }
 
-Value DocumentSourceChangeStreamEnsureResumeTokenPresent::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    // We only serialize this stage in the context of explain.
-    if (explain) {
-        return Value(DOC(DocumentSourceChangeStream::kStageName
-                         << DOC("stage"
-                                << "internalEnsureResumeTokenPresent"_sd
-                                << "resumeToken" << ResumeToken(_tokenFromClient).toDocument())));
+Value DocumentSourceChangeStreamEnsureResumeTokenPresent::doSerialize(
+    const SerializationOptions& opts) const {
+    BSONObjBuilder builder;
+    if (opts.verbosity) {
+        BSONObjBuilder sub(builder.subobjStart(DocumentSourceChangeStream::kStageName));
+        sub.append("stage"_sd, kStageName);
+        sub << "resumeToken"_sd << Value(ResumeToken(_tokenFromClient).toDocument(opts));
+        sub.done();
+    } else {
+        BSONObjBuilder sub(builder.subobjStart(kStageName));
+        sub << "resumeToken"_sd << Value(ResumeToken(_tokenFromClient).toDocument(opts));
+        sub.done();
     }
-    MONGO_UNREACHABLE_TASSERT(5467611);
+    return Value(builder.obj());
 }
 
 }  // namespace mongo

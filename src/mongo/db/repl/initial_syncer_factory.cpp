@@ -29,6 +29,13 @@
 
 #include "mongo/db/repl/initial_syncer_factory.h"
 
+#include <utility>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/util/assert_util_core.h"
+#include "mongo/util/decorable.h"
+#include "mongo/util/str.h"
+
 namespace mongo {
 namespace repl {
 
@@ -57,7 +64,7 @@ StatusWith<std::shared_ptr<InitialSyncerInterface>> InitialSyncerFactory::makeIn
     const std::string& initialSyncMethod,
     InitialSyncerInterface::Options opts,
     std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
-    ThreadPool* writerPool,
+    ThreadPool* workerPool,
     StorageInterface* storage,
     ReplicationProcess* replicationProcess,
     const InitialSyncerInterface::OnCompletionFn& onCompletion) {
@@ -69,7 +76,7 @@ StatusWith<std::shared_ptr<InitialSyncerInterface>> InitialSyncerFactory::makeIn
     }
     return fn->second(opts,
                       std::move(dataReplicatorExternalState),
-                      writerPool,
+                      workerPool,
                       storage,
                       replicationProcess,
                       onCompletion);

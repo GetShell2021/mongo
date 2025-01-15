@@ -29,17 +29,44 @@
 
 #pragma once
 
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+#include <list>
+#include <memory>
+#include <string>
 #include <type_traits>
+#include <utility>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/api_parameters.h"
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/change_stream_constants.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream_gen.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/resume_token.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/read_concern_support_result.h"
+#include "mongo/db/repl/read_concern_level.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/intrusive_counter.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -68,10 +95,6 @@ public:
             return true;
         }
 
-        bool allowedToPassthroughFromMongos() const final {
-            return false;
-        }
-
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
         }
@@ -81,10 +104,10 @@ public:
                                            bool bypassDocumentValidation) const override {
             if (_nss.isAdminDB() && _nss.isCollectionlessAggregateNS()) {
                 // Watching a whole cluster.
-                return {Privilege(ResourcePattern::forAnyNormalResource(), actions)};
+                return {Privilege(ResourcePattern::forAnyNormalResource(_nss.tenantId()), actions)};
             } else if (_nss.isCollectionlessAggregateNS()) {
                 // Watching a whole database.
-                return {Privilege(ResourcePattern::forDatabaseName(_nss.db()), actions)};
+                return {Privilege(ResourcePattern::forDatabaseName(_nss.dbName()), actions)};
             } else {
                 // Watching a single collection. Note if this is in the admin database it will fail
                 // at parse time.
@@ -93,7 +116,7 @@ public:
         }
 
         ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level,
-                                                     bool isImplicitDefault) const {
+                                                     bool isImplicitDefault) const override {
             // Change streams require "majority" readConcern. If the client did not specify an
             // explicit readConcern, change streams will internally upconvert the readConcern to
             // majority (so clients can always send aggregations without readConcern). We therefore
@@ -102,7 +125,7 @@ public:
                 kStageName, repl::ReadConcernLevel::kMajorityReadConcern, level, isImplicitDefault);
         }
 
-        void assertSupportsMultiDocumentTransaction() const {
+        void assertSupportsMultiDocumentTransaction() const override {
             transactionNotSupported(kStageName);
         }
 
@@ -130,8 +153,10 @@ public:
             }
         }
 
-    private:
+    protected:
         const NamespaceString _nss;
+
+    private:
         BSONElement _spec;
     };
 
@@ -141,6 +166,10 @@ public:
 
     // The name of the field where the operation description of the non-CRUD operations will be
     // located. This is complementary to the 'documentKey' for CRUD operations.
+    // Note that the operation description of an event will be part of the event's resume token.
+    // Thus the operation description for an existing event should never be changed, because
+    // otherwise the changestream resumability between different versions of MongoDB may be
+    // jeopardized.
     static constexpr StringData kOperationDescriptionField = "operationDescription"_sd;
 
     // The name of the field where the pre-image document will be found, if requested and available.
@@ -194,6 +223,10 @@ public:
     // path to the cluster time will be kIdField + "." + kClusterTimeField.
     static constexpr StringData kClusterTimeField = "clusterTime"_sd;
 
+    // The name of the field with the nsType of a changestream create event. Will contain
+    // "collection", "view" or "timeseries". Will only be exposed if 'showExpandedEvents' is used.
+    static constexpr StringData kNsTypeField = "nsType"_sd;
+
     // The name of this stage.
     static constexpr StringData kStageName = "$changeStream"_sd;
 
@@ -243,13 +276,21 @@ public:
     static constexpr StringData kRefineCollectionShardKeyOpType = "refineCollectionShardKey"_sd;
     static constexpr StringData kReshardCollectionOpType = "reshardCollection"_sd;
     static constexpr StringData kModifyOpType = "modify"_sd;
+    static constexpr StringData kEndOfTransactionOpType = "endOfTransaction"_sd;
+
+    // These events are guarded behind the 'showSystemEvents' flag.
+    static constexpr StringData kStartIndexBuildOpType = "startIndexBuild"_sd;
+    static constexpr StringData kAbortIndexBuildOpType = "abortIndexBuild"_sd;
 
     // Default regex for collections match which prohibits system collections.
     static constexpr StringData kRegexAllCollections = R"((?!(\$|system\.)))"_sd;
 
     // Regex matching all user collections plus collections exposed when 'showSystemEvents' is set.
+    // Does not match a collection named $ or a collection with 'system.' in the name.
+    // However, it will still match collection names starting with system.buckets or
+    // system.resharding, or a collection exactly named system.js
     static constexpr StringData kRegexAllCollectionsShowSystemEvents =
-        R"((?!(\$|system\.(?!(js$|resharding\.)))))"_sd;
+        R"((?!(\$|system\.(?!(js$|resharding\.|buckets\.|views$)))))"_sd;
 
     static constexpr StringData kRegexAllDBs = R"(^(?!(admin|config|local)\.)[^.]+)"_sd;
     static constexpr StringData kRegexCmdColl = R"(\$cmd$)"_sd;
@@ -292,15 +333,6 @@ public:
     static void checkValueTypeOrMissing(Value v, StringData fieldName, BSONType expectedType);
 
     /**
-     * Extracts the resume token from the given spec. If a 'startAtOperationTime' is specified,
-     * returns the equivalent high-watermark token. This method should only ever be called on a spec
-     * where one of 'resumeAfter', 'startAfter', or 'startAtOperationTime' is populated.
-     */
-    static ResumeTokenData resolveResumeTokenFromSpec(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const DocumentSourceChangeStreamSpec& spec);
-
-    /**
      * For a change stream with no resume information supplied by the user, returns the clusterTime
      * at which the new stream should begin scanning the oplog.
      */
@@ -340,11 +372,44 @@ public:
     LiteParsedDocumentSourceChangeStreamInternal(std::string parseTimeName,
                                                  NamespaceString nss,
                                                  const BSONElement& spec)
-        : DocumentSourceChangeStream::LiteParsed(std::move(parseTimeName), std::move(nss), spec) {}
+        : DocumentSourceChangeStream::LiteParsed(std::move(parseTimeName), std::move(nss), spec),
+          _privileges({Privilege(ResourcePattern::forClusterResource(_nss.tenantId()),
+                                 ActionType::internal)}) {}
 
-    PrivilegeVector requiredPrivileges(bool isMongos,
-                                       bool bypassDocumentValidation) const override final {
-        return {Privilege(ResourcePattern::forClusterResource(), ActionType::internal)};
+    PrivilegeVector requiredPrivileges(bool isMongos, bool bypassDocumentValidation) const final {
+        return _privileges;
+    }
+
+private:
+    const PrivilegeVector _privileges;
+};
+
+/**
+ * A DocumentSource class for all internal change stream stages. This class is useful for
+ * shared logic between all of the internal change stream stages. For internally created match
+ * stages see 'DocumentSourceInternalChangeStreamMatch'.
+ */
+class DocumentSourceInternalChangeStreamStage : public DocumentSource {
+public:
+    DocumentSourceInternalChangeStreamStage(StringData stageName,
+                                            const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : DocumentSource(stageName, expCtx) {}
+
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const override {
+        if (opts.literalPolicy != LiteralSerializationPolicy::kUnchanged ||
+            opts.transformIdentifiers) {
+            // Stages made internally by 'DocumentSourceChangeStream' should not be serialized for
+            // query stats. For query stats we will serialize only the user specified $changeStream
+            // stage.
+            return Value();
+        }
+        return doSerialize(opts);
+    }
+
+    virtual Value doSerialize(const SerializationOptions& opts) const = 0;
+
+    DocumentSourceType getType() const final {
+        return DocumentSourceType::kInternalChangeStream;
     }
 };
 

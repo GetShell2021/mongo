@@ -5,34 +5,12 @@
  * events.
  * @tags: [
  *   requires_fcv_60,
+ *   uses_change_streams,
  * ]
  */
-(function() {
-"use strict";
-
-load("jstests/aggregation/extras/utils.js");       // For arrayEq.
-load("jstests/libs/change_stream_util.js");        // For ChangeStreamTest.
-load("jstests/libs/collection_drop_recreate.js");  // For assertDropAndRecreateCollection.
-
-const isFeatureEnabled =
-    assert.commandWorked(db.adminCommand({getParameter: 1, featureFlagChangeStreamsVisibility: 1}))
-        .featureFlagChangeStreamsVisibility.value;
-if (!isFeatureEnabled) {
-    assert.commandFailedWithCode(db.runCommand({
-        aggregate: 1,
-        pipeline: [{$changeStream: {showRawUpdateDescription: true}}],
-        cursor: {},
-    }),
-                                 6189400);
-    return;
-}
-
-const oplogV2FlagName = "internalQueryEnableLoggingV2OplogEntries";
-const oplogV2Enabled =
-    assert.commandWorked(db.adminCommand({getParameter: 1, [oplogV2FlagName]: 1}))[oplogV2FlagName];
-if (!oplogV2Enabled) {
-    return;
-}
+import {arrayEq} from "jstests/aggregation/extras/utils.js";
+import {assertDropAndRecreateCollection} from "jstests/libs/collection_drop_recreate.js";
+import {ChangeStreamTest} from "jstests/libs/query/change_stream_util.js";
 
 // Drop and recreate the collections to be used in this set of tests.
 assertDropAndRecreateCollection(db, "t1");
@@ -141,10 +119,15 @@ cst.assertNextChangesEqualUnordered({cursor: cursor, expectedChanges: expected})
 //
 
 function assertCollectionsAreIdentical(coll1, coll2) {
-    const values1 = coll1.find().toArray();
-    const values2 = coll2.find().toArray();
-    assert(arrayEq(values1, values2),
-           () => "actual: " + tojson(values1) + "  expected: " + tojson(values2));
+    // Some passthrough suites use secondary read preference, so we use assert.soon to ensure that
+    // the updates have time to replicate to secondary nodes.
+    assert.soon(() => {
+        const values1 = coll1.find().toArray();
+        const values2 = coll2.find().toArray();
+
+        return arrayEq(values1, values2),
+               () => "actual: " + tojson(values1) + "  expected: " + tojson(values2);
+    });
 }
 
 function assertCanApplyRawUpdate(origColl, copyColl, events) {
@@ -417,4 +400,3 @@ cst.assertNextChangesEqual({cursor: cursor, expectedChanges: [expected]});
 assertCanApplyRawUpdate(db.t2, db.t2Copy, expected);
 
 cst.cleanUp();
-}());

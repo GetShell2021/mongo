@@ -29,7 +29,30 @@
 
 #pragma once
 
+#include <algorithm>
+#include <list>
+#include <memory>
+#include <set>
+#include <utility>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/pipeline/variables.h"
+#include "mongo/db/query/query_shape/serialization_options.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -46,7 +69,7 @@ public:
         std::unique_ptr<Pipeline, PipelineDeleter> subpipeline,
         Variables::Id varID);
 
-    ~DocumentSourceSetVariableFromSubPipeline() = default;
+    ~DocumentSourceSetVariableFromSubPipeline() override = default;
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
@@ -55,6 +78,11 @@ public:
     const char* getSourceName() const final {
         return kStageName.rawData();
     }
+
+    DocumentSourceType getType() const override {
+        return DocumentSourceType::kSetVariableFromSubPipeline;
+    }
+
     StageConstraints constraints(Pipeline::SplitState) const final {
         StageConstraints setVariableConstraints(StreamType::kStreaming,
                                                 PositionRequirement::kNone,
@@ -76,6 +104,7 @@ public:
         }
         // This stage doesn't modify documents.
         setVariableConstraints.preservesOrderAndMetadata = true;
+        setVariableConstraints.canSwapWithSkippingOrLimitingStage = true;
         return setVariableConstraints;
     }
 
@@ -89,11 +118,17 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
     /**
      * Set the sub-pipeline's initial source. Similar to Pipeline's addInitialSource().
      * Should be used to add a cursor/document generating stage to the pipeline.
      */
     void addSubPipelineInitialSource(boost::intrusive_ptr<DocumentSource> source);
+
+    void detachFromOperationContext() final;
+    void reattachToOperationContext(OperationContext* opCtx) final;
+    bool validateOperationContext(const OperationContext* opCtx) const final;
 
 protected:
     DocumentSourceSetVariableFromSubPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -103,10 +138,12 @@ protected:
           _subPipeline(std::move(subpipeline)),
           _variableID(varID) {}
 
+    void doDispose() final;
+
 
 private:
     GetNextResult doGetNext() final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(const SerializationOptions& opts = SerializationOptions{}) const final;
     std::unique_ptr<Pipeline, PipelineDeleter> _subPipeline;
     Variables::Id _variableID;
     // $setVariableFromSubPipeline sets the value of $$SEARCH_META only on the first call to

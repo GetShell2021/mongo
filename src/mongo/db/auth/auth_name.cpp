@@ -29,8 +29,19 @@
 
 #include "mongo/db/auth/auth_name.h"
 
+#include <bitset>
+#include <type_traits>
+
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 namespace {
@@ -51,13 +62,13 @@ StatusWith<T> AuthName<T>::parse(StringData str, const boost::optional<TenantId>
 }
 
 template <typename T>
-T AuthName<T>::parseFromVariant(const stdx::variant<std::string, BSONObj>& name,
+T AuthName<T>::parseFromVariant(const std::variant<std::string, BSONObj>& name,
                                 const boost::optional<TenantId>& tenant) {
-    if (stdx::holds_alternative<std::string>(name)) {
-        return uassertStatusOK(parse(stdx::get<std::string>(name)));
+    if (holds_alternative<std::string>(name)) {
+        return uassertStatusOK(parse(get<std::string>(name)));
     }
 
-    return parseFromBSONObj(stdx::get<BSONObj>(name), tenant);
+    return parseFromBSONObj(get<BSONObj>(name), tenant);
 }
 
 template <typename T>
@@ -152,8 +163,10 @@ void AuthName<T>::serializeToBSON(BSONArrayBuilder* bob) const {
 template <typename T>
 void AuthName<T>::appendToBSON(BSONObjBuilder* bob, bool encodeTenant) const {
     *bob << T::kFieldName << getName() << "db"_sd << getDB();
-    if (encodeTenant && _tenant) {
-        *bob << kTenantFieldName << _tenant.get();
+    if (encodeTenant) {
+        if (auto tenant = _dbname.tenantId()) {
+            *bob << kTenantFieldName << *tenant;
+        }
     }
 }
 
@@ -164,6 +177,15 @@ BSONObj AuthName<T>::toBSON(bool encodeTenant) const {
     return bob.obj();
 }
 
+template <typename T>
+std::size_t AuthName<T>::getBSONObjSize() const {
+    return 4UL +                            // BSONObj size
+        1UL + T::kFieldName.size() + 1UL +  // FieldName elem type, FieldName, terminating NULL.
+        4UL + getName().size() + 1UL +      // Length of name data, name data, terminating NULL.
+        1UL + ("db"_sd).size() + 1UL +      // DB field elem type, "db", terminating NULL.
+        4UL + getDB().size() + 1UL +        // DB value length, DB value, terminating NULL.
+        1UL;                                // EOD marker.
+}
 
 // Materialize the types we care about.
 template class AuthName<RoleName>;

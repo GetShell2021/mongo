@@ -27,20 +27,39 @@
  *    it in the license file.
  */
 
-#include "mongo/unittest/unittest.h"
+#include <boost/move/utility_core.hpp>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
 
-#include "mongo/db/matcher/expression_parser.h"
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/json.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/status_with.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/bson/json.h"
+#include "mongo/crypto/fle_field_schema_gen.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
-#include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/expression_type.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
+
 
 TEST(MatchExpressionParserTest, SimpleEQ1) {
     BSONObj query = BSON("x" << 2);
@@ -367,6 +386,33 @@ TEST(MatchExpressionParserTest, ExprParsesSuccessfullyWithinTopLevelAnd) {
             .getStatus());
 }
 
+TEST(MatchExpressionParserTest, ExprParseFailsWithEmptyAnd) {
+    auto query = fromjson("{$and: []}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "$and argument must be a non-empty array");
+}
+
+TEST(MatchExpressionParserTest, ExprParseFailsWithNotArrayAnd) {
+    auto query = fromjson("{$and: 'dummy string'}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "$and argument must be an array");
+}
+
+TEST(MatchExpressionParserTest, ExprParseFailsWithNotObjectInArrayAnd) {
+    auto query = fromjson("{$and: ['dummy string']}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "$and argument's entries must be objects");
+}
+
 TEST(MatchExpressionParserTest, ExprFailsToParseWithTopLevelNot) {
     auto query = fromjson("{$not: {x: 1}}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -377,6 +423,24 @@ TEST(MatchExpressionParserTest, ExprFailsToParseWithTopLevelNot) {
         result.getStatus().reason() ==
         "unknown top level operator: $not. If you are trying to negate an entire expression, "
         "use $nor.");
+}
+
+TEST(MatchExpressionParserTest, ExprParseFailsWithStringNot) {
+    auto query = fromjson("{ a: {$not: 'dummy string'}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "$not argument must be a regex or an object");
+}
+
+TEST(MatchExpressionParserTest, ExprParseFailsWithEmptyNot) {
+    auto query = fromjson("{ a: {$not: {}}}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    StatusWithMatchExpression result = MatchExpressionParser::parse(
+        query, expCtx, ExtensionsCallbackNoop(), MatchExpressionParser::AllowedFeatures::kExpr);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "$not argument must be a non-empty object");
 }
 
 TEST(MatchExpressionParserTest, ExprFailsToParseWithinElemMatch) {
@@ -427,13 +491,13 @@ TEST(MatchExpressionParserTest, InternalExprEqParsesCorrectly) {
     ASSERT_FALSE(statusWith.getValue()->matchesBSON(fromjson("{a: {b: 6}}")));
 }
 
-TEST(MatchesExpressionParserTest, InternalExprEqComparisonToArrayDoesNotParse) {
+TEST(MatchExpressionParserTest, InternalExprEqComparisonToArrayDoesNotParse) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto query = fromjson("{'a.b': {$_internalExprEq: [5]}}");
     ASSERT_EQ(MatchExpressionParser::parse(query, expCtx).getStatus(), ErrorCodes::BadValue);
 }
 
-TEST(MatchesExpressionParserTest, InternalExprEqComparisonToUndefinedDoesNotParse) {
+TEST(MatchExpressionParserTest, InternalExprEqComparisonToUndefinedDoesNotParse) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto query = fromjson("{'a.b': {$_internalExprEq: undefined}}");
     ASSERT_EQ(MatchExpressionParser::parse(query, expCtx).getStatus(), ErrorCodes::BadValue);

@@ -11,27 +11,34 @@
 // (connection connected after shard change).
 //
 
-// Checking UUID and index consistency involves talking to shard primaries, but by the end of this
-// test, one shard does not have a primary.
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+
+// The following checks involves talking to shard primaries, but by the end of this test, one shard
+// does not have a primary.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
+TestData.skipCheckMetadataConsistency = true;
 
 // Replica set nodes started with --shardsvr do not enable key generation until they are added to a
 // sharded cluster and reject commands with gossiped clusterTime from users without the
 // advanceClusterTime privilege. This causes ShardingTest setup to fail because the shell briefly
-// authenticates as __system and recieves clusterTime metadata then will fail trying to gossip that
+// authenticates as __system and receives clusterTime metadata then will fail trying to gossip that
 // time later in setup.
 //
 
 // Multiple users cannot be authenticated on one connection within a session.
-// @tags: [live_record_incompatible]
 TestData.disableImplicitSessions = true;
 
-(function() {
-'use strict';
-
-var options = {rs: true, rsOptions: {nodes: 2}, keyFile: "jstests/libs/key1"};
+var options = {
+    rs: true,
+    rsOptions: {nodes: 2},
+    keyFile: "jstests/libs/key1",
+    // ShardingTest use a high config command timeout to avoid spurious failures but this test may
+    // require a timeout to complete, so we restore the default value to avoid failures.
+    mongosOptions: {setParameter: {defaultConfigCommandTimeoutMS: 30000}}
+};
 
 var st = new ShardingTest({shards: 3, mongos: 1, other: options});
 
@@ -52,19 +59,16 @@ st.stopBalancer();
 
 assert.commandWorked(admin.runCommand({setParameter: 1, traceExceptions: true}));
 
+// Create the unsharded database with shard0 primary
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'fooUnsharded', primaryShard: st.shard0.shardName}));
+// Create the sharded database with shard1 primary
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: 'fooSharded', primaryShard: st.shard1.shardName}));
+
 var collSharded = mongos.getCollection("fooSharded.barSharded");
 var collUnsharded = mongos.getCollection("fooUnsharded.barUnsharded");
 
-// Create the unsharded database with shard0 primary
-assert.commandWorked(collUnsharded.insert({some: "doc"}));
-assert.commandWorked(collUnsharded.remove({}));
-assert.commandWorked(
-    admin.runCommand({movePrimary: collUnsharded.getDB().toString(), to: st.shard0.shardName}));
-
-// Create the sharded database with shard1 primary
-assert.commandWorked(admin.runCommand({enableSharding: collSharded.getDB().toString()}));
-assert.commandWorked(
-    admin.runCommand({movePrimary: collSharded.getDB().toString(), to: st.shard1.shardName}));
 assert.commandWorked(admin.runCommand({shardCollection: collSharded.toString(), key: {_id: 1}}));
 assert.commandWorked(admin.runCommand({split: collSharded.toString(), middle: {_id: 0}}));
 assert.commandWorked(admin.runCommand(
@@ -301,4 +305,3 @@ gc();  // Clean up new connections
 
 jsTest.log("DONE!");
 st.stop();
-})();

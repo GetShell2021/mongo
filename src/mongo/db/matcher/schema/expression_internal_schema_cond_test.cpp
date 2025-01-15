@@ -27,14 +27,23 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include "mongo/base/status_with.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_cond.h"
 #include "mongo/db/matcher/schema/expression_internal_schema_object_match.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/unittest/assert.h"
+#include "mongo/unittest/framework.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 namespace {
@@ -96,6 +105,9 @@ TEST(InternalSchemaCondMatchExpressionTest, EmptyMatchAlwaysUsesThenBranch) {
 
     ASSERT_TRUE(cond->matchesBSON(BSON("value" << 0)));
     ASSERT_TRUE(cond->matchesBSON(BSON("value" << 2)));
+
+    BSONObj match = BSON("value" << 10);
+    ASSERT_TRUE(cond->matchesSingleElement(match.firstElement()));
 }
 
 TEST(InternalSchemaCondMatchExpressionTest, AppliesToSubobjectsViaObjectMatch) {
@@ -154,7 +166,7 @@ TEST(InternalSchemaCondMatchExpressionTest, EquivalentToClone) {
     auto elseQuery = BSON("interests"
                           << "dogs");
     auto cond = createCondMatchExpression(conditionQuery, thenQuery, elseQuery);
-    auto clone = cond->shallowClone();
+    auto clone = cond->clone();
     ASSERT_TRUE(cond->equivalent(clone.get()));
 }
 }  // namespace

@@ -27,21 +27,45 @@
  *    it in the license file.
  */
 
+#include <algorithm>
+#include <functional>
+#include <limits>
+#include <list>
+#include <memory>
+#include <ostream>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <absl/container/flat_hash_set.h>
+#include <boost/optional/optional.hpp>
+#include <fmt/format.h>
+
+#include "mongo/base/data_type.h"
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
-
-#include "mongo/db/jsobj.h"
-
-#include "mongo/base/data_range.h"
-#include "mongo/bson/bson_validate.h"
 #include "mongo/bson/bsonelement_comparator_interface.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
 #include "mongo/bson/generator_extended_canonical_2_0_0.h"
 #include "mongo/bson/generator_extended_relaxed_2_0_0.h"
 #include "mongo/bson/generator_legacy_strict.h"
-#include "mongo/db/json.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/ordering.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/bson/util/builder_fwd.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/allocator.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/hex.h"
+#include "mongo/util/shared_buffer.h"
 #include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
@@ -55,7 +79,7 @@ int compareObjects(const BSONObj& firstObj,
                    const BSONObj& secondObj,
                    const BSONObj& idxKey,
                    BSONObj::ComparisonRulesSet rules,
-                   const StringData::ComparatorInterface* comparator) {
+                   const StringDataComparator* comparator) {
     if (firstObj.isEmpty())
         return secondObj.isEmpty() ? 0 : -1;
     if (secondObj.isEmpty())
@@ -89,6 +113,8 @@ int compareObjects(const BSONObj& firstObj,
 }  // namespace
 
 /* BSONObj ------------------------------------------------------------*/
+
+const BSONObj BSONObj::kEmptyObject;
 
 void BSONObj::_assertInvalid(int maxSize) const {
     StringBuilder ss;
@@ -130,6 +156,12 @@ BSONObj BSONObj::copy() const {
     return BSONObj(std::move(storage));
 }
 
+void BSONObj::makeOwned() {
+    if (!isOwned()) {
+        *this = copy();
+    }
+}
+
 BSONObj BSONObj::getOwned() const {
     if (isOwned())
         return *this;
@@ -140,41 +172,71 @@ BSONObj BSONObj::getOwned(const BSONObj& obj) {
     return obj.getOwned();
 }
 
-BSONObj BSONObj::redact(bool onlyEncryptedFields) const {
+BSONObj BSONObj::redact(RedactLevel level,
+                        std::function<std::string(const BSONElement&)> fieldNameRedactor) const {
     _validateUnownedSize(objsize());
 
     // Helper to get an "internal function" to be able to do recursion
     struct redactor {
-        void appendRedactedElem(BSONObjBuilder& builder, const BSONElement& e, bool appendMask) {
+        void appendRedactedElem(BSONObjBuilder& builder,
+                                StringData fieldNameString,
+                                bool appendMask) {
             if (appendMask) {
-                builder.append(e.fieldNameStringData(), "###"_sd);
+                builder.append(fieldNameString, "###"_sd);
             } else {
-                builder.appendNull(e.fieldNameStringData());
+                builder.appendNull(fieldNameString);
             }
         }
 
         void operator()(BSONObjBuilder& builder,
                         const BSONObj& obj,
                         bool appendMask,
-                        bool onlyEncryptedFields) {
+                        RedactLevel level,
+                        std::function<std::string(const BSONElement&)> fieldNameRedactor) {
             for (BSONElement e : obj) {
+                StringData fieldNameString;
+                // Temporarily allocated string that must live long enough to be copied by builder.
+                std::string tempString;
+                if (!fieldNameRedactor) {
+                    fieldNameString = e.fieldNameStringData();
+                } else {
+                    tempString = fieldNameRedactor(e);
+                    fieldNameString = {tempString};
+                }
                 if (e.type() == Object) {
-                    BSONObjBuilder subBuilder = builder.subobjStart(e.fieldNameStringData());
-                    operator()(subBuilder, e.Obj(), appendMask, onlyEncryptedFields);
+                    BSONObjBuilder subBuilder = builder.subobjStart(fieldNameString);
+                    operator()(subBuilder, e.Obj(), appendMask, level, fieldNameRedactor);
                     subBuilder.done();
                 } else if (e.type() == Array) {
-                    BSONObjBuilder subBuilder = builder.subarrayStart(e.fieldNameStringData());
-                    operator()(subBuilder, e.Obj(), appendMask, onlyEncryptedFields);
+                    BSONObjBuilder subBuilder = builder.subarrayStart(fieldNameString);
+                    operator()(subBuilder, e.Obj(), appendMask, level, fieldNameRedactor);
                     subBuilder.done();
                 } else {
-                    if (onlyEncryptedFields) {
-                        if (e.type() == BinData && e.binDataType() == BinDataType::Encrypt) {
-                            appendRedactedElem(builder, e, appendMask);
-                        } else {
-                            builder.append(e);
+                    // SERVER-79068 Templatizing this could be a good opportunity for performance
+                    // improvements.
+                    switch (level) {
+                        case RedactLevel::all: {
+                            appendRedactedElem(builder, fieldNameString, appendMask);
+                            break;
                         }
-                    } else {
-                        appendRedactedElem(builder, e, appendMask);
+                        case RedactLevel::encryptedAndSensitive: {
+                            if (e.type() == BinData &&
+                                (e.binDataType() == BinDataType::Encrypt ||
+                                 e.binDataType() == BinDataType::Sensitive)) {
+                                appendRedactedElem(builder, fieldNameString, appendMask);
+                            } else {
+                                builder.append(e);
+                            }
+                            break;
+                        }
+                        case RedactLevel::sensitiveOnly: {
+                            if (e.type() == BinData && e.binDataType() == BinDataType::Sensitive) {
+                                appendRedactedElem(builder, fieldNameString, appendMask);
+                            } else {
+                                builder.append(e);
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -183,7 +245,7 @@ BSONObj BSONObj::redact(bool onlyEncryptedFields) const {
 
     try {
         BSONObjBuilder builder;
-        redactor()(builder, *this, /*appendMask=*/true, onlyEncryptedFields);
+        redactor()(builder, *this, /*appendMask=*/true, level, fieldNameRedactor);
         return builder.obj();
     } catch (const ExceptionFor<ErrorCodes::BSONObjectTooLarge>&) {
     }
@@ -193,7 +255,7 @@ BSONObj BSONObj::redact(bool onlyEncryptedFields) const {
     // we use BSONType::jstNull, which ensures the redacted object will not be larger than the
     // original.
     BSONObjBuilder builder;
-    redactor()(builder, *this, /*appendMask=*/false, onlyEncryptedFields);
+    redactor()(builder, *this, /*appendMask=*/false, level, fieldNameRedactor);
     return builder.obj();
 }
 
@@ -230,8 +292,32 @@ BSONObj BSONObj::_jsonStringGenerator(const Generator& g,
         while (1) {
             truncation = e.jsonStringGenerator(
                 g, writeSeparator, !isArray, pretty ? (pretty + 1) : 0, buffer, writeLimit);
+
+            if (!truncation.isEmpty()) {
+                g.writePadding(buffer);
+
+                BSONObjBuilder bob;
+                int omitted = 0;
+
+                bob.append("truncated", truncation);
+                if (!e.isABSONObj()) {
+                    // element is a leaf and will be omitted
+                    omitted++;
+                }
+                // subsequent elements are omitted
+                while (!(e = i.next()).eoo())
+                    ++omitted;
+
+                if (omitted) {
+                    bob.append("omitted", omitted);
+                }
+                truncation = bob.obj();
+                break;
+            }
+
             e = i.next();
-            if (!truncation.isEmpty() || e.eoo()) {
+
+            if (e.eoo()) {
                 g.writePadding(buffer);
                 break;
             }
@@ -300,14 +386,11 @@ BSONObj BSONObj::jsonStringBuffer(JsonStringFormat format,
     }
 }
 
-bool BSONObj::valid() const {
-    return validateBSON(objdata(), objsize()).isOK();
-}
 
 int BSONObj::woCompare(const BSONObj& r,
                        const Ordering& o,
                        ComparisonRulesSet rules,
-                       const StringData::ComparatorInterface* comparator) const {
+                       const StringDataComparator* comparator) const {
     if (isEmpty())
         return r.isEmpty() ? 0 : -1;
     if (r.isEmpty())
@@ -343,7 +426,7 @@ int BSONObj::woCompare(const BSONObj& r,
 int BSONObj::woCompare(const BSONObj& r,
                        const BSONObj& idxKey,
                        ComparisonRulesSet rules,
-                       const StringData::ComparatorInterface* comparator) const {
+                       const StringDataComparator* comparator) const {
     return (rules & ComparisonRules::kIgnoreFieldOrder)
         ? compareObjects<BSONObjIteratorSorted>(*this, r, idxKey, rules, comparator)
         : compareObjects<BSONObjIterator>(*this, r, idxKey, rules, comparator);
@@ -381,10 +464,8 @@ bool BSONObj::isFieldNamePrefixOf(const BSONObj& otherObj) const {
 
 void BSONObj::extractFieldsUndotted(BSONObjBuilder* b, const BSONObj& pattern) const {
     BSONObjIterator i(pattern);
-    while (i.moreWithEOO()) {
+    while (i.more()) {
         BSONElement e = i.next();
-        if (e.eoo())
-            break;
         BSONElement x = getField(e.fieldName());
         if (!x.eoo())
             b->appendAs(x, "");
@@ -399,10 +480,8 @@ BSONObj BSONObj::extractFieldsUndotted(const BSONObj& pattern) const {
 
 void BSONObj::filterFieldsUndotted(BSONObjBuilder* b, const BSONObj& filter, bool inFilter) const {
     BSONObjIterator i(*this);
-    while (i.moreWithEOO()) {
+    while (i.more()) {
         BSONElement e = i.next();
-        if (e.eoo())
-            break;
         BSONElement x = filter.getField(e.fieldName());
         if ((x.eoo() && !inFilter) || (!x.eoo() && inFilter))
             b->append(e);
@@ -415,37 +494,11 @@ BSONObj BSONObj::filterFieldsUndotted(const BSONObj& filter, bool inFilter) cons
     return b.obj();
 }
 
-BSONElement BSONObj::getFieldUsingIndexNames(StringData fieldName, const BSONObj& indexKey) const {
-    BSONObjIterator i(indexKey);
-    int j = 0;
-    while (i.moreWithEOO()) {
-        BSONElement f = i.next();
-        if (f.eoo())
-            return BSONElement();
-        if (f.fieldName() == fieldName)
-            break;
-        ++j;
-    }
-    BSONObjIterator k(*this);
-    while (k.moreWithEOO()) {
-        BSONElement g = k.next();
-        if (g.eoo())
-            return BSONElement();
-        if (j == 0) {
-            return g;
-        }
-        --j;
-    }
-    return BSONElement();
-}
-
 bool BSONObj::couldBeArray() const {
     BSONObjIterator i(*this);
     int index = 0;
-    while (i.moreWithEOO()) {
+    while (i.more()) {
         BSONElement e = i.next();
-        if (e.eoo())
-            break;
 
         // TODO:  If actually important, may be able to do int->char* much faster
         if (strcmp(e.fieldName(), static_cast<std::string>(str::stream() << index).c_str()) != 0)
@@ -458,10 +511,8 @@ bool BSONObj::couldBeArray() const {
 BSONObj BSONObj::clientReadable() const {
     BSONObjBuilder b;
     BSONObjIterator i(*this);
-    while (i.moreWithEOO()) {
+    while (i.more()) {
         BSONElement e = i.next();
-        if (e.eoo())
-            break;
         switch (e.type()) {
             case MinKey: {
                 BSONObjBuilder m;
@@ -486,11 +537,9 @@ BSONObj BSONObj::replaceFieldNames(const BSONObj& names) const {
     BSONObjBuilder b;
     BSONObjIterator i(*this);
     BSONObjIterator j(names);
-    BSONElement f = j.moreWithEOO() ? j.next() : BSONObj().firstElement();
-    while (i.moreWithEOO()) {
+    BSONElement f = j.next();
+    while (i.more()) {
         BSONElement e = i.next();
-        if (e.eoo())
-            break;
         if (!f.eoo()) {
             b.appendAs(e, f.fieldName());
             f = j.next();
@@ -514,7 +563,7 @@ BSONObj BSONObj::stripFieldNames(const BSONObj& obj) {
 
 bool BSONObj::hasFieldNames() const {
     for (auto e : *this) {
-        if (e.fieldName()[0])
+        if (!e.fieldNameStringData().empty())
             return true;
     }
     return false;
@@ -583,30 +632,28 @@ Status BSONObj::storageValidEmbedded() const {
     return Status::OK();
 }
 
-void BSONObj::getFields(unsigned n, const char** fieldNames, BSONElement* fields) const {
-    BSONObjIterator i(*this);
-    while (i.more()) {
-        BSONElement e = i.next();
-        const char* p = e.fieldName();
-        for (unsigned i = 0; i < n; i++) {
-            if (strcmp(p, fieldNames[i]) == 0) {
-                fields[i] = e;
-                break;
-            }
-        }
-    }
-}
-
 BSONElement BSONObj::getField(StringData name) const {
-    BSONObjIterator i(*this);
-    while (i.more()) {
-        BSONElement e = i.next();
-        // We know that e has a cached field length since BSONObjIterator::next internally
-        // called BSONElement::size on the BSONElement that it returned, so it is more
-        // efficient to re-use that information by obtaining the field name as a
-        // StringData, which will be pre-populated with the cached length.
-        if (name == e.fieldNameStringData())
-            return e;
+    const char* elem = objdata() + sizeof(int);
+    while (*elem) {
+        auto ptr = elem;
+        // Use the name comparison while computing the name length: this avoids having to look at
+        // the same name bytes twice.
+        for (auto c : name)
+            if (*++ptr != c || c == '\0')
+                goto next;  // *ptr is the first non-matching byte, possibly the 0 terminator
+
+        // If the field name is found and complete, return the element.
+        if (!*++ptr)
+            return BSONElement(elem, ptr - elem, BSONElement::TrustedInitTag{});
+
+        // The name is found, but the field name is not yet complete, so there's no match.
+        ++ptr;
+next:
+        // Skip any remaining part of the field name.
+        while (*ptr)
+            ++ptr;
+
+        elem += BSONElement(elem, ptr - elem, BSONElement::TrustedInitTag{}).size();
     }
     return BSONElement();
 }
@@ -624,15 +671,6 @@ bool BSONObj::getBoolField(StringData name) const {
 StringData BSONObj::getStringField(StringData name) const {
     BSONElement e = getField(name);
     return e.valueStringDataSafe();
-}
-
-bool BSONObj::getObjectID(BSONElement& e) const {
-    BSONElement f = getField("_id");
-    if (!f.eoo()) {
-        e = f;
-        return true;
-    }
-    return false;
 }
 
 BSONObj BSONObj::addField(const BSONElement& field) const {
@@ -683,22 +721,11 @@ BSONObj BSONObj::removeField(StringData name) const {
     BSONObjIterator i(*this);
     while (i.more()) {
         BSONElement e = i.next();
-        const char* fname = e.fieldName();
+        auto fname = e.fieldNameStringData();
         if (name != fname)
             b.append(e);
     }
     return b.obj();
-}
-
-BSONObj BSONObj::removeFields(const std::set<std::string>& fields) const {
-    BSONObjBuilder bob;
-    for (auto&& field : *this) {
-        if (fields.count(field.fieldName())) {
-            continue;
-        }
-        bob.append(field);
-    }
-    return bob.obj();
 }
 
 BSONObj BSONObj::removeFields(const StringDataSet& fields) const {
@@ -749,13 +776,8 @@ BSONObj BSONObj::getObjectField(StringData name) const {
 
 int BSONObj::nFields() const {
     int n = 0;
-    BSONObjIterator i(*this);
-    while (i.moreWithEOO()) {
-        BSONElement e = i.next();
-        if (e.eoo())
-            break;
-        n++;
-    }
+    for (BSONObjIterator i(*this); i.more(); i.next())
+        ++n;
     return n;
 }
 
@@ -774,11 +796,10 @@ void BSONObj::toString(
     }
 
     s << (isArray ? "[ " : "{ ");
-    BSONObjIterator i(*this);
     bool first = true;
-    while (1) {
-        massert(10327, "Object does not end with EOO", i.moreWithEOO());
-        BSONElement e = i.next();
+    for (auto i = begin();; ++i) {
+        BSONElement e = *i;
+        massert(10327, "Object does not end with EOO", i != end() || e.eoo());
         massert(10328, "Invalid element size", e.size() > 0);
         massert(10329, "Element too large", e.size() < (1 << 30));
         int offset = (int)(e.rawdata() - this->objdata());
@@ -832,45 +853,44 @@ StringBuilder& operator<<(StringBuilder& s, const BSONObj& o) {
 }
 
 /** Compare two bson elements, provided as const char *'s, by field name. */
-class BSONIteratorSorted::ElementFieldCmp {
+class BSONIteratorSorted::FieldNameCmp {
 public:
-    ElementFieldCmp(bool isArray);
-    bool operator()(const Field& lhs, const Field& rhs) const;
+    FieldNameCmp(bool isArray);
+    bool operator()(StringData lhs, StringData rhs) const;
 
 private:
     str::LexNumCmp _cmp;
 };
 
-BSONIteratorSorted::ElementFieldCmp::ElementFieldCmp(bool isArray) : _cmp(!isArray) {}
+BSONIteratorSorted::FieldNameCmp::FieldNameCmp(bool isArray) : _cmp(!isArray) {}
 
-bool BSONIteratorSorted::ElementFieldCmp::operator()(const Field& lhs, const Field& rhs) const {
+bool BSONIteratorSorted::FieldNameCmp::operator()(StringData lhs, StringData rhs) const {
     // Just compare field names.
-    return _cmp(lhs.fieldName, rhs.fieldName);
+    return _cmp(lhs, rhs);
 }
 
-BSONIteratorSorted::BSONIteratorSorted(const BSONObj& o, const ElementFieldCmp& cmp)
-    : _nfields(o.nFields()), _fields(std::make_unique<Field[]>(_nfields)) {
+BSONIteratorSorted::BSONIteratorSorted(const BSONObj& o, const FieldNameCmp& cmp)
+    : _fields(o.nFields()) {
     int x = 0;
     BSONObjIterator i(o);
     while (i.more()) {
         auto elem = i.next();
-        _fields[x++] = {elem.fieldNameStringData(), elem.size()};
+        _fields[x++] = elem.fieldNameStringData();
     }
-    verify(x == _nfields);
-    std::sort(_fields.get(), _fields.get() + _nfields, cmp);
+    std::sort(_fields.begin(), _fields.end(), cmp);
     _cur = 0;
 }
 
 BSONObjIteratorSorted::BSONObjIteratorSorted(const BSONObj& object)
-    : BSONIteratorSorted(object, ElementFieldCmp(false)) {}
+    : BSONIteratorSorted(object, FieldNameCmp(false)) {}
 
 BSONArrayIteratorSorted::BSONArrayIteratorSorted(const BSONArray& array)
-    : BSONIteratorSorted(array, ElementFieldCmp(true)) {}
+    : BSONIteratorSorted(array, FieldNameCmp(true)) {}
 
 /**
  * Types used to represent BSONObj and BSONArray memory in the Visual Studio debugger
  */
-#if defined(_MSC_VER) && defined(_DEBUG)
+#if defined(_MSC_VER)
 struct BSONObjData {
     int32_t size;
 } bsonObjDataInstance;
@@ -878,6 +898,6 @@ struct BSONObjData {
 struct BSONArrayData {
     int32_t size;
 } bsonObjArrayInstance;
-#endif  // defined(_MSC_VER) && defined(_DEBUG)
+#endif  // defined(_MSC_VER)
 
 }  // namespace mongo

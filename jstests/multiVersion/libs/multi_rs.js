@@ -1,6 +1,7 @@
 //
 // Utility functions for multi-version replica sets
 //
+import {ReplSetTest} from "jstests/libs/replsettest.js";
 
 ReplSetTest.prototype._stablePrimaryOnRestarts = function() {
     // In a 2-node replica set the secondary can step up after a restart. In fact while the
@@ -39,7 +40,7 @@ ReplSetTest.prototype.upgradeSet = function(options, user, pwd) {
     }
 };
 
-function mergeNodeOptions(nodeOptions, options) {
+export function mergeNodeOptions(nodeOptions, options) {
     for (let nodeName in nodeOptions) {
         nodeOptions[nodeName] = Object.merge(nodeOptions[nodeName], options);
     }
@@ -92,11 +93,9 @@ ReplSetTest.prototype.upgradePrimary = function(primary, options, user, pwd) {
     authNode(primary);
 
     let oldPrimary = this.stepdown(primary);
-    this.waitForState(oldPrimary, ReplSetTest.State.SECONDARY, undefined, authNode);
+    this.awaitSecondaryNodes(null, [oldPrimary]);
 
-    // waitForState() runs the logout command via asCluster() on either the current primary or the
-    // first node in the replica set so we re-authenticate on all connections before calling
-    // awaitNodesAgreeOnPrimary().
+    // we need to re-authenticate on all connections before calling awaitNodesAgreeOnPrimary().
     for (const node of this.nodes) {
         const connStatus =
             assert.commandWorked(node.adminCommand({connectionStatus: 1, showPrivileges: true}));

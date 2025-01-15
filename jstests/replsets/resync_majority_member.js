@@ -7,18 +7,18 @@
  *
  * @tags: [
  *   multiversion_incompatible,
- *   live_record_incompatible,
+ *   incompatible_with_windows_tls,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/libs/fail_point_util.js");
-load("jstests/libs/storage_engine_utils.js");
-load("jstests/libs/write_concern_util.js");
+import {configureFailPoint, kDefaultWaitForFailPointTimeout} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
 TestData.skipCheckDBHashes = true;  // the set is not consistent when we shutdown the test
+// Because this test intentionally causes the server to crash, we need to instruct the
+// shell to clean up the core dump that is left behind.
+TestData.cleanUpCoreDumpsFromExpectedCrash = true;
 
 const dbName = "testdb";
 const collName = "testcoll";
@@ -31,7 +31,7 @@ const rst = new ReplSetTest({
     settings: {chainingAllowed: false, catchupTimeoutMillis: 0 /* disable primary catchup */},
 });
 rst.startSet();
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 
 const primary = rst.getPrimary();
 const primaryDb = primary.getDB(dbName);
@@ -85,7 +85,7 @@ assert.commandWorked(
 
 assert.commandWorked(
     rollbackNode.adminCommand({replSetStepDown: ReplSetTest.kForeverSecs, force: true}));
-rst.waitForState(rollbackNode, ReplSetTest.State.SECONDARY);
+rst.awaitSecondaryNodes(null, [rollbackNode]);
 
 restartServerReplication(syncSource);
 
@@ -99,13 +99,8 @@ assert.commandWorked(syncSource.getDB(dbName).getCollection(collName).insert(
 // commit point, which triggers an invariant. This failpoint is used to verify the invariant
 // will be hit without having to search the logs.
 let rollbackCommittedWritesFailPoint;
-if (storageEngineIsWiredTigerOrInMemory()) {
-    rollbackCommittedWritesFailPoint =
-        configureFailPoint(rollbackNode, "rollbackToTimestampHangCommonPointBeforeReplCommitPoint");
-} else {
-    rollbackCommittedWritesFailPoint =
-        configureFailPoint(rollbackNode, "rollbackViaRefetchHangCommonPointBeforeReplCommitPoint");
-}
+rollbackCommittedWritesFailPoint =
+    configureFailPoint(rollbackNode, "rollbackToTimestampHangCommonPointBeforeReplCommitPoint");
 
 // Node 1 will have to roll back to rejoin the set. It will crash as it will refuse to roll back
 // majority committed data.
@@ -128,4 +123,3 @@ assert.eq(0, resyncNode.getDB(dbName)[collName].find(disappearingDoc).itcount())
 // We expect node 1 to have crashed.
 rst.stop(0, undefined, {allowedExitCode: MongoRunner.EXIT_ABORT});
 rst.stopSet();
-})();

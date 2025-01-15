@@ -54,7 +54,7 @@ public:
         return Status::OK();
     };
 
-    Status unyieldNoThrow(OperationContext* opCtx) noexcept {
+    virtual Status unyieldNoThrow(OperationContext* opCtx) noexcept {
         try {
             unyield(opCtx);
         } catch (const DBException& e) {
@@ -63,4 +63,33 @@ public:
         return Status::OK();
     };
 };
+
+/**
+ * Helper to run the given callback after yielding the given ResourceYielder and will always
+ * unyield if yielding succeeded. If the callback and unyielding both throw errors, the unyield
+ * error will be thrown.
+ */
+template <typename Func>
+std::invoke_result_t<Func> runWithYielding(OperationContext* opCtx,
+                                           ResourceYielder* yielder,
+                                           Func fn) {
+    if (yielder) {
+        yielder->yield(opCtx);
+    }
+
+    auto sw = [&]() -> StatusWith<std::invoke_result_t<Func>> {
+        try {
+            return fn();
+        } catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+    }();
+
+    if (yielder) {
+        yielder->unyield(opCtx);
+    }
+
+    return uassertStatusOK(sw);
+};
+
 }  // namespace mongo

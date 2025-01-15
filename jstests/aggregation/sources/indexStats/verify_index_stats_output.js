@@ -9,14 +9,14 @@
  *   # $indexStats aggregation stage cannot be used with $facet.
  *   do_not_wrap_aggregations_in_facets,
  *   uses_parallel_shell,
+ *   # Multi clients cannot share global fail points. When one client turns off a fail point, other
+ *   # clients waiting on the fail point will get failed.
+ *   multi_clients_incompatible,
  * ]
  */
-(function() {
-"use strict";
-load('jstests/noPassthrough/libs/index_build.js');  // for waitForIndexBuildToStart().
-load('jstests/libs/fixture_helpers.js');            // for runCommandOnEachPrimary.
-load("jstests/aggregation/extras/utils.js");        // for resultsEq.
-load("jstests/libs/fail_point_util.js");            // for configureFailPoint.
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {FixtureHelpers} from "jstests/libs/fixture_helpers.js";
+import {IndexBuildTest} from "jstests/noPassthrough/libs/index_build.js";
 
 const coll = db.index_stats_output;
 coll.drop();
@@ -68,6 +68,7 @@ let shardsFound = [];
 db.getSiblingDB("config").shards.find().forEach(function(shard) {
     allShards.push(shard._id);
 });
+const isShardedCluster = !!allShards.length;
 
 for (const indexStats of pausedOutput) {
     assert.hasFields(indexStats, ["building", "spec"]);
@@ -83,6 +84,8 @@ for (const indexStats of pausedOutput) {
     // names of known shards.
     if (indexStats.hasOwnProperty("shard")) {
         shardsFound.push(indexStats["shard"]);
+    } else {
+        assert(!isShardedCluster);
     }
 }
 
@@ -107,4 +110,3 @@ let finishedOutput = coll.aggregate([{$indexStats: {}}, {$match: {name: indexNam
 for (const indexStats of finishedOutput) {
     assert(!indexStats.hasOwnProperty("building"), tojson(indexStats));
 }
-})();

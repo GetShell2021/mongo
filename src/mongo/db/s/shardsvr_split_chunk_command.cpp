@@ -28,22 +28,47 @@
  */
 
 
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "mongo/base/error_codes.h"
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog_raii.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/s/chunk_operation_precondition_checks.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/split_chunk.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/tenant_id.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_attr.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/util/str.h"
+#include "mongo/s/chunk_version.h"
+#include "mongo/s/sharding_state.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/database_name_util.h"
+#include "mongo/util/namespace_string_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -59,7 +84,7 @@ public:
         return "internal command usage only\n"
                "example:\n"
                " { splitChunk:\"db.foo\" , keyPattern: {a:1} , min : {a:100} , max: {a:200} { "
-               "splitKeys : [ {a:150} , ... ], fromChunkSplitter: <bool>}";
+               "splitKeys : [ {a:150} , ... ]}";
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -74,51 +99,32 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forClusterResource(dbName.tenantId()),
+                     ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::deserialize(dbName.tenantId(),
+                                                CommandHelpers::parseNsFullyQualified(cmdObj),
+                                                SerializationContext::stateDefault());
     }
 
     bool errmsgRun(OperationContext* opCtx,
-                   const std::string& dbname,
+                   const DatabaseName& dbName,
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
+        ShardingState::get(opCtx)->assertCanAcceptShardedCommands();
 
-        const NamespaceString nss = NamespaceString(parseNs(dbname, cmdObj));
-
-        // throw if the provided shard version is too old
-        {
-            AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-            auto csr = CollectionShardingRuntime::get(opCtx, nss);
-
-            // pre 5.1 client  will send the collection version, which will make
-            // checkShardVersionOrThrow fail. TODO remove try-catch in 6.1
-            try {
-                csr->checkShardVersionOrThrow(opCtx);
-            } catch (const ExceptionFor<ErrorCodes::StaleConfig>& e) {
-                do {
-                    if (auto staleInfo = e.extraInfo<StaleConfigInfo>()) {
-                        if (staleInfo->getVersionWanted() &&
-                            staleInfo->getVersionWanted()->isOlderThan(
-                                staleInfo->getVersionReceived())) {
-                            break;
-                        }
-                    }
-                    throw;  // cause a refresh
-                } while (false);
-            }
-        }
+        const NamespaceString nss(parseNs(dbName, cmdObj));
 
         // Check whether parameters passed to splitChunk are sound
         BSONObj keyPatternObj;
@@ -134,16 +140,13 @@ public:
             keyPatternObj = keyPatternElem.Obj();
         }
 
-        auto chunkRange = uassertStatusOK(ChunkRange::fromBSON(cmdObj));
+        auto chunkRange = ChunkRange::fromBSON(cmdObj);
 
         std::string shardName;
         auto parseShardNameStatus = bsonExtractStringField(cmdObj, "from", &shardName);
         uassertStatusOK(parseShardNameStatus);
 
-        LOGV2(22104,
-              "Received splitChunk request: {request}",
-              "Received splitChunk request",
-              "request"_attr = redact(cmdObj));
+        LOGV2(22104, "Received splitChunk request", "request"_attr = redact(cmdObj));
 
         std::vector<BSONObj> splitKeys;
         {
@@ -172,34 +175,31 @@ public:
                 cmdObj, "timestamp", expectedCollectionTimestamp.get_ptr()));
         }
 
-        bool fromChunkSplitter = [&]() {
-            bool field = false;
-            Status status = bsonExtractBooleanField(cmdObj, "fromChunkSplitter", &field);
-            return status.isOK() && field;
-        }();
-
-        auto topChunk = uassertStatusOK(splitChunk(opCtx,
-                                                   nss,
-                                                   keyPatternObj,
-                                                   chunkRange,
-                                                   std::move(splitKeys),
-                                                   shardName,
-                                                   expectedCollectionEpoch,
-                                                   expectedCollectionTimestamp,
-                                                   fromChunkSplitter));
-
-        // Otherwise, we want to check whether or not top-chunk optimization should be performed. If
-        // yes, then we should have a ChunkRange that was returned. Regardless of whether it should
-        // be performed, we will return true.
-        if (topChunk) {
-            result.append("shouldMigrate",
-                          BSON("min" << topChunk->getMin() << "max" << topChunk->getMax()));
+        // Check that the preconditions for split chunk are met and throw StaleShardVersion
+        // otherwise.
+        {
+            uassertStatusOK(
+                FilteringMetadataCache::get(opCtx)->onCollectionPlacementVersionMismatch(
+                    opCtx, nss, boost::none));
+            const auto [metadata, indexInfo] = checkCollectionIdentity(
+                opCtx, nss, expectedCollectionEpoch, expectedCollectionTimestamp);
+            checkShardKeyPattern(opCtx, nss, metadata, indexInfo, chunkRange);
+            checkChunkMatchesRange(opCtx, nss, metadata, indexInfo, chunkRange);
         }
+
+        uassertStatusOK(splitChunk(opCtx,
+                                   nss,
+                                   keyPatternObj,
+                                   chunkRange,
+                                   std::move(splitKeys),
+                                   shardName,
+                                   expectedCollectionEpoch,
+                                   expectedCollectionTimestamp));
 
         return true;
     }
-
-} cmdSplitChunk;
+};
+MONGO_REGISTER_COMMAND(SplitChunkCommand).forShard();
 
 }  // namespace
 }  // namespace mongo

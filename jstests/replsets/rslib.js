@@ -1,34 +1,34 @@
-var syncFrom;
-var wait;
-var occasionally;
-var reconnect;
-var getLatestOp;
-var waitForAllMembers;
-var reconfig;
-var safeReconfigShouldFail;
-var awaitOpTime;
-var waitUntilAllNodesCaughtUp;
-var waitForState;
-var reInitiateWithoutThrowingOnAbortedMember;
-var awaitRSClientHosts;
-var getLastOpTime;
-var getFirstOplogEntry;
-var setLogVerbosity;
-var stopReplicationAndEnforceNewPrimaryToCatchUp;
-var isConfigCommitted;
-var assertSameConfigContent;
-var getConfigWithNewlyAdded;
-var isMemberNewlyAdded;
-var waitForNewlyAddedRemovalForNodeToBeCommitted;
-var assertVoteCount;
-var disconnectSecondaries;
-var reconnectSecondaries;
-var createRstArgs;
-var createRst;
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {restartServerReplication, stopServerReplication} from "jstests/libs/write_concern_util.js";
 
-(function() {
-"use strict";
-load("jstests/libs/write_concern_util.js");
+export var syncFrom;
+export var wait;
+export var occasionally;
+export var reconnect;
+export var getLatestOp;
+export var waitForAllMembers;
+export var reconfig;
+export var safeReconfigShouldFail;
+export var awaitOpTime;
+export var waitUntilAllNodesCaughtUp;
+export var waitForState;
+export var reInitiateWithoutThrowingOnAbortedMember;
+export var awaitRSClientHosts;
+export var getLastOpTime;
+export var getFirstOplogEntry;
+export var setLogVerbosity;
+export var stopReplicationAndEnforceNewPrimaryToCatchUp;
+export var isConfigCommitted;
+export var assertSameConfigContent;
+export var isSameConfigContent;
+export var getConfigWithNewlyAdded;
+export var isMemberNewlyAdded;
+export var waitForNewlyAddedRemovalForNodeToBeCommitted;
+export var assertVoteCount;
+export var disconnectSecondaries;
+export var reconnectSecondaries;
+export var createRstArgs;
+export var createRst;
 
 var count = 0;
 var w = 0;
@@ -128,13 +128,13 @@ reconnect = function(conn) {
         try {
             // Make this work with either dbs or connections.
             if (typeof (conn.getDB) == "function") {
-                db = conn.getDB('foo');
+                db = conn.getDB('config');
             } else {
                 db = conn;
             }
 
             // Run a simple command to re-establish connection.
-            db.bar.stats();
+            db.settings.stats();
 
             // SERVER-4241: Shell connections don't re-authenticate on reconnect.
             if (jsTest.options().keyFile) {
@@ -398,7 +398,6 @@ function autoReconfig(rst, targetConfig) {
  *     secondary, or arbiter states
  */
 reconfig = function(rst, config, force, doNotWaitForMembers) {
-    "use strict";
     var primary = rst.getPrimary();
     config = rst._updateConfigIfNotDurable(config);
 
@@ -531,8 +530,8 @@ reInitiateWithoutThrowingOnAbortedMember = function(replSetTest) {
     try {
         replSetTest.reInitiate();
     } catch (e) {
-        // reInitiate can throw because it tries to run an ismaster command on
-        // all secondaries, including the new one that may have already aborted
+        // reInitiate can throw because it tries to run a "hello" command on all secondaries,
+        // including the new one that may have already aborted
         const errMsg = tojson(e);
         if (isNetworkError(e)) {
             // Ignore these exceptions, which are indicative of an aborted node
@@ -586,7 +585,7 @@ awaitRSClientHosts = function(conn, host, hostOk, rs, timeout) {
                 // Check that *all* host properties are set correctly
                 var propOk = true;
                 for (var prop in hostOk) {
-                    // Use special comparator for tags because isMaster can return the fields in
+                    // Use special comparator for tags because hello can return the fields in
                     // different order. The fields of the tags should be treated like a set of
                     // strings and 2 tags should be considered the same if the set is equal.
                     if (prop == 'tags') {
@@ -698,12 +697,26 @@ stopReplicationAndEnforceNewPrimaryToCatchUp = function(rst, node) {
     const oldSecondaries = rst.getSecondaries();
     const oldPrimary = rst.getPrimary();
 
-    // In the case that the old primary has just stepped up and is running internal writes from
-    // PrimaryOnlyService, wait for those to be replicated. This is because there could be a race
-    // between stopping one of the secondaries, while the other secondary is still able to replicate
-    // the internal writes from PrimaryOnlyService before stopping replication.
+    // It's possible for the old primary to be running internal writes from the PrimaryOnlyService
+    // at random. This means that when we halt replication on the secondaries, a race may occur
+    // in which one secondary may have replicated the internal write already while the other hasn't
+    // yet. Therefore, we ensure that the passed in 'node' is ahead of the other secondaries through
+    // some writes to a junk collection 'junk_coll' to guarantee that 'node' can get elected.
+    assert.commandWorked(oldPrimary.getDB("test").junk_coll.remove({}));
     rst.awaitReplication();
     stopServerReplication(oldSecondaries);
+    // Restart replication on just the selected node, and allow it to progress ahead of the other
+    // secondaries before stopping replication on it again.
+    restartServerReplication(node);
+    assert.commandWorked(oldPrimary.getDB("test").junk_coll.insert({junk: 0}));
+    assert.soon(
+        () => {
+            return node.getDB("test").junk_coll.find().readConcern("local").itcount() == 1;
+        },
+        `Unexpected document count: ${
+            node.getDB("test").junk_coll.find().readConcern("local").itcount()}`);
+    stopServerReplication(node);
+
     for (let i = 0; i < 3; i++) {
         assert.commandWorked(oldPrimary.getDB("test").foo.insert({x: i}));
     }
@@ -741,19 +754,28 @@ isConfigCommitted = function(node) {
  * 'term' field.
  */
 assertSameConfigContent = function(configA, configB) {
+    assert(isSameConfigContent(configA, configB));
+};
+
+/**
+ * Returns true if replica set config A is the same as replica set config B ignoring the 'version'
+ * and 'term' field.
+ */
+isSameConfigContent = function(configA, configB) {
     // Save original versions and terms.
     const [versionA, termA] = [configA.version, configA.term];
     const [versionB, termB] = [configB.version, configB.term];
 
     configA.version = configA.term = 0;
     configB.version = configB.term = 0;
-    assert.eq(configA, configB);
+    const isEqual = tojson(configA) === tojson(configB);
 
     // Reset values so we don't modify the original objects.
     configA.version = versionA;
     configA.term = termA;
     configB.version = versionB;
     configB.term = termB;
+    return isEqual;
 };
 
 /**
@@ -863,9 +885,8 @@ createRst = function(rstArgs, retryOnRetryableErrors) {
             return new ReplSetTest({rstArgs: rstArgs});
         } catch (e) {
             if (retryOnRetryableErrors && isNetworkError(e)) {
-                jsTest.log(`Failed to create ReplSetTest for ${
-                    rstArgs.name} inside tenant migration thread: ${tojson(e)}. Retrying in ${
-                    kCreateRstRetryIntervalMS}ms.`);
+                jsTest.log(`Failed to create ReplSetTest for ${rstArgs.name} with error: ${
+                    tojson(e)}. Retrying in ${kCreateRstRetryIntervalMS}ms.`);
                 sleep(kCreateRstRetryIntervalMS);
                 continue;
             }
@@ -873,4 +894,3 @@ createRst = function(rstArgs, retryOnRetryableErrors) {
         }
     }
 };
-}());

@@ -27,9 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <boost/move/utility_core.hpp>
+
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
 #include "mongo/db/stats/single_transaction_stats.h"
+#include "mongo/util/assert_util_core.h"
 
 namespace mongo {
 
@@ -57,11 +61,11 @@ Microseconds SingleTransactionStats::getPreparedDuration(TickSource* tickSource,
     if (_preparedStartTime != boost::none) {
         // If the transaction hasn't ended yet, we return how long it has currently been running
         // for.
-        invariant(_preparedStartTime.get() > 0);
+        invariant(_preparedStartTime.value() > 0);
         if (_endTime == 0) {
-            return tickSource->ticksTo<Microseconds>(curTick - _preparedStartTime.get());
+            return tickSource->ticksTo<Microseconds>(curTick - _preparedStartTime.value());
         }
-        return tickSource->ticksTo<Microseconds>(_endTime - _preparedStartTime.get());
+        return tickSource->ticksTo<Microseconds>(_endTime - _preparedStartTime.value());
     }
     return Microseconds(0);
 }

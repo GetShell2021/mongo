@@ -1,12 +1,21 @@
 /*
  * Utilities for testing that internal transactions for retryable writes can be retried.
  */
-'use strict';
 
-load('jstests/sharding/internal_txns/libs/fixture_helpers.js');
-load('jstests/sharding/libs/sharded_transactions_helpers.js');
+import {withRetryOnTransientTxnError} from "jstests/libs/auto_retry_transaction_in_sharding.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    getImageEntriesForTxn,
+    getImageEntriesForTxnOnNode,
+    getOplogEntriesForTxn,
+    getTxnEntriesForSession,
+    makeAbortTransactionCmdObj,
+    makeCommitTransactionCmdObj,
+    makePrepareTransactionCmdObj,
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
-function getOplogEntriesForTxnWithRetries(rs, lsid, txnNumber) {
+export function getOplogEntriesForTxnWithRetries(rs, lsid, txnNumber) {
     let oplogEntries;
     assert.soon(
         () => {
@@ -32,12 +41,31 @@ function getOplogEntriesForTxnWithRetries(rs, lsid, txnNumber) {
     return oplogEntries;
 }
 
-function RetryableInternalTransactionTest(collectionOptions = {}) {
+export function RetryableInternalTransactionTest(collectionOptions = {},
+                                                 initiateWithDefaultElectionTimeout = false) {
+    // This test requires running prepareTransaction and commitTransaction directly against the
+    // shard.
+    TestData.replicaSetEndpointIncompatible = true;
+
+    // Transactions with more than two operations will have the behavior of large transactions and
+    // span multiple oplog entries.
+    const maxNumberOfTransactionOperationsInSingleOplogEntry = 2;
+
     // Set a large oplogSize since this test runs a find command to get the oplog entries for
     // every transaction that it runs including large transactions and with the default oplogSize,
     // oplog reading done by the find command may not be able to keep up with the oplog truncation,
     // causing the command to fail with CappedPositionLost.
-    const st = new ShardingTest({shards: 1, rs: {nodes: 2, oplogSize: 256}});
+    const st = new ShardingTest({
+        shards: 1,
+        rs: {nodes: 2, oplogSize: 256},
+        rsOptions: {
+            setParameter: {
+                maxNumberOfTransactionOperationsInSingleOplogEntry:
+                    maxNumberOfTransactionOperationsInSingleOplogEntry
+            }
+        },
+        initiateWithDefaultElectionTimeout: initiateWithDefaultElectionTimeout
+    });
 
     const kTestMode = {kNonRecovery: 1, kRestart: 2, kFailover: 3, kRollback: 4};
 
@@ -45,9 +73,6 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
     // applyOps oplog entry should contain the entry for retryable write being tested.
     // 'testRetryLargeTxn' runs a large transaction with three applyOps oplog entries.
     const kOplogEntryLocation = {kFirst: 1, kMiddle: 2, kLast: 3};
-
-    // For creating documents that will result in large transactions.
-    const kSize10MB = 10 * 1024 * 1024;
 
     const kDbName = "testDb";
     const kCollName = "testColl";
@@ -81,6 +106,7 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
     function assertConsistentImageEntries(lsid, txnNumber) {
         const imageEntriesOnPrimary =
             getImageEntriesForTxnOnNode(st.rs0.getPrimary(), lsid, txnNumber);
+        st.rs0.awaitReplication();
         st.rs0.getSecondaries().forEach(secondary => {
             const imageEntriesOnSecondary = getImageEntriesForTxnOnNode(secondary, lsid, txnNumber);
             assert.eq(imageEntriesOnSecondary, imageEntriesOnPrimary);
@@ -89,15 +115,17 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
 
     function setUpTestMode(mode) {
         if (mode == kTestMode.kRestart) {
-            st.rs0.stopSet(null /* signal */, true /*forRestart */);
-            st.rs0.startSet({restart: true});
-            const newPrimary = st.rs0.getPrimary();
+            st.rs0.restart(0, {
+                remember: true,
+                startClean: false,
+            });
+            st.rs0.waitForPrimary();
         } else if (mode == kTestMode.kFailover) {
             const oldPrimary = st.rs0.getPrimary();
             assert.commandWorked(
                 oldPrimary.adminCommand({replSetStepDown: ReplSetTest.kForeverSecs, force: true}));
             assert.commandWorked(oldPrimary.adminCommand({replSetFreeze: 0}));
-            const newPrimary = st.rs0.getPrimary();
+            st.rs0.waitForPrimary();
         }
     }
 
@@ -113,15 +141,17 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         assert.commandWorked(mongosTestDB.adminCommand(commitCmdObj));
     }
 
-    function testNonRetryableBasic(cmdObj, {
-        txnOptions,
-        testMode,
-        expectFindAndModifyImageInOplog,
-        expectFindAndModifyImageInSideCollection
-    }) {
+    function retryCommittedInternalTransaction(cmdObj, initialRes, checkRetryResponseFunc) {
+        withRetryOnTransientTxnError(() => {
+            const retryRes = assert.commandWorked(mongosTestDB.runCommand(cmdObj));
+            checkRetryResponseFunc(initialRes, retryRes);
+        });
+    }
+
+    function testNonRetryableBasic(
+        cmdObj, {txnOptions, testMode, expectFindAndModifyImageInSideCollection}) {
         // A findAndModify write statement in a non-retryable transaction will not generate a
         // pre/post image.
-        assert(!expectFindAndModifyImageInOplog);
         assert(!expectFindAndModifyImageInSideCollection);
         jsTest.log("Testing retrying a non-retryable internal transaction");
         cmdObj.startTransaction = true;
@@ -129,7 +159,7 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         // Initial try.
         const initialLsid = txnOptions.makeSessionIdFunc();
         let initialTxnNumber = 0;
-        runTxnRetryOnLockTimeoutError(() => {
+        withRetryOnTransientTxnError(() => {
             initialTxnNumber++;
             setTxnFields(cmdObj, initialLsid, initialTxnNumber);
             assert.commandWorked(mongosTestDB.runCommand(cmdObj));
@@ -138,7 +168,7 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
 
         const initialTxnStateBefore = getTransactionState(initialLsid, initialTxnNumber);
         assert.eq(initialTxnStateBefore.oplogEntries.length,
-                  (txnOptions.isPreparedTxn ? 2 : 1) + (expectFindAndModifyImageInOplog ? 1 : 0),
+                  (txnOptions.isPreparedTxn ? 2 : 1),
                   initialTxnStateBefore.oplogEntries);
         assert.eq(initialTxnStateBefore.imageEntries.length,
                   expectFindAndModifyImageInSideCollection ? 1 : 0,
@@ -159,14 +189,9 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         assert.commandWorked(mongosTestColl.remove({}));
     }
 
-    function testRetryableBasic(cmdObj, {
-        txnOptions,
-        testMode,
-        expectFindAndModifyImageInOplog,
-        expectFindAndModifyImageInSideCollection,
-        checkRetryResponseFunc
-    }) {
-        assert(!expectFindAndModifyImageInOplog || !expectFindAndModifyImageInSideCollection);
+    function testRetryableBasic(
+        cmdObj,
+        {txnOptions, testMode, expectFindAndModifyImageInSideCollection, checkRetryResponseFunc}) {
         jsTest.log(
             "Testing retrying a retryable internal transaction with one applyOps oplog entry");
         cmdObj.startTransaction = true;
@@ -175,7 +200,7 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         const initialLsid = txnOptions.makeSessionIdFunc();
         let initialTxnNumber = 0;
         let initialRes;
-        runTxnRetryOnLockTimeoutError(() => {
+        withRetryOnTransientTxnError(() => {
             initialTxnNumber++;
             setTxnFields(cmdObj, initialLsid, initialTxnNumber);
             initialRes = assert.commandWorked(mongosTestDB.runCommand(cmdObj));
@@ -184,7 +209,7 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
 
         const initialTxnStateBefore = getTransactionState(initialLsid, initialTxnNumber);
         assert.eq(initialTxnStateBefore.oplogEntries.length,
-                  (txnOptions.isPreparedTxn ? 2 : 1) + (expectFindAndModifyImageInOplog ? 1 : 0),
+                  (txnOptions.isPreparedTxn ? 2 : 1),
                   initialTxnStateBefore.oplogEntries);
         assert.eq(initialTxnStateBefore.imageEntries.length,
                   expectFindAndModifyImageInSideCollection ? 1 : 0,
@@ -193,16 +218,13 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
 
         setUpTestMode(testMode);
 
-        // Retry in the initial internal transaction. No need to commit since the transaction has
-        // already committed.
-        const retryRes = assert.commandWorked(mongosTestDB.runCommand(cmdObj));
-        checkRetryResponseFunc(initialRes, retryRes);
+        retryCommittedInternalTransaction(cmdObj, initialRes, checkRetryResponseFunc);
 
         // Retry in a different internal transaction (running in an internal session with a
         // different txnUUID) to simulate a retry from a different mongos.
         const retryLsid = Object.assign({}, initialLsid, {txnUUID: UUID()});
         let retryTxnNumber = 0;
-        runTxnRetryOnLockTimeoutError(() => {
+        withRetryOnTransientTxnError(() => {
             retryTxnNumber++;
             setTxnFields(cmdObj, retryLsid, retryTxnNumber);
             const retryRes = assert.commandWorked(mongosTestDB.runCommand(cmdObj));
@@ -224,24 +246,18 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         assert.commandWorked(mongosTestColl.remove({}));
     }
 
-    function testRetryableLargeTxn(cmdObj, {
-        txnOptions,
-        testMode,
-        expectFindAndModifyImageInOplog,
-        expectFindAndModifyImageInSideCollection,
-        checkRetryResponseFunc
-    }) {
-        assert(!expectFindAndModifyImageInOplog || !expectFindAndModifyImageInSideCollection);
-
+    function testRetryableLargeTxn(
+        cmdObj,
+        {txnOptions, testMode, expectFindAndModifyImageInSideCollection, checkRetryResponseFunc}) {
         jsTest.log(
             "Testing retrying a retryable internal transaction with more than one applyOps oplog entry");
-
         let stmtId = 1;
-        let makeInsertCmdObj = (doc) => {
+        let makeInsertCmdObj = (docs) => {
+            assert.eq(maxNumberOfTransactionOperationsInSingleOplogEntry, docs.length);
             return {
                 insert: kCollName,
-                documents: [Object.assign(doc, {y: new Array(kSize10MB).join("a")})],
-                stmtId: NumberInt(stmtId++),
+                documents: docs,
+                stmtIds: [NumberInt(stmtId++), NumberInt(stmtId++)],
             };
         };
         let makeCmdObjToRetry = (cmdObj) => {
@@ -260,10 +276,9 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
             return cmdObjToRetry;
         };
 
-        const insertCmdObj0 =
-            Object.assign(makeInsertCmdObj({_id: -100, x: 100}), {startTransaction: true});
-        const insertCmdObj1 = makeInsertCmdObj({_id: -200, x: -200});
-        const insertCmdObj2 = makeInsertCmdObj({_id: -300, x: -300});
+        const insertCmdObj0 = makeInsertCmdObj([{_id: -100, x: 100}, {_id: -101, x: 101}]);
+        const insertCmdObj1 = makeInsertCmdObj([{_id: -200, x: 200}, {_id: -201, x: 201}]);
+        const insertCmdObj2 = makeInsertCmdObj([{_id: -300, x: 300}, {_id: -301, x: 301}]);
         const cmdObjToRetry = makeCmdObjToRetry(cmdObj);
         const insertCmdObjs = [insertCmdObj0, insertCmdObj1, insertCmdObj2];
 
@@ -271,23 +286,26 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         const initialLsid = txnOptions.makeSessionIdFunc();
         let initialTxnNumber = 0;
         let initialRes;
-        runTxnRetryOnLockTimeoutError(() => {
+        withRetryOnTransientTxnError(() => {
             initialTxnNumber++;
             setTxnFields(cmdObjToRetry, initialLsid, initialTxnNumber);
             insertCmdObjs.forEach(cmdObj => setTxnFields(cmdObj, initialLsid, initialTxnNumber));
             if (txnOptions.oplogEntryLocation == kOplogEntryLocation.kLast) {
-                assert.commandWorked(mongosTestDB.runCommand(insertCmdObj0));
+                assert.commandWorked(mongosTestDB.runCommand(
+                    Object.assign(insertCmdObj0, {startTransaction: true})));
                 assert.commandWorked(mongosTestDB.runCommand(insertCmdObj1));
                 assert.commandWorked(mongosTestDB.runCommand(insertCmdObj2));
                 initialRes = assert.commandWorked(mongosTestDB.runCommand(cmdObjToRetry));
             } else if (txnOptions.oplogEntryLocation == kOplogEntryLocation.kMiddle) {
-                assert.commandWorked(mongosTestDB.runCommand(insertCmdObj0));
+                assert.commandWorked(mongosTestDB.runCommand(
+                    Object.assign(insertCmdObj0, {startTransaction: true})));
                 assert.commandWorked(mongosTestDB.runCommand(insertCmdObj1));
                 initialRes = assert.commandWorked(mongosTestDB.runCommand(cmdObjToRetry));
                 assert.commandWorked(mongosTestDB.runCommand(insertCmdObj2));
             } else {
+                initialRes = assert.commandWorked(mongosTestDB.runCommand(
+                    Object.assign({}, cmdObjToRetry, {startTransaction: true})));
                 assert.commandWorked(mongosTestDB.runCommand(insertCmdObj0));
-                initialRes = assert.commandWorked(mongosTestDB.runCommand(cmdObjToRetry));
                 assert.commandWorked(mongosTestDB.runCommand(insertCmdObj1));
                 assert.commandWorked(mongosTestDB.runCommand(insertCmdObj2));
             }
@@ -295,9 +313,12 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         });
 
         const initialTxnStateBefore = getTransactionState(initialLsid, initialTxnNumber);
+
+        // stmtId is one greater than the total number of statements executed in the transaction.
+        const expectedOplogLength =
+            Math.floor(stmtId / maxNumberOfTransactionOperationsInSingleOplogEntry);
         assert.eq(initialTxnStateBefore.oplogEntries.length,
-                  (txnOptions.isPreparedTxn ? insertCmdObjs.length + 1 : insertCmdObjs.length) +
-                      (expectFindAndModifyImageInOplog ? 1 : 0));
+                  (txnOptions.isPreparedTxn ? expectedOplogLength + 1 : expectedOplogLength));
         assert.eq(initialTxnStateBefore.imageEntries.length,
                   expectFindAndModifyImageInSideCollection ? 1 : 0,
                   initialTxnStateBefore.imageEntries);
@@ -305,22 +326,20 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
 
         setUpTestMode(testMode);
 
-        // Retry in the initial internal transaction. No need to commit since the transaction has
-        // already committed.
-        const retryRes = assert.commandWorked(mongosTestDB.runCommand(cmdObj));
-        checkRetryResponseFunc(initialRes, retryRes);
+        retryCommittedInternalTransaction(cmdObj, initialRes, checkRetryResponseFunc);
 
         // Retry in a different internal transaction (running in an internal session with a
         // different txnUUID) to simulate a retry from a different mongos.
         const retryLsid = Object.assign({}, initialLsid, {txnUUID: UUID()});
         let retryTxnNumber = 0;
-        runTxnRetryOnLockTimeoutError(() => {
+        withRetryOnTransientTxnError(() => {
             retryTxnNumber++;
             setTxnFields(cmdObjToRetry, retryLsid, retryTxnNumber);
+            insertCmdObj0.startTransaction = true;
             insertCmdObjs.forEach(cmdObj => setTxnFields(cmdObj, retryLsid, retryTxnNumber));
             insertCmdObjs.forEach(insertCmdObj => {
                 const retryRes = assert.commandWorked(mongosTestDB.runCommand(insertCmdObj));
-                assert.eq(retryRes.n, 1);
+                assert.eq(retryRes.n, 2);
             });
             const retryRes = assert.commandWorked(mongosTestDB.runCommand(cmdObjToRetry));
             checkRetryResponseFunc(initialRes, retryRes);
@@ -345,7 +364,6 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         txnOptions,
         testMode,
         expectRetryToSucceed,
-        expectFindAndModifyImageInOplog,
         expectFindAndModifyImageInSideCollection,
         checkRetryResponseFunc
     }) {
@@ -363,7 +381,6 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
             txnOptions,
             testMode,
             expectRetryToSucceed,
-            expectFindAndModifyImageInOplog,
             expectFindAndModifyImageInSideCollection,
             checkRetryResponseFunc
         });
@@ -432,15 +449,9 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
     function testRetryFindAndModify(findAndModifyCmdObj, {
         txnOptions,
         testMode,
-        enableFindAndModifyImageCollection,
         expectRetryToSucceed,
         expectFindAndModifyImage,
     }) {
-        const shard0Primary = st.rs0.getPrimary();
-        assert.commandWorked(shard0Primary.adminCommand({
-            setParameter: 1,
-            storeFindAndModifyImagesInSideCollection: enableFindAndModifyImageCollection
-        }));
         const checkRetryResponseFunc = (initialRes, retryRes) => {
             assert.eq(initialRes.lastErrorObject, retryRes.lastErrorObject);
             assert.eq(initialRes.value, retryRes.value);
@@ -450,10 +461,8 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
             txnOptions,
             testMode,
             expectRetryToSucceed,
-            expectFindAndModifyImageInOplog: expectRetryToSucceed && expectFindAndModifyImage &&
-                !enableFindAndModifyImageCollection,
-            expectFindAndModifyImageInSideCollection: expectRetryToSucceed &&
-                expectFindAndModifyImage && enableFindAndModifyImageCollection,
+            expectFindAndModifyImageInSideCollection:
+                expectRetryToSucceed && expectFindAndModifyImage,
             checkRetryResponseFunc
         });
     }
@@ -461,12 +470,9 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
     function testRetryFindAndModifyUpsert({
         txnOptions,
         testMode,
-        enableFindAndModifyImageCollection,
         expectRetryToSucceed,
     }) {
-        jsTest.log(
-            "Testing findAndModify upsert (i.e. no preImage or postImage) with enableFindAndModifyImageCollection: " +
-            enableFindAndModifyImageCollection);
+        jsTest.log("Testing findAndModify upsert (i.e. no preImage or postImage)");
 
         const findAndModifyCmdObj = {
             findAndModify: kCollName,
@@ -478,7 +484,6 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         testRetryFindAndModify(findAndModifyCmdObj, {
             txnOptions,
             testMode,
-            enableFindAndModifyImageCollection,
             expectFindAndModifyImage,
             expectRetryToSucceed,
         });
@@ -487,12 +492,9 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
     function testRetryFindAndModifyUpdateWithPreImage({
         txnOptions,
         testMode,
-        enableFindAndModifyImageCollection,
         expectRetryToSucceed,
     }) {
-        jsTest.log(
-            "Testing findAndModify update with preImage with enableFindAndModifyImageCollection: " +
-            enableFindAndModifyImageCollection);
+        jsTest.log("Testing findAndModify update with preImage");
 
         assert.commandWorked(mongosTestColl.insert([{_id: -1, x: -1}]));
         const findAndModifyCmdObj = {
@@ -504,7 +506,6 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         testRetryFindAndModify(findAndModifyCmdObj, {
             txnOptions,
             testMode,
-            enableFindAndModifyImageCollection,
             expectFindAndModifyImage,
             expectRetryToSucceed,
         });
@@ -513,12 +514,9 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
     function testRetryFindAndModifyUpdateWithPostImage({
         txnOptions,
         testMode,
-        enableFindAndModifyImageCollection,
         expectRetryToSucceed,
     }) {
-        jsTest.log(
-            "Testing findAndModify update with postImage with enableFindAndModifyImageCollection: " +
-            enableFindAndModifyImageCollection);
+        jsTest.log("Testing findAndModify update with postImage");
 
         assert.commandWorked(mongosTestColl.insert([{_id: -1, x: -1}]));
         const findAndModifyCmdObj = {
@@ -531,7 +529,6 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         testRetryFindAndModify(findAndModifyCmdObj, {
             txnOptions,
             testMode,
-            enableFindAndModifyImageCollection,
             expectFindAndModifyImage,
             expectRetryToSucceed,
         });
@@ -540,12 +537,9 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
     function testRetryFindAndModifyRemove({
         txnOptions,
         testMode,
-        enableFindAndModifyImageCollection,
         expectRetryToSucceed,
     }) {
-        jsTest.log(
-            "Testing findAndModify remove (i.e. with preImage) with enableFindAndModifyImageCollection: " +
-            enableFindAndModifyImageCollection);
+        jsTest.log("Testing findAndModify remove (i.e. with preImage)");
 
         assert.commandWorked(mongosTestColl.insert([{_id: -1, x: -1}]));
         const findAndModifyCmdObj = {
@@ -557,7 +551,6 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
         testRetryFindAndModify(findAndModifyCmdObj, {
             txnOptions,
             testMode,
-            enableFindAndModifyImageCollection,
             expectFindAndModifyImage,
             expectRetryToSucceed,
         });
@@ -589,12 +582,6 @@ function RetryableInternalTransactionTest(collectionOptions = {}) {
     }
 
     this.runFindAndModifyTestsEnableImageCollection = function(testOptions) {
-        testOptions.enableFindAndModifyImageCollection = true;
-        runFindAndModifyTests(testOptions);
-    };
-
-    this.runFindAndModifyTestsDisableImageCollection = function(testOptions) {
-        testOptions.enableFindAndModifyImageCollection = false;
         runFindAndModifyTests(testOptions);
     };
 

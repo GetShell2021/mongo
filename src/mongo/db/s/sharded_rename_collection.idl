@@ -35,7 +35,7 @@ global:
         - "mongo/s/catalog/type_collection.h"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/db/s/sharding_ddl_coordinator.idl"
     - "mongo/s/request_types/sharded_ddl_commands.idl"
 
@@ -80,6 +80,11 @@ commands:
                 type: uuid
                 description: "ID of the existing collection getting dropped."
                 optional: true
+            newTargetCollectionUuid:
+                type: uuid
+                description: "New ID for the renamed collection in case of renaming across DBs."
+                optional: true
+        reply_type: OkReply
 
     _shardsvrRenameCollectionParticipantUnblock:
         command_name: _shardsvrRenameCollectionParticipantUnblock
@@ -94,6 +99,7 @@ commands:
             sourceUUID:
                 type: uuid
                 description: "ID of the collection getting renamed."
+        reply_type: OkReply
 
 structs:
     RenameCollectionCoordinatorDocument:
@@ -107,12 +113,8 @@ structs:
             phase:
                 type: RenameCollectionCoordinatorPhase
                 default: kUnset
-            targetIsSharded:
-                description: "Indicates whether the target collection (to override) is sharded or not."
-                type: bool
-                default: false
-            optShardedCollInfo:
-                description: "CollectionType of the collection currently being renamed (if sharded)."
+            optTrackedCollInfo:
+                description: "CollectionType of the collection currently being renamed (if is tracked by the config server)."
                 type: CollectionType
                 optional: true
             sourceUUID:
@@ -122,6 +124,15 @@ structs:
             targetUUID:
                 type: uuid
                 description: "ID of the existing collection getting dropped."
+                optional: true
+            newTargetCollectionUuid:
+                type: uuid
+                description: "New ID for the renamed collection in case of renaming across DBs."
+                optional: true
+            allowEncryptedCollectionRename:
+                description: "Encrypted Collection renames are usually disallowed to minimize user error.
+                              C2C needs to do the renames to replicate create collection."
+                type: bool
                 optional: true
 
     RenameCollectionParticipantDocument:
@@ -145,4 +156,8 @@ structs:
             targetUUID:
                 type: uuid
                 description: "ID of the existing collection getting dropped."
+                optional: true
+            newTargetCollectionUuid:
+                type: uuid
+                description: "New ID for the renamed collection in case of renaming across DBs."
                 optional: true

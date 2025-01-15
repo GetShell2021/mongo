@@ -4,11 +4,15 @@
 //   uses_multi_shard_transaction,
 //   uses_transactions,
 // ]
-(function() {
-"use strict";
-
-load("jstests/sharding/libs/failpoint_helpers.js");
-load("jstests/sharding/libs/sharded_transactions_helpers.js");
+import {ShardingTest} from "jstests/libs/shardingtest.js";
+import {
+    failCommandWithError,
+    failCommandWithWriteConcernError,
+    turnOffFailCommand
+} from "jstests/sharding/libs/failpoint_helpers.js";
+import {
+    flushRoutersAndRefreshShardMetadata
+} from "jstests/sharding/libs/sharded_transactions_helpers.js";
 
 const dbName = "test";
 const collName = "foo";
@@ -124,8 +128,8 @@ let st = new ShardingTest({shards: 2, mongosOptions: {verbose: 3}});
 // Create a sharded collection with a chunk on each shard:
 // shard0: [-inf, 0)
 // shard1: [0, +inf)
-assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
-assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
+assert.commandWorked(
+    st.s.adminCommand({enableSharding: dbName, primaryShard: st.shard0.shardName}));
 assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: ns, middle: {_id: 0}}));
 st.refreshCatalogCacheForNs(st.s, ns);
@@ -206,4 +210,3 @@ flushRoutersAndRefreshShardMetadata(st, {ns});
 runCommitTests("coordinateCommitTransaction");
 
 st.stop();
-}());

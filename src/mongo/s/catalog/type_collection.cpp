@@ -27,21 +27,21 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include <utility>
 
-#include "mongo/s/catalog/type_collection.h"
+#include <boost/move/utility_core.hpp>
+#include <boost/none.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "mongo/base/status_with.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/s/balancer_configuration.h"
+#include "mongo/idl/idl_parser.h"
+#include "mongo/s/catalog/type_collection.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-const NamespaceString CollectionType::ConfigNS("config.collections");
+const NamespaceString CollectionType::ConfigNS(NamespaceString::kConfigsvrCollectionsNamespace);
 
 CollectionType::CollectionType(NamespaceString nss,
                                OID epoch,
@@ -54,15 +54,15 @@ CollectionType::CollectionType(NamespaceString nss,
                          std::move(creationTime),
                          std::move(uuid),
                          std::move(keyPattern)) {
-    invariant(creationTime != Timestamp(0, 0));
+    invariant(getTimestamp() != Timestamp(0, 0));
     setEpoch(std::move(epoch));
 }
 
 CollectionType::CollectionType(const BSONObj& obj) {
-    CollectionType::parseProtected(IDLParserErrorContext("CollectionType"), obj);
+    CollectionType::parseProtected(IDLParserContext("CollectionType"), obj);
     invariant(getTimestamp() != Timestamp(0, 0));
     uassert(ErrorCodes::BadValue,
-            str::stream() << "Invalid namespace " << getNss(),
+            str::stream() << "Invalid namespace " << getNss().toStringForErrorMsg(),
             getNss().isValid());
     if (!getPre22CompatibleEpoch()) {
         setPre22CompatibleEpoch(OID());

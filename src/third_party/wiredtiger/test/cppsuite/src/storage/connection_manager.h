@@ -26,8 +26,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef CONN_API_H
-#define CONN_API_H
+#pragma once
 
 /* Following definitions are required in order to use printing format specifiers in C++. */
 #ifndef __STDC_LIMIT_MACROS
@@ -47,10 +46,10 @@ namespace test_harness {
  * required connection API calls.
  */
 class connection_manager {
-    public:
+public:
     static connection_manager &instance();
 
-    public:
+public:
     /* No copies of the singleton allowed. */
     connection_manager(connection_manager const &) = delete;
     connection_manager &operator=(connection_manager const &) = delete;
@@ -58,6 +57,7 @@ class connection_manager {
 
     void close();
     void create(const std::string &config, const std::string &home);
+    void reopen(const std::string &config, const std::string &home);
     scoped_session create_session();
 
     WT_CONNECTION *get_connection();
@@ -67,13 +67,11 @@ class connection_manager {
      */
     void set_timestamp(const std::string &config);
 
-    private:
+private:
     connection_manager();
 
-    private:
+private:
     WT_CONNECTION *_conn = nullptr;
     std::mutex _conn_mutex;
 };
 } // namespace test_harness
-
-#endif

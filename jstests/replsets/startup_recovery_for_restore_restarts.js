@@ -4,15 +4,15 @@
  * we can do so even after we crash in the middle of an attempt to restore.
  *
  * This test only makes sense for storage engines that support recover to stable timestamp.
- * @tags: [requires_wiredtiger, requires_persistence, requires_journaling, requires_replication,
+ * @tags: [requires_wiredtiger, requires_persistence, requires_replication,
  * requires_majority_read_concern, uses_transactions, uses_prepare_transaction,
  * # We don't expect to do this while upgrading.
  * multiversion_incompatible]
  */
 
-(function() {
-"use strict";
-load("jstests/libs/fail_point_util.js");
+import {configureFailPoint} from "jstests/libs/fail_point_util.js";
+import {ReplSetTest} from "jstests/libs/replsettest.js";
+
 const SIGKILL = 9;
 
 const dbName = TestData.testName;
@@ -29,7 +29,7 @@ const startParams = {
 };
 const nodes = rst.startSet({setParameter: startParams});
 let restoreNode = nodes[1];
-rst.initiateWithHighElectionTimeout();
+rst.initiate();
 const primary = rst.getPrimary();
 const db = primary.getDB(dbName);
 const collName = "testcoll";
@@ -128,23 +128,25 @@ rst.start(restoreNode,
               })
           },
           true /* restart */);
+let subStr = "hangAfterCollectionInserts fail point enabled";
 assert.soon(() => {  // Can't use checklog because we can't connect to the mongo in startup mode.
-    return rawMongoProgramOutput().search("hangAfterCollectionInserts fail point enabled") !== -1;
+    return rawMongoProgramOutput(subStr).search(subStr) !== -1;
 });
 // We need to make sure we get a checkpoint after the failpoint is hit, so we clear the output after
 // hitting it.  Occasionally we'll miss a checkpoint as a result of clearing the output, but we'll
 // get another one a second later.
 clearRawMongoProgramOutput();
 // Ensure the checkpoint starts after the insert.
+subStr = "WT_VERB_CHECKPOINT.*saving checkpoint snapshot min";
 assert.soon(() => {
-    return rawMongoProgramOutput().search("WT_VERB_CHECKPOINT.*saving checkpoint snapshot min") !==
-        -1;
+    return rawMongoProgramOutput(subStr).search(subStr) !== -1;
 });
 // Ensure that we wait for a checkpoint completed log message that comes strictly after the above
 // checkpoint started message.
 clearRawMongoProgramOutput();
+subStr = "Completed unstable checkpoint.";
 assert.soon(() => {
-    return rawMongoProgramOutput().search("Completed unstable checkpoint.") !== -1;
+    return rawMongoProgramOutput(subStr).search(subStr) !== -1;
 });
 
 jsTestLog("Restarting restore node uncleanly");
@@ -193,4 +195,3 @@ assert.docEq({_id: "s2"}, restoreNode.getDB(dbName)[sentinelCollName].findOne({_
 stopReplProducer2.off();
 stopReplProducer3.off();
 rst.stopSet();
-})();

@@ -29,13 +29,31 @@
 
 #include "mongo/db/pipeline/change_stream_filter_helpers.h"
 
-#include "mongo/db/bson/bson_helper.h"
+#include <boost/optional/optional.hpp>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/bsontypes_util.h"
+#include "mongo/db/basic_types.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/pipeline/change_stream_helpers_legacy.h"
+#include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
 #include "mongo/db/pipeline/change_stream_rewrite_helpers.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
-#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/bson/bson_helper.h"
+#include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/optime.h"
 
 namespace mongo {
 namespace change_stream_filter {
@@ -43,56 +61,63 @@ namespace change_stream_filter {
 std::unique_ptr<MatchExpression> buildTsFilter(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     Timestamp startFromInclusive,
-    const MatchExpression* userMatch) {
-    return MatchExpressionParser::parseAndNormalize(BSON("ts" << GTE << startFromInclusive),
-                                                    expCtx);
+    const MatchExpression* userMatch,
+    std::vector<BSONObj>& backingBsonObjs) {
+    return MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(BSON("ts" << GTE << startFromInclusive)), expCtx);
 }
 
 std::unique_ptr<MatchExpression> buildFromMigrateSystemOpFilter(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MatchExpression* userMatch,
+    std::vector<BSONObj>& backingBsonObjs) {
     auto cmdNsRegex = DocumentSourceChangeStream::getCmdNsRegexForChangeStream(expCtx);
 
     // The filter {fromMigrate:true} allows quickly skip nonrelevant oplog entries
     auto andMigrateEvents = std::make_unique<AndMatchExpression>();
-    andMigrateEvents->add(
-        MatchExpressionParser::parseAndNormalize(BSON("fromMigrate" << true), expCtx));
-    andMigrateEvents->add(
-        MatchExpressionParser::parseAndNormalize(BSON("ns" << BSONRegEx(cmdNsRegex)), expCtx));
+    andMigrateEvents->add(MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(BSON("fromMigrate" << true)), expCtx));
+    andMigrateEvents->add(MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(BSON("ns" << BSONRegEx(cmdNsRegex))), expCtx));
 
     auto orMigrateEvents = std::make_unique<OrMatchExpression>();
     auto collRegex = DocumentSourceChangeStream::getCollRegexForChangeStream(expCtx);
-    orMigrateEvents->add(
-        MatchExpressionParser::parseAndNormalize(BSON("o.create" << BSONRegEx(collRegex)), expCtx));
     orMigrateEvents->add(MatchExpressionParser::parseAndNormalize(
-        BSON("o.createIndexes" << BSONRegEx(collRegex)), expCtx));
+        backingBsonObjs.emplace_back(BSON("o.create" << BSONRegEx(collRegex))), expCtx));
+    orMigrateEvents->add(MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(BSON("o.createIndexes" << BSONRegEx(collRegex))), expCtx));
     andMigrateEvents->add(std::move(orMigrateEvents));
     return andMigrateEvents;
 }
 
 std::unique_ptr<MatchExpression> buildNotFromMigrateFilter(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MatchExpression* userMatch,
+    std::vector<BSONObj>& backingBsonObjs) {
     // Exclude any events that are marked as 'fromMigrate' in the oplog.
-    auto fromMigrateFilter =
-        MatchExpressionParser::parseAndNormalize(BSON("fromMigrate" << NE << true), expCtx);
+    auto fromMigrateFilter = MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(BSON("fromMigrate" << NE << true)), expCtx);
 
     // If 'showSystemEvents' is set, however, we do return some specific 'fromMigrate' events.
-    if (expCtx->changeStreamSpec->getShowSystemEvents()) {
+    if (expCtx->getChangeStreamSpec()->getShowSystemEvents()) {
         auto orMigrateEvents = std::make_unique<OrMatchExpression>(std::move(fromMigrateFilter));
-        orMigrateEvents->add(buildFromMigrateSystemOpFilter(expCtx, userMatch));
+        orMigrateEvents->add(buildFromMigrateSystemOpFilter(expCtx, userMatch, backingBsonObjs));
         fromMigrateFilter = std::move(orMigrateEvents);
     }
     return fromMigrateFilter;
 }
 
 std::unique_ptr<MatchExpression> buildOperationFilter(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MatchExpression* userMatch,
+    std::vector<BSONObj>& backingBsonObjs) {
 
     // Regexes to match each of the necessary namespace components for the current stream type.
     auto nsRegex = DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx);
     auto collRegex = DocumentSourceChangeStream::getCollRegexForChangeStream(expCtx);
     auto cmdNsRegex = DocumentSourceChangeStream::getCmdNsRegexForChangeStream(expCtx);
 
-    auto streamType = DocumentSourceChangeStream::getChangeStreamType(expCtx->ns);
+    auto streamType = DocumentSourceChangeStream::getChangeStreamType(expCtx->getNamespaceString());
 
     /**
      * IMPORTANT: Any new operationType added here must also add corresponding oplog rewrites in the
@@ -120,28 +145,32 @@ std::unique_ptr<MatchExpression> buildOperationFilter(
     std::unique_ptr<ListOfMatchExpression> operationFilter = std::make_unique<OrMatchExpression>();
 
     // (1) CRUD events on a monitored namespace.
-    auto crudEvents = BSON("ns" << BSONRegEx(nsRegex) << "$nor"
-                                << BSON_ARRAY(BSON("op"
-                                                   << "n")
-                                              << BSON("op"
-                                                      << "c")));
+    auto crudEvents = backingBsonObjs.emplace_back(BSON("ns" << BSONRegEx(nsRegex) << "$nor"
+                                                             << BSON_ARRAY(BSON("op"
+                                                                                << "n")
+                                                                           << BSON("op"
+                                                                                   << "c"))));
 
     // (2.1) The namespace for matching relevant commands.
-    auto cmdNsMatch = BSON("op"
-                           << "c"
-                           << "ns" << BSONRegEx(cmdNsRegex));
+    auto cmdNsMatch = backingBsonObjs.emplace_back(BSON("op"
+                                                        << "c"
+                                                        << "ns" << BSONRegEx(cmdNsRegex)));
 
     // (2.2) Commands that are run on a monitored database and/or collection.
-    auto dropEvent = BSON("o.drop" << BSONRegEx(collRegex));
-    auto dropDbEvent = BSON("o.dropDatabase" << BSON("$exists" << true));
-    auto renameFromEvent = BSON("o.renameCollection" << BSONRegEx(nsRegex));
-    auto renameToEvent =
-        BSON("o.renameCollection" << BSON("$exists" << true) << "o.to" << BSONRegEx(nsRegex));
-    const auto createEvent = BSON("o.create" << BSONRegEx(collRegex));
-    const auto createIndexesEvent = BSON("o.createIndexes" << BSONRegEx(collRegex));
-    const auto commitIndexBuildEvent = BSON("o.commitIndexBuild" << BSONRegEx(collRegex));
-    const auto dropIndexesEvent = BSON("o.dropIndexes" << BSONRegEx(collRegex));
-    const auto collModEvent = BSON("o.collMod" << BSONRegEx(collRegex));
+    auto dropEvent = backingBsonObjs.emplace_back(BSON("o.drop" << BSONRegEx(collRegex)));
+    auto renameFromEvent =
+        backingBsonObjs.emplace_back(BSON("o.renameCollection" << BSONRegEx(nsRegex)));
+    auto renameToEvent = backingBsonObjs.emplace_back(
+        BSON("o.renameCollection" << BSON("$exists" << true) << "o.to" << BSONRegEx(nsRegex)));
+    const auto createEvent = backingBsonObjs.emplace_back(BSON("o.create" << BSONRegEx(collRegex)));
+    const auto createIndexesEvent =
+        backingBsonObjs.emplace_back(BSON("o.createIndexes" << BSONRegEx(collRegex)));
+    const auto commitIndexBuildEvent =
+        backingBsonObjs.emplace_back(BSON("o.commitIndexBuild" << BSONRegEx(collRegex)));
+    const auto dropIndexesEvent =
+        backingBsonObjs.emplace_back(BSON("o.dropIndexes" << BSONRegEx(collRegex)));
+    const auto collModEvent =
+        backingBsonObjs.emplace_back(BSON("o.collMod" << BSONRegEx(collRegex)));
 
     auto orCmdEvents = std::make_unique<OrMatchExpression>();
     orCmdEvents->add(MatchExpressionParser::parseAndNormalize(dropEvent, expCtx));
@@ -153,9 +182,20 @@ std::unique_ptr<MatchExpression> buildOperationFilter(
     orCmdEvents->add(MatchExpressionParser::parseAndNormalize(dropIndexesEvent, expCtx));
     orCmdEvents->add(MatchExpressionParser::parseAndNormalize(collModEvent, expCtx));
 
+    if (expCtx->getChangeStreamSpec()->getShowSystemEvents()) {
+        orCmdEvents->add(MatchExpressionParser::parseAndNormalize(
+            backingBsonObjs.emplace_back(BSON("o.startIndexBuild" << BSONRegEx{collRegex})),
+            expCtx));
+        orCmdEvents->add(MatchExpressionParser::parseAndNormalize(
+            backingBsonObjs.emplace_back(BSON("o.abortIndexBuild" << BSONRegEx{collRegex})),
+            expCtx));
+    }
+
     // Omit dropDatabase on single-collection streams. While the stream will be invalidated before
     // it sees this event, the user will incorrectly see it if they startAfter the invalidate.
     if (streamType != DocumentSourceChangeStream::ChangeStreamType::kSingleCollection) {
+        auto dropDbEvent =
+            backingBsonObjs.emplace_back(BSON("o.dropDatabase" << BSON("$exists" << true)));
         orCmdEvents->add(MatchExpressionParser::parseAndNormalize(dropDbEvent, expCtx));
     }
 
@@ -169,7 +209,8 @@ std::unique_ptr<MatchExpression> buildOperationFilter(
     operationFilter->add(std::move(cmdEventsOnTargetDb));
 
     // (4) Apply the user's match filters to the standard event filter.
-    if (auto rewrittenMatch = change_stream_rewrite::rewriteFilterForFields(expCtx, userMatch)) {
+    if (auto rewrittenMatch =
+            change_stream_rewrite::rewriteFilterForFields(expCtx, userMatch, backingBsonObjs)) {
         operationFilter = std::make_unique<AndMatchExpression>(std::move(operationFilter), nullptr);
         operationFilter->add(std::move(rewrittenMatch));
     }
@@ -178,7 +219,9 @@ std::unique_ptr<MatchExpression> buildOperationFilter(
 }
 
 std::unique_ptr<MatchExpression> buildViewDefinitionEventFilter(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MatchExpression* userMatch,
+    std::vector<BSONObj>& backingBsonObjs) {
     // The view op filter is as follows:
     // {
     //   ns: nsSystemViewsRegex, // match system.views for relevant DBs
@@ -188,18 +231,21 @@ std::unique_ptr<MatchExpression> buildViewDefinitionEventFilter(
     //   ]
     // }
     auto nsSystemViewsRegex = DocumentSourceChangeStream::getViewNsRegexForChangeStream(expCtx);
-    auto viewEventsFilter = BSON("ns" << BSONRegEx(nsSystemViewsRegex) << "$nor"
-                                      << BSON_ARRAY(BSON("op"
-                                                         << "n")
-                                                    << BSON("op"
-                                                            << "c")));
+    auto viewEventsFilter =
+        backingBsonObjs.emplace_back(BSON("ns" << BSONRegEx(nsSystemViewsRegex) << "$nor"
+                                               << BSON_ARRAY(BSON("op"
+                                                                  << "n")
+                                                             << BSON("op"
+                                                                     << "c"))));
 
     return MatchExpressionParser::parseAndNormalize(viewEventsFilter, expCtx);
 }
 
 std::unique_ptr<MatchExpression> buildInvalidationFilter(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
-    auto nss = expCtx->ns;
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MatchExpression* userMatch,
+    std::vector<BSONObj>& backingBsonObjs) {
+    auto nss = expCtx->getNamespaceString();
     auto streamType = DocumentSourceChangeStream::getChangeStreamType(nss);
 
     // A whole-cluster change stream is not invalidated by anything.
@@ -211,25 +257,34 @@ std::unique_ptr<MatchExpression> buildInvalidationFilter(
     if (streamType == DocumentSourceChangeStream::ChangeStreamType::kSingleCollection) {
         // A single-collection stream is invalidated by drop and rename events.
         invalidatingCommands.append(BSON("o.drop" << nss.coll()));
-        invalidatingCommands.append(BSON("o.renameCollection" << nss.ns()));
+        invalidatingCommands.append(BSON("o.renameCollection" << NamespaceStringUtil::serialize(
+                                             nss, SerializationContext::stateDefault())));
         invalidatingCommands.append(
-            BSON("o.renameCollection" << BSON("$exists" << true) << "o.to" << nss.ns()));
+            BSON("o.renameCollection"
+                 << BSON("$exists" << true) << "o.to"
+                 << NamespaceStringUtil::serialize(nss, SerializationContext::stateDefault())));
     } else {
         // For a whole-db streams, only 'dropDatabase' will cause an invalidation event.
         invalidatingCommands.append(BSON("o.dropDatabase" << BSON("$exists" << true)));
     }
 
     // Match only against the target db's command namespace.
-    auto invalidatingFilter = BSON("op"
-                                   << "c"
-                                   << "ns" << nss.getCommandNS().ns() << "$or"
-                                   << invalidatingCommands.arr());
+    auto invalidatingFilter = backingBsonObjs.emplace_back(BSON(
+        "op"
+        << "c"
+        << "ns"
+        << NamespaceStringUtil::serialize(nss.getCommandNS(), SerializationContext::stateDefault())
+        << "$or" << invalidatingCommands.arr()));
     return MatchExpressionParser::parseAndNormalize(invalidatingFilter, expCtx);
 }  // namespace change_stream_filter
 
 std::unique_ptr<MatchExpression> buildTransactionFilter(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MatchExpression* userMatch,
+    std::vector<BSONObj>& backingBsonObjs) {
     BSONObjBuilder applyOpsBuilder;
+
+    auto nsRegex = DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx);
 
     // "o.applyOps" stores the list of operations, so it must be an array.
     applyOpsBuilder.append("op", "c");
@@ -244,7 +299,6 @@ std::unique_ptr<MatchExpression> buildTransactionFilter(
         BSONArrayBuilder orBuilder(applyOpsBuilder.subarrayStart("$or"));
         {
             // Regexes for full-namespace, collection, and command-namespace matching.
-            auto nsRegex = DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx);
             auto collRegex = DocumentSourceChangeStream::getCollRegexForChangeStream(expCtx);
             auto cmdNsRegex = DocumentSourceChangeStream::getCmdNsRegexForChangeStream(expCtx);
 
@@ -267,19 +321,23 @@ std::unique_ptr<MatchExpression> buildTransactionFilter(
         }
     }
     auto applyOpsFilter = applyOpsBuilder.obj();
+    auto endOfTransactionFilter = BSON("op"
+                                       << "n"
+                                       << "o2.endOfTransaction" << BSONRegEx(nsRegex));
+    auto commitTransactionFilter = BSON("op"
+                                        << "c"
+                                        << "o.commitTransaction" << 1);
 
-    auto transactionFilter =
-        MatchExpressionParser::parseAndNormalize(BSON(OR(applyOpsFilter,
-                                                         BSON("op"
-                                                              << "c"
-                                                              << "o.commitTransaction" << 1))),
-                                                 expCtx);
+    auto transactionFilter = MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(
+            BSON(OR(applyOpsFilter, endOfTransactionFilter, commitTransactionFilter))),
+        expCtx);
 
     // All events in a transaction share the same clusterTime, lsid, and txNumber values. If the
     // user wishes to filter out events based on these values, it is possible to rewrite these
     // filters to filter out entire applyOps and commitTransaction entries before they are unwound.
     if (auto rewrittenMatch = change_stream_rewrite::rewriteFilterForFields(
-            expCtx, userMatch, {"clusterTime", "lsid", "txnNumber"})) {
+            expCtx, userMatch, backingBsonObjs, {"clusterTime", "lsid", "txnNumber"})) {
         auto transactionFilterWithUserMatch = std::make_unique<AndMatchExpression>();
         transactionFilterWithUserMatch->add(std::move(transactionFilter));
         transactionFilterWithUserMatch->add(std::move(rewrittenMatch));
@@ -290,7 +348,9 @@ std::unique_ptr<MatchExpression> buildTransactionFilter(
 }
 
 std::unique_ptr<MatchExpression> buildInternalOpFilter(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const MatchExpression* userMatch) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MatchExpression* userMatch,
+    std::vector<BSONObj>& backingBsonObjs) {
     // Noop change events:
     //   - reshardBegin: A resharding operation begins.
     //   - reshardDoneCatchUp: "Catch up" phase of reshard operation completes.
@@ -298,22 +358,19 @@ std::unique_ptr<MatchExpression> buildInternalOpFilter(
     std::vector<StringData> internalOpTypes = {
         "reshardBegin"_sd, "reshardDoneCatchUp"_sd, "shardCollection"_sd};
 
-    // Noop change events that are only applicable when merging results on mongoS:
+    // Noop change events that are only applicable when merging results on router:
     //   - migrateChunkToNewShard: A chunk migrated to a shard that didn't have any chunks.
-    if (expCtx->inMongos || expCtx->needsMerge) {
+    if (expCtx->getInRouter() || expCtx->getNeedsMerge()) {
         internalOpTypes.push_back("migrateChunkToNewShard"_sd);
     }
 
     // Only return the 'migrateLastChunkFromShard' event if 'showSystemEvents' is set.
-    if (expCtx->changeStreamSpec->getShowSystemEvents()) {
+    if (expCtx->getChangeStreamSpec()->getShowSystemEvents()) {
         internalOpTypes.push_back("migrateLastChunkFromShard"_sd);
     }
 
-    if (feature_flags::gFeatureFlagChangeStreamsFurtherEnrichedEvents.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
-        internalOpTypes.push_back("refineCollectionShardKey"_sd);
-        internalOpTypes.push_back("reshardCollection"_sd);
-    }
+    internalOpTypes.push_back("refineCollectionShardKey"_sd);
+    internalOpTypes.push_back("reshardCollection"_sd);
 
     // Build the oplog filter to match the required internal op types.
     BSONArrayBuilder internalOpTypeOrBuilder;
@@ -321,23 +378,21 @@ std::unique_ptr<MatchExpression> buildInternalOpFilter(
         internalOpTypeOrBuilder.append(BSON("o2." + eventName << BSON("$exists" << true)));
     }
 
-    // TODO SERVER-66138: This filter can be removed after 7.0 release.
-    change_stream_legacy::populateInternalOperationFilter(expCtx, &internalOpTypeOrBuilder);
-
     // Finalize the array of $or filter predicates.
     internalOpTypeOrBuilder.done();
 
     auto nsRegex = DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx);
-    return MatchExpressionParser::parseAndNormalize(BSON("op"
-                                                         << "n"
-                                                         << "ns" << BSONRegEx(nsRegex) << "$or"
-                                                         << internalOpTypeOrBuilder.arr()),
-                                                    expCtx);
+    return MatchExpressionParser::parseAndNormalize(
+        backingBsonObjs.emplace_back(BSON("op"
+                                          << "n"
+                                          << "ns" << BSONRegEx(nsRegex) << "$or"
+                                          << internalOpTypeOrBuilder.arr())),
+        expCtx);
 }
 
 BSONObj getMatchFilterForClassicOperationTypes() {
     return BSON(DocumentSourceChangeStream::kOperationTypeField
-                << BSON("$in" << change_stream_legacy::kClassicOperationTypes));
+                << BSON("$in" << change_stream::kClassicOperationTypes));
 }
 
 }  // namespace change_stream_filter

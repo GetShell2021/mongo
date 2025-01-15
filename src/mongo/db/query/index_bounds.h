@@ -29,9 +29,12 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/interval.h"
 #include "mongo/db/storage/index_entry_comparison.h"
@@ -95,12 +98,34 @@ struct OrderedIntervalList {
     bool isMinToMax() const;
 
     /**
+     * Returns true if this OIL represents a single [MaxKey, MinKey] bound.
+     */
+    bool isMaxToMin() const;
+
+    /**
      * Returns true if this OIL represents a point predicate: [N, N].
      *
      * These predicates are interesting because if you have an index on {a:1, b:1},
      * and a point predicate on 'a', then the index provides a sort on {b: 1}.
      */
     bool isPoint() const;
+
+    /**
+     * Returns true if this OIL contains only point intervals (such as [N, N]).
+     */
+    bool containsOnlyPointIntervals() const;
+
+    /**
+     * Returns true is this OIL overlaps the type bracket containing objects.
+     */
+    bool boundsOverlapObjectTypeBracket() const;
+
+    template <typename H>
+    friend H AbslHashValue(H state, const OrderedIntervalList& c) {
+        state = absl::HashState::combine_contiguous(
+            std::move(state), c.intervals.data(), c.intervals.size());
+        return H::combine(std::move(state), c.name);
+    }
 };
 
 /**
@@ -188,6 +213,17 @@ struct IndexBounds {
      */
     IndexBounds reverse() const;
 
+    /**
+     * Returns whether these index bounds represent being unbounded.
+     */
+    bool isUnbounded() const;
+
+    template <typename H>
+    friend H AbslHashValue(H state, const IndexBounds& c) {
+        return absl::HashState::combine_contiguous(
+            std::move(state), c.fields.data(), c.fields.size());
+    }
+
     // TODO: we use this for max/min scan.  Consider migrating that.
     bool isSimpleRange;
     BSONObj startKey;
@@ -264,6 +300,19 @@ public:
      * Out parameter only valid if we return MUST_ADVANCE.
      */
     KeyState checkKey(const BSONObj& currentKey, IndexSeekPoint* query);
+
+    /**
+     * The function is same as above `checkKey` plus returning the end key position when the last
+     * field of the index is a range interval.
+     *
+     * The end key will be set to empty if KeyState is not VALID or the last field is not a range
+     * interval.
+     */
+    KeyState checkKeyWithEndPosition(const BSONObj& currentKey,
+                                     IndexSeekPoint* query,
+                                     key_string::Builder& endKey,
+                                     Ordering ord,
+                                     bool forward);
 
     /**
      * Relative position of a key to an interval.

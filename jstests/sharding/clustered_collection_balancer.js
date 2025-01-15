@@ -8,8 +8,7 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {ShardingTest} from "jstests/libs/shardingtest.js";
 
 Random.setRandomSeed();
 
@@ -74,4 +73,3 @@ function runTest(shardKey) {
 runTest("_id");
 runTest("b");
 st.stop();
-})();

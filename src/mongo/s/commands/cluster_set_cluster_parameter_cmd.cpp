@@ -28,19 +28,41 @@
  */
 
 
-#include "mongo/platform/basic.h"
+#include <memory>
+#include <string>
+#include <utility>
 
+#include <boost/move/utility_core.hpp>
+#include <fmt/format.h>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/base/shim.h"
+#include "mongo/client/read_preference.h"
+#include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/cluster_server_parameter_cmds_gen.h"
-#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/db/commands/set_cluster_parameter_command_impl.h"
+#include "mongo/db/database_name.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/query_settings/query_settings_manager.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/update/storage_validation.h"
+#include "mongo/rpc/op_msg.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/util/assert_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
-
 namespace mongo {
+
+using namespace fmt::literals;
 namespace {
 
 class SetClusterParameterCmd final : public TypedCommand<SetClusterParameterCmd> {
@@ -64,20 +86,36 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            ConfigsvrSetClusterParameter configsvrSetClusterParameter(
-                request().getCommandParameter());
-            configsvrSetClusterParameter.setDbName(ns().db());
+            auto service = opCtx->getService();
+            invariant(service->role().hasExclusively(ClusterRole::RouterServer),
+                      "Attempted to run a router-only command directly from the shard role.");
 
-            const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+            uassert(ErrorCodes::NoSuchKey,
+                    "No cluster parameter provided",
+                    request().getCommandParameter().nFields() > 0);
 
-            const auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
-                opCtx,
-                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                NamespaceString::kAdminDb.toString(),
-                configsvrSetClusterParameter.toBSON({}),
-                Shard::RetryPolicy::kIdempotent));
+            uassert(ErrorCodes::InvalidOptions,
+                    "{} only supports setting exactly one parameter"_format(Request::kCommandName),
+                    request().getCommandParameter().nFields() == 1);
 
-            uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(std::move(cmdResponse)));
+            uassert(
+                ErrorCodes::NoSuchKey,
+                "Unknown server parameter: {}"_format(
+                    query_settings::QuerySettingsManager::kQuerySettingsClusterParameterName),
+                !request().getCommandParameter()
+                     [query_settings::QuerySettingsManager::kQuerySettingsClusterParameterName]);
+
+            {
+                bool ignore;
+                mutablebson::Document mutableUpdate(request().getCommandParameter());
+                storage_validation::scanDocument(mutableUpdate, false, true, &ignore);
+            }
+
+            static auto impl = getSetClusterParameterImpl(service);
+            impl(opCtx,
+                 request(),
+                 boost::none /* clusterParameterTime */,
+                 boost::none /* previousTime */);
         }
 
     private:
@@ -86,18 +124,20 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString();
+            return NamespaceString::kEmpty;
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())
-                        ->isAuthorizedForPrivilege(Privilege{ResourcePattern::forClusterResource(),
-                                                             ActionType::setClusterParameter}));
+                        ->isAuthorizedForPrivilege(Privilege{
+                            ResourcePattern::forClusterResource(request().getDbName().tenantId()),
+                            ActionType::setClusterParameter}));
         }
     };
-} setClusterParameterCmd;
+};
+MONGO_REGISTER_COMMAND(SetClusterParameterCmd).forRouter();
 
 }  // namespace
 }  // namespace mongo

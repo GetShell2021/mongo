@@ -29,16 +29,24 @@
 
 #pragma once
 
+#include <absl/container/node_hash_map.h>
+#include <boost/move/utility_core.hpp>
+#include <boost/optional/optional.hpp>
 #include <string>
+#include <sys/types.h>
 #include <vector>
 
+#include "mongo/base/status.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/rpc/topology_version_gen.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/net/hostandport.h"
-#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -208,13 +216,13 @@ public:
 
     void setReplSetVersion(long long version);
 
-    void addHost(const HostAndPort& host);
+    void addHost(HostAndPort host);
 
-    void addPassive(const HostAndPort& passive);
+    void addPassive(HostAndPort passive);
 
-    void addArbiter(const HostAndPort& arbiter);
+    void addArbiter(HostAndPort arbiter);
 
-    void setPrimary(const HostAndPort& primary);
+    void setPrimary(HostAndPort primary);
 
     void setIsArbiterOnly(bool arbiterOnly);
 
@@ -230,7 +238,7 @@ public:
 
     void addTag(const std::string& tagKey, const std::string& tagValue);
 
-    void setMe(const HostAndPort& me);
+    void setMe(HostAndPort me);
 
     void setElectionId(const OID& electionId);
 
